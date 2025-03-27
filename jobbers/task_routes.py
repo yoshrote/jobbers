@@ -15,7 +15,6 @@ hit_counter = meter.create_up_down_counter("hit_counter")
 async def read_root():
     """Serve the index page."""
     logger.info("Serving the index page")
-    # hit_counter.add(1)
     return {"message": "Welcome to Task Manager!"}
 
 @app.post("/submit-task")
