@@ -6,7 +6,7 @@ from httpx import ASGITransport, AsyncClient
 from playground.state_manager import Task
 from playground.task_routes import app
 
-ULID1 = "01JQC31AJP7TSA9X8AEP64XG08" 
+ULID1 = "01JQC31AJP7TSA9X8AEP64XG08"
 ULID2 = "01JQC31BHQ5AXV0JK23ZWSS5NA"
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from opentelemetry import metrics
 from ulid import ULID
 
-from .state_manager import Task, StateManager
+from .state_manager import StateManager, Task
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
