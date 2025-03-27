@@ -11,8 +11,6 @@ logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 hit_counter = meter.create_up_down_counter("hit_counter")
 
-
-
 @app.get("/")
 async def read_root():
     """Serve the index page."""
