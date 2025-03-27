@@ -42,7 +42,6 @@ class Task(BaseModel):
     @classmethod
     def from_redis(cls, task_id: ULID, raw_task_data: dict) -> "Task":
         # Try to set good defaults for missing fields so when new fields are added to the task model, we don't break
-        print(raw_task_data[b"error"])
         return cls(
             id=task_id,
             name=raw_task_data.get(b"name", b"").decode("utf-8"),
@@ -115,3 +114,6 @@ class StateManager:
             results.append(task)
         return results
 
+def build_sm() -> StateManager:
+    from jobbers import db
+    return StateManager(db.get_client())

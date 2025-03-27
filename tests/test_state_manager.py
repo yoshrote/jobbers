@@ -4,7 +4,7 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
-from playground.state_manager import StateManager, Task
+from jobbers.state_manager import StateManager, Task
 
 ISO_FROZEN_TIME = "2021-01-01T00:00:00+00:00"
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")

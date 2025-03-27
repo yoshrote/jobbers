@@ -24,7 +24,7 @@ services:
       timeout: 5s
       retries: 3
 
-  playground:
+  jobbers:
     build: .
     environment:
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://collector:4317"

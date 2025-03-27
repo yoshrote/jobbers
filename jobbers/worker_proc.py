@@ -3,9 +3,9 @@ import datetime as dt
 import logging
 import os
 
-from playground.db import get_client
-from playground.registry import get_task_function
-from playground.state_manager import StateManager, Task
+from jobbers.db import get_client
+from jobbers.registry import get_task_function
+from jobbers.state_manager import StateManager, Task
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

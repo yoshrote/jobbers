@@ -8,10 +8,10 @@ requires = [
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "playground/__init__.py"
+path = "jobbers/__init__.py"
 
 [project]
-name = "playground"
+name = "jobbers"
 description = "like airflow + celery but smaller"
 readme = { file = "README.md", content-type = "text/markdown" }
 license-files.globs = ["LICENSE"]
@@ -54,11 +54,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yoshrote/playground"
+Homepage = "https://github.com/yoshrote/jobbers"
 
 [project.scripts]
-task_manager = 'playground.manager_proc:run'
-task_worker = 'playground.worker_proc:run'
+task_manager = 'jobbers.manager_proc:run'
+task_worker = 'jobbers.worker_proc:run'
 
 ## ruff settings ##
 [tool.ruff]
@@ -173,7 +173,7 @@ norecursedirs = [
 # pythonpath in basically random order and pytest does not understand legacy namespace packages and cannot
 # use namespace packages effectively when collecting tests.
 pythonpath = [
-    "playground",
+    "jobbers",
     "tests"
 ]
 testpaths = [

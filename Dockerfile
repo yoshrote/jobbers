@@ -1,6 +1,6 @@
 FROM python:3.11
 WORKDIR /usr/src/app
-COPY ./playground ./playground
+COPY ./jobbers ./jobbers
 COPY otel-config.yaml .
 COPY pyproject.toml .
 COPY LICENSE .

@@ -26,7 +26,7 @@ def enable_otel(handlers, app):
 
     resource=Resource.create(
         {
-            "service.name": "playground",
+            "service.name": "jobbers",
             "service.instance.id": os.uname().nodename,
         }
     )
@@ -71,8 +71,9 @@ def run():
         enable_otel(handlers, app)
 
     logging.basicConfig(level=logging.INFO, handlers=handlers)
-    logging.getLogger("playground").setLevel(logging.DEBUG)
+    logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
+    # Initialize the database client
     db.get_client()
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
