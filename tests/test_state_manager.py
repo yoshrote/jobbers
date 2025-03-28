@@ -4,7 +4,7 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
-from jobbers.state_manager import StateManager, Task
+from jobbers.state_manager import StateManager, Task, TaskStatus
 
 ISO_FROZEN_TIME = "2021-01-01T00:00:00+00:00"
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -49,7 +49,7 @@ async def test_submit_task_twice_updates_only(redis):
     # submitted_at should not change
     saved_task = await state_manager.get_task(ULID1)
     assert saved_task.name == "Updated Task"
-    assert saved_task.status == "completed"
+    assert saved_task.status == TaskStatus.COMPLETED
     assert saved_task.submitted_at == task.submitted_at
 
 @pytest.mark.asyncio
@@ -63,7 +63,7 @@ async def test_get_task(redis):
     assert task is not None
     assert task.id == ULID1
     assert task.name == "Test Task"
-    assert task.status == "started"
+    assert task.status == TaskStatus.STARTED
 
 @pytest.mark.asyncio
 async def test_get_task_not_found(redis):
