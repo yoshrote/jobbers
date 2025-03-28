@@ -30,9 +30,21 @@ class Task(BaseModel):
     # status fields
     status: str = "unsubmitted"
     submitted_at: dt.datetime | None = None
+    retried_at: dt.datetime | None = None
     started_at: dt.datetime | None = None
     heartbeat_at: dt.datetime | None = None
     completed_at: dt.datetime | None = None
+
+    expected_exceptions = tuple[Exception]
+
+    def should_retry(self) -> bool:
+        return False
+
+    def has_callbacks(self) -> bool:
+        return False
+
+    def generate_callbacks(self) -> list["Task"]:
+        return []
 
     def summarized(self):
         summary = self.model_dump(include={"id", "name", "parameters", "status", "submitted_at"})

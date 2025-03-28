@@ -21,17 +21,32 @@ async def process_task(task: Task, state_manager: StateManager):
         return
     try:
         task.result = await task_function(**task.parameters)
-    except Exception as exc:
+
+    except task.expected_exceptions as exc:
         logger.exception("Task %d failed with error: %s", task.id, exc)
+        if task.should_retry():
+            task.status = "retrying"
+            task.error = str(exc)
+        else:
+            task.status = "failed"
+            task.error = str(exc)
+            task.completed_at = dt.datetime.now(dt.timezone.utc)
+    except Exception as exc:
+        logger.exception("Task %d failed with unexpected error: %s", task.id, exc)
         task.status = "failed"
         task.error = str(exc)
-    # except TimeoutError:
-    #     logger.exception("Task %d timed out.", task.id)
+    else:
+        logger.info("Task %d completed.", task.id)
+        task.status = "completed"
+        task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-    logger.info("Task %d completed.", task.id)
-    task.status = "completed"
-    task.completed_at = dt.datetime.now(dt.timezone.utc)
-    await state_manager.submit_task(task)
+    await state_manager.submit_task(
+        task,
+        force_reenqueue=task.status == "retrying",
+        retry_delay=task.retry_delay
+    )
+
+    return task.status
 
 # move TaskGenerator to a separate file
 class TaskGenerator:
@@ -44,7 +59,7 @@ class TaskGenerator:
         self.role = role
         self.state_manager = state_manager
         self.task_queues = None
-        self.hup_tag = None
+        self.refresh_tag = None
 
     async def find_queues(self):
         """Find all queues we should listen to via Redis."""
@@ -58,11 +73,11 @@ class TaskGenerator:
         return self.task_queues
 
     async def should_reload_queues(self):
-        if not self.hup_tag:
+        if not self.refresh_tag:
             return False
-        current_hup = await self.redis.get("worker-queues:hup")
-        if current_hup != self.hup_tag:
-            self.hup_tag = current_hup
+        refresh_tag = await self.redis.get(f"worker-queues:{self.role}:refresh_tag")
+        if refresh_tag != self.refresh_tag:
+            self.refresh_tag = refresh_tag
             return True
         return False
 
@@ -71,6 +86,8 @@ class TaskGenerator:
 
     async def __anext__(self):
         task_queues = await self.queues()
+        # TODO: Switch from a list to zscore to sort by ULID
+        # this lets us sort/query tasks in a queue by created_at, sortof
         task_id = await self.redis.brpop(task_queues, timeout=0)
         if task_id:
             task = await self.state_manager.get_task(int(task_id[1]))
@@ -89,7 +106,11 @@ async def task_consumer():
     task_generator = TaskGenerator(redis, state_manager, role)
     try:
         async for task in task_generator:
-            await process_task(task, state_manager)
+            task_status = await process_task(task, state_manager)
+            if task_status == "completed" and task.has_callbacks():
+                # Monitor for when fan-out becomes problematic
+                for callback_task in task.generate_callbacks():
+                    await state_manager.submit_task(callback_task)
     except asyncio.CancelledError:
         logger.info("Task consumer shutting down...")
     finally:
