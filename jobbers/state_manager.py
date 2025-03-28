@@ -1,8 +1,10 @@
 import datetime as dt
 import logging
 from asyncio import TaskGroup
+from enum import StrEnum
+from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ulid import ULID
 
 from .serialization import (
@@ -16,6 +18,17 @@ from .serialization import (
 
 logger = logging.getLogger(__name__)
 
+class TaskStatus(StrEnum):
+    """Enumeration of task statuses."""
+
+    UNSUBMITTED = "unsubmitted"
+    SUBMITTED = "submitted"
+    STARTED = "started"
+    HEARTBEAT = "heartbeat"
+    COMPLETED = "completed"
+    RETRIED = "retried"
+    FAILED = "failed"
+
 class Task(BaseModel):
     """A task to be executed."""
 
@@ -26,16 +39,16 @@ class Task(BaseModel):
     version: int = 0
     parameters: dict = {}
     results: dict = {}
-    error: str | None = None
+    error: Optional[str] = None
     # status fields
-    status: str = "unsubmitted"
-    submitted_at: dt.datetime | None = None
-    retried_at: dt.datetime | None = None
-    started_at: dt.datetime | None = None
-    heartbeat_at: dt.datetime | None = None
-    completed_at: dt.datetime | None = None
+    status: TaskStatus = Field(default=TaskStatus.UNSUBMITTED)
+    submitted_at: Optional[dt.datetime] = None
+    retried_at: Optional[dt.datetime] = None
+    started_at: Optional[dt.datetime] = None
+    heartbeat_at: Optional[dt.datetime] = None
+    completed_at: Optional[dt.datetime] = None
 
-    expected_exceptions = tuple[Exception]
+    # expected_exceptions = tuple([]) #[Exception]
 
     def should_retry(self) -> bool:
         return False
@@ -61,7 +74,7 @@ class Task(BaseModel):
             parameters=deserialize(raw_task_data.get(b"parameters") or EMPTY_DICT),
             results=deserialize(raw_task_data.get(b"results") or EMPTY_DICT),
             error=decode_optional_string(raw_task_data.get(b"error")),
-            status=raw_task_data.get(b"status", b"").decode("utf-8"),
+            status=TaskStatus(raw_task_data.get(b"status", b"").decode("utf-8")),
             submitted_at=dt.datetime.fromisoformat(raw_task_data.get(b"submitted_at", b"").decode("utf-8")),
             started_at=decode_optional_datetime(raw_task_data.get(b"started_at")),
             heartbeat_at=decode_optional_datetime(raw_task_data.get(b"heartbeat_at")),
@@ -94,7 +107,7 @@ class StateManager:
         if not await self.task_exists(task.id):
             pipe.lpush(f"task-list:{task.queue}", bytes(task.id))
             task.submitted_at = dt.datetime.now(dt.timezone.utc)
-            task.status = "submitted"
+            task.status = TaskStatus.SUBMITTED
 
         pipe.hset(f"task:{task.id}", mapping=task.to_redis())
         await pipe.execute()
@@ -125,6 +138,37 @@ class StateManager:
         if task:
             results.append(task)
         return results
+
+    async def get_queues(self, role: str) -> list[str]:
+        return [role.decode("utf-8") for role in await self.data_store.smembers(f"worker-queues:{role}")]
+
+    async def set_queues(self, role: str, queues: list[str]):
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.delete(f"worker-queues:{role}")
+        pipe.sadd("all-queues", *queues)
+        for queue in queues:
+            pipe.sadd(f"worker-queues:{role}", queue)
+        await pipe.execute()
+
+    async def get_all_queues(self) -> list[str]:
+        # find the union of the queues for all roles
+        # this query approach is not ideal for large numbers of roles or queues
+        roles = await self.get_all_roles()
+        if not roles:
+            return []
+
+        return [
+            queue.decode("utf-8")
+            for queue in await self.data_store.sunion(
+                [f"worker-queues:{role}" for role in roles]
+            )
+        ]
+
+    async def get_all_roles(self) -> list[str]:
+        roles = []
+        async for key in self.data_store.scan_iter(match="worker-queues:*"):
+            roles.append(key.decode("utf-8").split(":")[1])
+        return roles
 
 def build_sm() -> StateManager:
     from jobbers import db
