@@ -1,0 +1,47 @@
+services:
+  collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    volumes:
+      - ./otel-config.yaml:/etc/otelcol-contrib/config.yaml
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4317:4317"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3      
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  jobbers:
+    build: .
+    environment:
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://collector:4317"
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://collector:4317"
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://collector:4317"
+      # # Logs are disabled by default
+      OTEL_LOGS_EXPORTER: "otlp"
+      OTEL_PYTHON_LOG_CORRELATION: "true"
+      REDIS_URL: "redis://redis:6379"
+    command: /usr/local/bin/task_manager
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/usr/src/app
+    depends_on:
+      - redis
+      - collector
+
+volumes:
+  redis_data:
