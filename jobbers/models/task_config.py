@@ -1,7 +1,7 @@
 import datetime as dt
 from typing import Callable, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TaskConfig(BaseModel):
@@ -9,13 +9,11 @@ class TaskConfig(BaseModel):
 
     name: str  # Name of the task
     version: int = 0  # Version of the task, used for versioning task definitions
-    max_concurrent: Optional[int] = 1  # Maximum number of concurrent executions of this task
-    timeout: Optional[int] = None  # Timeout for the task in seconds, if applicable
-    max_retries: int = 3  # Maximum number of retries for the task
-    retry_delay: dt.timedelta = dt.timedelta(seconds=5)  # Delay before retrying the task
+    max_concurrent: Optional[int] = Field(default=1)  # Maximum number of concurrent executions of this task
+    timeout: Optional[int] = Field(default=None)  # Timeout for the task in seconds, if applicable
+    max_retries: int = Field(default=3)  # Maximum number of retries for the task
+    retry_delay: Optional[int] = Field(default=None)  # Delay before retrying the task in seconds
 
-    @property
-    def task_function(self) -> Callable:
-        """Get the task function name."""
-        from jobbers.registry import get_task_function
-        return get_task_function(self.name, self.version)
+    # The actual function to execute for this task, used internally by the worker
+    function: Callable = Field(exclude=True)
+

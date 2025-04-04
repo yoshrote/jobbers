@@ -4,6 +4,7 @@ import logging
 import os
 
 from jobbers.db import get_client
+from jobbers.registry import get_task_config
 from jobbers.state_manager import StateManager, Task, TaskConfig, TaskStatus
 
 logging.basicConfig(level=logging.INFO)
@@ -14,9 +15,9 @@ async def process_task(task: Task, state_manager: StateManager):
     """Process a task given its ID."""
     # Simulate task processing
     logger.info("Task %s details: %s", task.id, task)
-    task_config: TaskConfig = state_manager.get_task_config(task.name, task.version)
+    task_config: TaskConfig = get_task_config(task.name, task.version)
     should_retry = False
-    if not task_config or not task_config.task_function:
+    if not task_config:
         logger.warning("Dropping unknown task %s id=%s.", task.name, task.id)
         return
     try:
