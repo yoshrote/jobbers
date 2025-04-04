@@ -6,7 +6,14 @@ logger = logging.getLogger(__name__)
 _task_function_map = {}
 
 def register_task(
-        name: str, version: int, max_concurrent=1, timeout=None, max_retries=3, retry_delay=None):
+        name: str,
+        version: int,
+        max_concurrent=1,
+        timeout=None,
+        max_retries=3,
+        retry_delay=None,
+        expected_exceptions=()
+    ):
     """Register a task function with the given name and version."""
 
     def decorator(func):
@@ -29,7 +36,8 @@ def register_task(
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
-            function=func,  # Store the original function for execution
+            function=func,
+            expected_exceptions=expected_exceptions,
         )
         _task_function_map[(name, version)] = task_conf
         return func

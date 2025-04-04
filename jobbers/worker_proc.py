@@ -27,11 +27,11 @@ class TaskProcessor:
         else:
             try:
                 async with asyncio.timeout(task_config.timeout):
-                    self.task.result = await task_config.task_function(**self.task.parameters)
-            except self.task.expected_exceptions as exc:
-                self.handle_expected_exception(exc)
-            except TimeoutError:
-                self.handle_timeout_exception()
+                    self.task.results = await task_config.function(**self.task.parameters)
+            except task_config.expected_exceptions as exc:
+                self.handle_expected_exception(task_config, exc)
+            except asyncio.TimeoutError:
+                self.handle_timeout_exception(task_config)
             except asyncio.CancelledError:
                 self.handle_cancelled_task()
             except Exception as exc:
@@ -60,11 +60,11 @@ class TaskProcessor:
         self.task.status = TaskStatus.FAILED
         self.task.error = str(exc)
 
-    def handle_expected_exception(self, exc: Exception):
+    def handle_expected_exception(self, task_config: TaskConfig, exc: Exception):
         logger.warning("Task %s failed with error: %s", self.task.id, exc)
         # TODO: Set metrics to track expected exceptions
         self.task.error = str(exc)
-        if self.task.should_retry():
+        if self.task.should_retry(task_config):
             # Task status will change to submitted when re-enqueued
             self.task.retry_attempt += 1
             self.task.status = TaskStatus.UNSUBMITTED
@@ -72,13 +72,13 @@ class TaskProcessor:
             self.task.status = TaskStatus.FAILED
             self.task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-    def handle_timeout_exception(self, exc: Exception):
-        logger.warning("Task %s timed out after %d seconds.", self.task.id, self.task_config.timeout)
-        self.task.error = f"Task {self.task.id} timed out after {self.task_config.timeout} seconds"
-        if self.task.should_retry():
+    def handle_timeout_exception(self, task_config: TaskConfig):
+        logger.warning("Task %s timed out after %d seconds.", self.task.id, task_config.timeout)
+        self.task.error = f"Task {self.task.id} timed out after {task_config.timeout} seconds"
+        if self.task.should_retry(task_config):
             # Task status will change to submitted when re-enqueued
-            self.task.retry_attempt += 1
             self.task.status = TaskStatus.UNSUBMITTED
+            self.task.retry_attempt += 1
         else:
             self.task.status = TaskStatus.FAILED
             self.task.completed_at = dt.datetime.now(dt.timezone.utc)

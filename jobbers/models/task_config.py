@@ -1,7 +1,6 @@
-import datetime as dt
 from typing import Callable, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TaskConfig(BaseModel):
@@ -17,3 +16,15 @@ class TaskConfig(BaseModel):
     # The actual function to execute for this task, used internally by the worker
     function: Callable = Field(exclude=True)
 
+    model_config = ConfigDict(extra='allow')
+
+    @property
+    def expected_exceptions(self) -> tuple[Exception]:
+        """
+        Returns the tuple of expected exceptions that can be handled by the task processor.
+
+        This allows for custom handling of exceptions during task execution.
+        """
+        if hasattr(self, '__pydantic_extra__') and self.__pydantic_extra__.get('expected_exceptions'):
+            return self.__pydantic_extra__['expected_exceptions']
+        return tuple()

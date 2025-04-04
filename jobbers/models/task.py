@@ -34,8 +34,6 @@ class Task(BaseModel):
     heartbeat_at: Optional[dt.datetime] = None
     completed_at: Optional[dt.datetime] = None
 
-    # expected_exceptions = tuple([]) #[Exception]
-
     def should_retry(self, task_config: TaskConfig) -> bool:
         return self.retry_attempt < task_config.max_retries
 
