@@ -1,0 +1,205 @@
+[build-system]
+requires = [
+    "hatchling", 
+    "packaging",
+    "tomli>=1.2.1; python_version<'3.11'",
+    "trove-classifiers==2025.3.19.19",
+]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "jobbers/__init__.py"
+
+[project]
+name = "jobbers"
+description = "like airflow + celery but smaller"
+readme = { file = "README.md", content-type = "text/markdown" }
+license-files.globs = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [
+    { name = "Josh Forman", email="josh@yoshrote.com" },
+]
+maintainers = [
+    { name = "Josh Forman", email="josh@yoshrote.com" },
+]
+keywords = [  ]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: System :: Monitoring",
+]
+
+dynamic = ["version"]
+dependencies = [
+    "fastapi", 
+    "uvicorn",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp",
+    "opentelemetry-instrumentation-fastapi",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-redis",
+    "pytest-cov",
+    "fakeredis",
+    "pytest_unordered",
+    "pydantic>=2.10.5",
+    "httpx",
+    "redis",
+    "python_on_whales",
+    "msgpack",
+    "python-ulid[pydantic]",
+]
+
+[project.urls]
+Homepage = "https://github.com/yoshrote/jobbers"
+
+[project.scripts]
+task_manager = 'jobbers.manager_proc:run'
+task_worker = 'jobbers.worker_proc:run'
+
+## ruff settings ##
+[tool.ruff]
+target-version = "py39"
+line-length = 110
+extend-exclude = [
+    "Include",
+    "Lib",
+    "Scripts",
+]
+
+[tool.ruff.lint]
+extend-select = [
+    # Enable entire ruff rule section
+    "I", # Missing required import (auto-fixable)
+    "UP", # Pyupgrade
+    "ASYNC", # subset of flake8-async rules
+    "ISC",  # Checks for implicit literal string concatenation (auto-fixable)
+    "TC", # Rules around TYPE_CHECKING blocks
+    "G", # flake8-logging-format rules
+    "LOG", # flake8-logging rules, most of them autofixable
+    "PT", # flake8-pytest-style rules
+    "TID25", # flake8-tidy-imports rules
+    "E", # pycodestyle rules
+    "W", # pycodestyle rules
+    # Per rule enables
+    "RUF006", # Checks for asyncio dangling task
+    "RUF015", # Checks for unnecessary iterable allocation for first element
+    "RUF019", # Checks for unnecessary key check
+    "RUF100", # Unused noqa (auto-fixable)
+    # We ignore more pydocstyle than we enable, so be more selective at what we enable
+    "D1",
+    "D2",
+    "D213", # Conflicts with D212.  Both can not be enabled.
+    "D3",
+    "D400",
+    "D401",
+    "D402",
+    "D403",
+    "D412",
+    "D419",
+    "PGH004",  # Use specific rule codes when using noqa
+    "PGH005", # Invalid unittest.mock.Mock methods/attributes/properties
+    "S101", # Checks use `assert` outside the test cases, test cases should be added into the exclusions
+    "SIM300", # Checks for conditions that position a constant on the left-hand side of the comparison
+              # operator, rather than the right-hand side.
+    "B004", # Checks for use of hasattr(x, "__call__") and replaces it with callable(x)
+    "B006", # Checks for uses of mutable objects as function argument defaults.
+    "B007", # Checks for unused variables in the loop
+    "B017", # Checks for pytest.raises context managers that catch Exception or BaseException.
+    "B019", # Use of functools.lru_cache or functools.cache on methods can lead to memory leaks
+    "B028", # No explicit stacklevel keyword argument found
+    "TRY002", # Prohibit use of `raise Exception`, use specific exceptions instead.
+]
+ignore = [
+    "D100", # Unwanted; Docstring at the top of every file.
+    "D102", # TODO: Missing docstring in public method
+    "D103", # TODO: Missing docstring in public function
+    "D104", # Unwanted; Docstring at the top of every `__init__.py` file.
+    "D105", # Unwanted; See https://lists.apache.org/thread/8jbg1dd2lr2cfydtqbjxsd6pb6q2wkc3
+    "D107", # Unwanted; Docstring in every constructor is unnecessary if the class has a docstring.
+    "D203",
+    "D212", # Conflicts with D213.  Both can not be enabled.
+    "PT013", # silly rule prohibiting e.g. `from pytest import param`
+    # Rules below explicitly set off which could overlap with Ruff's formatter
+    # as it recommended by https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
+    # Except ISC rules
+    "W191",
+    "E111",
+    "E114",
+    "E117",
+    "D206",
+    "D300",
+    "Q000",
+    "Q001",
+    "Q002",
+    "Q003",
+    "COM812",
+    "COM819",
+    "E501", # Formatted code may exceed the line length, leading to line-too-long (E501) errors.
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+## pytest settings ##
+[tool.pytest.ini_options]
+addopts = [
+    "--tb=short",
+    "-rasl",
+    "--verbosity=2",
+    # Disable `flaky` plugin for pytest. This plugin conflicts with `rerunfailures` because provide the same marker.
+    "-p", "no:flaky",
+    # Disable `nose` builtin plugin for pytest. This feature is deprecated in 7.2 and will be removed in pytest>=8
+    "-p", "no:nose",
+    # Disable support of a legacy `LocalPath` in favor of stdlib `pathlib.Path`.
+    "-p", "no:legacypath",
+    # Disable warnings summary, because we use our warning summary.
+    "--disable-warnings",
+    "--asyncio-mode=strict",
+    "--redis-port=6379",
+]
+
+norecursedirs = [
+    ".eggs",
+]
+
+# We need to make sure airflow-core sources are first in the pythonpath, because uv sync adds sources to
+# pythonpath in basically random order and pytest does not understand legacy namespace packages and cannot
+# use namespace packages effectively when collecting tests.
+pythonpath = [
+    "jobbers",
+    "tests"
+]
+testpaths = [
+    "tests",
+]
+asyncio_default_fixture_loop_scope = "function"
+
+# Keep temporary directories (created by `tmp_path`) for 2 recent runs only failed tests.
+tmp_path_retention_count = "2"
+tmp_path_retention_policy = "failed"
+
+## coverage.py settings ##
+[tool.coverage.run]
+branch = true
+relative_files = false
+
+[tool.coverage.report]
+skip_empty = true
+exclude_also = [
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "@(abc\\.)?abstractmethod",
+    "@(typing(_extensions)?\\.)?overload",
+    "if (typing(_extensions)?\\.)?TYPE_CHECKING:"
+]
