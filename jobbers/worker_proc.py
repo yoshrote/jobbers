@@ -11,57 +11,82 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-async def process_task(task: Task, state_manager: StateManager):
-    """Process a task given its ID."""
-    # Simulate task processing
-    logger.info("Task %s details: %s", task.id, task)
-    task_config: TaskConfig = get_task_config(task.name, task.version)
-    should_retry = False
-    if not task_config:
-        logger.warning("Dropping unknown task %s id=%s.", task.name, task.id)
-        return
-    try:
-        async with asyncio.timeout(task_config.timeout):
-            task.result = await task_config.task_function(**task.parameters)
-    except task.expected_exceptions as exc:
-        logger.exception("Task %s failed with error: %s", task.id, exc)
-        if task.should_retry():
-            task.status = TaskStatus.RETRIED
-            task.error = str(exc)
+class TaskProcessor:
+    """TaskProcessor to process tasks from a TaskGenerator."""
+
+    def __init__(self, task: Task, state_manager: StateManager):
+        self.state_manager = state_manager
+        self.task = task
+
+    async def process(self) -> Task:
+        """Process the task and return the result."""
+        logger.debug("Task %s details: %s", self.task.id, self.task)
+        task_config: TaskConfig = get_task_config(self.task.name, self.task.version)
+        if not task_config:
+            self.handle_dropped_task()
         else:
-            task.status = TaskStatus.FAILED
-            task.retry_attempt += 1
-            task.error = str(exc)
-            task.completed_at = dt.datetime.now(dt.timezone.utc)
-    except TimeoutError:
-        logger.warning("Task %s timed out after %d seconds.", task.id, task_config.timeout)
-        task.error = "Task timed out"
-        if task.should_retry():
+            try:
+                async with asyncio.timeout(task_config.timeout):
+                    self.task.result = await task_config.task_function(**self.task.parameters)
+            except self.task.expected_exceptions as exc:
+                self.handle_expected_exception(exc)
+            except TimeoutError:
+                self.handle_timeout_exception()
+            except asyncio.CancelledError:
+                self.handle_cancelled_task()
+            except Exception as exc:
+                self.handle_unexpected_exception(exc)
+            else:
+                self.handle_success()
+
+        await self.state_manager.submit_task(
+            self.task,
+        )
+
+        return self.task
+
+    def handle_dropped_task(self):
+        logger.error("Dropping unknown task %s v%s id=%s.", self.task.name, self.task.version, self.task.id)
+        self.task.status = TaskStatus.DROPPED
+        self.task.completed_at = dt.datetime.now(dt.timezone.utc)
+
+    def handle_cancelled_task(self):
+        logger.info("Task %s was cancelled.", self.task.id)
+        self.task.status = TaskStatus.CANCELLED
+        self.task.completed_at = dt.datetime.now(dt.timezone.utc)
+
+    def handle_unexpected_exception(self, exc: Exception):
+        logger.exception("Exception occurred while processing task %s: %s", self.task.id, exc)
+        self.task.status = TaskStatus.FAILED
+        self.task.error = str(exc)
+
+    def handle_expected_exception(self, exc: Exception):
+        logger.warning("Task %s failed with error: %s", self.task.id, exc)
+        # TODO: Set metrics to track expected exceptions
+        self.task.error = str(exc)
+        if self.task.should_retry():
             # Task status will change to submitted when re-enqueued
-            task.retry_attempt += 1
-            should_retry = True
+            self.task.retry_attempt += 1
+            self.task.status = TaskStatus.UNSUBMITTED
         else:
-            task.status = TaskStatus.FAILED
-            task.completed_at = dt.datetime.now(dt.timezone.utc)
-    except asyncio.CancelledError:
-        logger.info("Task %s was cancelled.", task.id)
-        task.status = TaskStatus.CANCELLED
-        task.completed_at = dt.datetime.now(dt.timezone.utc)
-    except Exception as exc:
-        logger.exception("Task %s failed with unexpected error: %s", task.id, exc)
-        task.status = TaskStatus.FAILED
-        task.error = str(exc)
-    else:
-        logger.info("Task %s completed.", task.id)
-        task.status = TaskStatus.COMPLETED
-        task.completed_at = dt.datetime.now(dt.timezone.utc)
+            self.task.status = TaskStatus.FAILED
+            self.task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-    await state_manager.submit_task(
-        task,
-        force_reenqueue=should_retry,
-    )
+    def handle_timeout_exception(self, exc: Exception):
+        logger.warning("Task %s timed out after %d seconds.", self.task.id, self.task_config.timeout)
+        self.task.error = f"Task {self.task.id} timed out after {self.task_config.timeout} seconds"
+        if self.task.should_retry():
+            # Task status will change to submitted when re-enqueued
+            self.task.retry_attempt += 1
+            self.task.status = TaskStatus.UNSUBMITTED
+        else:
+            self.task.status = TaskStatus.FAILED
+            self.task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-    return task.status
+    def handle_success(self):
+        logger.info("Task %s completed.", self.task.id)
+        self.task.status = TaskStatus.COMPLETED
+        self.task.completed_at = dt.datetime.now(dt.timezone.utc)
 
 # move TaskGenerator to a separate file
 class TaskGenerator:
@@ -121,7 +146,7 @@ async def task_consumer():
     task_generator = TaskGenerator(redis, state_manager, role)
     try:
         async for task in task_generator:
-            task_status = await process_task(task, state_manager)
+            task_status = await TaskProcessor(task, state_manager).process()
             if task_status == "completed" and task.has_callbacks():
                 # Monitor for when fan-out becomes problematic
                 for callback_task in task.generate_callbacks():

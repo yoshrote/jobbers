@@ -11,6 +11,7 @@ class TaskStatus(StrEnum):
     COMPLETED = "completed"
     CANCELLED = "cancelled"
     FAILED = "failed"
+    DROPPED = "dropped"
 
     @classmethod
     def from_bytes(cls, raw_status: bytes) -> "TaskStatus":
