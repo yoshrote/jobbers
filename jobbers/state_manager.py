@@ -14,11 +14,11 @@ class StateManager:
     def __init__(self, data_store):
         self.data_store = data_store
 
-    async def submit_task(self, task: Task, force_reenqueue: bool = False):
+    async def submit_task(self, task: Task):
         """Submit a task to the Redis data store."""
         pipe = self.data_store.pipeline(transaction=True)
         # Avoid pushing a task onto the queue multiple times
-        if force_reenqueue or not await self.task_exists(task.id):
+        if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
             pipe.lpush(f"task-list:{task.queue}", bytes(task.id))
             task.submitted_at = dt.datetime.now(dt.timezone.utc)
             task.status = TaskStatus.SUBMITTED

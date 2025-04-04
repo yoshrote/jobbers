@@ -24,7 +24,7 @@ async def redis():
 @pytest.mark.asyncio
 async def test_submit_task(redis):
     """Test submitting a task to Redis."""
-    task = Task(id=ULID1, name="Test Task", status="submitted")
+    task = Task(id=ULID1, name="Test Task", status="unsubmitted")
     await StateManager(redis).submit_task(task)
     # Verify the task was added to Redis
     task_list = await redis.lrange("task-list:default", 0, -1)
@@ -38,7 +38,7 @@ async def test_submit_task_twice_updates_only(redis):
     state_manager = StateManager(redis)
 
     # Submit the task for the first time
-    task = Task(id=ULID1, name="Initial Task", status="submitted")
+    task = Task(id=ULID1, name="Initial Task", status="unsubmitted")
     await state_manager.submit_task(task)
 
     # Submit the task again with updated details
