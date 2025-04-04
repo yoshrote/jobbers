@@ -5,15 +5,6 @@ import msgpack
 EMPTY_DICT = b"\x80"
 NONE = b"\xc0"
 
-def decode_optional_datetime(raw_data: bytes) -> datetime.datetime | None:
-    if raw_data == NONE or not raw_data:
-        return None
-    return datetime.datetime.fromisoformat(raw_data.decode())
-
-def decode_optional_string(raw_data: bytes) -> str | None:
-    if raw_data == NONE or not raw_data:
-        return None
-    return raw_data.decode()
 
 def default(obj):
     if isinstance(obj, datetime.datetime):

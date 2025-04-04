@@ -7,8 +7,6 @@ from ulid import ULID
 from jobbers.serialization import (
     EMPTY_DICT,
     NONE,
-    decode_optional_datetime,
-    decode_optional_string,
     deserialize,
     serialize,
 )
@@ -55,30 +53,31 @@ class Task(BaseModel):
     @classmethod
     def from_redis(cls, task_id: ULID, raw_task_data: dict) -> "Task":
         # Try to set good defaults for missing fields so when new fields are added to the task model, we don't break
+        print(repr(raw_task_data.get(b"submitted_at")))
         return cls(
             id=task_id,
             name=raw_task_data.get(b"name", b"").decode(),
             version=int(raw_task_data.get(b"version", b"0")),
             parameters=deserialize(raw_task_data.get(b"parameters") or EMPTY_DICT),
             results=deserialize(raw_task_data.get(b"results") or EMPTY_DICT),
-            error=decode_optional_string(raw_task_data.get(b"error")),
-            status=TaskStatus(raw_task_data.get(b"status", b"").decode()),
-            submitted_at=dt.datetime.fromisoformat(raw_task_data.get(b"submitted_at", b"").decode()),
-            started_at=decode_optional_datetime(raw_task_data.get(b"started_at")),
-            heartbeat_at=decode_optional_datetime(raw_task_data.get(b"heartbeat_at")),
-            completed_at=decode_optional_datetime(raw_task_data.get(b"completed_at")),
+            error=deserialize(raw_task_data.get(b"error") or NONE),
+            status=TaskStatus.from_bytes(raw_task_data.get(b"status")),
+            submitted_at=deserialize(raw_task_data.get(b"submitted_at") or NONE),
+            started_at=deserialize(raw_task_data.get(b"started_at") or NONE),
+            heartbeat_at=deserialize(raw_task_data.get(b"heartbeat_at") or NONE),
+            completed_at=deserialize(raw_task_data.get(b"completed_at") or NONE),
         )
 
     def to_redis(self):
         return {
-            "name": self.name,
-            "version": self.version,
-            "parameters": serialize(self.parameters or {}),
-            "results": serialize(self.results or {}),
-            "error": self.error or NONE,
-            "status": self.status,
-            "submitted_at": self.submitted_at.isoformat(),
-            "started_at": self.started_at.isoformat() if self.started_at else NONE,
-            "heartbeat_at": self.heartbeat_at.isoformat() if self.heartbeat_at else NONE,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else NONE,
+            b"name": self.name.encode(),
+            b"version": self.version,
+            b"parameters": serialize(self.parameters or {}),
+            b"results": serialize(self.results or {}),
+            b"error": serialize(self.error),
+            b"status": self.status.to_bytes(),
+            b"submitted_at": serialize(self.submitted_at),
+            b"started_at": serialize(self.started_at),
+            b"heartbeat_at": serialize(self.heartbeat_at),
+            b"completed_at": serialize(self.completed_at),
         }

@@ -1,12 +1,16 @@
+import datetime
+
 import fakeredis.aioredis as fakeredis
 import pytest
 import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
+from jobbers.serialization import serialize
 from jobbers.state_manager import StateManager, Task, TaskStatus
 
-ISO_FROZEN_TIME = "2021-01-01T00:00:00+00:00"
+FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
+ISO_FROZEN_TIME = serialize(FROZEN_TIME)
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
@@ -26,7 +30,7 @@ async def test_submit_task(redis):
     task_list = await redis.lrange("task-list:default", 0, -1)
     assert bytes(ULID1) in task_list
     task_data = await redis.hgetall(f"task:{ULID1}")
-    assert set(task_data.items()) >= set({b"name": b"Test Task", b"status": b"submitted", b"submitted_at": task.submitted_at.isoformat().encode()}.items())
+    assert set(task_data.items()) >= set({b"name": b"Test Task", b"status": b"submitted", b"submitted_at": serialize(task.submitted_at)}.items())
 
 @pytest.mark.asyncio
 async def test_submit_task_twice_updates_only(redis):
@@ -57,13 +61,14 @@ async def test_get_task(redis):
     """Test retrieving a task from Redis."""
     # Add a task to Redis
     await redis.lpush("task-list:default", bytes(ULID1))
-    await redis.hset(f"task:{ULID1}", mapping={"name": "Test Task", "status": "started", "submitted_at": ISO_FROZEN_TIME, "version": "0"})
+    await redis.hset(f"task:{ULID1}", mapping={b"name": b"Test Task", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME, b"version": 0})
     # Retrieve the task
     task = await StateManager(redis).get_task(ULID1)
     assert task is not None
     assert task.id == ULID1
     assert task.name == "Test Task"
     assert task.status == TaskStatus.STARTED
+    assert task.submitted_at == FROZEN_TIME
 
 @pytest.mark.asyncio
 async def test_get_task_not_found(redis):
@@ -89,14 +94,14 @@ async def test_get_all_tasks(redis):
     """Test retrieving all tasks from Redis."""
     # Add tasks to Redis
     await redis.lpush("task-list:default", bytes(ULID1), bytes(ULID2))
-    await redis.hset(f"task:{ULID1}", mapping={"name": "Task 1", "status": "started", "submitted_at": ISO_FROZEN_TIME})
-    await redis.hset(f"task:{ULID2}", mapping={"name": "Task 2", "status": "completed", "submitted_at": ISO_FROZEN_TIME})
+    await redis.hset(f"task:{ULID1}", mapping={b"name": b"Task 1", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME})
+    await redis.hset(f"task:{ULID2}", mapping={b"name": b"Task 2", b"status": b"completed", b"submitted_at": ISO_FROZEN_TIME})
     # Retrieve all tasks
     tasks = await StateManager(redis).get_all_tasks()
     assert len(tasks) == 2
     assert tasks == unordered([
-        Task(id=ULID1, name="Task 1", status="started", submitted_at=ISO_FROZEN_TIME),
-        Task(id=ULID2, name="Task 2", status="completed", submitted_at=ISO_FROZEN_TIME),
+        Task(id=ULID1, name="Task 1", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME),
+        Task(id=ULID2, name="Task 2", status=TaskStatus.COMPLETED, submitted_at=FROZEN_TIME),
     ])
 
 @pytest.mark.asyncio
