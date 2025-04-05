@@ -27,7 +27,7 @@ async def test_submit_task(redis):
     task = Task(id=ULID1, name="Test Task", status="unsubmitted")
     await StateManager(redis).submit_task(task)
     # Verify the task was added to Redis
-    task_list = await redis.lrange("task-list:default", 0, -1)
+    task_list = await redis.zrange("task-list:default", 0, -1)
     assert bytes(ULID1) in task_list
     task_data = await redis.hgetall(f"task:{ULID1}")
     assert set(task_data.items()) >= set({b"name": b"Test Task", b"status": b"submitted", b"submitted_at": serialize(task.submitted_at)}.items())
@@ -46,7 +46,7 @@ async def test_submit_task_twice_updates_only(redis):
     await state_manager.submit_task(updated_task)
 
     # Verify the task ID is only added once to the task-list
-    task_list = await redis.lrange(f"task-list:{task.queue}", 0, -1)
+    task_list = await redis.zrange(f"task-list:{task.queue}", 0, -1)
     assert task_list == [bytes(ULID1)]
 
     # Verify the task details were updated

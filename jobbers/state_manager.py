@@ -19,9 +19,9 @@ class StateManager:
         pipe = self.data_store.pipeline(transaction=True)
         # Avoid pushing a task onto the queue multiple times
         if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
-            pipe.lpush(f"task-list:{task.queue}", bytes(task.id))
             task.submitted_at = dt.datetime.now(dt.timezone.utc)
             task.status = TaskStatus.SUBMITTED
+            pipe.zadd(f"task-list:{task.queue}", {bytes(task.id): task.submitted_at.timestamp()})
 
         pipe.hset(f"task:{task.id}", mapping=task.to_redis())
         await pipe.execute()

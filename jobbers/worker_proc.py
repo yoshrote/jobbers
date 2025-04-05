@@ -128,7 +128,7 @@ class TaskGenerator:
         task_queues = await self.queues()
         # TODO: Switch from a list to zscore to sort by ULID
         # this lets us sort/query tasks in a queue by created_at, sortof
-        task_id = await self.redis.brpop(task_queues, timeout=0)
+        task_id = await self.redis.bzpopmin(task_queues, timeout=0)
         if task_id:
             task = await self.state_manager.get_task(int(task_id[1]))
             if not task:
