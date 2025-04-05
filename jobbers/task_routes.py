@@ -44,8 +44,6 @@ async def get_task_list():
     tasks = await sm.build_sm().get_all_tasks()
     return {"tasks": tasks}
 
-# f"worker-queues:{self.role}"
-
 @app.get("/queues/{role}")
 async def get_queues(role: str):
     """Retrieve the list of all queues for a given role."""
