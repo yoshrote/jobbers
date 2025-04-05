@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Optional
 
 
 class TaskStatus(StrEnum):
@@ -14,7 +15,7 @@ class TaskStatus(StrEnum):
     DROPPED = "dropped"
 
     @classmethod
-    def from_bytes(cls, raw_status: bytes) -> "TaskStatus":
+    def from_bytes(cls, raw_status: Optional[bytes]) -> "TaskStatus":
         if not raw_status:
             return cls.UNSUBMITTED
         return cls(raw_status.decode("utf-8"))
