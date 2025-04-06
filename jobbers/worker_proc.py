@@ -142,7 +142,7 @@ async def task_consumer():
     try:
         async for task in task_generator:
             task_status = await TaskProcessor(task, state_manager).process()
-            if task_status == "completed" and task.has_callbacks():
+            if task_status == TaskStatus.COMPLETED and task.has_callbacks():
                 # Monitor for when fan-out becomes problematic
                 for callback_task in task.generate_callbacks():
                     await state_manager.submit_task(callback_task)
