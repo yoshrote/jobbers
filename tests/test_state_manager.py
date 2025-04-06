@@ -123,14 +123,14 @@ async def test_get_queues(redis):
 async def test_get_queues_empty(redis):
     """Test retrieving queues for a role with no queues."""
     queues = await StateManager(redis).get_queues("role1")
-    assert queues == []
+    assert queues == set()
 
 @pytest.mark.asyncio
 async def test_set_queues(redis):
     """Test setting queues for a specific role."""
     state_manager = StateManager(redis)
     # Set queues for a role
-    await state_manager.set_queues("role1", ["queue1", "queue2"])
+    await state_manager.set_queues("role1", {"queue1", "queue2"})
     # Verify the queues were set
     queues = await redis.smembers("worker-queues:role1")
     assert set(queues) == {b"queue1", b"queue2"}

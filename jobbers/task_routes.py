@@ -48,14 +48,14 @@ async def get_task_list():
 async def get_queues(role: str):
     """Retrieve the list of all queues for a given role."""
     logger.info("Getting all queues for role %s", role)
-    queues = await sm.build_sm().get_queues(role)
-    return {"queues": queues}
+    queues = await sm.build_sm().get_queues(role)  # Ensure the queues are sorted for consistency
+    return {"queues": sorted(queues)}
 
 @app.post("/queues/{role}")
 async def set_queues(role: str, queues: list[str]):
     """Set the list of all queues for a given role."""
     logger.info("Setting all queues for role %s", role)
-    await sm.build_sm().set_queues(role, queues)
+    await sm.build_sm().set_queues(role, set(queues))
     return {"message": "Queues set successfully"}
 
 @app.get("/queues")

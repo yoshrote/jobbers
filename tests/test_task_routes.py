@@ -78,7 +78,7 @@ async def test_get_task_list():
 async def test_get_queues():
     """Test retrieving the list of all queues for a given role."""
     mock_state_manager = AsyncMock()
-    mock_state_manager.get_queues.return_value = ["queue1", "queue2"]
+    mock_state_manager.get_queues.return_value = {"queue1", "queue2"}
 
     with patch("jobbers.state_manager.build_sm", return_value=mock_state_manager):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -99,7 +99,7 @@ async def test_set_queues():
 
         assert response.status_code == 200
         assert response.json() == {"message": "Queues set successfully"}
-        mock_state_manager.set_queues.assert_called_once_with("role1", ["queue1", "queue2"])
+        mock_state_manager.set_queues.assert_called_once_with("role1", {"queue1", "queue2"})
 
 @pytest.mark.asyncio
 async def test_get_all_queues():

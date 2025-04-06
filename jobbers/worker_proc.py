@@ -93,26 +93,26 @@ class TaskProcessor:
 class TaskGenerator:
     """Generates tasks from the Redis list 'task-list'."""
 
-    DEFAULT_QUEUES = ["task-queues:default"]
+    DEFAULT_QUEUES = {"default"}
 
     def __init__(self, state_manager, role="default"):
-        self.role = role
-        self.state_manager = state_manager
-        self.task_queues = None
-        self.refresh_tag = None
+        self.role: str = role
+        self.state_manager: StateManager = state_manager
+        self.task_queues: set[str] = None
+        self.refresh_tag: str = None
 
-    async def find_queues(self):
+    async def find_queues(self) -> set[str]:
         """Find all queues we should listen to via Redis."""
         if self.role == "default":
             return self.DEFAULT_QUEUES
-        return await self.state_manager.get_queues(self.role) or self.DEFAULT_QUEUES
+        return await self.state_manager.get_queues(self.role) or set()
 
-    async def queues(self):
+    async def queues(self) -> set[str]:
         if not self.task_queues or self.should_reload_queues():
             self.task_queues = await self.find_queues()
         return self.task_queues
 
-    async def should_reload_queues(self):
+    async def should_reload_queues(self) -> bool:
         if not self.refresh_tag:
             return False
         refresh_tag = await self.state_manager.get_refresh_tag(self.role)

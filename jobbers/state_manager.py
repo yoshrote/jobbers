@@ -66,8 +66,8 @@ class StateManager:
             results.append(task)
         return results
 
-    async def get_queues(self, role: str) -> list[str]:
-        return [role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))]
+    async def get_queues(self, role: str) -> set[str]:
+        return {role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))}
 
     async def get_refresh_tag(self, role: str) -> Optional[str]:
         return self.data_store.get(f"worker-queues:{role}:refresh_tag")
@@ -87,7 +87,7 @@ class StateManager:
             logger.warning("Task with ID %s not found.", task_id)
         return None
 
-    async def set_queues(self, role: str, queues: list[str]):
+    async def set_queues(self, role: str, queues: set[str]):
         pipe = self.data_store.pipeline(transaction=True)
         pipe.delete(self.QUEUES_BY_ROLE(role=role))
         pipe.sadd(self.ALL_QUEUES, *queues)
