@@ -51,7 +51,6 @@ class Task(BaseModel):
     @classmethod
     def from_redis(cls, task_id: ULID, raw_task_data: dict) -> "Task":
         # Try to set good defaults for missing fields so when new fields are added to the task model, we don't break
-        print(repr(raw_task_data.get(b"submitted_at")))
         return cls(
             id=task_id,
             name=raw_task_data.get(b"name", b"").decode(),
