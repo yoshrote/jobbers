@@ -4,8 +4,9 @@ import logging
 import os
 
 from jobbers.db import get_client
+from jobbers.models import Task, TaskConfig, TaskStatus
 from jobbers.registry import get_task_config
-from jobbers.state_manager import StateManager, Task, TaskConfig, TaskStatus
+from jobbers.state_manager import StateManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -92,7 +93,7 @@ class TaskProcessor:
 class TaskGenerator:
     """Generates tasks from the Redis list 'task-list'."""
 
-    DEFAULT_QUEUES = ["task-list:default"]
+    DEFAULT_QUEUES = ["task-queues:default"]
 
     def __init__(self, redis, state_manager, role="default"):
         self.redis = redis
@@ -128,7 +129,7 @@ class TaskGenerator:
         task_queues = await self.queues()
         # TODO: Switch from a list to zscore to sort by ULID
         # this lets us sort/query tasks in a queue by created_at, sortof
-        task_id = await self.redis.brpop(task_queues, timeout=0)
+        task_id = await self.redis.bzpopmin(task_queues, timeout=0)
         if task_id:
             task = await self.state_manager.get_task(int(task_id[1]))
             if not task:

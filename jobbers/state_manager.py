@@ -4,12 +4,24 @@ from asyncio import TaskGroup
 
 from ulid import ULID
 
-from jobbers.models import Task, TaskConfig, TaskStatus
+from jobbers.models import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 
 class StateManager:
-    """Manages tasks in a Redis data store."""
+    """
+    Manages tasks in a Redis data store.
+
+    The state is stored across a number of different key types:
+    - `task-queues:<queue>`: Sorted set of task IDs for each queue, used for task submission order.
+    - `task:<task_id>`: Hash containing the task details (name, status, etc).
+    - `worker-queues:<role>`: Set of queues for a given role, used to manage which queues are available for task submission.
+    """
+
+    TASKS_BY_QUEUE = "task-queues:{queue}".format
+    QUEUES_BY_ROLE = "worker-queues:{role}".format
+    TASK_DETAILS = "task:{task_id}".format
+    ALL_QUEUES = "all-queues"
 
     def __init__(self, data_store):
         self.data_store = data_store
@@ -19,34 +31,26 @@ class StateManager:
         pipe = self.data_store.pipeline(transaction=True)
         # Avoid pushing a task onto the queue multiple times
         if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
-            pipe.lpush(f"task-list:{task.queue}", bytes(task.id))
             task.submitted_at = dt.datetime.now(dt.timezone.utc)
             task.status = TaskStatus.SUBMITTED
+            pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
-        pipe.hset(f"task:{task.id}", mapping=task.to_redis())
+        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
         await pipe.execute()
 
     async def get_task(self, task_id: ULID) -> Task | None:
-        raw_task_data: dict = await self.data_store.hgetall(f"task:{task_id}".encode())
+        raw_task_data: dict = await self.data_store.hgetall(self.TASK_DETAILS(task_id=task_id))
 
         if raw_task_data:
             return Task.from_redis(task_id, raw_task_data)
 
         return None
 
-    async def get_task_config(self, name: str, version: int) -> Task | None:
-        raw_task_data: dict = await self.data_store.hgetall(f"task_config:{name}:{version}".encode())
-
-        if raw_task_data:
-            return TaskConfig.from_redis(name, version, raw_task_data)
-
-        return None
-
     async def task_exists(self, task_id: ULID) -> bool:
-        return await self.data_store.exists(f"task:{task_id}")
+        return await self.data_store.exists(self.TASK_DETAILS(task_id=task_id)) == 1
 
     async def get_all_tasks(self) -> list[ULID]:
-        task_ids = await self.data_store.lrange("task-list:default", 0, -1)
+        task_ids = await self.data_store.zrange(self.TASKS_BY_QUEUE(queue="default"), 0, -1)
         if not task_ids:
             return []
         results = []
@@ -62,14 +66,14 @@ class StateManager:
         return results
 
     async def get_queues(self, role: str) -> list[str]:
-        return [role.decode() for role in await self.data_store.smembers(f"worker-queues:{role}")]
+        return [role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))]
 
     async def set_queues(self, role: str, queues: list[str]):
         pipe = self.data_store.pipeline(transaction=True)
-        pipe.delete(f"worker-queues:{role}")
-        pipe.sadd("all-queues", *queues)
+        pipe.delete(self.QUEUES_BY_ROLE(role=role))
+        pipe.sadd(self.ALL_QUEUES, *queues)
         for queue in queues:
-            pipe.sadd(f"worker-queues:{role}", queue)
+            pipe.sadd(self.QUEUES_BY_ROLE(role=role), queue)
         await pipe.execute()
 
     async def get_all_queues(self) -> list[str]:
@@ -82,13 +86,13 @@ class StateManager:
         return [
             queue.decode()
             for queue in await self.data_store.sunion(
-                [f"worker-queues:{role}" for role in roles]
+                [self.QUEUES_BY_ROLE(role=role) for role in roles]
             )
         ]
 
     async def get_all_roles(self) -> list[str]:
         roles = []
-        async for key in self.data_store.scan_iter(match="worker-queues:*"):
+        async for key in self.data_store.scan_iter(match=self.QUEUES_BY_ROLE(role="*").encode()):
             roles.append(key.decode().split(":")[1])
         return roles
 
