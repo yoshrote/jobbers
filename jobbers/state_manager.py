@@ -80,9 +80,9 @@ class StateManager:
 
         # Try to pop from each queue until we find a task
         task_queues = [self.TASKS_BY_QUEUE(queue=queue) for queue in queues]
-        task_id = await self.redis.bzpopmin(task_queues, timeout=timeout)
+        task_id = await self.data_store.bzpopmin(task_queues, timeout=timeout)
         if task_id:
-            task = await self.get_task(int(task_id[1]))
+            task = await self.get_task(ULID.from_bytes(task_id[1]))
             if task:
                 return task
             logger.warning("Task with ID %s not found.", task_id)

@@ -6,7 +6,7 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
-from jobbers.serialization import serialize
+from jobbers.serialization import EMPTY_DICT, serialize
 from jobbers.state_manager import StateManager, Task, TaskStatus
 
 FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -27,10 +27,10 @@ def state_manager(redis):
     return StateManager(redis)
 
 @pytest.mark.asyncio
-async def test_submit_task(redis):
+async def test_submit_task(redis, state_manager):
     """Test submitting a task to Redis."""
     task = Task(id=ULID1, name="Test Task", status=TaskStatus.UNSUBMITTED, queue="default")
-    await StateManager(redis).submit_task(task)
+    await state_manager.submit_task(task)
     # Verify the task was added to Redis
     task_list = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in task_list
@@ -38,10 +38,8 @@ async def test_submit_task(redis):
     assert set(task_data.items()) >= set({b"name": b"Test Task", b"status": b"submitted", b"submitted_at": serialize(task.submitted_at)}.items())
 
 @pytest.mark.asyncio
-async def test_submit_task_twice_updates_only(redis):
+async def test_submit_task_twice_updates_only(redis, state_manager):
     """Test that submitting a task twice updates the task but does not add it to the task-list again."""
-    state_manager = StateManager(redis)
-
     # Submit the task for the first time
     task = Task(id=ULID1, name="Initial Task", status="unsubmitted")
     await state_manager.submit_task(task)
@@ -76,33 +74,33 @@ async def test_get_task(redis):
     assert task.submitted_at == FROZEN_TIME
 
 @pytest.mark.asyncio
-async def test_get_task_not_found(redis):
+async def test_get_task_not_found(state_manager):
     """Test retrieving a non-existent task."""
-    task = await StateManager(redis).get_task(ULID1)
+    task = await state_manager.get_task(ULID1)
     assert task is None
 
 @pytest.mark.asyncio
-async def test_task_exists(redis):
+async def test_task_exists(redis, state_manager):
     """Test checking if a task exists in Redis."""
     # Add a task to Redis
     await redis.zadd("worker-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp()})
     await redis.hset(f"task:{ULID1}", mapping={"name": "Test Task", "status": "started", "submitted_at": ISO_FROZEN_TIME})
     # Check if the task exists
-    exists = await StateManager(redis).task_exists(ULID1)
+    exists = await state_manager.task_exists(ULID1)
     assert exists
     # Check for a non-existent task
-    exists = await StateManager(redis).task_exists(999)
+    exists = await state_manager.task_exists(999)
     assert not exists
 
 @pytest.mark.asyncio
-async def test_get_all_tasks(redis):
+async def test_get_all_tasks(redis, state_manager):
     """Test retrieving all tasks from Redis."""
     # Add tasks to Redis
     await redis.zadd("task-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp(), bytes(ULID2): FROZEN_TIME.timestamp()})
     await redis.hset(f"task:{ULID1}", mapping={b"name": b"Task 1", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME})
     await redis.hset(f"task:{ULID2}", mapping={b"name": b"Task 2", b"status": b"completed", b"submitted_at": ISO_FROZEN_TIME})
     # Retrieve all tasks
-    tasks = await StateManager(redis).get_all_tasks()
+    tasks = await state_manager.get_all_tasks()
     assert len(tasks) == 2
     assert tasks == unordered([
         Task(id=ULID1, name="Task 1", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME),
@@ -110,30 +108,29 @@ async def test_get_all_tasks(redis):
     ])
 
 @pytest.mark.asyncio
-async def test_get_all_tasks_empty(redis):
+async def test_get_all_tasks_empty(state_manager):
     """Test retrieving tasks when no tasks exist."""
-    tasks = await StateManager(redis).get_all_tasks()
+    tasks = await state_manager.get_all_tasks()
     assert tasks == []
 
 @pytest.mark.asyncio
-async def test_get_queues(redis):
+async def test_get_queues(redis, state_manager):
     """Test retrieving queues for a specific role."""
     # Add queues for a role
     await redis.sadd("worker-queues:role1", "queue1", "queue2")
     # Retrieve queues
-    queues = await StateManager(redis).get_queues("role1")
+    queues = await state_manager.get_queues("role1")
     assert set(queues) == {"queue1", "queue2"}
 
 @pytest.mark.asyncio
-async def test_get_queues_empty(redis):
+async def test_get_queues_empty(redis, state_manager):
     """Test retrieving queues for a role with no queues."""
-    queues = await StateManager(redis).get_queues("role1")
+    queues = await state_manager.get_queues("role1")
     assert queues == set()
 
 @pytest.mark.asyncio
-async def test_set_queues(redis):
+async def test_set_queues(redis, state_manager):
     """Test setting queues for a specific role."""
-    state_manager = StateManager(redis)
     # Set queues for a role
     await state_manager.set_queues("role1", {"queue1", "queue2"})
     # Verify the queues were set
@@ -143,35 +140,35 @@ async def test_set_queues(redis):
     assert set(all_queues) == {b"queue1", b"queue2"}
 
 @pytest.mark.asyncio
-async def test_get_all_queues(redis):
+async def test_get_all_queues(redis, state_manager):
     """Test retrieving all queues across roles."""
     # Add queues for multiple roles
     await redis.sadd("worker-queues:role1", "queue1", "queue2")
     await redis.sadd("worker-queues:role2", "queue3")
     # Retrieve all queues
-    queues = await StateManager(redis).get_all_queues()
+    queues = await state_manager.get_all_queues()
     assert set(queues) == {"queue1", "queue2", "queue3"}
 
 @pytest.mark.asyncio
-async def test_get_all_queues_empty(redis):
+async def test_get_all_queues_empty(redis, state_manager):
     """Test retrieving all queues when no queues exist."""
-    queues = await StateManager(redis).get_all_queues()
+    queues = await state_manager.get_all_queues()
     assert queues == []
 
 @pytest.mark.asyncio
-async def test_get_all_roles(redis):
+async def test_get_all_roles(redis, state_manager):
     """Test retrieving all roles."""
     # Add roles with queues
     await redis.sadd("worker-queues:role1", "queue1")
     await redis.sadd("worker-queues:role2", "queue2")
     # Retrieve all roles
-    roles = await StateManager(redis).get_all_roles()
+    roles = await state_manager.get_all_roles()
     assert set(roles) == {"role1", "role2"}
 
 @pytest.mark.asyncio
-async def test_get_all_roles_empty(redis):
+async def test_get_all_roles_empty(state_manager):
     """Test retrieving all roles when no roles exist."""
-    roles = await StateManager(redis).get_all_roles()
+    roles = await state_manager.get_all_roles()
     assert roles == []
 
 @pytest.mark.asyncio
@@ -185,6 +182,55 @@ async def test_get_refresh_tag(redis, state_manager):
 
     # Assert the result
     assert refresh_tag == ULID1
+
+
+@pytest.mark.asyncio
+async def test_get_next_task_returns_task(redis, state_manager):
+    """Test that get_next_task retrieves the next task from the queues."""
+    # Set up the fake Redis data
+    task_id = ULID()
+    task_data = {
+        b"name": b"Test Task",
+        b"status": b"submitted",
+        b"parameters": EMPTY_DICT,
+        b"version": b"1",
+        b"submitted_at": ISO_FROZEN_TIME,
+    }
+    await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
+    await redis.hset(f"task:{task_id}", mapping=task_data)
+
+    # Call the method
+    task = await state_manager.get_next_task(["queue1", "queue2"])
+
+    # Assert the result
+    assert task is not None
+    assert task.id == task_id
+    assert task.name == "Test Task"
+    assert task.status == TaskStatus.SUBMITTED
+
+
+# @pytest.mark.asyncio
+# async def test_get_next_task_no_task_found(redis, state_manager):
+#     """Test that get_next_task returns None if no task is found."""
+#     # Call the method with no tasks in the queues
+#     task = await state_manager.get_next_task(["queue1", "queue2"])
+
+#     # Assert the result
+#     assert task is None
+
+
+@pytest.mark.asyncio
+async def test_get_next_task_missing_task_data(redis, state_manager):
+    """Test that get_next_task logs a warning and returns None if task data is missing."""
+    # Set up the fake Redis data
+    task_id = ULID()
+    await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
+
+    # Call the method
+    task = await state_manager.get_next_task(["queue1", "queue2"])
+
+    # Assert the result
+    assert task is None
 
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])
