@@ -1,6 +1,7 @@
 import datetime as dt
 import logging
 from asyncio import TaskGroup
+from typing import Optional
 
 from ulid import ULID
 
@@ -67,6 +68,24 @@ class StateManager:
 
     async def get_queues(self, role: str) -> list[str]:
         return [role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))]
+
+    async def get_refresh_tag(self, role: str) -> Optional[str]:
+        return self.data_store.get(f"worker-queues:{role}:refresh_tag")
+
+    async def get_next_task(self, queues: list[str], timeout=0) -> Optional[Task]:
+        """Get the next task from the queues in order of priority (first in the list is highest priority)."""
+        if not queues:
+            return None
+
+        # Try to pop from each queue until we find a task
+        task_queues = [self.TASKS_BY_QUEUE(queue=queue) for queue in queues]
+        task_id = await self.redis.bzpopmin(task_queues, timeout=timeout)
+        if task_id:
+            task = await self.get_task(int(task_id[1]))
+            if task:
+                return task
+            logger.warning("Task with ID %s not found.", task_id)
+        return None
 
     async def set_queues(self, role: str, queues: list[str]):
         pipe = self.data_store.pipeline(transaction=True)

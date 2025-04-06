@@ -95,8 +95,7 @@ class TaskGenerator:
 
     DEFAULT_QUEUES = ["task-queues:default"]
 
-    def __init__(self, redis, state_manager, role="default"):
-        self.redis = redis
+    def __init__(self, state_manager, role="default"):
         self.role = role
         self.state_manager = state_manager
         self.task_queues = None
@@ -106,7 +105,7 @@ class TaskGenerator:
         """Find all queues we should listen to via Redis."""
         if self.role == "default":
             return self.DEFAULT_QUEUES
-        return await self.redis.smembers(f"worker-queues:{self.role}") or self.DEFAULT_QUEUES
+        return await self.state_manager.get_queues(self.role) or self.DEFAULT_QUEUES
 
     async def queues(self):
         if not self.task_queues or self.should_reload_queues():
@@ -116,7 +115,7 @@ class TaskGenerator:
     async def should_reload_queues(self):
         if not self.refresh_tag:
             return False
-        refresh_tag = await self.redis.get(f"worker-queues:{self.role}:refresh_tag")
+        refresh_tag = await self.state_manager.get_refresh_tag(self.role)
         if refresh_tag != self.refresh_tag:
             self.refresh_tag = refresh_tag
             return True
@@ -127,16 +126,11 @@ class TaskGenerator:
 
     async def __anext__(self):
         task_queues = await self.queues()
-        # TODO: Switch from a list to zscore to sort by ULID
-        # this lets us sort/query tasks in a queue by created_at, sortof
-        task_id = await self.redis.bzpopmin(task_queues, timeout=0)
-        if task_id:
-            task = await self.state_manager.get_task(int(task_id[1]))
-            if not task:
-                logger.warning("Task with ID %s not found.", task_id)
-                return await self.__anext__()
-            return task
-        raise StopAsyncIteration
+        task = await self.state_manager.get_next_task(task_queues)
+        if not task:
+            raise StopAsyncIteration
+        return task
+
 
 
 async def task_consumer():
@@ -144,7 +138,7 @@ async def task_consumer():
     redis = await get_client()
     state_manager = StateManager(redis)
     role = os.environ("WORKER_ROLE", "default")
-    task_generator = TaskGenerator(redis, state_manager, role)
+    task_generator = TaskGenerator(state_manager, role)
     try:
         async for task in task_generator:
             task_status = await TaskProcessor(task, state_manager).process()
