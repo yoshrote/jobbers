@@ -69,8 +69,9 @@ class StateManager:
     async def get_queues(self, role: str) -> set[str]:
         return {role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))}
 
-    async def get_refresh_tag(self, role: str) -> Optional[str]:
-        return self.data_store.get(f"worker-queues:{role}:refresh_tag")
+    async def get_refresh_tag(self, role: str) -> Optional[ULID]:
+        tag = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
+        return ULID.from_bytes(tag) if tag else None
 
     async def get_next_task(self, queues: list[str], timeout=0) -> Optional[Task]:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""

@@ -2,6 +2,10 @@ import asyncio
 import datetime as dt
 import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ulid import ULID
 
 from jobbers.db import get_client
 from jobbers.models import Task, TaskConfig, TaskStatus
@@ -99,7 +103,7 @@ class TaskGenerator:
         self.role: str = role
         self.state_manager: StateManager = state_manager
         self.task_queues: set[str] = None
-        self.refresh_tag: str = None
+        self.refresh_tag: ULID = None
 
     async def find_queues(self) -> set[str]:
         """Find all queues we should listen to via Redis."""
@@ -113,8 +117,6 @@ class TaskGenerator:
         return self.task_queues
 
     async def should_reload_queues(self) -> bool:
-        if not self.refresh_tag:
-            return False
         refresh_tag = await self.state_manager.get_refresh_tag(self.role)
         if refresh_tag != self.refresh_tag:
             self.refresh_tag = refresh_tag

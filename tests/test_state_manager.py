@@ -21,6 +21,11 @@ async def redis():
     yield fake_store
     await fake_store.close()
 
+@pytest.fixture
+def state_manager(redis):
+    """Fixture to provide a StateManager instance with a fake Redis data store."""
+    return StateManager(redis)
+
 @pytest.mark.asyncio
 async def test_submit_task(redis):
     """Test submitting a task to Redis."""
@@ -168,6 +173,18 @@ async def test_get_all_roles_empty(redis):
     """Test retrieving all roles when no roles exist."""
     roles = await StateManager(redis).get_all_roles()
     assert roles == []
+
+@pytest.mark.asyncio
+async def test_get_refresh_tag(redis, state_manager):
+    """Test that get_refresh_tag retrieves the correct refresh tag for a role."""
+    # Set up the fake Redis data
+    await redis.set("worker-queues:test_role:refresh_tag", bytes(ULID1))
+
+    # Call the method
+    refresh_tag = await state_manager.get_refresh_tag("test_role")
+
+    # Assert the result
+    assert refresh_tag == ULID1
 
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])
