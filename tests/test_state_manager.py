@@ -209,14 +209,15 @@ async def test_get_next_task_returns_task(redis, state_manager):
     assert task.status == TaskStatus.SUBMITTED
 
 
-# @pytest.mark.asyncio
-# async def test_get_next_task_no_task_found(redis, state_manager):
-#     """Test that get_next_task returns None if no task is found."""
-#     # Call the method with no tasks in the queues
-#     task = await state_manager.get_next_task(["queue1", "queue2"])
+@pytest.mark.asyncio
+async def test_get_next_task_no_task_found(redis, state_manager):
+    """Test that get_next_task returns None if no task is found."""
+    # Call the method with no tasks in the queues
+    # Use a timeout to avoid blocking forever
+    task = await state_manager.get_next_task(["queue1", "queue2"], timeout=1)
 
-#     # Assert the result
-#     assert task is None
+    # Assert the result
+    assert task is None
 
 
 @pytest.mark.asyncio
