@@ -33,6 +33,7 @@ class TaskProcessor:
             self.handle_dropped_task(task)
         else:
             try:
+                task = await self.mark_task_as_started(task)
                 async with asyncio.timeout(task_config.timeout):
                     self.task.results = await task_config.function(**self.task.parameters)
             except task_config.expected_exceptions as exc:
@@ -52,6 +53,11 @@ class TaskProcessor:
             await self.post_process(task)
 
         return task
+
+    def mark_task_as_started(self, task: Task) -> Awaitable[Task]:
+        task.started_at = dt.datetime.now(dt.timezone.utc)
+        task.status = TaskStatus.STARTED
+        return self.state_manager.submit_task(task)
 
     async def post_process(self, task: Task):
         if task.has_callbacks():
