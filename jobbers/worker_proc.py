@@ -110,30 +110,44 @@ class TaskGenerator:
 
     DEFAULT_QUEUES = {"default"}
 
-    def __init__(self, state_manager, role="default", max_tasks=100):
+    def __init__(self, state_manager, role="default", max_tasks=100, config_ttl=60):
         self.role: str = role
         self.state_manager: StateManager = state_manager
         self.task_queues: set[str] = None
+        self.config_ttl: int = config_ttl
+        self._refresh_tag: ULID = None
+        self._last_refreshed: Optional[dt.datetime] = None
         self.max_tasks: int = max_tasks
         self._task_count: int = 0
 
-    async def find_queues(self) -> set[str]:
+    async def find_queues(self) -> Awaitable[set[str]]:
         """Find all queues we should listen to via Redis."""
         if self.role == "default":
             return self.DEFAULT_QUEUES
-        return await self.state_manager.get_queues(self.role) or set()
+        queues = await self.state_manager.get_queues(self.role)
+        return queues or set()
 
     async def queues(self) -> set[str]:
-        if not self.task_queues or self.should_reload_queues():
-            self.task_queues = await self.find_queues()
+        if self.task_queues is None or self.should_reload_queues():
+            self.task_queues = {
+                queue
+                for queue in await self.find_queues()
+            }
+        # TODO: filter out queues if we are at capacity running tasks from them
         return self.task_queues
 
     async def should_reload_queues(self) -> bool:
+        now = dt.datetime.now(dt.timezone.utc)
+        if self._last_refreshed and (now - self._last_refreshed).total_seconds() < self.config_ttl:
+            return False
         refresh_tag = await self.state_manager.get_refresh_tag(self.role)
-        if refresh_tag != self.refresh_tag:
-            self.refresh_tag = refresh_tag
-            return True
-        return False
+        if refresh_tag != self._refresh_tag:
+            self._refresh_tag = refresh_tag
+            needs_refresh = True
+        else:
+            needs_refresh = False
+        self._last_refreshed = now
+        return needs_refresh
 
     def __aiter__(self):
         return self
@@ -145,6 +159,7 @@ class TaskGenerator:
         task = await self.state_manager.get_next_task(task_queues)
         self._task_count += 1
         if not task:
+            # TODO: We need to monitor how often the generator dies this way
             raise StopAsyncIteration
         return task
 
