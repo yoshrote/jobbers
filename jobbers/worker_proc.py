@@ -18,6 +18,15 @@ from jobbers.state_manager import StateManager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+"""
+Important environment variables:
+- WORKER_ROLE: Role of the worker (default is "default")
+- WORKER_TTL: Time to live for the worker (in seconds) (default is 50)
+- WORKER_CONCURRENT_TASKS: Maximum number of concurrent tasks to process (default is 5)
+
+Rate limiting should be implemented by limiting the creation of tasks rather
+than on the consumption of tasks.
+"""
 
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
@@ -42,6 +51,7 @@ class TaskProcessor:
                 self.handle_timeout_exception(task, task_config)
             except asyncio.CancelledError:
                 self.handle_cancelled_task(task)
+                raise
             except Exception as exc:
                 self.handle_unexpected_exception(task, exc)
             else:
@@ -173,14 +183,14 @@ async def task_consumer():
     """Consume tasks from the Redis list 'task-list'."""
     role = os.environ("WORKER_ROLE", "default")
     worker_ttl = int(os.environ("WORKER_TTL", 50)) # if 0, will run indefinitely
-    max_concurrent = float(os.environ("MAX_CONCURRENT_TASKS", 5))
+    num_concurrent = float(os.environ("WORKER_CONCURRENT_TASKS", 5))
     redis = await get_client()
     state_manager = StateManager(redis)
 
     task_generator = TaskGenerator(state_manager, role, max_tasks=worker_ttl)
     try:
         pool = TaskPool()
-        pool.map(TaskProcessor(state_manager).process, task_generator, num_concurrent=max_concurrent)
+        pool.map(TaskProcessor(state_manager).process, task_generator, num_concurrent=num_concurrent)
         await pool.gather_and_close()
     # except asyncio.CancelledError:
     #     logger.info("Task consumer killed. Shutting down...")
