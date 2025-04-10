@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
@@ -19,8 +19,7 @@ async def test_task_processor_success():
         status=TaskStatus.SUBMITTED,
     )
     state_manager = AsyncMock()
-    async def task_function(param1: str):
-        return {"result": "success"}
+    task_function = AsyncMock(return_value={"result": "success"})
 
     task_config = TaskConfig(
         name="test_task",
@@ -31,12 +30,13 @@ async def test_task_processor_success():
     )
 
     with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
-        processor = TaskProcessor(task, state_manager)
-        result_task = await processor.process()
+        processor = TaskProcessor(state_manager)
+        result_task = await processor.process(task)
 
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
-    state_manager.submit_task.assert_called_once_with(result_task)
+    # Once when starting and once when done
+    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
 
 
 @pytest.mark.asyncio
@@ -51,12 +51,14 @@ async def test_task_processor_dropped_task():
     state_manager = AsyncMock()
 
     with patch("jobbers.worker_proc.get_task_config", return_value=None):
-        processor = TaskProcessor(task, state_manager)
-        result_task = await processor.process()
+        processor = TaskProcessor(state_manager)
+        result_task = await processor.process(task)
 
     assert result_task.status == TaskStatus.DROPPED
     assert result_task.completed_at is not None
+    # Once when starting
     state_manager.submit_task.assert_called_once_with(result_task)
+
 
 
 @pytest.mark.asyncio
@@ -82,13 +84,15 @@ async def test_task_processor_expected_exception():
     )
 
     with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
-        processor = TaskProcessor(task, state_manager)
-        result_task = await processor.process()
+        processor = TaskProcessor(state_manager)
+        result_task = await processor.process(task)
 
     assert result_task.status == TaskStatus.UNSUBMITTED
     assert result_task.retry_attempt == 1
     assert "Expected error" in result_task.error
-    state_manager.submit_task.assert_called_once_with(result_task)
+    # Once when starting and once when done
+    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+
 
 
 @pytest.mark.asyncio
@@ -112,12 +116,14 @@ async def test_task_processor_unexpected_exception():
     )
 
     with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
-        processor = TaskProcessor(task, state_manager)
-        result_task = await processor.process()
+        processor = TaskProcessor(state_manager)
+        result_task = await processor.process(task)
 
     assert result_task.status == TaskStatus.FAILED
     assert "Unexpected error" in result_task.error
-    state_manager.submit_task.assert_called_once_with(result_task)
+    # Once when starting and once when done
+    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+
 
 
 @pytest.mark.asyncio
@@ -141,12 +147,14 @@ async def test_task_processor_timeout_with_retry():
     )
 
     with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
-        processor = TaskProcessor(task, state_manager)
-        result_task = await processor.process()
+        processor = TaskProcessor(state_manager)
+        result_task = await processor.process(task)
 
     assert result_task.status == TaskStatus.UNSUBMITTED
     assert "timed out" in result_task.error
-    state_manager.submit_task.assert_called_once_with(result_task)
+    # Once when starting and once when done
+    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+
 
 @pytest.mark.asyncio
 async def test_task_processor_timeout_without_retry():
@@ -169,13 +177,15 @@ async def test_task_processor_timeout_without_retry():
     )
 
     with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
-        processor = TaskProcessor(task, state_manager)
-        result_task = await processor.process()
+        processor = TaskProcessor(state_manager)
+        result_task = await processor.process(task)
 
     assert result_task.status == TaskStatus.FAILED
     assert result_task.completed_at is not None, "Failed tasks should have a completed_at timestamp"
     assert "timed out" in result_task.error
-    state_manager.submit_task.assert_called_once_with(result_task)
+    # Once when starting and once when done
+    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+
 
 @pytest.mark.asyncio
 async def test_task_processor_cancelled():
@@ -198,9 +208,13 @@ async def test_task_processor_cancelled():
     )
 
     with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
-        processor = TaskProcessor(task, state_manager)
-        result_task = await processor.process()
+        processor = TaskProcessor(state_manager)
+        with pytest.raises(asyncio.CancelledError):
+            await processor.process(task)
 
-    assert result_task.status == TaskStatus.CANCELLED
-    assert result_task.completed_at is not None, "Cancelled tasks should have a completed_at timestamp"
-    state_manager.submit_task.assert_called_once_with(result_task)
+    # the task should have been updated via side effects
+    assert task.status == TaskStatus.CANCELLED
+    assert task.completed_at is not None, "Cancelled tasks should have a completed_at timestamp"
+    # Once when starting and once when done
+    state_manager.submit_task.assert_has_calls([call(task), call(task)])
+

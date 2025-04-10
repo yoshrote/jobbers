@@ -41,17 +41,18 @@ class TaskProcessor:
         if not task_config:
             self.handle_dropped_task(task)
         else:
+            ex = None
             try:
                 task = await self.mark_task_as_started(task)
                 async with asyncio.timeout(task_config.timeout):
-                    self.task.results = await task_config.function(**self.task.parameters)
+                    task.results = await task_config.function(**task.parameters)
             except task_config.expected_exceptions as exc:
                 self.handle_expected_exception(task, task_config, exc)
             except asyncio.TimeoutError:
                 self.handle_timeout_exception(task, task_config)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
+                ex = exc
                 self.handle_cancelled_task(task)
-                raise
             except Exception as exc:
                 self.handle_unexpected_exception(task, exc)
             else:
@@ -61,13 +62,16 @@ class TaskProcessor:
 
         if task.status == TaskStatus.COMPLETED:
             await self.post_process(task)
+        elif task.status == TaskStatus.CANCELLED:
+            raise ex
 
         return task
 
-    def mark_task_as_started(self, task: Task) -> Awaitable[Task]:
+    async def mark_task_as_started(self, task: Task) -> Awaitable[Task]:
         task.started_at = dt.datetime.now(dt.timezone.utc)
         task.status = TaskStatus.STARTED
-        return self.state_manager.submit_task(task)
+        await self.state_manager.submit_task(task)
+        return task
 
     async def post_process(self, task: Task):
         if task.has_callbacks():
@@ -107,7 +111,7 @@ class TaskProcessor:
 
     def handle_timeout_exception(self, task: Task, task_config: TaskConfig):
         logger.warning("Task %s timed out after %d seconds.", task.id, task_config.timeout)
-        task.error = f"Task {self.task.id} timed out after {task_config.timeout} seconds"
+        task.error = f"Task {task.id} timed out after {task_config.timeout} seconds"
         if task.should_retry(task_config):
             # Task status will change to submitted when re-enqueued
             task.status = TaskStatus.UNSUBMITTED
