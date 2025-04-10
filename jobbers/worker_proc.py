@@ -48,7 +48,19 @@ class TaskProcessor:
 
         await self.state_manager.submit_task(task)
 
+        if task.status == TaskStatus.COMPLETED:
+            await self.post_process(task)
+
         return task
+
+    async def post_process(self, task: Task):
+        if task.has_callbacks():
+            return
+
+        # TODO: submit tasks in parallel
+        # Monitor for when fan-out becomes problematic
+        for callback_task in task.generate_callbacks():
+            await self.state_manager.submit_task(callback_task)
 
     def handle_dropped_task(self, task: Task):
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
