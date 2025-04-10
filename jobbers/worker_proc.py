@@ -110,11 +110,12 @@ class TaskGenerator:
 
     DEFAULT_QUEUES = {"default"}
 
-    def __init__(self, state_manager, role="default"):
+    def __init__(self, state_manager, role="default", max_tasks=100):
         self.role: str = role
         self.state_manager: StateManager = state_manager
         self.task_queues: set[str] = None
-        self.refresh_tag: ULID = None
+        self.max_tasks: int = max_tasks
+        self._task_count: int = 0
 
     async def find_queues(self) -> set[str]:
         """Find all queues we should listen to via Redis."""
@@ -138,8 +139,11 @@ class TaskGenerator:
         return self
 
     async def __anext__(self):
+        if self.max_tasks and self._task_count >= self.max_tasks:
+            raise StopAsyncIteration
         task_queues = await self.queues()
         task = await self.state_manager.get_next_task(task_queues)
+        self._task_count += 1
         if not task:
             raise StopAsyncIteration
         return task
@@ -147,11 +151,12 @@ class TaskGenerator:
 async def task_consumer():
     """Consume tasks from the Redis list 'task-list'."""
     role = os.environ("WORKER_ROLE", "default")
+    worker_ttl = int(os.environ("WORKER_TTL", 50)) # if 0, will run indefinitely
     max_concurrent = float(os.environ("MAX_CONCURRENT_TASKS", 5))
     redis = await get_client()
     state_manager = StateManager(redis)
 
-    task_generator = TaskGenerator(state_manager, role)
+    task_generator = TaskGenerator(state_manager, role, max_tasks=worker_ttl)
     try:
         pool = TaskPool()
         pool.map(TaskProcessor(state_manager).process, task_generator, num_concurrent=max_concurrent)
