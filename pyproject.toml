@@ -53,6 +53,7 @@ dependencies = [
     "python_on_whales",
     "msgpack",
     "python-ulid[pydantic]",
+    "asyncio-taskpool",
 ]
 
 [project.urls]

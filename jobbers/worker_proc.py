@@ -2,10 +2,13 @@ import asyncio
 import datetime as dt
 import logging
 import os
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from ulid import ULID
+
+from asyncio_taskpool import TaskPool
 
 from jobbers.db import get_client
 from jobbers.models import Task, TaskConfig, TaskStatus
@@ -19,81 +22,77 @@ logger = logging.getLogger(__name__)
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
 
-    def __init__(self, task: Task, state_manager: StateManager):
+    def __init__(self, state_manager: StateManager):
         self.state_manager = state_manager
-        self.task = task
 
-    async def process(self) -> Task:
+    async def process(self, task: Task) -> Task:
         """Process the task and return the result."""
-        logger.debug("Task %s details: %s", self.task.id, self.task)
-        task_config: TaskConfig = get_task_config(self.task.name, self.task.version)
+        logger.debug("Task %s details: %s", task.id, task)
+        task_config: TaskConfig = get_task_config(task.name, task.version)
         if not task_config:
-            self.handle_dropped_task()
+            self.handle_dropped_task(task)
         else:
             try:
                 async with asyncio.timeout(task_config.timeout):
                     self.task.results = await task_config.function(**self.task.parameters)
             except task_config.expected_exceptions as exc:
-                self.handle_expected_exception(task_config, exc)
+                self.handle_expected_exception(task, task_config, exc)
             except asyncio.TimeoutError:
-                self.handle_timeout_exception(task_config)
+                self.handle_timeout_exception(task, task_config)
             except asyncio.CancelledError:
-                self.handle_cancelled_task()
+                self.handle_cancelled_task(task)
             except Exception as exc:
-                self.handle_unexpected_exception(exc)
+                self.handle_unexpected_exception(task, exc)
             else:
-                self.handle_success()
+                self.handle_success(task)
 
-        await self.state_manager.submit_task(
-            self.task,
-        )
+        await self.state_manager.submit_task(task)
 
-        return self.task
+        return task
 
-    def handle_dropped_task(self):
-        logger.error("Dropping unknown task %s v%s id=%s.", self.task.name, self.task.version, self.task.id)
-        self.task.status = TaskStatus.DROPPED
-        self.task.completed_at = dt.datetime.now(dt.timezone.utc)
+    def handle_dropped_task(self, task: Task):
+        logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
+        task.status = TaskStatus.DROPPED
+        task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-    def handle_cancelled_task(self):
-        logger.info("Task %s was cancelled.", self.task.id)
-        self.task.status = TaskStatus.CANCELLED
-        self.task.completed_at = dt.datetime.now(dt.timezone.utc)
+    def handle_cancelled_task(self, task: Task):
+        logger.info("Task %s was cancelled.", task.id)
+        task.status = TaskStatus.CANCELLED
+        task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-    def handle_unexpected_exception(self, exc: Exception):
-        logger.exception("Exception occurred while processing task %s: %s", self.task.id, exc)
-        self.task.status = TaskStatus.FAILED
-        self.task.error = str(exc)
+    def handle_unexpected_exception(self, task: Task, exc: Exception):
+        logger.exception("Exception occurred while processing task %s: %s", task.id, exc)
+        task.status = TaskStatus.FAILED
+        task.error = str(exc)
 
-    def handle_expected_exception(self, task_config: TaskConfig, exc: Exception):
-        logger.warning("Task %s failed with error: %s", self.task.id, exc)
+    def handle_expected_exception(self, task: Task, task_config: TaskConfig, exc: Exception):
+        logger.warning("Task %s failed with error: %s", task.id, exc)
         # TODO: Set metrics to track expected exceptions
-        self.task.error = str(exc)
-        if self.task.should_retry(task_config):
+        task.error = str(exc)
+        if task.should_retry(task_config):
             # Task status will change to submitted when re-enqueued
-            self.task.retry_attempt += 1
-            self.task.status = TaskStatus.UNSUBMITTED
+            task.retry_attempt += 1
+            task.status = TaskStatus.UNSUBMITTED
         else:
-            self.task.status = TaskStatus.FAILED
-            self.task.completed_at = dt.datetime.now(dt.timezone.utc)
+            task.status = TaskStatus.FAILED
+            task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-    def handle_timeout_exception(self, task_config: TaskConfig):
-        logger.warning("Task %s timed out after %d seconds.", self.task.id, task_config.timeout)
-        self.task.error = f"Task {self.task.id} timed out after {task_config.timeout} seconds"
-        if self.task.should_retry(task_config):
+    def handle_timeout_exception(self, task: Task, task_config: TaskConfig):
+        logger.warning("Task %s timed out after %d seconds.", task.id, task_config.timeout)
+        task.error = f"Task {self.task.id} timed out after {task_config.timeout} seconds"
+        if task.should_retry(task_config):
             # Task status will change to submitted when re-enqueued
-            self.task.status = TaskStatus.UNSUBMITTED
-            self.task.retry_attempt += 1
+            task.status = TaskStatus.UNSUBMITTED
+            task.retry_attempt += 1
         else:
-            self.task.status = TaskStatus.FAILED
-            self.task.completed_at = dt.datetime.now(dt.timezone.utc)
+            task.status = TaskStatus.FAILED
+            task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-    def handle_success(self):
-        logger.info("Task %s completed.", self.task.id)
-        self.task.status = TaskStatus.COMPLETED
-        self.task.completed_at = dt.datetime.now(dt.timezone.utc)
+    def handle_success(self, task: Task):
+        logger.info("Task %s completed.", task.id)
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = dt.datetime.now(dt.timezone.utc)
 
-# move TaskGenerator to a separate file
 class TaskGenerator:
     """Generates tasks from the Redis list 'task-list'."""
 
@@ -133,23 +132,23 @@ class TaskGenerator:
             raise StopAsyncIteration
         return task
 
-
-
 async def task_consumer():
     """Consume tasks from the Redis list 'task-list'."""
+    role = os.environ("WORKER_ROLE", "default")
+    max_concurrent = float(os.environ("MAX_CONCURRENT_TASKS", 5))
     redis = await get_client()
     state_manager = StateManager(redis)
-    role = os.environ("WORKER_ROLE", "default")
+
     task_generator = TaskGenerator(state_manager, role)
     try:
-        async for task in task_generator:
-            task_status = await TaskProcessor(task, state_manager).process()
-            if task_status == TaskStatus.COMPLETED and task.has_callbacks():
-                # Monitor for when fan-out becomes problematic
-                for callback_task in task.generate_callbacks():
-                    await state_manager.submit_task(callback_task)
-    except asyncio.CancelledError:
-        logger.info("Task consumer shutting down...")
+        pool = TaskPool()
+        pool.map(TaskProcessor(state_manager).process, task_generator, num_concurrent=max_concurrent)
+        await pool.gather_and_close()
+    # except asyncio.CancelledError:
+    #     logger.info("Task consumer killed. Shutting down...")
+    #     raise
+    # else:
+    #     logger.info("Task consumer finished. Shutting down...")
     finally:
         await redis.close()
 
