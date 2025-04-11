@@ -6,6 +6,7 @@ from typing import Optional
 from ulid import ULID
 
 from jobbers.models import Task, TaskStatus
+from jobbers.models.queue_config import QueueConfig
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class StateManager:
 
     TASKS_BY_QUEUE = "task-queues:{queue}".format
     QUEUES_BY_ROLE = "worker-queues:{role}".format
+    QUEUE_CONFIG = "queue-config:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
     ALL_QUEUES = "all-queues"
 
@@ -119,6 +121,10 @@ class StateManager:
         async for key in self.data_store.scan_iter(match=self.QUEUES_BY_ROLE(role="*").encode()):
             roles.append(key.decode().split(":")[1])
         return roles
+
+    async def get_queue_config(self, queue: str) -> QueueConfig:
+        raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
+        return QueueConfig.from_redis(raw_data)
 
 def build_sm() -> StateManager:
     from jobbers import db
