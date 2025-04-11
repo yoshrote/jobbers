@@ -1,9 +1,11 @@
+import datetime as dt
 from unittest.mock import AsyncMock
 
 import pytest
 from ulid import ULID
 
 from jobbers.models.task import Task, TaskStatus
+from jobbers.state_manager import StateManager
 from jobbers.worker_proc import TaskGenerator
 
 
@@ -104,3 +106,47 @@ async def test_task_generator_stops_iteration():
         pass
 
     state_manager.get_next_task.assert_called_once_with({"default"})
+
+
+@pytest.mark.asyncio
+async def test_should_reload_queues_due_to_ttl():
+    """Test that should_reload_queues returns True when now - _last_refreshed >= config_ttl."""
+    state_manager = AsyncMock(spec=StateManager)
+    task_generator = TaskGenerator(state_manager, config_ttl=60)
+
+    # Set _last_refreshed to 61 seconds ago
+    task_generator._last_refreshed = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=61)
+
+    should_reload = await task_generator.should_reload_queues()
+
+    state_manager.get_refresh_tag.assert_called_once()
+    assert should_reload is True, "should_reload_queues should return True when TTL has expired"
+
+@pytest.mark.asyncio
+async def test_should_reload_queues_under_ttl():
+    """Test that should_reload_queues returns False when now - _last_refreshed < config_ttl."""
+    state_manager = AsyncMock(spec=StateManager)
+    task_generator = TaskGenerator(state_manager, config_ttl=60)
+
+    # Set _last_refreshed to 61 seconds ago
+    task_generator._last_refreshed = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=30)
+
+    should_reload = await task_generator.should_reload_queues()
+
+    # We should not check state when under the TTL
+    state_manager.get_refresh_tag.assert_not_called()
+    assert should_reload is False, "should_reload_queues should return True when TTL has expired"
+
+@pytest.mark.asyncio
+async def test_should_reload_queues_on_intial_load():
+    """Test that should_reload_queues returns False when now - _last_refreshed < config_ttl."""
+    state_manager = AsyncMock(spec=StateManager)
+    task_generator = TaskGenerator(state_manager, config_ttl=60)
+
+    # Set _last_refreshed to 61 seconds ago
+    task_generator._last_refreshed = None
+
+    should_reload = await task_generator.should_reload_queues()
+
+    state_manager.get_refresh_tag.assert_called_once()
+    assert should_reload is True, "should_reload_queues should return True when TTL has expired"

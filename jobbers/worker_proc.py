@@ -135,7 +135,7 @@ class TaskGenerator:
         self.state_manager: StateManager = state_manager
         self.task_queues: set[str] = None
         self.config_ttl: int = config_ttl
-        self._refresh_tag: ULID = None
+        self.refresh_tag: ULID = None
         self._last_refreshed: Optional[dt.datetime] = None
         self.max_tasks: int = max_tasks
         self._task_count: int = 0
@@ -153,20 +153,20 @@ class TaskGenerator:
                 queue
                 for queue in await self.find_queues()
             }
+            self._last_refreshed = dt.datetime.now(dt.timezone.utc)
         # TODO: filter out queues if we are at capacity running tasks from them
         return self.task_queues
 
     async def should_reload_queues(self) -> bool:
         now = dt.datetime.now(dt.timezone.utc)
-        if self._last_refreshed and (now - self._last_refreshed).total_seconds() < self.config_ttl:
+        if self.config_ttl and self._last_refreshed and (now - self._last_refreshed).total_seconds() < self.config_ttl:
             return False
         refresh_tag = await self.state_manager.get_refresh_tag(self.role)
-        if refresh_tag != self._refresh_tag:
-            self._refresh_tag = refresh_tag
+        if refresh_tag != self.refresh_tag:
+            self.refresh_tag = refresh_tag
             needs_refresh = True
         else:
             needs_refresh = False
-        self._last_refreshed = now
         return needs_refresh
 
     def __aiter__(self):
