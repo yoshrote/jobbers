@@ -19,9 +19,14 @@ class StateManager:
         - ZPOPMIN to get the oldest task from a set of queues
     - `task:<task_id>`: Hash containing the task state (name, status, etc).
     - `worker-queues:<role>`: Set of queues for a given role, used to manage which queues are available for task submission.
+
+    - `rate-limiter:<queue>`: Sorted set of task id => task name/hash key. This should be updated when the task-queues are updated.
+        - ZADD/ZREM by task id: O(log(N))
+        - ZCOUNT by hash key: O(log(N)) to get the current number of tasks with that hash key
     """
 
     TASKS_BY_QUEUE = "task-queues:{queue}".format
+    QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     QUEUES_BY_ROLE = "worker-queues:{role}".format
     QUEUE_CONFIG = "queue-config:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
@@ -35,9 +40,11 @@ class StateManager:
         pipe = self.data_store.pipeline(transaction=True)
         # Avoid pushing a task onto the queue multiple times
         if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
+            # if RateLimiter.has_room_in_queue_queue(task.queue):
             task.submitted_at = dt.datetime.now(dt.timezone.utc)
             task.status = TaskStatus.SUBMITTED
             pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+            # RateLimiter.add_task_to_queue(task, pipe=pipe)
 
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
         await pipe.execute()
