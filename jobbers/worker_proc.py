@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import datetime as dt
 import logging
 import os
@@ -148,26 +149,36 @@ class TaskGenerator:
         return queues or set()
 
     async def queues(self) -> set[str]:
-        if self.task_queues is None or self.should_reload_queues():
-            self.task_queues = {
-                queue
-                for queue in await self.find_queues()
-            }
-            self._last_refreshed = dt.datetime.now(dt.timezone.utc)
+        async with self.is_local_cache_stale() as is_stale:
+            if is_stale:
+                self.task_queues = {
+                    queue
+                    for queue in await self.find_queues()
+                }
         # TODO: filter out queues if we are at capacity running tasks from them
         return self.task_queues
 
-    async def should_reload_queues(self) -> bool:
+    @asynccontextmanager
+    async def is_local_cache_stale(self):
         now = dt.datetime.now(dt.timezone.utc)
-        if self.config_ttl and self._last_refreshed and (now - self._last_refreshed).total_seconds() < self.config_ttl:
-            return False
-        refresh_tag = await self.state_manager.get_refresh_tag(self.role)
-        if refresh_tag != self.refresh_tag:
-            self.refresh_tag = refresh_tag
-            needs_refresh = True
+
+        should_attempt_refresh = True
+        if self.task_queues is None:
+            pass # initial load
+        elif not self.config_ttl:
+            pass # no TTL, always check the data store
+        elif self._last_refreshed and (now - self._last_refreshed).total_seconds() < self.config_ttl:
+            should_attempt_refresh = False
+
+        if should_attempt_refresh:
+            refresh_tag = await self.state_manager.get_refresh_tag(self.role)
+            needs_refresh = refresh_tag != self.refresh_tag
+            yield needs_refresh
+            if needs_refresh: # This little cleanup is why we need the context manager
+                self.refresh_tag = refresh_tag
+                self._last_refreshed = dt.datetime.now(dt.timezone.utc)
         else:
-            needs_refresh = False
-        return needs_refresh
+            yield False
 
     def __aiter__(self):
         return self
