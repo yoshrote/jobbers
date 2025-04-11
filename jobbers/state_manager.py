@@ -14,8 +14,9 @@ class StateManager:
     Manages tasks in a Redis data store.
 
     The state is stored across a number of different key types:
-    - `task-queues:<queue>`: Sorted set of task IDs for each queue, used for task submission order.
-    - `task:<task_id>`: Hash containing the task details (name, status, etc).
+    - `task-queues:<queue>`: Sorted set of task ID => submitted at timestamp for each queue
+        - ZPOPMIN to get the oldest task from a set of queues
+    - `task:<task_id>`: Hash containing the task state (name, status, etc).
     - `worker-queues:<role>`: Set of queues for a given role, used to manage which queues are available for task submission.
     """
 
@@ -79,6 +80,9 @@ class StateManager:
             return None
 
         # Try to pop from each queue until we find a task
+        # TODO: Shuffle/rotate the order of queues to avoid starving any of them
+        # see https://redis.io/docs/latest/commands/blpop/#what-key-is-served-first-what-client-what-element-priority-ordering-details
+        # for details of how the order of keys impact how tasks are popped
         task_queues = [self.TASKS_BY_QUEUE(queue=queue) for queue in queues]
         task_id = await self.data_store.bzpopmin(task_queues, timeout=timeout)
         if task_id:
