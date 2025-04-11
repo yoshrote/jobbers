@@ -1,4 +1,3 @@
-import datetime as dt
 from unittest.mock import AsyncMock
 
 import pytest
