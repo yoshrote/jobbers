@@ -18,7 +18,7 @@ class TaskStatus(StrEnum):
     def from_bytes(cls, raw_status: Optional[bytes]) -> "TaskStatus":
         if not raw_status:
             return cls.UNSUBMITTED
-        return cls(raw_status.decode("utf-8"))
+        return cls(raw_status.decode())
 
     def to_bytes(self) -> bytes:
-        return self.value.encode("utf-8")
+        return self.value.encode()
