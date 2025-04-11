@@ -178,6 +178,8 @@ class MaxTaskCounter:
         return self.max_tasks > 0 and self._task_count >= self.max_tasks
 
     def __enter__(self):
+        if self.limit_reached():
+            raise StopAsyncIteration
         return self._task_count
 
     def __exit__(self, exc_type, exc, tb):
@@ -206,14 +208,16 @@ class TaskGenerator:
 
     async def queues(self) -> set[str]:
         async with self.ttl as needs_refresh:
-            if needs_refresh:
-                new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
-                if new_refresh_tag != self.refresh_tag:
-                    self.refresh_tag = new_refresh_tag
-                    self.task_queues = {
-                        queue
-                        for queue in await self.find_queues()
-                    }
+            if not needs_refresh:
+                # TODO: filter out queues if we are at capacity running tasks from them
+                return self.task_queues
+            new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
+            if new_refresh_tag != self.refresh_tag:
+                self.refresh_tag = new_refresh_tag
+                self.task_queues = {
+                    queue
+                    for queue in await self.find_queues()
+                }
         # TODO: filter out queues if we are at capacity running tasks from them
         return self.task_queues
 
@@ -221,10 +225,8 @@ class TaskGenerator:
         return self
 
     async def __anext__(self):
-        if self.max_task_check.limit_reached():
-            raise StopAsyncIteration
-        task_queues = await self.queues()
         with self.max_task_check:
+            task_queues = await self.queues()
             task = await self.state_manager.get_next_task(task_queues)
         if not task:
             # TODO: We need to monitor how often the generator dies this way
