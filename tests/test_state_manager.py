@@ -8,7 +8,7 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
-from jobbers.serialization import EMPTY_DICT, serialize
+from jobbers.serialization import deserialize, serialize
 from jobbers.state_manager import RateLimiter, StateManager, Task, TaskStatus
 
 FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -36,8 +36,8 @@ async def test_submit_task(redis, state_manager):
     # Verify the task was added to Redis
     task_list = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in task_list
-    task_data = await redis.hgetall(f"task:{ULID1}")
-    assert set(task_data.items()) >= set({b"name": b"Test Task", b"status": b"submitted", b"submitted_at": serialize(task.submitted_at)}.items())
+    task_data = await redis.hget("task-table", bytes(ULID1))
+    assert deserialize(task_data).items() >= set({b"name": "Test Task", b"status": b"submitted", b"submitted_at": task.submitted_at}.items())
 
 @pytest.mark.asyncio
 async def test_submit_task_twice_updates_only(redis, state_manager):
@@ -66,7 +66,7 @@ async def test_get_task(redis):
     """Test retrieving a task from Redis."""
     # Add a task to Redis
     await redis.zadd("worker-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp()})
-    await redis.hset(f"task:{ULID1}", mapping={b"name": b"Test Task", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME, b"version": 0})
+    await redis.hset("task-table", bytes(ULID1), serialize({b"name": "Test Task", b"status": b"started", b"submitted_at": FROZEN_TIME, b"version": 0}))
     # Retrieve the task
     task = await StateManager(redis).get_task(ULID1)
     assert task is not None
@@ -86,7 +86,7 @@ async def test_task_exists(redis, state_manager):
     """Test checking if a task exists in Redis."""
     # Add a task to Redis
     await redis.zadd("worker-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp()})
-    await redis.hset(f"task:{ULID1}", mapping={"name": "Test Task", "status": "started", "submitted_at": ISO_FROZEN_TIME})
+    await redis.hset("task-table", bytes(ULID1), serialize({b"name": "Test Task", b"status": b"started", b"submitted_at": FROZEN_TIME}))
     # Check if the task exists
     exists = await state_manager.task_exists(ULID1)
     assert exists
@@ -99,8 +99,8 @@ async def test_get_all_tasks(redis, state_manager):
     """Test retrieving all tasks from Redis."""
     # Add tasks to Redis
     await redis.zadd("task-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp(), bytes(ULID2): FROZEN_TIME.timestamp()})
-    await redis.hset(f"task:{ULID1}", mapping={b"name": b"Task 1", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME})
-    await redis.hset(f"task:{ULID2}", mapping={b"name": b"Task 2", b"status": b"completed", b"submitted_at": ISO_FROZEN_TIME})
+    await redis.hset("task-table", bytes(ULID1), serialize({b"name": b"Task 1", b"status": b"started", b"submitted_at": FROZEN_TIME}))
+    await redis.hset("task-table", bytes(ULID2), serialize({b"name": b"Task 2", b"status": b"completed", b"submitted_at": FROZEN_TIME}))
     # Retrieve all tasks
     tasks = await state_manager.get_all_tasks()
     assert len(tasks) == 2
@@ -194,12 +194,12 @@ async def test_get_next_task_returns_task(redis, state_manager):
     task_data = {
         b"name": b"Test Task",
         b"status": b"submitted",
-        b"parameters": EMPTY_DICT,
-        b"version": b"1",
-        b"submitted_at": ISO_FROZEN_TIME,
+        b"parameters": {},
+        b"version": 1,
+        b"submitted_at": FROZEN_TIME,
     }
     await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
-    await redis.hset(f"task:{task_id}", mapping=task_data)
+    await redis.hset("task-table", bytes(task_id), serialize(task_data))
 
     # Call the method
     task = await state_manager.get_next_task(["queue1", "queue2"])

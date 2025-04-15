@@ -49,32 +49,34 @@ class Task(BaseModel):
         return summary
 
     @classmethod
-    def from_redis(cls, task_id: ULID, raw_task_data: dict) -> "Task":
+    def from_redis(cls, task_id: ULID, raw_task_data: bytes) -> "Task":
         # Try to set good defaults for missing fields so when new fields are added to the task model, we don't break
+        unpacked_data = deserialize(raw_task_data)
+        print(unpacked_data)
         return cls(
             id=task_id,
-            name=raw_task_data.get(b"name", b"").decode(),
-            version=int(raw_task_data.get(b"version", b"0")),
-            parameters=deserialize(raw_task_data.get(b"parameters") or EMPTY_DICT),
-            results=deserialize(raw_task_data.get(b"results") or EMPTY_DICT),
-            error=deserialize(raw_task_data.get(b"error") or NONE),
-            status=TaskStatus.from_bytes(raw_task_data.get(b"status")),
-            submitted_at=deserialize(raw_task_data.get(b"submitted_at") or NONE),
-            started_at=deserialize(raw_task_data.get(b"started_at") or NONE),
-            heartbeat_at=deserialize(raw_task_data.get(b"heartbeat_at") or NONE),
-            completed_at=deserialize(raw_task_data.get(b"completed_at") or NONE),
+            name=unpacked_data.get(b"name", ""),
+            version=unpacked_data.get(b"version", 0),
+            parameters=unpacked_data.get(b"parameters") or {},
+            results=unpacked_data.get(b"results") or {},
+            error=unpacked_data.get(b"error") or None,
+            status=TaskStatus.from_bytes(unpacked_data.get(b"status")),
+            submitted_at=unpacked_data.get(b"submitted_at") or None,
+            started_at=unpacked_data.get(b"started_at") or None,
+            heartbeat_at=unpacked_data.get(b"heartbeat_at") or None,
+            completed_at=unpacked_data.get(b"completed_at") or None,
         )
 
     def to_redis(self):
-        return {
-            b"name": self.name.encode(),
+        return serialize({
+            b"name": self.name,
             b"version": self.version,
-            b"parameters": serialize(self.parameters or {}),
-            b"results": serialize(self.results or {}),
-            b"error": serialize(self.error),
+            b"parameters": self.parameters or {},
+            b"results": self.results or {},
+            b"error": self.error,
             b"status": self.status.to_bytes(),
-            b"submitted_at": serialize(self.submitted_at),
-            b"started_at": serialize(self.started_at),
-            b"heartbeat_at": serialize(self.heartbeat_at),
-            b"completed_at": serialize(self.completed_at),
-        }
+            b"submitted_at": self.submitted_at,
+            b"started_at": self.started_at,
+            b"heartbeat_at": self.heartbeat_at,
+            b"completed_at": self.completed_at,
+        })
