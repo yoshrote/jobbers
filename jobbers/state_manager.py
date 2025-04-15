@@ -14,15 +14,16 @@ class StateManager:
     Manages tasks in a Redis data store.
 
     The state is stored across a number of different key types:
+    - `task-table`: Hash of task ID => task state (name, status, etc).
     - `task-queues:<queue>`: Sorted set of task ID => submitted at timestamp for each queue
         - ZPOPMIN to get the oldest task from a set of queues
-    - `task:<task_id>`: Hash containing the task state (name, status, etc).
-    - `worker-queues:<role>`: Set of queues for a given role, used to manage which queues are available for task submission.
+    - `worker-queues:<role>`: Set of queues for a given role, used to manage which queues
+       are available for task submission.
     """
 
     TASKS_BY_QUEUE = "task-queues:{queue}".format
     QUEUES_BY_ROLE = "worker-queues:{role}".format
-    TASK_DETAILS = "task:{task_id}".format
+    TASK_DETAILS = "task-table"
     ALL_QUEUES = "all-queues"
 
     def __init__(self, data_store):
@@ -37,11 +38,11 @@ class StateManager:
             task.status = TaskStatus.SUBMITTED
             pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
-        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
+        pipe.hset(self.TASK_DETAILS, bytes(task.id), task.to_redis())
         await pipe.execute()
 
     async def get_task(self, task_id: ULID) -> Task | None:
-        raw_task_data: dict = await self.data_store.hgetall(self.TASK_DETAILS(task_id=task_id))
+        raw_task_data: bytes = await self.data_store.hget(self.TASK_DETAILS, bytes(task_id))
 
         if raw_task_data:
             return Task.from_redis(task_id, raw_task_data)
@@ -49,7 +50,7 @@ class StateManager:
         return None
 
     async def task_exists(self, task_id: ULID) -> bool:
-        return await self.data_store.exists(self.TASK_DETAILS(task_id=task_id)) == 1
+        return await self.data_store.hexists(self.TASK_DETAILS, bytes(task_id)) == 1
 
     async def get_all_tasks(self) -> list[ULID]:
         task_ids = await self.data_store.zrange(self.TASKS_BY_QUEUE(queue="default"), 0, -1)

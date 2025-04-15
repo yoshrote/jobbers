@@ -3,7 +3,7 @@ import datetime as dt
 from ulid import ULID
 
 from jobbers.models.task import Task, TaskStatus
-from jobbers.serialization import EMPTY_DICT, NONE
+from jobbers.serialization import EMPTY_DICT, NONE, deserialize
 
 
 def test_task_serialization_and_deserialization():
@@ -51,18 +51,19 @@ def test_task_serialization_with_none_values():
     )
 
     # Serialize the task to Redis format
-    redis_data = task.to_redis()
+    raw_data = task.to_redis()
+    redis_data = deserialize(raw_data)
 
     # Assert that None values are serialized as expected
-    assert redis_data[b"parameters"] == EMPTY_DICT
-    assert redis_data[b"results"] == EMPTY_DICT
-    assert redis_data[b"error"] == NONE
-    assert redis_data[b"started_at"] == NONE
-    assert redis_data[b"heartbeat_at"] == NONE
-    assert redis_data[b"completed_at"] == NONE
+    assert redis_data[b"parameters"] == {}
+    assert redis_data[b"results"] == {}
+    assert redis_data[b"error"] == None
+    assert redis_data[b"started_at"] == None
+    assert redis_data[b"heartbeat_at"] == None
+    assert redis_data[b"completed_at"] == None
 
     # Deserialize the task back from Redis format
-    deserialized_task = Task.from_redis(task_id, redis_data)
+    deserialized_task = Task.from_redis(task_id, raw_data)
 
     # Assert that the original task and deserialized task are equal
     assert task == deserialized_task
@@ -86,20 +87,21 @@ def test_task_serialization_with_non_none_values():
     )
 
     # Serialize the task to Redis format
-    redis_data = task.to_redis()
+    raw_data = task.to_redis()
+    redis_data = deserialize(raw_data)
 
     # Assert that non-None values are serialized as expected
-    assert redis_data[b"parameters"] == b"\x81\xa3key\xa5value"
-    assert redis_data[b"results"] == b"\x81\xaaresult_key\xacresult_value"
-    assert redis_data[b"error"] == b"\xb3Some error occurred"
+    assert redis_data[b"parameters"] == {"key": "value"}
+    assert redis_data[b"results"] == {"result_key": "result_value"}
+    assert redis_data[b"error"] == "Some error occurred"
     assert redis_data[b"status"] == b"completed"
-    assert redis_data[b"submitted_at"] == b"\xc7\x13\x012025-04-04T12:00:00"
-    assert redis_data[b"started_at"] == b"\xc7\x13\x012025-04-04T12:05:00"
-    assert redis_data[b"heartbeat_at"] == b"\xc7\x13\x012025-04-04T12:10:00"
-    assert redis_data[b"completed_at"] == b"\xc7\x13\x012025-04-04T12:15:00"
+    assert redis_data[b"submitted_at"] == dt.datetime(2025, 4, 4, 12, 0, 0)
+    assert redis_data[b"started_at"] ==dt.datetime(2025, 4, 4, 12, 5, 0)
+    assert redis_data[b"heartbeat_at"] ==dt.datetime(2025, 4, 4, 12, 10, 0)
+    assert redis_data[b"completed_at"] == dt.datetime(2025, 4, 4, 12, 15, 0)
 
     # Deserialize the task back from Redis format
-    deserialized_task = Task.from_redis(task_id, redis_data)
+    deserialized_task = Task.from_redis(task_id, raw_data)
 
     # Assert that the original task and deserialized task are equal
     assert task == deserialized_task
