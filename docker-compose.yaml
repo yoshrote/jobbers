@@ -24,7 +24,7 @@ services:
       timeout: 5s
       retries: 3
 
-  jobbers:
+  manager:
     build: .
     environment:
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://collector:4317"
@@ -34,9 +34,26 @@ services:
       OTEL_LOGS_EXPORTER: "otlp"
       OTEL_PYTHON_LOG_CORRELATION: "true"
       REDIS_URL: "redis://redis:6379"
-    command: /usr/local/bin/task_manager
+    command: /usr/local/bin/jobbers_manager
     ports:
       - "8000:8000"
+    volumes:
+      - .:/usr/src/app
+    depends_on:
+      - redis
+      - collector
+
+  worker:
+    build: .
+    environment:
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://collector:4317"
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://collector:4317"
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://collector:4317"
+      # # Logs are disabled by default
+      OTEL_LOGS_EXPORTER: "otlp"
+      OTEL_PYTHON_LOG_CORRELATION: "true"
+      REDIS_URL: "redis://redis:6379"
+    command: /usr/local/bin/jobbers_worker
     volumes:
       - .:/usr/src/app
     depends_on:

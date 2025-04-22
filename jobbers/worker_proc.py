@@ -10,14 +10,11 @@ if TYPE_CHECKING:
 
 from asyncio_taskpool import TaskPool
 
-from jobbers.db import get_client
 from jobbers.models import Task, TaskConfig, TaskStatus
 from jobbers.registry import get_task_config
-from jobbers.state_manager import StateManager
+from jobbers.state_manager import StateManager, build_sm
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 """
 Important environment variables:
 - WORKER_ROLE: Role of the worker (default is "default")
@@ -182,11 +179,13 @@ class MaxTaskCounter:
     def __enter__(self):
         if self.limit_reached():
             raise StopAsyncIteration
+        # Increment immediately so consuming tasks have an accurate count
+        if self.max_tasks > 0:
+            self._task_count += 1
         return self._task_count
 
     def __exit__(self, exc_type, exc, tb):
-        if self.max_tasks > 0:
-            self._task_count += 1
+        pass
 
 class TaskGenerator:
     """Generates tasks from the Redis list 'task-list'."""
@@ -235,29 +234,38 @@ class TaskGenerator:
             raise StopAsyncIteration
         return task
 
-async def task_consumer():
+def build_task_generator(state_manager: StateManager):
     """Consume tasks from the Redis list 'task-list'."""
-    role = os.environ("WORKER_ROLE", "default")
-    worker_ttl = int(os.environ("WORKER_TTL", 50)) # if 0, will run indefinitely
-    num_concurrent = float(os.environ("WORKER_CONCURRENT_TASKS", 5))
-    redis = await get_client()
-    state_manager = StateManager(redis)
+    role = os.environ.get("WORKER_ROLE", "default")
+    worker_ttl = int(os.environ.get("WORKER_TTL", 50)) # if 0, will run indefinitely
 
-    task_generator = TaskGenerator(state_manager, role, max_tasks=worker_ttl)
-    try:
-        pool = TaskPool()
-        pool.map(TaskProcessor(state_manager).process, task_generator, num_concurrent=num_concurrent)
-        await pool.gather_and_close()
-    # except asyncio.CancelledError:
-    #     logger.info("Task consumer killed. Shutting down...")
-    #     raise
-    # else:
-    #     logger.info("Task consumer finished. Shutting down...")
-    finally:
-        await redis.close()
+    return TaskGenerator(state_manager, role, max_tasks=worker_ttl)
 
 def run():
+    import sys
+
+    from jobbers.otel import enable_otel
+
+    handlers = [logging.StreamHandler(stream=sys.stdout)]
+    enable_otel(handlers, service_name="jobbers-worker")
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
+    logging.getLogger("jobbers").setLevel(logging.DEBUG)
+
+    logger = logging.getLogger(__name__)
+    logger.info("\n\n\n")
+
+    num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
+    # queue = asyncio.Queue(maxsize=100)
+    state_manager: StateManager = build_sm()
+    task_generator = build_task_generator(state_manager)
+
+    async def worker_factory(tg: TaskGenerator):
+        async for task in tg:
+            await TaskProcessor(state_manager).process(task)
+
+    workers = [worker_factory(task_generator) for _ in range(num_concurrent)]
     try:
-        asyncio.run(task_consumer())
+        logger.info("Task consumer started.")
+        asyncio.gather(*workers)
     except KeyboardInterrupt:
         logger.info("Task consumer stopped.")
