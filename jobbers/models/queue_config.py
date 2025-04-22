@@ -56,8 +56,7 @@ class QueueConfig(BaseModel):
             return 3600 * self.rate_denominator
         elif self.rate_period == RatePeriod.DAY:
             return 86400 * self.rate_denominator
-        else:
-            raise ValueError(f"Unknown rate period: {self.rate_period}")
+        raise ValueError(f"Unknown rate period: {self.rate_period}")
 
     @classmethod
     def from_redis(cls, name: str, raw_task_data: dict) -> "QueueConfig":

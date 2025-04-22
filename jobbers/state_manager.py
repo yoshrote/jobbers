@@ -196,7 +196,7 @@ class RateLimiter:
     async def concurrency_limits(self, task_queues: list[str], current_tasks_by_queue: dict[str, set[ULID]]) -> list[str]:
         """Limit the number of concurrent tasks in each queue."""
         queues_to_use = []
-        # TODO: Consider ways to check each queue in a single transaction or in parallel 
+        # TODO: Consider ways to check each queue in a single transaction or in parallel
         for queue in task_queues:
             config = await self.get_queue_config(queue=queue)
             if config and config.max_concurrent:
