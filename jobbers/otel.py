@@ -18,25 +18,17 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 
-def enable_otel(handlers, service_name="jobbers"):
-    resource=Resource.create(
-        {
-            "service.name": service_name,
-            "service.instance.id": os.uname().nodename,
-        }
-    )
-    logger_provider = LoggerProvider(resource=resource)
-    set_logger_provider(logger_provider)
-
+def setup_metrics(resource: Resource):
     metric_exporter = OTLPMetricExporter(
         endpoint=os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://localhost:4317"),
         insecure=True
     )
     metric_reader = PeriodicExportingMetricReader(metric_exporter)
-    metric_provider = MeterProvider(metric_readers=[metric_reader])
+    metric_provider = MeterProvider(metric_readers=[metric_reader], resource=resource)
     set_meter_provider(metric_provider)
 
-    trace.set_tracer_provider(TracerProvider())
+def setup_tracer(resource: Resource):
+    trace.set_tracer_provider(TracerProvider(resource=resource))
     trace_exporter = OTLPSpanExporter(
         endpoint=os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4317"),
         insecure=True
@@ -44,10 +36,26 @@ def enable_otel(handlers, service_name="jobbers"):
     trace_processor = BatchSpanProcessor(trace_exporter)
     trace.get_tracer_provider().add_span_processor(trace_processor)
 
-    exporter = OTLPLogExporter(
+def setup_logger(resource: Resource):
+    logger_provider = LoggerProvider(resource=resource)
+    set_logger_provider(logger_provider)
+
+    log_exporter = OTLPLogExporter(
         endpoint=os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://localhost:4317"),
         insecure=True
     )
-    logger_provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
-    handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
-    handlers.append(handler)
+    logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
+    return LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
+
+def enable_otel(handlers, service_name="jobbers"):
+    resource=Resource.create(
+        {
+            "service.name": service_name,
+            "service.instance.id": os.uname().nodename,
+        }
+    )
+    otel_handler = setup_logger(resource)
+    setup_metrics(resource)
+    setup_tracer(resource)
+
+    handlers.append(otel_handler)
