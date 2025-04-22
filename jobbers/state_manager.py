@@ -12,6 +12,8 @@ from jobbers.models.queue_config import QueueConfig
 
 logger = logging.getLogger(__name__)
 
+TIME_ZERO = dt.datetime.fromtimestamp(0, dt.timezone.utc)
+
 class StateManager:
     """
     Manages tasks in a Redis data store.
@@ -47,6 +49,32 @@ class StateManager:
             # TODO: Do we need to clean this up before handle_success?
             # Need to consider interactions with callbacks of the task
             self.current_tasks_by_queue[task.queue].remove(task.id)
+
+    async def clean(self, rate_limit_age: Optional[dt.timedelta]=None, min_queue_age: Optional[dt.datetime]=None, max_queue_age: Optional[dt.datetime]=None):
+        """Clean up the state manager."""
+        now = dt.datetime.now(dt.timezone.utc)
+        if rate_limit_age:
+            # Remove tasks from the rate limiter that are older than the rate limit age
+            earliest_time = now - rate_limit_age
+            pipe = self.data_store.pipeline(transaction=True)
+            for queue in await self.data_store.smembers(self.ALL_QUEUES):
+                pipe.zremrangebyscore(self.rate_limiter.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp())
+            await pipe.execute()
+
+        if max_queue_age or min_queue_age:
+            earliest_time = min_queue_age or TIME_ZERO
+            latest_time = max_queue_age or now
+            for queue in await self.data_store.smembers(self.ALL_QUEUES):
+                pipe = self.data_store.pipeline(transaction=True)
+                if earliest_time <= latest_time:
+                    pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=earliest_time.timestamp(), max=latest_time.timestamp())
+                else:
+                    pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=0, max=earliest_time.timestamp())
+                    pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=latest_time.timestamp(), max=now.timestamp())
+                await pipe.execute()
+
+
+
 
     async def submit_task(self, task: Task):
         """Submit a task to the Redis data store."""

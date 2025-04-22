@@ -334,5 +334,84 @@ async def test_concurrency_limits_empty_queues(redis, rate_limiter):
     result = await rate_limiter.concurrency_limits(task_queues, current_tasks_by_queue)
     assert result == ["queue1", "queue2"]
 
+@pytest.mark.asyncio
+async def test_clean_rate_limit_age(redis, state_manager):
+    """Test cleaning tasks from the rate limiter based on rate_limit_age."""
+    # Add tasks to the rate limiter
+    await redis.sadd("all-queues", "queue1", "queue2")
+    await redis.zadd("rate-limiter:queue1", {ULID1.bytes: FROZEN_TIME.timestamp() - 3600})
+    await redis.zadd("rate-limiter:queue2", {ULID2.bytes: FROZEN_TIME.timestamp() - 1800})
+
+    # Call the clean method with a rate_limit_age of 1 hour
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        await state_manager.clean(rate_limit_age=datetime.timedelta(hours=1))
+
+    # Verify tasks older than 1 hour were removed
+    queue1_tasks = await redis.zrange("rate-limiter:queue1", 0, -1)
+    queue2_tasks = await redis.zrange("rate-limiter:queue2", 0, -1)
+    assert queue1_tasks == []
+    assert queue2_tasks == [ULID2.bytes]
+
+@pytest.mark.asyncio
+async def test_clean_min_queue_age(redis, state_manager):
+    """Test cleaning tasks from queues based on min_queue_age."""
+    # Add tasks to the task queues
+    await redis.sadd("all-queues", "queue1")
+    await redis.zadd("task-queues:queue1", {
+        ULID1.bytes: FROZEN_TIME.timestamp() - 3600,
+        ULID2.bytes: FROZEN_TIME.timestamp() - 1800,
+    })
+
+    # Call the clean method with a min_queue_age of 30 minutes
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        await state_manager.clean(min_queue_age=FROZEN_TIME-datetime.timedelta(minutes=30))
+
+    # Verify tasks older than 30 minutes remain
+    queue1_tasks = await redis.zrange("task-queues:queue1", 0, -1, withscores=True)
+    assert queue1_tasks == [(ULID1.bytes, FROZEN_TIME.timestamp() - 3600)]
+
+@pytest.mark.asyncio
+async def test_clean_max_queue_age(redis, state_manager):
+    """Test cleaning tasks from queues based on max_queue_age."""
+    # Add tasks to the task queues
+    await redis.sadd("all-queues", "queue1")
+    await redis.zadd("task-queues:queue1", {
+        ULID1.bytes: FROZEN_TIME.timestamp() - 3600,
+        ULID2.bytes: FROZEN_TIME.timestamp() - 1800,
+    })
+
+    # Call the clean method with a max_queue_age of 1 hour
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        await state_manager.clean(max_queue_age=FROZEN_TIME-datetime.timedelta(hours=1))
+
+    # Verify tasks newer than 1 hour remain
+    queue1_tasks = await redis.zrange("task-queues:queue1", 0, -1, withscores=True)
+    assert queue1_tasks == [(ULID2.bytes, FROZEN_TIME.timestamp() - 1800)]
+
+@pytest.mark.asyncio
+async def test_clean_min_and_max_queue_age(redis, state_manager):
+    """Test cleaning tasks from queues based on both min_queue_age and max_queue_age."""
+    # Add tasks to the task queues
+    await redis.sadd("all-queues", "queue1")
+    await redis.zadd("task-queues:queue1", {
+        ULID1.bytes: FROZEN_TIME.timestamp() - 3600,
+        ULID2.bytes: FROZEN_TIME.timestamp() - 1800,
+    })
+
+    # Call the clean method with a min_queue_age of 30 minutes and max_queue_age of 1 hour
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        await state_manager.clean(
+            min_queue_age=FROZEN_TIME-datetime.timedelta(minutes=30),
+            max_queue_age=FROZEN_TIME-datetime.timedelta(hours=1),
+        )
+
+    # Verify only tasks within the age range remain
+    queue1_tasks = await redis.zrange("task-queues:queue1", 0, -1, withscores=True)
+    assert queue1_tasks == []
+
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])
