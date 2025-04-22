@@ -1,4 +1,5 @@
 import datetime
+from unittest.mock import patch
 
 import fakeredis.aioredis as fakeredis
 import pytest
@@ -7,7 +8,7 @@ from pytest_unordered import unordered
 from ulid import ULID
 
 from jobbers.serialization import EMPTY_DICT, serialize
-from jobbers.state_manager import StateManager, Task, TaskStatus
+from jobbers.state_manager import RateLimiter, StateManager, Task, TaskStatus
 
 FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ISO_FROZEN_TIME = serialize(FROZEN_TIME)
@@ -232,6 +233,69 @@ async def test_get_next_task_missing_task_data(redis, state_manager):
 
     # Assert the result
     assert task is None
+
+@pytest.fixture
+def rate_limiter(redis):
+    return RateLimiter(redis)
+
+@pytest.mark.asyncio
+async def test_rate_limiter_has_room_empty(redis, rate_limiter):
+    await redis.hset("queue-config:default", mapping={
+        # 2 tasks per minute
+        b"rate_numerator": serialize(2),
+        b"rate_denominator": serialize(1),
+        b"rate_period": b"minute",
+    })
+
+    result = await rate_limiter.has_room_in_queue_queue("default")
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_rate_limiter_has_room_nonempty(redis, rate_limiter):
+    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-1})
+    await redis.hset("queue-config:default", mapping={
+        # 2 tasks per minute
+        b"rate_numerator": serialize(2),
+        b"rate_denominator": serialize(1),
+        b"rate_period": b"minute",
+    })
+
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        result = await rate_limiter.has_room_in_queue_queue("default")
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_rate_limiter_has_room_older_jobs(redis, rate_limiter):
+    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-60})
+    await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp()-61})
+    await redis.hset("queue-config:default", mapping={
+        # 2 tasks per minute
+        b"rate_numerator": serialize(2),
+        b"rate_denominator": serialize(1),
+        b"rate_period": b"minute",
+    })
+
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        result = await rate_limiter.has_room_in_queue_queue("default")
+    assert result is True
+
+@pytest.mark.asyncio
+async def test_rate_limiter_no_room(redis, rate_limiter):
+    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-1})
+    await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp()-2})
+    await redis.hset("queue-config:default", mapping={
+        # 2 tasks per minute
+        b"rate_numerator": serialize(2),
+        b"rate_denominator": serialize(1),
+        b"rate_period": b"minute",
+    })
+
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        result = await rate_limiter.has_room_in_queue_queue("default")
+    assert result is False
 
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])

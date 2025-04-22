@@ -26,25 +26,24 @@ class StateManager:
     """
 
     TASKS_BY_QUEUE = "task-queues:{queue}".format
-    QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     QUEUES_BY_ROLE = "worker-queues:{role}".format
-    QUEUE_CONFIG = "queue-config:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
     ALL_QUEUES = "all-queues"
 
     def __init__(self, data_store):
         self.data_store = data_store
+        self.rate_limiter = RateLimiter(data_store)
 
     async def submit_task(self, task: Task):
         """Submit a task to the Redis data store."""
         pipe = self.data_store.pipeline(transaction=True)
         # Avoid pushing a task onto the queue multiple times
         if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
-            # if RateLimiter.has_room_in_queue_queue(task.queue):
-            task.submitted_at = dt.datetime.now(dt.timezone.utc)
-            task.status = TaskStatus.SUBMITTED
-            pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
-            # RateLimiter.add_task_to_queue(task, pipe=pipe)
+            if self.rate_limiter.has_room_in_queue_queue(task.queue):
+                task.submitted_at = dt.datetime.now(dt.timezone.utc)
+                task.status = TaskStatus.SUBMITTED
+                pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+                self.rate_limiter.add_task_to_queue(task, pipe=pipe)
 
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
         await pipe.execute()
@@ -129,9 +128,53 @@ class StateManager:
             roles.append(key.decode().split(":")[1])
         return roles
 
+
+class RateLimiter:
+    """
+    Rate limiter for tasks in a Redis data store.
+
+    The rate limiter is stored in a sorted set with the following key:
+    """
+
+    QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
+    QUEUE_CONFIG = "queue-config:{queue}".format
+
+    def __init__(self, data_store):
+        self.data_store = data_store
+
+    async def has_room_in_queue_queue(self, queue: str) -> bool:
+        """Check if there is room in the queue for a task."""
+        config = await self.get_queue_config(queue=queue)
+        if not config:
+            return True  # No config means no rate limiting
+        elif config.rate_numerator is None or config.rate_denominator is None or config.rate_period is None:
+            return True  # No config means no rate limiting
+
+        # May be better as a lua script to include adding the task to the queue in the same transaction
+        now = dt.datetime.now(dt.timezone.utc)
+        earliest_time = now - dt.timedelta(seconds=config.period_in_seconds())
+        # Count the number of tasks in the queue that are older than the earliest time
+        task_count = await self.data_store.zcount(
+            self.QUEUE_RATE_LIMITER(queue=queue),
+            min=earliest_time.timestamp(),
+            max=now.timestamp(),
+        )
+
+        return task_count < config.rate_numerator
+
     async def get_queue_config(self, queue: str) -> QueueConfig:
         raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
-        return QueueConfig.from_redis(raw_data)
+        return QueueConfig.from_redis(queue, raw_data)
+
+    async def add_task_to_queue(self, task: Task, pipe=None):
+        """Add a task to the queue."""
+        if pipe is None:
+            pipe = self.data_store.pipeline(transaction=True)
+
+        # Add the task to the rate limiter for the queue
+        pipe.zadd(self.QUEUE_RATE_LIMITER(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+
+        return pipe
 
 def build_sm() -> StateManager:
     from jobbers import db
