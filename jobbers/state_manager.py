@@ -147,20 +147,22 @@ class RateLimiter:
         config = await self.get_queue_config(queue=queue)
         if not config:
             return True  # No config means no rate limiting
-        elif config.rate_numerator is None or config.rate_denominator is None or config.rate_period is None:
-            return True  # No config means no rate limiting
 
-        # May be better as a lua script to include adding the task to the queue in the same transaction
-        now = dt.datetime.now(dt.timezone.utc)
-        earliest_time = now - dt.timedelta(seconds=config.period_in_seconds())
-        # Count the number of tasks in the queue that are older than the earliest time
-        task_count = await self.data_store.zcount(
-            self.QUEUE_RATE_LIMITER(queue=queue),
-            min=earliest_time.timestamp(),
-            max=now.timestamp(),
-        )
+        if config.rate_numerator and config.rate_denominator and config.rate_period:
+            now = dt.datetime.now(dt.timezone.utc)
+            # May be better as a lua script to include adding the task to the queue in the same transaction
+            earliest_time = now - dt.timedelta(seconds=config.period_in_seconds())
+            # Count the number of tasks in the queue that are older than the earliest time
+            task_count = await self.data_store.zcount(
+                self.QUEUE_RATE_LIMITER(queue=queue),
+                min=earliest_time.timestamp(),
+                max=now.timestamp(),
+            )
 
-        return task_count < config.rate_numerator
+            if task_count >= config.rate_numerator:
+                return False
+
+        return True
 
     async def get_queue_config(self, queue: str) -> QueueConfig:
         raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
@@ -168,8 +170,7 @@ class RateLimiter:
 
     async def add_task_to_queue(self, task: Task, pipe=None):
         """Add a task to the queue."""
-        if pipe is None:
-            pipe = self.data_store.pipeline(transaction=True)
+        pipe = pipe or self.data_store
 
         # Add the task to the rate limiter for the queue
         pipe.zadd(self.QUEUE_RATE_LIMITER(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
