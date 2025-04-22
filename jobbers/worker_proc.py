@@ -44,8 +44,9 @@ class TaskProcessor:
             ex = None
             try:
                 task = await self.mark_task_as_started(task)
-                async with asyncio.timeout(task_config.timeout):
-                    task.results = await task_config.function(**task.parameters)
+                with self.state_manager.task_in_registry(task):
+                    async with asyncio.timeout(task_config.timeout):
+                        task.results = await task_config.function(**task.parameters)
             except task_config.expected_exceptions as exc:
                 self.handle_expected_exception(task, task_config, exc)
             except asyncio.TimeoutError:

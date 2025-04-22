@@ -1,6 +1,8 @@
 import datetime as dt
 import logging
 from asyncio import TaskGroup
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from ulid import ULID
@@ -33,6 +35,18 @@ class StateManager:
     def __init__(self, data_store):
         self.data_store = data_store
         self.rate_limiter = RateLimiter(data_store)
+        self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
+
+    @asynccontextmanager
+    def task_in_registry(self, task: Task):
+        """Context manager to add a task to the registry."""
+        self.current_tasks_by_queue[task.queue].add(task.id)
+        try:
+            yield
+        finally:
+            # TODO: Do we need to clean this up before handle_success?
+            # Need to consider interactions with callbacks of the task
+            self.current_tasks_by_queue[task.queue].remove(task.id)
 
     async def submit_task(self, task: Task):
         """Submit a task to the Redis data store."""
@@ -87,11 +101,13 @@ class StateManager:
         if not queues:
             return None
 
+        queues = await self.rate_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
+        task_queues = [self.TASKS_BY_QUEUE(queue=queue) for queue in queues]
+
         # Try to pop from each queue until we find a task
         # TODO: Shuffle/rotate the order of queues to avoid starving any of them
         # see https://redis.io/docs/latest/commands/blpop/#what-key-is-served-first-what-client-what-element-priority-ordering-details
         # for details of how the order of keys impact how tasks are popped
-        task_queues = [self.TASKS_BY_QUEUE(queue=queue) for queue in queues]
         task_id = await self.data_store.bzpopmin(task_queues, timeout=timeout)
         if task_id:
             task = await self.get_task(ULID.from_bytes(task_id[1]))
@@ -176,6 +192,18 @@ class RateLimiter:
         pipe.zadd(self.QUEUE_RATE_LIMITER(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
         return pipe
+
+    async def concurrency_limits(self, task_queues: list[str], current_tasks_by_queue: dict[str, set[ULID]]) -> list[str]:
+        """Limit the number of concurrent tasks in each queue."""
+        queues_to_use = []
+        # TODO: Consider ways to check each queue in a single transaction or in parallel 
+        for queue in task_queues:
+            config = await self.get_queue_config(queue=queue)
+            if config and config.max_concurrent:
+                if len(current_tasks_by_queue[queue]) < config.max_concurrent:
+                    queues_to_use.append(queue)
+
+        return queues_to_use
 
 def build_sm() -> StateManager:
     from jobbers import db

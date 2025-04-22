@@ -5,6 +5,7 @@ import pytest
 
 from jobbers.models.task import Task, TaskStatus
 from jobbers.registry import TaskConfig
+from jobbers.state_manager import StateManager
 from jobbers.worker_proc import TaskProcessor
 
 
@@ -17,8 +18,9 @@ async def test_task_processor_success():
         version=1,
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
+        queue="test_queue",
     )
-    state_manager = AsyncMock()
+    state_manager = AsyncMock(spec=StateManager)
     task_function = AsyncMock(return_value={"result": "success"})
 
     task_config = TaskConfig(
@@ -48,7 +50,7 @@ async def test_task_processor_dropped_task():
         version=1,
         status=TaskStatus.UNSUBMITTED,
     )
-    state_manager = AsyncMock()
+    state_manager = AsyncMock(spec=StateManager)
 
     with patch("jobbers.worker_proc.get_task_config", return_value=None):
         processor = TaskProcessor(state_manager)
@@ -72,7 +74,7 @@ async def test_task_processor_expected_exception():
         status=TaskStatus.UNSUBMITTED,
         retry_attempt=0,
     )
-    state_manager = AsyncMock()
+    state_manager = AsyncMock(spec=StateManager)
     task_function = AsyncMock(side_effect=ValueError("Expected error"))
     task_config = TaskConfig(
         name="test_task",
@@ -105,7 +107,7 @@ async def test_task_processor_unexpected_exception():
         parameters={"param1": "value1"},
         status=TaskStatus.UNSUBMITTED,
     )
-    state_manager = AsyncMock()
+    state_manager = AsyncMock(spec=StateManager)
     task_function = AsyncMock(side_effect=RuntimeError("Unexpected error"))
     task_config = TaskConfig(
         name="test_task",
@@ -136,7 +138,7 @@ async def test_task_processor_timeout_with_retry():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock()
+    state_manager = AsyncMock(spec=StateManager)
     task_function = AsyncMock(side_effect=asyncio.TimeoutError)
     task_config = TaskConfig(
         name="test_task",
@@ -166,7 +168,7 @@ async def test_task_processor_timeout_without_retry():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock()
+    state_manager = AsyncMock(spec=StateManager)
     task_function = AsyncMock(side_effect=asyncio.TimeoutError)
     task_config = TaskConfig(
         name="test_task",
@@ -197,7 +199,7 @@ async def test_task_processor_cancelled():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock()
+    state_manager = AsyncMock(spec=StateManager)
     task_function = AsyncMock(side_effect=asyncio.CancelledError)
     task_config = TaskConfig(
         name="test_task",

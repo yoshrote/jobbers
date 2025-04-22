@@ -1,4 +1,5 @@
 import datetime
+from collections import defaultdict
 from unittest.mock import patch
 
 import fakeredis.aioredis as fakeredis
@@ -296,6 +297,42 @@ async def test_rate_limiter_no_room(redis, rate_limiter):
         mock_datetime.now.return_value = FROZEN_TIME
         result = await rate_limiter.has_room_in_queue_queue("default")
     assert result is False
+
+@pytest.mark.asyncio
+async def test_concurrency_limits_no_limits(rate_limiter):
+    task_queues = ["queue1", "queue2"]
+    current_tasks_by_queue = {
+        "queue1": {ULID()},
+        "queue2": {ULID()},
+    }
+
+    result = await rate_limiter.concurrency_limits(task_queues, current_tasks_by_queue)
+    assert result == ["queue1", "queue2"]
+
+@pytest.mark.asyncio
+async def test_concurrency_limits_with_limits(redis, rate_limiter):
+    await redis.hset("queue-config:queue1",  mapping={b"max_concurrent": "1"})
+    await redis.hset("queue-config:queue2",  mapping={b"max_concurrent": "2"})
+
+    task_queues = ["queue1", "queue2"]
+    current_tasks_by_queue = {
+        "queue1": {ULID()},
+        "queue2": {ULID()},
+    }
+
+    result = await rate_limiter.concurrency_limits(task_queues, current_tasks_by_queue)
+    assert result == ["queue2"]
+
+@pytest.mark.asyncio
+async def test_concurrency_limits_empty_queues(redis, rate_limiter):
+    await redis.hset("queue-config:queue1",  mapping={b"max_concurrent": b"1"})
+    await redis.hset("queue-config:queue2",  mapping={b"max_concurrent": b"1"})
+
+    task_queues = ["queue1", "queue2"]
+    current_tasks_by_queue = defaultdict(set)
+
+    result = await rate_limiter.concurrency_limits(task_queues, current_tasks_by_queue)
+    assert result == ["queue1", "queue2"]
 
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])
