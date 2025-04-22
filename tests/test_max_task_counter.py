@@ -1,4 +1,4 @@
-from jobbers.worker_proc import MaxTaskCounter
+from jobbers.task_generator import MaxTaskCounter
 
 
 def test_max_task_counter_initial_state():

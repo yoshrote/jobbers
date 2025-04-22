@@ -6,7 +6,7 @@ import pytest
 from jobbers.models.task import Task, TaskStatus
 from jobbers.registry import TaskConfig
 from jobbers.state_manager import StateManager
-from jobbers.worker_proc import TaskProcessor
+from jobbers.task_processor import TaskProcessor
 
 
 @pytest.mark.asyncio
@@ -31,7 +31,7 @@ async def test_task_processor_success():
         max_retries=3,
     )
 
-    with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -52,7 +52,7 @@ async def test_task_processor_dropped_task():
     )
     state_manager = AsyncMock(spec=StateManager)
 
-    with patch("jobbers.worker_proc.get_task_config", return_value=None):
+    with patch("jobbers.task_processor.get_task_config", return_value=None):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -85,7 +85,7 @@ async def test_task_processor_expected_exception():
         expected_exceptions=(ValueError,),  # Specify expected exceptions for retry logic
     )
 
-    with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -117,7 +117,7 @@ async def test_task_processor_unexpected_exception():
         max_retries=3,
     )
 
-    with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -148,7 +148,7 @@ async def test_task_processor_timeout_with_retry():
         max_retries=3,
     )
 
-    with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -178,7 +178,7 @@ async def test_task_processor_timeout_without_retry():
         max_retries=0,  # No retries for this task
     )
 
-    with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -209,7 +209,7 @@ async def test_task_processor_cancelled():
         max_retries=0,  # No retries for this task
     )
 
-    with patch("jobbers.worker_proc.get_task_config", return_value=task_config):
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         with pytest.raises(asyncio.CancelledError):
             await processor.process(task)

@@ -2,7 +2,7 @@ import datetime as dt
 
 import pytest
 
-from jobbers.worker_proc import LocalTTL
+from jobbers.task_generator import LocalTTL
 
 
 @pytest.mark.asyncio

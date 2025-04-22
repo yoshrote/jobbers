@@ -5,7 +5,7 @@ from ulid import ULID
 
 from jobbers.models.task import Task, TaskStatus
 from jobbers.state_manager import StateManager
-from jobbers.worker_proc import TaskGenerator
+from jobbers.task_generator import TaskGenerator
 
 
 @pytest.mark.asyncio
