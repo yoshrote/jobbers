@@ -48,15 +48,15 @@ class QueueConfig(BaseModel):
         """Convert the rate period to seconds."""
         if self.rate_period is None or self.rate_denominator is None:
             return None
-        if self.rate_period == RatePeriod.SECOND:
-            return 1 * self.rate_denominator
-        elif self.rate_period == RatePeriod.MINUTE:
-            return 60 * self.rate_denominator
-        elif self.rate_period == RatePeriod.HOUR:
-            return 3600 * self.rate_denominator
-        elif self.rate_period == RatePeriod.DAY:
-            return 86400 * self.rate_denominator
-        raise ValueError(f"Unknown rate period: {self.rate_period}")
+        match self.rate_period:
+            case RatePeriod.SECOND:
+                return 1 * self.rate_denominator
+            case RatePeriod.MINUTE:
+                return 60 * self.rate_denominator
+            case RatePeriod.HOUR:
+                return 3600 * self.rate_denominator
+            case RatePeriod.DAY:
+                return 86400 * self.rate_denominator
 
     @classmethod
     def from_redis(cls, name: str, raw_task_data: dict) -> "QueueConfig":
