@@ -1,4 +1,5 @@
 import datetime as dt
+import logging
 import os
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Optional
@@ -8,6 +9,7 @@ from jobbers.state_manager import StateManager
 if TYPE_CHECKING:
     from ulid import ULID
 
+logger = logging.getLogger(__name__)
 
 class LocalTTL:
     """
@@ -63,6 +65,7 @@ class MaxTaskCounter:
 
     def __enter__(self):
         if self.limit_reached():
+            logger.info("Limit reached; exiting")
             raise StopAsyncIteration
         # Increment immediately so consuming tasks have an accurate count
         if self.max_tasks > 0:
@@ -93,17 +96,18 @@ class TaskGenerator:
         return queues or set()
 
     async def queues(self) -> set[str]:
-        async with self.ttl as needs_refresh:
-            if not needs_refresh:
-                # TODO: filter out queues if we are at capacity running tasks from them
-                return self.task_queues
-            new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
-            if new_refresh_tag != self.refresh_tag:
-                self.refresh_tag = new_refresh_tag
-                self.task_queues = {
-                    queue
-                    for queue in await self.find_queues()
-                }
+        # async with self.ttl as needs_refresh:
+        #     if not needs_refresh:
+        #         # TODO: filter out queues if we are at capacity running tasks from them
+        #         return self.task_queues
+        new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
+        if new_refresh_tag != self.refresh_tag:
+            self.refresh_tag = new_refresh_tag
+            self.task_queues = {
+                queue
+                for queue in await self.find_queues()
+            }
+            logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
         # TODO: filter out queues if we are at capacity running tasks from them
         return self.task_queues
 
@@ -116,6 +120,7 @@ class TaskGenerator:
             task = await self.state_manager.get_next_task(task_queues)
         if not task:
             # TODO: We need to monitor how often the generator dies this way
+            logger.warning("Strange stop")
             raise StopAsyncIteration
         return task
 

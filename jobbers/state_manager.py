@@ -122,11 +122,12 @@ class StateManager:
 
     async def get_refresh_tag(self, role: str) -> Optional[ULID]:
         tag = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
-        return ULID.from_bytes(tag) if tag else None
+        return ULID.from_bytes(tag) if tag else ULID()
 
     async def get_next_task(self, queues: list[str], timeout=0) -> Optional[Task]:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
         if not queues:
+            logger.info("no queues defined")
             return None
 
         queues = await self.rate_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
@@ -142,6 +143,8 @@ class StateManager:
             if task:
                 return task
             logger.warning("Task with ID %s not found.", task_id)
+        else:
+            logger.info("task query timed out")
         return None
 
     async def set_queues(self, role: str, queues: set[str]):

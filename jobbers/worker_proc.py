@@ -17,6 +17,18 @@ Rate limiting should be implemented by limiting the creation of tasks rather
 than on the consumption of tasks.
 """
 
+async def main():
+    num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
+    state_manager: StateManager = build_sm()
+    task_generator = build_task_generator(state_manager)
+
+    async def worker_factory(tg: TaskGenerator):
+        async for task in tg:
+            await TaskProcessor(state_manager).process(task)
+
+    async with asyncio.TaskGroup() as group:
+        for _ in range(num_concurrent):
+            group.create_task(worker_factory(task_generator))
 
 def run():
     import sys
@@ -29,20 +41,8 @@ def run():
     logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
     logger = logging.getLogger(__name__)
-    logger.info("\n\n\n")
-
-    num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
-    # queue = asyncio.Queue(maxsize=100)
-    state_manager: StateManager = build_sm()
-    task_generator = build_task_generator(state_manager)
-
-    async def worker_factory(tg: TaskGenerator):
-        async for task in tg:
-            await TaskProcessor(state_manager).process(task)
-
-    workers = [worker_factory(task_generator) for _ in range(num_concurrent)]
     try:
         logger.info("Task consumer started.")
-        asyncio.gather(*workers)
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Task consumer stopped.")
