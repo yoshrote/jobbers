@@ -3,7 +3,7 @@ import datetime as dt
 from ulid import ULID
 
 from jobbers.models.task import Task, TaskStatus
-from jobbers.serialization import EMPTY_DICT, NONE
+from jobbers.utils.serialization import EMPTY_DICT, NONE
 
 
 def test_task_serialization_and_deserialization():

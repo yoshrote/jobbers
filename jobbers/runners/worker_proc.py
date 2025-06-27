@@ -33,7 +33,7 @@ async def main():
 def run():
     import sys
 
-    from jobbers.otel import enable_otel
+    from jobbers.utils.otel import enable_otel
 
     handlers = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-worker")

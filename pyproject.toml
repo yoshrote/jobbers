@@ -60,9 +60,9 @@ dependencies = [
 Homepage = "https://github.com/yoshrote/jobbers"
 
 [project.scripts]
-jobbers_manager = 'jobbers.manager_proc:run'
-jobbers_worker = 'jobbers.worker_proc:run'
-jobbers_cleaner = 'jobbers.cleaner_proc:run'
+jobbers_manager = 'jobbers.runners.manager_proc:run'
+jobbers_worker = 'jobbers.runners.worker_proc:run'
+jobbers_cleaner = 'jobbers.runners.cleaner_proc:run'
 
 ## ruff settings ##
 [tool.ruff]

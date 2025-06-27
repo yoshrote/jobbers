@@ -4,7 +4,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 from ulid import ULID
 
-from jobbers.serialization import (
+from jobbers.utils.serialization import (
     EMPTY_DICT,
     NONE,
     deserialize,

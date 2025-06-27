@@ -26,11 +26,11 @@ parser.add_argument(
 
 
 def run():
-    from .state_manager import build_sm
+    from jobbers.state_manager import build_sm
 
     handlers = [logging.StreamHandler(stream=sys.stdout)]
 
-    from jobbers.otel import enable_otel
+    from jobbers.utils.otel import enable_otel
     enable_otel(handlers, service_name="jobbers-cleaner")
 
     logging.basicConfig(level=logging.INFO, handlers=handlers)

@@ -3,7 +3,7 @@ import datetime
 import msgpack
 import pytest
 
-from jobbers.serialization import default, ext_hook
+from jobbers.utils.serialization import default, ext_hook
 
 
 def test_default_with_datetime():

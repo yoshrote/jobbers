@@ -3,7 +3,7 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from jobbers.serialization import NONE, deserialize
+from jobbers.utils.serialization import NONE, deserialize
 
 
 class RatePeriod(StrEnum):

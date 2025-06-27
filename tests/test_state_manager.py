@@ -8,7 +8,7 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
-from jobbers.serialization import EMPTY_DICT, serialize
+from jobbers.utils.serialization import EMPTY_DICT, serialize
 from jobbers.state_manager import RateLimiter, StateManager, Task, TaskStatus
 
 FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
