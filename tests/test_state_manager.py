@@ -236,8 +236,8 @@ async def test_get_next_task_missing_task_data(redis, state_manager):
     assert task is None
 
 @pytest.fixture
-def rate_limiter(redis):
-    return RateLimiter(redis)
+def rate_limiter(state_manager):
+    return state_manager.rate_limiter
 
 @pytest.mark.asyncio
 async def test_rate_limiter_has_room_empty(redis, rate_limiter):

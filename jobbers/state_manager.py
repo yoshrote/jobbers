@@ -32,6 +32,7 @@ class StateManager:
 
     TASKS_BY_QUEUE = "task-queues:{queue}".format
     QUEUES_BY_ROLE = "worker-queues:{role}".format
+    QUEUE_CONFIG = "queue-config:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
     ALL_QUEUES = "all-queues"
 
@@ -245,7 +246,7 @@ class RateLimiter:
         queues_to_use = []
         # TODO: Consider ways to check each queue in a single transaction or in parallel
         for queue in task_queues:
-            config = await self.get_queue_config(queue=queue)
+            config = await self.sm.get_queue_config(queue=queue)
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
                     queues_to_use.append(queue)
