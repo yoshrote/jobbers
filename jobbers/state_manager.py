@@ -15,6 +15,67 @@ logger = logging.getLogger(__name__)
 
 TIME_ZERO = dt.datetime.fromtimestamp(0, dt.timezone.utc)
 
+class QueueConfigAdapter:
+    """
+    Manages queue configuration in a Redis data store.
+
+    - `worker-queues:<role>`: Set of queues for a given role, used to manage which queues are available for task submission.
+    - `queue-config:<queue>`: Hash of queue configuration data which is shared for by all roles using this queue
+    - `all_queues`: a list of all queues used across all roles.
+    """
+
+    QUEUES_BY_ROLE = "worker-queues:{role}".format
+    QUEUE_CONFIG = "queue-config:{queue}".format
+    ALL_QUEUES = "all-queues"
+
+    def __init__(self, data_store):
+        self.data_store = data_store
+
+    async def get_queues(self, role: str) -> set[str]:
+        return {role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))}
+
+    async def set_queues(self, role: str, queues: set[str]):
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.delete(self.QUEUES_BY_ROLE(role=role))
+        pipe.sadd(self.ALL_QUEUES, *queues)
+        for queue in queues:
+            pipe.sadd(self.QUEUES_BY_ROLE(role=role), queue)
+        await pipe.execute()
+
+    async def get_all_queues(self) -> list[str]:
+        # find the union of the queues for all roles
+        # this query approach is not ideal for large numbers of roles or queues
+        roles = await self.get_all_roles()
+        if not roles:
+            return []
+
+        return [
+            queue.decode()
+            for queue in await self.data_store.sunion(
+                [self.QUEUES_BY_ROLE(role=role) for role in roles]
+            )
+        ]
+
+    async def get_all_roles(self) -> list[str]:
+        roles = []
+        async for key in self.data_store.scan_iter(match=self.QUEUES_BY_ROLE(role="*").encode()):
+            roles.append(key.decode().split(":")[1])
+        return roles
+
+    async def get_queue_config(self, queue: str) -> QueueConfig:
+        raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
+        return QueueConfig.from_redis(queue, raw_data)
+
+    async def get_queue_limits(self, queues: set[str]) -> dict[str, int]:
+        # TODO: replace with a redis query
+        return {
+            q: conf
+            for q, conf in await asyncio.gather(*(
+                (q, self.get_queue_config(q))
+                for q in queues
+            ))
+        }
+
 class StateManager:
     """
     Manages tasks in a Redis data store.
@@ -31,13 +92,11 @@ class StateManager:
     """
 
     TASKS_BY_QUEUE = "task-queues:{queue}".format
-    QUEUES_BY_ROLE = "worker-queues:{role}".format
-    QUEUE_CONFIG = "queue-config:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
-    ALL_QUEUES = "all-queues"
 
     def __init__(self, data_store):
         self.data_store = data_store
+        self.qca = QueueConfigAdapter(data_store)
         self.rate_limiter = RateLimiter(self)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
 
@@ -63,14 +122,14 @@ class StateManager:
             # Remove tasks from the rate limiter that are older than the rate limit age
             earliest_time = now - rate_limit_age
             pipe = self.data_store.pipeline(transaction=True)
-            for queue in await self.data_store.smembers(self.ALL_QUEUES):
+            for queue in await self.data_store.smembers(self.qca.ALL_QUEUES):
                 pipe.zremrangebyscore(self.rate_limiter.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp())
             await pipe.execute()
 
         if max_queue_age or min_queue_age:
             earliest_time = min_queue_age or TIME_ZERO
             latest_time = max_queue_age or now
-            for queue in await self.data_store.smembers(self.ALL_QUEUES):
+            for queue in await self.data_store.smembers(self.qca.ALL_QUEUES):
                 pipe = self.data_store.pipeline(transaction=True)
                 if earliest_time <= latest_time:
                     pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=earliest_time.timestamp(), max=latest_time.timestamp())
@@ -123,9 +182,6 @@ class StateManager:
             results.append(task)
         return results
 
-    async def get_queues(self, role: str) -> set[str]:
-        return {role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))}
-
     async def get_refresh_tag(self, role: str) -> Optional[ULID]:
         tag = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
         return ULID.from_bytes(tag) if tag else ULID()
@@ -153,47 +209,23 @@ class StateManager:
             logger.info("task query timed out")
         return None
 
+    async def get_queues(self, role: str) -> set[str]:
+        return await self.qca.get_queues(role=role)
+
     async def set_queues(self, role: str, queues: set[str]):
-        pipe = self.data_store.pipeline(transaction=True)
-        pipe.delete(self.QUEUES_BY_ROLE(role=role))
-        pipe.sadd(self.ALL_QUEUES, *queues)
-        for queue in queues:
-            pipe.sadd(self.QUEUES_BY_ROLE(role=role), queue)
-        await pipe.execute()
+        return await self.qca.set_queues(role=role, queues=queues)
 
     async def get_all_queues(self) -> list[str]:
-        # find the union of the queues for all roles
-        # this query approach is not ideal for large numbers of roles or queues
-        roles = await self.get_all_roles()
-        if not roles:
-            return []
-
-        return [
-            queue.decode()
-            for queue in await self.data_store.sunion(
-                [self.QUEUES_BY_ROLE(role=role) for role in roles]
-            )
-        ]
+        return await self.qca.get_all_queues()
 
     async def get_all_roles(self) -> list[str]:
-        roles = []
-        async for key in self.data_store.scan_iter(match=self.QUEUES_BY_ROLE(role="*").encode()):
-            roles.append(key.decode().split(":")[1])
-        return roles
+        return await self.qca.get_all_roles()
 
     async def get_queue_config(self, queue: str) -> QueueConfig:
-        raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
-        return QueueConfig.from_redis(queue, raw_data)
+        return await self.qca.get_queue_config(queue=queue)
 
     async def get_queue_limits(self, queues: set[str]) -> dict[str, int]:
-        # TODO: replace with a redis query
-        return {
-            q: conf
-            for q, conf in await asyncio.gather(*(
-                (q, self.get_queue_config(q))
-                for q in queues
-            ))
-        }
+        return await self.qca.get_queue_limits(queues=queues)
 
 
 class RateLimiter:
