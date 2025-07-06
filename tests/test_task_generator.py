@@ -56,6 +56,8 @@ async def test_task_generator_iteration():
         status=TaskStatus.UNSUBMITTED,
     )
     state_manager.get_next_task.return_value = task
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits.return_value = {}
     task_generator = TaskGenerator(state_manager, role="default")
 
     async for generated_task in task_generator:
@@ -70,6 +72,8 @@ async def test_task_generator_stops_iteration():
     """Test that TaskGenerator stops iteration when no tasks are available."""
     state_manager = AsyncMock()
     state_manager.get_next_task.return_value = None
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits.return_value = {}
     task_generator = TaskGenerator(state_manager, role="default")
 
     async for _ in task_generator:
@@ -83,6 +87,8 @@ async def test_task_generator_stops_iteration():
 async def test_task_generator_stops_after_max_tasks():
     """Test that TaskGenerator stops yielding after emitting max_tasks tasks."""
     state_manager = AsyncMock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits.return_value = {}
     task_generator = TaskGenerator(state_manager, max_tasks=2)
 
     # Mock get_next_task to return a new Task
