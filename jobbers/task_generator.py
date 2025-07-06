@@ -95,11 +95,25 @@ class TaskGenerator:
         queues = await self.state_manager.get_queues(self.role)
         return queues or set()
 
+    def filter_by_worker_queue_capacity(self, queues: set[str]) -> set[str]:
+        if not queues:
+            return queues
+
+        active_tasks = self.state_manager.active_tasks_per_queue
+        queue_worker_limits = self.state_manager.get_queue_limits(queues)
+        return {
+            q for q in queues
+            if active_tasks.get(q, 0) > queue_worker_limits.get(q, 0)
+        }
+
     async def queues(self) -> set[str]:
+        # store the full set of tasks in self.task_queues, but emit the
+        # queues that meet configured limits so that we evaluate that aspect
+        # between configuration refresh
+
         # async with self.ttl as needs_refresh:
         #     if not needs_refresh:
-        #         # TODO: filter out queues if we are at capacity running tasks from them
-        #         return self.task_queues
+        #         return self.filter_by_worker_queue_capacity(self.task_queues)
         new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
         if new_refresh_tag != self.refresh_tag:
             self.refresh_tag = new_refresh_tag
@@ -108,8 +122,7 @@ class TaskGenerator:
                 for queue in await self.find_queues()
             }
             logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
-        # TODO: filter out queues if we are at capacity running tasks from them
-        return self.task_queues
+        return self.filter_by_worker_queue_capacity(self.task_queues)
 
     def __aiter__(self):
         return self

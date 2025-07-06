@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 import logging
 from asyncio import TaskGroup
@@ -38,6 +39,10 @@ class StateManager:
         self.data_store = data_store
         self.rate_limiter = RateLimiter(data_store)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
+
+    @property
+    def active_tasks_per_queue(self) -> dict[str, int]:
+        return {q: len(ids) for q, ids in self.current_tasks_by_queue.items()}
 
     @asynccontextmanager
     def task_in_registry(self, task: Task):
@@ -174,6 +179,20 @@ class StateManager:
         async for key in self.data_store.scan_iter(match=self.QUEUES_BY_ROLE(role="*").encode()):
             roles.append(key.decode().split(":")[1])
         return roles
+
+    async def get_queue_config(self, queue: str) -> QueueConfig:
+        raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
+        return QueueConfig.from_redis(queue, raw_data)
+
+    async def get_queue_limits(self, queues: set[str]) -> dict[str, int]:
+        # TODO: replace with a redis query
+        return {
+            q: conf
+            for q, conf in await asyncio.gather(*(
+                (q, self.get_queue_config(q))
+                for q in queues
+            ))
+        }
 
 
 class RateLimiter:
