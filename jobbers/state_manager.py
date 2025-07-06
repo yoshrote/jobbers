@@ -37,7 +37,7 @@ class StateManager:
 
     def __init__(self, data_store):
         self.data_store = data_store
-        self.rate_limiter = RateLimiter(data_store)
+        self.rate_limiter = RateLimiter(self)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
 
     @property
@@ -205,12 +205,13 @@ class RateLimiter:
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     QUEUE_CONFIG = "queue-config:{queue}".format
 
-    def __init__(self, data_store):
-        self.data_store = data_store
+    def __init__(self, state_manager: StateManager):
+        self.data_store = state_manager.data_store
+        self.sm = state_manager
 
     async def has_room_in_queue_queue(self, queue: str) -> bool:
         """Check if there is room in the queue for a task."""
-        config = await self.get_queue_config(queue=queue)
+        config = await self.sm.get_queue_config(queue=queue)
         if not config:
             return True  # No config means no rate limiting
 
@@ -229,10 +230,6 @@ class RateLimiter:
                 return False
 
         return True
-
-    async def get_queue_config(self, queue: str) -> QueueConfig:
-        raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
-        return QueueConfig.from_redis(queue, raw_data)
 
     async def add_task_to_queue(self, task: Task, pipe=None):
         """Add a task to the queue."""
