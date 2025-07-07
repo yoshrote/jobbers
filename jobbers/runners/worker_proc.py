@@ -17,12 +17,12 @@ Rate limiting should be implemented by limiting the creation of tasks rather
 than on the consumption of tasks.
 """
 
-async def main():
+async def main() -> None:
     num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
     state_manager: StateManager = build_sm()
     task_generator = build_task_generator(state_manager)
 
-    async def worker_factory(tg: TaskGenerator):
+    async def worker_factory(tg: TaskGenerator) -> None:
         async for task in tg:
             await TaskProcessor(state_manager).process(task)
 
@@ -30,7 +30,7 @@ async def main():
         for _ in range(num_concurrent):
             group.create_task(worker_factory(task_generator))
 
-def run():
+def run() -> None:
     import sys
 
     from jobbers.utils.otel import enable_otel

@@ -1,5 +1,5 @@
 import datetime as dt
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 from ulid import ULID
@@ -22,17 +22,17 @@ class Task(BaseModel):
     name: str
     queue: str = "default"
     version: int = 0
-    parameters: dict = {}
-    results: dict = {}
-    error: Optional[str] = None
+    parameters: dict[Any, Any] = {}
+    results: dict[Any, Any] = {}
+    error: str | None = None
     # status fields
     retry_attempt: int = 0  # Number of times this task has been retried
     status: TaskStatus = Field(default=TaskStatus.UNSUBMITTED)
-    submitted_at: Optional[dt.datetime] = None
-    retried_at: Optional[dt.datetime] = None
-    started_at: Optional[dt.datetime] = None
-    heartbeat_at: Optional[dt.datetime] = None
-    completed_at: Optional[dt.datetime] = None
+    submitted_at: dt.datetime | None = None
+    retried_at: dt.datetime | None = None
+    started_at: dt.datetime | None = None
+    heartbeat_at: dt.datetime | None = None
+    completed_at: dt.datetime | None = None
 
     def should_retry(self, task_config: TaskConfig) -> bool:
         return self.retry_attempt < task_config.max_retries
@@ -49,7 +49,7 @@ class Task(BaseModel):
         return summary
 
     @classmethod
-    def from_redis(cls, task_id: ULID, raw_task_data: dict) -> "Task":
+    def from_redis(cls, task_id: ULID, raw_task_data: dict[bytes, bytes]) -> "Task":
         # Try to set good defaults for missing fields so when new fields are added to the task model, we don't break
         return cls(
             id=task_id,
@@ -65,7 +65,7 @@ class Task(BaseModel):
             completed_at=deserialize(raw_task_data.get(b"completed_at") or NONE),
         )
 
-    def to_redis(self):
+    def to_redis(self) -> dict[bytes, bytes | int]:
         return {
             b"name": self.name.encode(),
             b"version": self.version,

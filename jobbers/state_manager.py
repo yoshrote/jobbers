@@ -3,13 +3,19 @@ import datetime as dt
 import logging
 from asyncio import TaskGroup
 from collections import defaultdict
-from contextlib import asynccontextmanager
-from typing import Optional
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
 
+from redis.asyncio.client import Pipeline
 from ulid import ULID
 
 from jobbers.models import Task, TaskStatus
 from jobbers.models.queue_config import QueueConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +34,17 @@ class QueueConfigAdapter:
     QUEUE_CONFIG = "queue-config:{queue}".format
     ALL_QUEUES = "all-queues"
 
-    def __init__(self, data_store):
-        self.data_store = data_store
+    def __init__(self, data_store: Any) -> None:
+        self.data_store: Any = data_store
 
     async def get_queues(self, role: str) -> set[str]:
         return {role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))}
 
-    async def set_queues(self, role: str, queues: set[str]):
-        pipe = self.data_store.pipeline(transaction=True)
+    async def set_queues(self, role: str, queues: set[str]) -> None:
+        pipe: Pipeline = self.data_store.pipeline(transaction=True)
         pipe.delete(self.QUEUES_BY_ROLE(role=role))
         pipe.sadd(self.ALL_QUEUES, *queues)
-        for queue in queues:
-            pipe.sadd(self.QUEUES_BY_ROLE(role=role), queue)
+        pipe.sadd(self.QUEUES_BY_ROLE(role=role), *queues)
         await pipe.execute()
 
     async def get_all_queues(self) -> list[str]:
@@ -66,14 +71,17 @@ class QueueConfigAdapter:
         raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
         return QueueConfig.from_redis(queue, raw_data)
 
-    async def get_queue_limits(self, queues: set[str]) -> dict[str, int]:
+    async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
         # TODO: replace with a redis query
+        result_gen: Iterator[Awaitable[QueueConfig | None]] = (
+            self.get_queue_config(q)
+            for q in queues
+        )
+
         return {
-            q: conf
-            for q, conf in await asyncio.gather(*(
-                (q, self.get_queue_config(q))
-                for q in queues
-            ))
+            conf.name: conf.max_concurrent
+            for conf in await asyncio.gather(*result_gen)
+            if conf is not None
         }
 
 class StateManager:
@@ -94,7 +102,7 @@ class StateManager:
     TASKS_BY_QUEUE = "task-queues:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
 
-    def __init__(self, data_store):
+    def __init__(self, data_store: Any) -> None:
         self.data_store = data_store
         self.qca = QueueConfigAdapter(data_store)
         self.rate_limiter = RateLimiter(self)
@@ -104,8 +112,8 @@ class StateManager:
     def active_tasks_per_queue(self) -> dict[str, int]:
         return {q: len(ids) for q, ids in self.current_tasks_by_queue.items()}
 
-    @asynccontextmanager
-    def task_in_registry(self, task: Task):
+    @contextmanager
+    def task_in_registry(self, task: Task) -> Iterator[None]:
         """Context manager to add a task to the registry."""
         self.current_tasks_by_queue[task.queue].add(task.id)
         try:
@@ -115,7 +123,7 @@ class StateManager:
             # Need to consider interactions with callbacks of the task
             self.current_tasks_by_queue[task.queue].remove(task.id)
 
-    async def clean(self, rate_limit_age: Optional[dt.timedelta]=None, min_queue_age: Optional[dt.datetime]=None, max_queue_age: Optional[dt.datetime]=None):
+    async def clean(self, rate_limit_age: dt.timedelta | None=None, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.timezone.utc)
         if rate_limit_age:
@@ -138,10 +146,7 @@ class StateManager:
                     pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=latest_time.timestamp(), max=now.timestamp())
                 await pipe.execute()
 
-
-
-
-    async def submit_task(self, task: Task):
+    async def submit_task(self, task: Task) -> None:
         """Submit a task to the Redis data store."""
         pipe = self.data_store.pipeline(transaction=True)
         # Avoid pushing a task onto the queue multiple times
@@ -150,13 +155,13 @@ class StateManager:
                 task.submitted_at = dt.datetime.now(dt.timezone.utc)
                 task.status = TaskStatus.SUBMITTED
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
-                self.rate_limiter.add_task_to_queue(task, pipe=pipe)
+                await self.rate_limiter.add_task_to_queue(task, pipe=pipe)
 
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
         await pipe.execute()
 
     async def get_task(self, task_id: ULID) -> Task | None:
-        raw_task_data: dict = await self.data_store.hgetall(self.TASK_DETAILS(task_id=task_id))
+        raw_task_data: dict[bytes, bytes] = await self.data_store.hgetall(self.TASK_DETAILS(task_id=task_id))
 
         if raw_task_data:
             return Task.from_redis(task_id, raw_task_data)
@@ -166,27 +171,27 @@ class StateManager:
     async def task_exists(self, task_id: ULID) -> bool:
         return await self.data_store.exists(self.TASK_DETAILS(task_id=task_id)) == 1
 
-    async def get_all_tasks(self) -> list[ULID]:
+    async def get_all_tasks(self) -> list[Task]:
         task_ids = await self.data_store.zrange(self.TASKS_BY_QUEUE(queue="default"), 0, -1)
         if not task_ids:
             return []
-        results = []
+        results: list[Task] = []
         async with TaskGroup() as group:
             for task_id in task_ids:
                 group.create_task(self._add_task_to_results(ULID(task_id), results))
         return results
 
-    async def _add_task_to_results(self, task_id: ULID, results: list[Task]):
+    async def _add_task_to_results(self, task_id: ULID, results: list[Task]) -> list[Task]:
         task = await self.get_task(task_id)
         if task:
             results.append(task)
         return results
 
-    async def get_refresh_tag(self, role: str) -> Optional[ULID]:
+    async def get_refresh_tag(self, role: str) -> ULID | None:
         tag = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
         return ULID.from_bytes(tag) if tag else ULID()
 
-    async def get_next_task(self, queues: list[str], timeout=0) -> Optional[Task]:
+    async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
         if not queues:
             logger.info("no queues defined")
@@ -209,10 +214,12 @@ class StateManager:
             logger.info("task query timed out")
         return None
 
+    # Proxy methods
+
     async def get_queues(self, role: str) -> set[str]:
         return await self.qca.get_queues(role=role)
 
-    async def set_queues(self, role: str, queues: set[str]):
+    async def set_queues(self, role: str, queues: set[str]) -> None:
         return await self.qca.set_queues(role=role, queues=queues)
 
     async def get_all_queues(self) -> list[str]:
@@ -224,7 +231,7 @@ class StateManager:
     async def get_queue_config(self, queue: str) -> QueueConfig:
         return await self.qca.get_queue_config(queue=queue)
 
-    async def get_queue_limits(self, queues: set[str]) -> dict[str, int]:
+    async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
         return await self.qca.get_queue_limits(queues=queues)
 
 
@@ -251,7 +258,7 @@ class RateLimiter:
         if config.rate_numerator and config.rate_denominator and config.rate_period:
             now = dt.datetime.now(dt.timezone.utc)
             # May be better as a lua script to include adding the task to the queue in the same transaction
-            earliest_time = now - dt.timedelta(seconds=config.period_in_seconds())
+            earliest_time = now - dt.timedelta(seconds=config.period_in_seconds() or 0)
             # Count the number of tasks in the queue that are older than the earliest time
             task_count = await self.data_store.zcount(
                 self.QUEUE_RATE_LIMITER(queue=queue),
@@ -264,7 +271,7 @@ class RateLimiter:
 
         return True
 
-    async def add_task_to_queue(self, task: Task, pipe=None):
+    async def add_task_to_queue(self, task: Task, pipe: Pipeline | None=None) -> Any:
         """Add a task to the queue."""
         pipe = pipe or self.data_store
 
@@ -273,15 +280,15 @@ class RateLimiter:
 
         return pipe
 
-    async def concurrency_limits(self, task_queues: list[str], current_tasks_by_queue: dict[str, set[ULID]]) -> list[str]:
+    async def concurrency_limits(self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]) -> set[str]:
         """Limit the number of concurrent tasks in each queue."""
-        queues_to_use = []
+        queues_to_use = set()
         # TODO: Consider ways to check each queue in a single transaction or in parallel
         for queue in task_queues:
             config = await self.sm.get_queue_config(queue=queue)
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
-                    queues_to_use.append(queue)
+                    queues_to_use.add(queue)
 
         return queues_to_use
 

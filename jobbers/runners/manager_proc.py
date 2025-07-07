@@ -5,7 +5,7 @@ import sys
 import uvicorn
 
 ENABLE_OTEL = True
-def run():
+def run() -> None:
     from jobbers import db
     from jobbers.task_routes import app
 

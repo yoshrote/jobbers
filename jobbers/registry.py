@@ -1,22 +1,24 @@
 import logging
+from collections.abc import Callable
+from typing import Any
 
-from .models import TaskConfig
+from jobbers.models import TaskConfig
 
 logger = logging.getLogger(__name__)
-_task_function_map = {}
+_task_function_map : dict[tuple[str, int], TaskConfig] = {}
 
 def register_task(
         name: str,
         version: int,
-        max_concurrent=1,
-        timeout=None,
-        max_retries=3,
-        retry_delay=None,
-        expected_exceptions=()
-    ):
+        max_concurrent: int | None=1,
+        timeout: int | None=None,
+        max_retries: int=3,
+        retry_delay: int | None=None,
+        expected_exceptions: tuple[Exception] | None=None
+    ) -> Callable[..., Any]:
     """Register a task function with the given name and version."""
 
-    def decorator(func):
+    def decorator(func: Callable[..., Any]) -> Any:
         """Decorate a task function and registers it for use with task instances."""
         if not callable(func):
             logger.exception("Task function must be callable")
@@ -31,18 +33,17 @@ def register_task(
         task_conf = TaskConfig(
             name=name,
             version=version,
-            task_function=func,
+            function=func,
             max_concurrent=max_concurrent,
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
-            function=func,
             expected_exceptions=expected_exceptions,
         )
         _task_function_map[(name, version)] = task_conf
         return func
     return decorator
 
-def get_task_config(name: str, version: int):
+def get_task_config(name: str, version: int) -> TaskConfig | None:
     """Retrieve a task function given its name."""
     return _task_function_map.get((name, version))

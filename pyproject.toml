@@ -66,7 +66,7 @@ jobbers_cleaner = 'jobbers.runners.cleaner_proc:run'
 
 ## ruff settings ##
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 line-length = 110
 extend-exclude = [
     "Include",
@@ -205,3 +205,8 @@ exclude_also = [
     "@(typing(_extensions)?\\.)?overload",
     "if (typing(_extensions)?\\.)?TYPE_CHECKING:"
 ]
+
+[tool.mypy]
+plugins = ['pydantic.mypy']
+strict = true
+warn_return_any = false

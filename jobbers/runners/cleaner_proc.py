@@ -25,7 +25,7 @@ parser.add_argument(
 )
 
 
-def run():
+def run() -> None:
     from jobbers.state_manager import build_sm
 
     handlers = [logging.StreamHandler(stream=sys.stdout)]

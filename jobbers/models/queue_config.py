@@ -15,7 +15,7 @@ class RatePeriod(StrEnum):
     DAY = "day"
 
     @classmethod
-    def from_bytes(cls, value: bytes) -> Optional["RatePeriod"]:
+    def from_bytes(cls, value: bytes | None) -> Optional["RatePeriod"]:
         if value is None:
             return None
         period_str = value.decode()
@@ -32,7 +32,7 @@ class QueueConfig(BaseModel):
     """Configuration for a task queue."""
 
     name: str  # Name of the queue
-    max_concurrent: Optional[int] = 10  # Maximum number of concurrent tasks that can be processed from this queue
+    max_concurrent: int | None = 10  # Maximum number of concurrent tasks that can be processed from this queue
     # max_tasks_per_worker: Optional[int] = None  # Maximum number of tasks a worker can process before shutting down
     # task_timeout: Optional[int] = None  # Timeout for tasks in this queue in seconds, if applicable
     # retry_delay: dt.timedelta = dt.timedelta(seconds=5)  # Delay before retrying failed tasks in this queue
@@ -40,11 +40,11 @@ class QueueConfig(BaseModel):
     # retry_delay: dt.timedelta = dt.timedelta(seconds=5)  # Delay before retrying the task
     # Rate limiting is {task_number} tasks every {rate_number} {rate_period}
     #  e.g. 5 tasks every 2 minutea
-    rate_numerator: Optional[int] = None  # Number of tasks to process from this queue
-    rate_denominator: Optional[int] = None  # Number of tasks to rate limit
-    rate_period: Optional[RatePeriod] = None  # Period for rate limiting in seconds
+    rate_numerator: int | None = None  # Number of tasks to process from this queue
+    rate_denominator: int | None = None  # Number of tasks to rate limit
+    rate_period: RatePeriod | None = None  # Period for rate limiting in seconds
 
-    def period_in_seconds(self) -> Optional[int]:
+    def period_in_seconds(self) -> int | None:
         """Convert the rate period to seconds."""
         if self.rate_period is None or self.rate_denominator is None:
             return None
@@ -59,7 +59,7 @@ class QueueConfig(BaseModel):
                 return 86400 * self.rate_denominator
 
     @classmethod
-    def from_redis(cls, name: str, raw_task_data: dict) -> "QueueConfig":
+    def from_redis(cls, name: str, raw_task_data: dict[bytes, bytes]) -> "QueueConfig":
         return cls(
             name=name,
             max_concurrent=int(raw_task_data.get(b"max_concurrent") or b"10"),

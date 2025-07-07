@@ -1,5 +1,6 @@
 import logging
 import os
+import platform
 
 from opentelemetry import trace
 from opentelemetry._logs import set_logger_provider
@@ -18,7 +19,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 
-def setup_metrics(resource: Resource):
+def setup_metrics(resource: Resource) -> None:
     metric_exporter = OTLPMetricExporter(
         endpoint=os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://localhost:4317"),
         insecure=True
@@ -27,7 +28,7 @@ def setup_metrics(resource: Resource):
     metric_provider = MeterProvider(metric_readers=[metric_reader], resource=resource)
     set_meter_provider(metric_provider)
 
-def setup_tracer(resource: Resource):
+def setup_tracer(resource: Resource) -> None:
     trace.set_tracer_provider(TracerProvider(resource=resource))
     trace_exporter = OTLPSpanExporter(
         endpoint=os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4317"),
@@ -36,7 +37,7 @@ def setup_tracer(resource: Resource):
     trace_processor = BatchSpanProcessor(trace_exporter)
     trace.get_tracer_provider().add_span_processor(trace_processor)
 
-def setup_logger(resource: Resource):
+def setup_logger(resource: Resource) -> LoggingHandler:
     logger_provider = LoggerProvider(resource=resource)
     set_logger_provider(logger_provider)
 
@@ -47,11 +48,11 @@ def setup_logger(resource: Resource):
     logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
     return LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
 
-def enable_otel(handlers, service_name="jobbers"):
+def enable_otel(handlers, service_name="jobbers") -> None:
     resource=Resource.create(
         {
             "service.name": service_name,
-            "service.instance.id": os.uname().nodename,
+            "service.instance.id": platform.uname().node,
         }
     )
     otel_handler = setup_logger(resource)
