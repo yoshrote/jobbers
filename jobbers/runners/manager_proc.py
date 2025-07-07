@@ -9,7 +9,7 @@ def run() -> None:
     from jobbers import db
     from jobbers.task_routes import app
 
-    handlers = [logging.StreamHandler(stream=sys.stdout)]
+    handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
 
     if ENABLE_OTEL:
         from jobbers.utils.otel import enable_otel

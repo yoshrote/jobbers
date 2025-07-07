@@ -28,7 +28,7 @@ parser.add_argument(
 def run() -> None:
     from jobbers.state_manager import build_sm
 
-    handlers = [logging.StreamHandler(stream=sys.stdout)]
+    handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
 
     from jobbers.utils.otel import enable_otel
     enable_otel(handlers, service_name="jobbers-cleaner")

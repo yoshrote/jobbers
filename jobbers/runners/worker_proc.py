@@ -35,7 +35,7 @@ def run() -> None:
 
     from jobbers.utils.otel import enable_otel
 
-    handlers = [logging.StreamHandler(stream=sys.stdout)]
+    handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-worker")
     logging.basicConfig(level=logging.INFO, handlers=handlers)
     logging.getLogger("jobbers").setLevel(logging.DEBUG)

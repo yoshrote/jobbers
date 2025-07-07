@@ -48,7 +48,7 @@ def setup_logger(resource: Resource) -> LoggingHandler:
     logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
     return LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
 
-def enable_otel(handlers, service_name="jobbers") -> None:
+def enable_otel(handlers: list[logging.Handler], service_name: str="jobbers") -> None:
     resource=Resource.create(
         {
             "service.name": service_name,
