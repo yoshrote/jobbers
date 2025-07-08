@@ -5,9 +5,9 @@ from asyncio import TaskGroup
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from redis.asyncio.client import Pipeline
+from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 from jobbers.models import Task, TaskStatus
@@ -34,11 +34,11 @@ class QueueConfigAdapter:
     QUEUE_CONFIG = "queue-config:{queue}".format
     ALL_QUEUES = "all-queues"
 
-    def __init__(self, data_store: Any) -> None:
-        self.data_store: Any = data_store
+    def __init__(self, data_store: Redis) -> None:
+        self.data_store: Redis = data_store
 
     async def get_queues(self, role: str) -> set[str]:
-        return {role.decode() for role in await self.data_store.smembers(self.QUEUES_BY_ROLE(role=role))}
+        return {role.decode() for role in await cast("Awaitable[set[bytes]]", self.data_store.smembers(self.QUEUES_BY_ROLE(role=role)))}
 
     async def set_queues(self, role: str, queues: set[str]) -> None:
         pipe: Pipeline = self.data_store.pipeline(transaction=True)
@@ -56,9 +56,9 @@ class QueueConfigAdapter:
 
         return [
             queue.decode()
-            for queue in await self.data_store.sunion(
+            for queue in await cast("Awaitable[list[bytes]]", self.data_store.sunion(
                 [self.QUEUES_BY_ROLE(role=role) for role in roles]
-            )
+            ))
         ]
 
     async def get_all_roles(self) -> list[str]:
@@ -68,7 +68,10 @@ class QueueConfigAdapter:
         return roles
 
     async def get_queue_config(self, queue: str) -> QueueConfig:
-        raw_data = await self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))  # Ensure the queue config exists in the store
+        raw_data: dict[bytes, Any] = await cast(
+            "Awaitable[dict[bytes, Any]]",
+            self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))
+        )  # Ensure the queue config exists in the store
         return QueueConfig.from_redis(queue, raw_data)
 
     async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
@@ -169,7 +172,8 @@ class StateManager:
         return None
 
     async def task_exists(self, task_id: ULID) -> bool:
-        return await self.data_store.exists(self.TASK_DETAILS(task_id=task_id)) == 1
+        does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
+        return does_exists == 1
 
     async def get_all_tasks(self) -> list[Task]:
         task_ids = await self.data_store.zrange(self.TASKS_BY_QUEUE(queue="default"), 0, -1)

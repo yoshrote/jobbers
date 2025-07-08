@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class TaskConfig(BaseModel):
@@ -17,17 +17,5 @@ class TaskConfig(BaseModel):
     # The actual function to execute for this task, used internally by the worker
     function: Callable[..., Any] = Field(exclude=True)
 
-    model_config = ConfigDict(extra='allow')
-
-    @property
-    def expected_exceptions(self) -> tuple[type[Exception]] | None:
-        """
-        Returns the tuple of expected exceptions that can be handled by the task processor.
-
-        This allows for custom handling of exceptions during task execution.
-        """
-        extra = getattr(self, '__pydantic_extra__', None)
-        if extra is not None and extra.get('expected_exceptions'):
-            return extra['expected_exceptions']
-        return None
-
+    # The tuple of expected exceptions that can be handled by the task processor
+    expected_exceptions: tuple[type[Exception]] | None = Field(default=None)

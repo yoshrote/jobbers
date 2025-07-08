@@ -2,7 +2,7 @@ import os
 
 import redis.asyncio as redis
 
-_client = None
+_client: redis.Redis | None = None
 
 def get_client() -> redis.Redis:
     global _client

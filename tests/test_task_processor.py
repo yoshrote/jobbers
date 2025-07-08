@@ -115,6 +115,7 @@ async def test_task_processor_unexpected_exception():
         function=task_function,
         timeout=10,
         max_retries=3,
+        expected_exceptions=(ValueError,),  # Specify expected exceptions for retry logic
     )
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):

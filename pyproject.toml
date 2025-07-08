@@ -210,7 +210,7 @@ exclude_also = [
 [tool.mypy]
 plugins = ['pydantic.mypy']
 strict = true
-warn_return_any = false
+warn_return_any = true
 exclude = [
     'tests',
 ]
