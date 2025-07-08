@@ -3,6 +3,30 @@
 A task/workflow framework similar to Celery/Airflow. The name is inspired by
 the many wrestlers who anonymously do the work to make the stars look good.
 
+## How it works
+
+Jobbers is split into two applications and a cleanup utility.
+
+`manager` is a web application to submit tasks, request results, and get the
+current state of the tasks and queues.
+The manager acts similar to the RMQ exchange in a Celery/Airflow system by
+determining which Redis queue should be used for a particular job.
+
+Multiple `managers` can be deployed to scale the reads/writes to Redis, but if Redis
+becomes the bottleneck then you could shard your workflows across multiple manager/redis clusters
+based on the queues, a parameter (such as a user id) or whatever else to segment the overall
+system across multiple Redis instances.
+
+`worker` is a task consumer to pull tasks from queues and run the actual task code.
+Each worker is independent of the others and so these can be scaled arbitrarily so
+long as the underlying Redis database can handle all of the connections.
+
+`cleaner` clears task state and queues of jobs that meet search criteria
+
+- task type
+- time of submission
+- queue name
+
 ## Key Principles
 
 - asyncio native
