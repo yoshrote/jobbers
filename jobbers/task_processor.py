@@ -23,13 +23,14 @@ class TaskProcessor:
         if not task_config:
             self.handle_dropped_task(task)
         else:
-            ex = None
+            ex: BaseException | None = None
             try:
                 task = await self.mark_task_as_started(task)
                 with self.state_manager.task_in_registry(task):
                     async with asyncio.timeout(task_config.timeout):
                         task.results = await task_config.function(**task.parameters)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
+                # ex = exc
                 self.handle_timeout_exception(task, task_config)
             except asyncio.CancelledError as exc:
                 ex = exc
@@ -38,6 +39,7 @@ class TaskProcessor:
                 if task_config.expected_exceptions and isinstance(exc, task_config.expected_exceptions):
                     self.handle_expected_exception(task, task_config, exc)
                 else:
+                    ex = exc
                     self.handle_unexpected_exception(task, exc)
             else:
                 self.handle_success(task)
@@ -46,7 +48,7 @@ class TaskProcessor:
 
         if task.status == TaskStatus.COMPLETED:
             await self.post_process(task)
-        elif task.status == TaskStatus.CANCELLED:
+        elif ex is not None:
             raise ex
 
         return task
