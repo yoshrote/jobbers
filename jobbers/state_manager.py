@@ -105,7 +105,7 @@ class StateManager:
     def __init__(self, data_store: Any) -> None:
         self.data_store = data_store
         self.qca = QueueConfigAdapter(data_store)
-        self.rate_limiter = RateLimiter(self)
+        self.submission_limiter = SubmissionRateLimiter(self)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
 
     @property
@@ -131,7 +131,7 @@ class StateManager:
             earliest_time = now - rate_limit_age
             pipe = self.data_store.pipeline(transaction=True)
             for queue in await self.data_store.smembers(self.qca.ALL_QUEUES):
-                pipe.zremrangebyscore(self.rate_limiter.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp())
+                pipe.zremrangebyscore(self.submission_limiter.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp())
             await pipe.execute()
 
         if max_queue_age or min_queue_age:
@@ -151,11 +151,11 @@ class StateManager:
         pipe = self.data_store.pipeline(transaction=True)
         # Avoid pushing a task onto the queue multiple times
         if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
-            if self.rate_limiter.has_room_in_queue_queue(task.queue):
+            if self.submission_limiter.has_room_in_queue_queue(task.queue):
                 task.submitted_at = dt.datetime.now(dt.timezone.utc)
                 task.status = TaskStatus.SUBMITTED
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
-                await self.rate_limiter.add_task_to_queue(task, pipe=pipe)
+                await self.submission_limiter.add_task_to_queue(task, pipe=pipe)
 
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
         await pipe.execute()
@@ -197,7 +197,7 @@ class StateManager:
             logger.info("no queues defined")
             return None
 
-        queues = await self.rate_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
+        queues = await self.submission_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
         task_queues = [self.TASKS_BY_QUEUE(queue=queue) for queue in queues]
 
         # Try to pop from each queue until we find a task
@@ -235,7 +235,7 @@ class StateManager:
         return await self.qca.get_queue_limits(queues=queues)
 
 
-class RateLimiter:
+class SubmissionRateLimiter:
     """
     Rate limiter for tasks in a Redis data store.
 

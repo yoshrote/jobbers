@@ -8,8 +8,8 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
+from jobbers.state_manager import StateManager, Task, TaskStatus
 from jobbers.utils.serialization import EMPTY_DICT, serialize
-from jobbers.state_manager import RateLimiter, StateManager, Task, TaskStatus
 
 FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ISO_FROZEN_TIME = serialize(FROZEN_TIME)
@@ -237,7 +237,7 @@ async def test_get_next_task_missing_task_data(redis, state_manager):
 
 @pytest.fixture
 def rate_limiter(state_manager):
-    return state_manager.rate_limiter
+    return state_manager.submission_limiter
 
 @pytest.mark.asyncio
 async def test_rate_limiter_has_room_empty(redis, rate_limiter):
