@@ -26,13 +26,13 @@ class LocalTTL:
     def __init__(self, config_ttl: int):
         self.config_ttl = config_ttl
         self.last_refreshed: dt.datetime | None = None
-        self._now: dt.datetime | None = None
+        self._now: dt.datetime = dt.datetime.now(dt.timezone.utc)
 
-    async def __aenter__(self) -> bool:
+    def __enter__(self) -> bool:
         self._now = dt.datetime.now(dt.timezone.utc)
         return self._older_than_ttl(self._now)
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None) -> None:
         if self._older_than_ttl(self._now):
             self.last_refreshed = self._now
 
@@ -72,7 +72,7 @@ class MaxTaskCounter:
             self._task_count += 1
         return self._task_count
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None) -> None:
         pass
 
 class TaskGenerator:
@@ -111,7 +111,7 @@ class TaskGenerator:
         # queues that meet configured limits so that we evaluate that aspect
         # between configuration refresh
 
-        # async with self.ttl as needs_refresh:
+        # with self.ttl as needs_refresh:
         #     if not needs_refresh:
         #         return self.filter_by_worker_queue_capacity(self.task_queues)
         new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)

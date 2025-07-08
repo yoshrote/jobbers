@@ -276,7 +276,8 @@ class RateLimiter:
         pipe = pipe or self.data_store
 
         # Add the task to the rate limiter for the queue
-        pipe.zadd(self.QUEUE_RATE_LIMITER(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        if task.submitted_at:
+            pipe.zadd(self.QUEUE_RATE_LIMITER(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
         return pipe
 

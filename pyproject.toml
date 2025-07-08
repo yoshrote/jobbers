@@ -54,6 +54,7 @@ dependencies = [
     "msgpack",
     "python-ulid[pydantic]",
     "asyncio-taskpool",
+    "msgpack-types",
 ]
 
 [project.urls]
