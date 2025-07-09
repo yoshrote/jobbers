@@ -8,7 +8,8 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
-from jobbers.state_manager import StateManager, Task, TaskStatus
+from jobbers.models import Task, TaskStatus
+from jobbers.state_manager import StateManager
 from jobbers.utils.serialization import EMPTY_DICT, serialize
 
 FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -412,6 +413,187 @@ async def test_clean_min_and_max_queue_age(redis, state_manager):
     # Verify only tasks within the age range remain
     queue1_tasks = await redis.zrange("task-queues:queue1", 0, -1, withscores=True)
     assert queue1_tasks == []
+
+
+# Tests for StateManager.get_queue_limits
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_empty_set(state_manager):
+    """Test get_queue_limits with an empty set of queues."""
+    result = await state_manager.get_queue_limits(set())
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_single_queue_with_limit(redis, state_manager):
+    """Test get_queue_limits with a single queue that has max_concurrent set."""
+    # Set up queue config in Redis
+    await redis.hset("queue-config:test_queue", mapping={
+        "max_concurrent": "5",
+        "rate_numerator": serialize(None),
+        "rate_denominator": serialize(None),
+        "rate_period": ""
+    })
+
+    result = await state_manager.get_queue_limits({"test_queue"})
+    assert result == {"test_queue": 5}
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_single_queue_no_limit(redis, state_manager):
+    """Test get_queue_limits with a queue that has no max_concurrent limit."""
+    # Set up queue config in Redis with no max_concurrent (defaults to 10)
+    await redis.hset("queue-config:unlimited_queue", mapping={
+        "rate_numerator": serialize(None),
+        "rate_denominator": serialize(None),
+        "rate_period": ""
+    })
+
+    result = await state_manager.get_queue_limits({"unlimited_queue"})
+    assert result == {"unlimited_queue": 10}  # Default value
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_single_queue_zero_limit(redis, state_manager):
+    """Test get_queue_limits with a queue that has max_concurrent set to 0."""
+    # Set up queue config in Redis
+    await redis.hset("queue-config:zero_limit_queue", mapping={
+        "max_concurrent": "0",
+        "rate_numerator": serialize(None),
+        "rate_denominator": serialize(None),
+        "rate_period": ""
+    })
+
+    result = await state_manager.get_queue_limits({"zero_limit_queue"})
+    assert result == {"zero_limit_queue": 0}
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_multiple_queues(redis, state_manager):
+    """Test get_queue_limits with multiple queues having different limits."""
+    # Set up multiple queue configs in Redis
+    await redis.hset("queue-config:queue1", mapping={
+        "max_concurrent": "3",
+        "rate_numerator": serialize(None),
+        "rate_denominator": serialize(None),
+        "rate_period": ""
+    })
+
+    await redis.hset("queue-config:queue2", mapping={
+        "max_concurrent": "10",
+        "rate_numerator": serialize(None),
+        "rate_denominator": serialize(None),
+        "rate_period": ""
+    })
+
+    await redis.hset("queue-config:queue3", mapping={
+        "max_concurrent": "1",
+        "rate_numerator": serialize(None),
+        "rate_denominator": serialize(None),
+        "rate_period": ""
+    })
+
+    result = await state_manager.get_queue_limits({"queue1", "queue2", "queue3"})
+    expected = {"queue1": 3, "queue2": 10, "queue3": 1}
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_with_nonexistent_queue(state_manager):
+    """Test get_queue_limits with a queue that doesn't exist in Redis."""
+    # Don't set up any queue config - this should still work with defaults
+    result = await state_manager.get_queue_limits({"nonexistent_queue"})
+    assert result == {"nonexistent_queue": 10}  # Default max_concurrent
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_mixed_existing_and_nonexistent(redis, state_manager):
+    """Test get_queue_limits with a mix of existing and non-existing queues."""
+    # Set up one queue config
+    await redis.hset("queue-config:existing_queue", mapping={
+        "max_concurrent": "7",
+        "rate_numerator": serialize(None),
+        "rate_denominator": serialize(None),
+        "rate_period": ""
+    })
+
+    result = await state_manager.get_queue_limits({"existing_queue", "nonexistent_queue"})
+    expected = {"existing_queue": 7, "nonexistent_queue": 10}
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_with_rate_limiting_config(redis, state_manager):
+    """Test get_queue_limits with queues that have rate limiting configured (should still return max_concurrent)."""
+    # Set up queue config with rate limiting
+    await redis.hset("queue-config:rate_limited_queue", mapping={
+        "max_concurrent": "15",
+        "rate_numerator": serialize(5),
+        "rate_denominator": serialize(2),
+        "rate_period": "minute"
+    })
+
+    result = await state_manager.get_queue_limits({"rate_limited_queue"})
+    assert result == {"rate_limited_queue": 15}
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_large_number_of_queues(redis, state_manager):
+    """Test get_queue_limits with a large number of queues to ensure it handles concurrency well."""
+    queue_names = [f"queue_{i}" for i in range(20)]
+
+    # Set up configs for all queues
+    for i, queue_name in enumerate(queue_names):
+        await redis.hset(f"queue-config:{queue_name}", mapping={
+            "max_concurrent": str(i + 1),  # Different limit for each queue
+            "rate_numerator": serialize(None),
+            "rate_denominator": serialize(None),
+            "rate_period": ""
+        })
+
+    result = await state_manager.get_queue_limits(set(queue_names))
+
+    # Verify all queues are present with correct limits
+    assert len(result) == 20
+    for i, queue_name in enumerate(queue_names):
+        expected_limit = i + 1
+        assert result[queue_name] == expected_limit
+
+@pytest.mark.asyncio
+async def test_add_task_to_queue_adds_task_to_rate_limiter(redis, rate_limiter):
+    """Test that add_task_to_queue adds the task to the rate limiter sorted set."""
+    task = Task(
+        id=ULID1,
+        name="Test Task",
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        submitted_at=FROZEN_TIME,
+    )
+    pipe = redis.pipeline()
+    rate_limiter.add_task_to_queue(task, pipe=pipe)
+    await pipe.execute()
+
+    # Check that the task was added to the correct sorted set with the correct score
+    members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
+    assert members == [(bytes(ULID1), FROZEN_TIME.timestamp())]
+
+@pytest.mark.asyncio
+async def test_add_task_to_queue_no_submitted_at(redis, rate_limiter):
+    """Test that add_task_to_queue does not add the task if submitted_at is None."""
+    task = Task(
+        id=ULID2,
+        name="No Submitted At",
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        submitted_at=None,
+    )
+    pipe = redis.pipeline()
+    rate_limiter.add_task_to_queue(task, pipe=pipe)
+    await pipe.execute()
+
+    # Should not add anything to the sorted set
+    members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
+    assert members == []
 
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])
