@@ -3,19 +3,15 @@ import datetime as dt
 import logging
 from asyncio import TaskGroup
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 from jobbers.models import Task, TaskStatus
 from jobbers.models.queue_config import QueueConfig
-
-if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
 
 logger = logging.getLogger(__name__)
 
