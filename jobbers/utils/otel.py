@@ -35,7 +35,7 @@ def setup_tracer(resource: Resource) -> None:
         insecure=True
     )
     trace_processor = BatchSpanProcessor(trace_exporter)
-    trace.get_tracer_provider().add_span_processor(trace_processor)
+    trace.get_tracer_provider().add_span_processor(trace_processor) # type: ignore
 
 def setup_logger(resource: Resource) -> LoggingHandler:
     logger_provider = LoggerProvider(resource=resource)
