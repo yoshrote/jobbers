@@ -7,6 +7,7 @@ from jobbers.models.task import Task, TaskStatus
 from jobbers.state_manager import StateManager
 from jobbers.task_generator import TaskGenerator
 
+EXHAUSTED = object()
 
 @pytest.mark.asyncio
 async def test_find_queues_default_role():
@@ -60,9 +61,7 @@ async def test_task_generator_iteration():
     state_manager.get_queue_limits.return_value = {}
     task_generator = TaskGenerator(state_manager, role="default")
 
-    async for generated_task in task_generator:
-        assert generated_task == task
-        break  # Stop after the first task for testing purposes
+    assert await anext(task_generator, EXHAUSTED) == task
 
     state_manager.get_next_task.assert_called_once_with({"default"})
 
@@ -76,8 +75,7 @@ async def test_task_generator_stops_iteration():
     state_manager.get_queue_limits.return_value = {}
     task_generator = TaskGenerator(state_manager, role="default")
 
-    async for _ in task_generator:
-        pass
+    assert await anext(task_generator, EXHAUSTED) == EXHAUSTED
 
     state_manager.get_next_task.assert_called_once_with({"default"})
 
