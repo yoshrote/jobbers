@@ -1,5 +1,5 @@
 import datetime as dt
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel, Field
 from ulid import ULID
@@ -40,7 +40,7 @@ class Task(BaseModel):
     def has_callbacks(self) -> bool:
         return False
 
-    def generate_callbacks(self) -> list["Task"]:
+    def generate_callbacks(self) -> list[Self]:
         return []
 
     def summarized(self) -> dict[str, Any]:
@@ -49,7 +49,7 @@ class Task(BaseModel):
         return summary
 
     @classmethod
-    def from_redis(cls, task_id: ULID, raw_task_data: dict[bytes, bytes]) -> "Task":
+    def from_redis(cls, task_id: ULID, raw_task_data: dict[bytes, bytes]) -> Self:
         # Try to set good defaults for missing fields so when new fields are added to the task model, we don't break
         return cls(
             id=task_id,

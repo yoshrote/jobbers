@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Optional
+from typing import Self
 
 from pydantic import BaseModel
 
@@ -15,7 +15,7 @@ class RatePeriod(StrEnum):
     DAY = "day"
 
     @classmethod
-    def from_bytes(cls, value: bytes | None) -> Optional["RatePeriod"]:
+    def from_bytes(cls, value: bytes | None) -> Self | None:
         if value is None:
             return None
         period_str = value.decode()
@@ -33,8 +33,8 @@ class QueueConfig(BaseModel):
 
     name: str  # Name of the queue
     max_concurrent: int | None = 10  # Maximum number of concurrent tasks that can be processed from this queue
-    # max_tasks_per_worker: Optional[int] = None  # Maximum number of tasks a worker can process before shutting down
-    # task_timeout: Optional[int] = None  # Timeout for tasks in this queue in seconds, if applicable
+    # max_tasks_per_worker: int | None = None  # Maximum number of tasks a worker can process before shutting down
+    # task_timeout: int | None = None  # Timeout for tasks in this queue in seconds, if applicable
     # retry_delay: dt.timedelta = dt.timedelta(seconds=5)  # Delay before retrying failed tasks in this queue
     # backoff_strategy: str = "exponential"  # Backoff strategy for retries (e.g., "exponential", "linear")
     # retry_delay: dt.timedelta = dt.timedelta(seconds=5)  # Delay before retrying the task
@@ -59,7 +59,7 @@ class QueueConfig(BaseModel):
                 return 86400 * self.rate_denominator
 
     @classmethod
-    def from_redis(cls, name: str, raw_task_data: dict[bytes, bytes]) -> "QueueConfig":
+    def from_redis(cls, name: str, raw_task_data: dict[bytes, bytes]) -> Self:
         return cls(
             name=name,
             max_concurrent=int(raw_task_data.get(b"max_concurrent") or b"10"),

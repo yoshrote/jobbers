@@ -3,7 +3,7 @@ import logging
 import os
 
 from jobbers.state_manager import StateManager, build_sm
-from jobbers.task_generator import TaskGenerator, build_task_generator
+from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
 
 logger = logging.getLogger(__name__)
@@ -16,6 +16,13 @@ Important environment variables:
 Rate limiting should be implemented by limiting the creation of tasks rather
 than on the consumption of tasks.
 """
+
+def build_task_generator(state_manager: StateManager) -> TaskGenerator:
+    """Consume tasks from the Redis list 'task-list'."""
+    role = os.environ.get("WORKER_ROLE", "default")
+    worker_ttl = int(os.environ.get("WORKER_TTL", 50)) # if 0, will run indefinitely
+
+    return TaskGenerator(state_manager, role, max_tasks=worker_ttl)
 
 async def main() -> None:
     num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))

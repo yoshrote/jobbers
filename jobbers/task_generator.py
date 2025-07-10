@@ -1,6 +1,6 @@
 import datetime as dt
 import logging
-import os
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
 from jobbers.models.task import Task
@@ -19,7 +19,7 @@ class LocalTTL:
     ----------
     config_ttl : int
         The TTL duration in seconds.
-    last_refreshed : Optional[datetime]
+    last_refreshed : datetime | None
         The last time the TTL was refreshed.
     """
 
@@ -125,7 +125,7 @@ class TaskGenerator:
             logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
         return await self.filter_by_worker_queue_capacity(self.task_queues)
 
-    def __aiter__(self) -> "TaskGenerator":
+    def __aiter__(self) -> AsyncIterator[Task]:
         return self
 
     async def __anext__(self) -> Task:
@@ -137,10 +137,3 @@ class TaskGenerator:
             logger.warning("Strange stop")
             raise StopAsyncIteration
         return task
-
-def build_task_generator(state_manager: StateManager) -> TaskGenerator:
-    """Consume tasks from the Redis list 'task-list'."""
-    role = os.environ.get("WORKER_ROLE", "default")
-    worker_ttl = int(os.environ.get("WORKER_TTL", 50)) # if 0, will run indefinitely
-
-    return TaskGenerator(state_manager, role, max_tasks=worker_ttl)
