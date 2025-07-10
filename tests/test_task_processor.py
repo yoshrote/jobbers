@@ -64,7 +64,7 @@ async def test_task_processor_dropped_task():
 
 
 @pytest.mark.asyncio
-async def test_task_processor_expected_exception():
+async def test_task_processor_expected_exception_with_retry():
     """Test that TaskProcessor handles an expected exception."""
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -95,6 +95,37 @@ async def test_task_processor_expected_exception():
     # Once when starting and once when done
     state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
 
+@pytest.mark.asyncio
+async def test_task_processor_expected_exception_without_retry():
+    """Test that TaskProcessor handles an expected exception."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={"param1": "value1"},
+        status=TaskStatus.UNSUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = AsyncMock(spec=StateManager)
+    task_function = AsyncMock(side_effect=ValueError("Expected error"))
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        max_retries=0,
+        expected_exceptions=(ValueError,),  # Specify expected exceptions for retry logic
+    )
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result_task = await processor.process(task)
+
+    assert result_task.status == TaskStatus.FAILED
+    assert result_task.retry_attempt == 0
+    assert "Expected error" in result_task.error
+    # Once when starting and once when done
+    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
 
 
 @pytest.mark.asyncio
