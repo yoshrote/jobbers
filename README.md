@@ -77,8 +77,6 @@ a slow task and a frozen task
      - TODO: more high contention on updating any shared heartbeat
   4. pass along the work to the next node in the DAG
 - implement task search and retry tools for debugging and recovery (generalize work from StateManager.clean)
-- task concurrency controls (per task, per worker, per cluster; easy worker pooling)
-  - determine how to divide tasks between workers and queues in order to keep load balanced
 
 Tech stack
 
@@ -107,4 +105,9 @@ Top Problems:
 - task chaining (DAG support)
   - task distribution strategies across queues (random, hash by parameter, etc)
 - enable good dashboards with useful metrics
+  - total queue length over time
+  - time-in-queue aggregates per queue
+  - which workers are/were running which tasks (diagnostics and failure recovery)
+  - aggregate task execution time (possibly per task+queue in case the queue assignment is significant)
+  - task completion rates (per task or per task per queue)
 - discover and handle when role -> queue mapping changes
