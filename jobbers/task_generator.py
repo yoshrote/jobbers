@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
 from jobbers.models.task import Task
-from jobbers.state_manager import StateManager
+from jobbers.state_manager import QueueConfigAdapter, StateManager
 
 if TYPE_CHECKING:
     from ulid import ULID
@@ -80,9 +80,15 @@ class TaskGenerator:
 
     DEFAULT_QUEUES = {"default"}
 
-    def __init__(self, state_manager: StateManager, role: str="default", max_tasks: int=100, config_ttl: int=60) -> None:
+    def __init__(self,
+                 state_manager: StateManager,
+                 query_config_adapter: QueueConfigAdapter,
+                 role: str="default",
+                 max_tasks: int=100,
+                 config_ttl: int=60) -> None:
         self.role: str = role
         self.state_manager: StateManager = state_manager
+        self.query_config_adapter = query_config_adapter
         self.ttl = LocalTTL(config_ttl)
         self.max_task_check = MaxTaskCounter(max_tasks)
         self.task_queues: set[str] = set()
@@ -92,7 +98,7 @@ class TaskGenerator:
         """Find all queues we should listen to via Redis."""
         if self.role == "default":
             return self.DEFAULT_QUEUES
-        queues = await self.state_manager.get_queues(self.role)
+        queues = await self.query_config_adapter.get_queues(self.role)
         return queues or set()
 
     async def filter_by_worker_queue_capacity(self, queues: set[str]) -> set[str]:
@@ -100,7 +106,7 @@ class TaskGenerator:
             return queues
 
         active_tasks = self.state_manager.active_tasks_per_queue
-        queue_worker_limits = await self.state_manager.get_queue_limits(queues)
+        queue_worker_limits = await self.query_config_adapter.get_queue_limits(queues)
         return {
             q for q in queues
             if not queue_worker_limits.get(q, 0) or active_tasks.get(q, 0) > (queue_worker_limits.get(q) or 0)

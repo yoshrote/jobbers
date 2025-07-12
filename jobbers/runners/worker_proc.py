@@ -22,7 +22,7 @@ def build_task_generator(state_manager: StateManager) -> TaskGenerator:
     role = os.environ.get("WORKER_ROLE", "default")
     worker_ttl = int(os.environ.get("WORKER_TTL", 50)) # if 0, will run indefinitely
 
-    return TaskGenerator(state_manager, role, max_tasks=worker_ttl)
+    return TaskGenerator(state_manager, state_manager.qca, role, max_tasks=worker_ttl)
 
 async def main() -> None:
     num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))

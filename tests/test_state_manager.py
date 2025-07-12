@@ -9,7 +9,8 @@ from pytest_unordered import unordered
 from ulid import ULID
 
 from jobbers.models import Task, TaskStatus
-from jobbers.state_manager import StateManager
+from jobbers.models.queue_config import QueueConfig, RatePeriod
+from jobbers.state_manager import QueueConfigAdapter, StateManager, TaskAdapter
 from jobbers.utils.serialization import EMPTY_DICT, serialize
 
 FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -29,11 +30,21 @@ def state_manager(redis):
     """Fixture to provide a StateManager instance with a fake Redis data store."""
     return StateManager(redis)
 
+@pytest.fixture
+def task_adapter(redis):
+    """Fixture to provide a TaskAdapter instance with a fake Redis data store."""
+    return TaskAdapter(redis)
+
+@pytest.fixture
+def queue_config_adapter(redis):
+    """Fixture to provide a QueueConfigAdapter instance with a fake Redis data store."""
+    return QueueConfigAdapter(redis)
+
 @pytest.mark.asyncio
-async def test_submit_task(redis, state_manager):
+async def test_submit_task(redis, task_adapter):
     """Test submitting a task to Redis."""
     task = Task(id=ULID1, name="Test Task", status=TaskStatus.UNSUBMITTED, queue="default")
-    await state_manager.submit_task(task)
+    await task_adapter.submit_task(task, extra_check=None)
     # Verify the task was added to Redis
     task_list = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in task_list
@@ -41,15 +52,15 @@ async def test_submit_task(redis, state_manager):
     assert set(task_data.items()) >= set({b"name": b"Test Task", b"status": b"submitted", b"submitted_at": serialize(task.submitted_at)}.items())
 
 @pytest.mark.asyncio
-async def test_submit_task_twice_updates_only(redis, state_manager):
+async def test_submit_task_twice_updates_only(redis, task_adapter):
     """Test that submitting a task twice updates the task but does not add it to the task-list again."""
     # Submit the task for the first time
     task = Task(id=ULID1, name="Initial Task", status="unsubmitted")
-    await state_manager.submit_task(task)
+    await task_adapter.submit_task(task, extra_check=None)
 
     # Submit the task again with updated details
     updated_task = Task(id=ULID1, name="Updated Task", status="completed", submitted_at=task.submitted_at)
-    await state_manager.submit_task(updated_task)
+    await task_adapter.submit_task(updated_task, extra_check=None)
 
     # Verify the task ID is only added once to the task-list
     task_list = await redis.zrange(f"task-queues:{task.queue}", 0, -1)
@@ -57,19 +68,19 @@ async def test_submit_task_twice_updates_only(redis, state_manager):
 
     # Verify the task details were updated
     # submitted_at should not change
-    saved_task = await state_manager.get_task(ULID1)
+    saved_task = await task_adapter.get_task(ULID1)
     assert saved_task.name == "Updated Task"
     assert saved_task.status == TaskStatus.COMPLETED
     assert saved_task.submitted_at == task.submitted_at
 
 @pytest.mark.asyncio
-async def test_get_task(redis):
+async def test_get_task(redis, task_adapter):
     """Test retrieving a task from Redis."""
     # Add a task to Redis
     await redis.zadd("worker-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp()})
     await redis.hset(f"task:{ULID1}", mapping={b"name": b"Test Task", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME, b"version": 0})
     # Retrieve the task
-    task = await StateManager(redis).get_task(ULID1)
+    task = await task_adapter.get_task(ULID1)
     assert task is not None
     assert task.id == ULID1
     assert task.name == "Test Task"
@@ -77,33 +88,33 @@ async def test_get_task(redis):
     assert task.submitted_at == FROZEN_TIME
 
 @pytest.mark.asyncio
-async def test_get_task_not_found(state_manager):
+async def test_get_task_not_found(task_adapter):
     """Test retrieving a non-existent task."""
-    task = await state_manager.get_task(ULID1)
+    task = await task_adapter.get_task(ULID1)
     assert task is None
 
 @pytest.mark.asyncio
-async def test_task_exists(redis, state_manager):
+async def test_task_exists(redis, task_adapter):
     """Test checking if a task exists in Redis."""
     # Add a task to Redis
     await redis.zadd("worker-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp()})
     await redis.hset(f"task:{ULID1}", mapping={"name": "Test Task", "status": "started", "submitted_at": ISO_FROZEN_TIME})
     # Check if the task exists
-    exists = await state_manager.task_exists(ULID1)
+    exists = await task_adapter.task_exists(ULID1)
     assert exists
     # Check for a non-existent task
-    exists = await state_manager.task_exists(999)
+    exists = await task_adapter.task_exists(999)
     assert not exists
 
 @pytest.mark.asyncio
-async def test_get_all_tasks(redis, state_manager):
+async def test_get_all_tasks(redis, task_adapter):
     """Test retrieving all tasks from Redis."""
     # Add tasks to Redis
     await redis.zadd("task-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp(), bytes(ULID2): FROZEN_TIME.timestamp()})
     await redis.hset(f"task:{ULID1}", mapping={b"name": b"Task 1", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME})
     await redis.hset(f"task:{ULID2}", mapping={b"name": b"Task 2", b"status": b"completed", b"submitted_at": ISO_FROZEN_TIME})
     # Retrieve all tasks
-    tasks = await state_manager.get_all_tasks()
+    tasks = await task_adapter.get_all_tasks()
     assert len(tasks) == 2
     assert tasks == unordered([
         Task(id=ULID1, name="Task 1", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME),
@@ -111,31 +122,31 @@ async def test_get_all_tasks(redis, state_manager):
     ])
 
 @pytest.mark.asyncio
-async def test_get_all_tasks_empty(state_manager):
+async def test_get_all_tasks_empty(task_adapter):
     """Test retrieving tasks when no tasks exist."""
-    tasks = await state_manager.get_all_tasks()
+    tasks = await task_adapter.get_all_tasks()
     assert tasks == []
 
 @pytest.mark.asyncio
-async def test_get_queues(redis, state_manager):
+async def test_get_queues(redis, queue_config_adapter):
     """Test retrieving queues for a specific role."""
     # Add queues for a role
     await redis.sadd("worker-queues:role1", "queue1", "queue2")
     # Retrieve queues
-    queues = await state_manager.get_queues("role1")
+    queues = await queue_config_adapter.get_queues("role1")
     assert set(queues) == {"queue1", "queue2"}
 
 @pytest.mark.asyncio
-async def test_get_queues_empty(redis, state_manager):
+async def test_get_queues_empty(redis, queue_config_adapter):
     """Test retrieving queues for a role with no queues."""
-    queues = await state_manager.get_queues("role1")
+    queues = await queue_config_adapter.get_queues("role1")
     assert queues == set()
 
 @pytest.mark.asyncio
-async def test_set_queues(redis, state_manager):
+async def test_set_queues(redis, queue_config_adapter):
     """Test setting queues for a specific role."""
     # Set queues for a role
-    await state_manager.set_queues("role1", {"queue1", "queue2"})
+    await queue_config_adapter.set_queues("role1", {"queue1", "queue2"})
     # Verify the queues were set
     queues = await redis.smembers("worker-queues:role1")
     assert set(queues) == {b"queue1", b"queue2"}
@@ -143,35 +154,35 @@ async def test_set_queues(redis, state_manager):
     assert set(all_queues) == {b"queue1", b"queue2"}
 
 @pytest.mark.asyncio
-async def test_get_all_queues(redis, state_manager):
+async def test_get_all_queues(redis, queue_config_adapter):
     """Test retrieving all queues across roles."""
     # Add queues for multiple roles
     await redis.sadd("worker-queues:role1", "queue1", "queue2")
     await redis.sadd("worker-queues:role2", "queue3")
     # Retrieve all queues
-    queues = await state_manager.get_all_queues()
+    queues = await queue_config_adapter.get_all_queues()
     assert set(queues) == {"queue1", "queue2", "queue3"}
 
 @pytest.mark.asyncio
-async def test_get_all_queues_empty(redis, state_manager):
+async def test_get_all_queues_empty(redis, queue_config_adapter):
     """Test retrieving all queues when no queues exist."""
-    queues = await state_manager.get_all_queues()
+    queues = await queue_config_adapter.get_all_queues()
     assert queues == []
 
 @pytest.mark.asyncio
-async def test_get_all_roles(redis, state_manager):
+async def test_get_all_roles(redis, queue_config_adapter):
     """Test retrieving all roles."""
     # Add roles with queues
     await redis.sadd("worker-queues:role1", "queue1")
     await redis.sadd("worker-queues:role2", "queue2")
     # Retrieve all roles
-    roles = await state_manager.get_all_roles()
+    roles = await queue_config_adapter.get_all_roles()
     assert set(roles) == {"role1", "role2"}
 
 @pytest.mark.asyncio
-async def test_get_all_roles_empty(state_manager):
+async def test_get_all_roles_empty(queue_config_adapter):
     """Test retrieving all roles when no roles exist."""
-    roles = await state_manager.get_all_roles()
+    roles = await queue_config_adapter.get_all_roles()
     assert roles == []
 
 @pytest.mark.asyncio
@@ -242,61 +253,63 @@ def rate_limiter(state_manager):
 
 @pytest.mark.asyncio
 async def test_rate_limiter_has_room_empty(redis, rate_limiter):
-    await redis.hset("queue-config:default", mapping={
+    result = await rate_limiter.has_room_in_queue_queue(QueueConfig(
+        name="default",
         # 2 tasks per minute
-        b"rate_numerator": serialize(2),
-        b"rate_denominator": serialize(1),
-        b"rate_period": b"minute",
-    })
-
-    result = await rate_limiter.has_room_in_queue_queue("default")
+        rate_numerator=2,
+        rate_denominator=1,
+        rate_period=RatePeriod.MINUTE
+    ))
     assert result is True
 
 @pytest.mark.asyncio
 async def test_rate_limiter_has_room_nonempty(redis, rate_limiter):
     await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-1})
-    await redis.hset("queue-config:default", mapping={
+    default_queue = QueueConfig(
+        name="default",
         # 2 tasks per minute
-        b"rate_numerator": serialize(2),
-        b"rate_denominator": serialize(1),
-        b"rate_period": b"minute",
-    })
+        rate_numerator=2,
+        rate_denominator=1,
+        rate_period=RatePeriod.MINUTE
+    )
 
     with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue("default")
+        result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is True
 
 @pytest.mark.asyncio
 async def test_rate_limiter_has_room_older_jobs(redis, rate_limiter):
     await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-60})
     await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp()-61})
-    await redis.hset("queue-config:default", mapping={
+    default_queue = QueueConfig(
+        name="default",
         # 2 tasks per minute
-        b"rate_numerator": serialize(2),
-        b"rate_denominator": serialize(1),
-        b"rate_period": b"minute",
-    })
+        rate_numerator=2,
+        rate_denominator=1,
+        rate_period=RatePeriod.MINUTE
+    )
 
     with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue("default")
+        result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is True
 
 @pytest.mark.asyncio
 async def test_rate_limiter_no_room(redis, rate_limiter):
     await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-1})
     await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp()-2})
-    await redis.hset("queue-config:default", mapping={
+    default_queue = QueueConfig(
+        name="default",
         # 2 tasks per minute
-        b"rate_numerator": serialize(2),
-        b"rate_denominator": serialize(1),
-        b"rate_period": b"minute",
-    })
+        rate_numerator=2,
+        rate_denominator=1,
+        rate_period=RatePeriod.MINUTE
+    )
 
     with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue("default")
+        result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is False
 
 @pytest.mark.asyncio
@@ -418,14 +431,14 @@ async def test_clean_min_and_max_queue_age(redis, state_manager):
 # Tests for StateManager.get_queue_limits
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_empty_set(state_manager):
+async def test_get_queue_limits_empty_set(queue_config_adapter):
     """Test get_queue_limits with an empty set of queues."""
-    result = await state_manager.get_queue_limits(set())
+    result = await queue_config_adapter.get_queue_limits(set())
     assert result == {}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_single_queue_with_limit(redis, state_manager):
+async def test_get_queue_limits_single_queue_with_limit(redis, queue_config_adapter):
     """Test get_queue_limits with a single queue that has max_concurrent set."""
     # Set up queue config in Redis
     await redis.hset("queue-config:test_queue", mapping={
@@ -435,12 +448,12 @@ async def test_get_queue_limits_single_queue_with_limit(redis, state_manager):
         "rate_period": ""
     })
 
-    result = await state_manager.get_queue_limits({"test_queue"})
+    result = await queue_config_adapter.get_queue_limits({"test_queue"})
     assert result == {"test_queue": 5}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_single_queue_no_limit(redis, state_manager):
+async def test_get_queue_limits_single_queue_no_limit(redis, queue_config_adapter):
     """Test get_queue_limits with a queue that has no max_concurrent limit."""
     # Set up queue config in Redis with no max_concurrent (defaults to 10)
     await redis.hset("queue-config:unlimited_queue", mapping={
@@ -449,12 +462,12 @@ async def test_get_queue_limits_single_queue_no_limit(redis, state_manager):
         "rate_period": ""
     })
 
-    result = await state_manager.get_queue_limits({"unlimited_queue"})
+    result = await queue_config_adapter.get_queue_limits({"unlimited_queue"})
     assert result == {"unlimited_queue": 10}  # Default value
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_single_queue_zero_limit(redis, state_manager):
+async def test_get_queue_limits_single_queue_zero_limit(redis, queue_config_adapter):
     """Test get_queue_limits with a queue that has max_concurrent set to 0."""
     # Set up queue config in Redis
     await redis.hset("queue-config:zero_limit_queue", mapping={
@@ -464,12 +477,12 @@ async def test_get_queue_limits_single_queue_zero_limit(redis, state_manager):
         "rate_period": ""
     })
 
-    result = await state_manager.get_queue_limits({"zero_limit_queue"})
+    result = await queue_config_adapter.get_queue_limits({"zero_limit_queue"})
     assert result == {"zero_limit_queue": 0}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_multiple_queues(redis, state_manager):
+async def test_get_queue_limits_multiple_queues(redis, queue_config_adapter):
     """Test get_queue_limits with multiple queues having different limits."""
     # Set up multiple queue configs in Redis
     await redis.hset("queue-config:queue1", mapping={
@@ -493,21 +506,21 @@ async def test_get_queue_limits_multiple_queues(redis, state_manager):
         "rate_period": ""
     })
 
-    result = await state_manager.get_queue_limits({"queue1", "queue2", "queue3"})
+    result = await queue_config_adapter.get_queue_limits({"queue1", "queue2", "queue3"})
     expected = {"queue1": 3, "queue2": 10, "queue3": 1}
     assert result == expected
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_with_nonexistent_queue(state_manager):
+async def test_get_queue_limits_with_nonexistent_queue(queue_config_adapter):
     """Test get_queue_limits with a queue that doesn't exist in Redis."""
     # Don't set up any queue config - this should still work with defaults
-    result = await state_manager.get_queue_limits({"nonexistent_queue"})
+    result = await queue_config_adapter.get_queue_limits({"nonexistent_queue"})
     assert result == {"nonexistent_queue": 10}  # Default max_concurrent
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_mixed_existing_and_nonexistent(redis, state_manager):
+async def test_get_queue_limits_mixed_existing_and_nonexistent(redis, queue_config_adapter):
     """Test get_queue_limits with a mix of existing and non-existing queues."""
     # Set up one queue config
     await redis.hset("queue-config:existing_queue", mapping={
@@ -517,13 +530,13 @@ async def test_get_queue_limits_mixed_existing_and_nonexistent(redis, state_mana
         "rate_period": ""
     })
 
-    result = await state_manager.get_queue_limits({"existing_queue", "nonexistent_queue"})
+    result = await queue_config_adapter.get_queue_limits({"existing_queue", "nonexistent_queue"})
     expected = {"existing_queue": 7, "nonexistent_queue": 10}
     assert result == expected
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_with_rate_limiting_config(redis, state_manager):
+async def test_get_queue_limits_with_rate_limiting_config(redis, queue_config_adapter):
     """Test get_queue_limits with queues that have rate limiting configured (should still return max_concurrent)."""
     # Set up queue config with rate limiting
     await redis.hset("queue-config:rate_limited_queue", mapping={
@@ -533,12 +546,12 @@ async def test_get_queue_limits_with_rate_limiting_config(redis, state_manager):
         "rate_period": "minute"
     })
 
-    result = await state_manager.get_queue_limits({"rate_limited_queue"})
+    result = await queue_config_adapter.get_queue_limits({"rate_limited_queue"})
     assert result == {"rate_limited_queue": 15}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_large_number_of_queues(redis, state_manager):
+async def test_get_queue_limits_large_number_of_queues(redis, queue_config_adapter):
     """Test get_queue_limits with a large number of queues to ensure it handles concurrency well."""
     queue_names = [f"queue_{i}" for i in range(20)]
 
@@ -551,7 +564,7 @@ async def test_get_queue_limits_large_number_of_queues(redis, state_manager):
             "rate_period": ""
         })
 
-    result = await state_manager.get_queue_limits(set(queue_names))
+    result = await queue_config_adapter.get_queue_limits(set(queue_names))
 
     # Verify all queues are present with correct limits
     assert len(result) == 20

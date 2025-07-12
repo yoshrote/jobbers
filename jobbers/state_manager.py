@@ -177,7 +177,7 @@ class StateManager:
         self.data_store = data_store
         self.qca = QueueConfigAdapter(data_store)
         self.ta = TaskAdapter(data_store)
-        self.submission_limiter = SubmissionRateLimiter(self)
+        self.submission_limiter = SubmissionRateLimiter(self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
 
     @property
@@ -223,36 +223,13 @@ class StateManager:
 
     # Proxy methods
 
-    async def get_queues(self, role: str) -> set[str]:
-        return await self.qca.get_queues(role=role)
-
-    async def set_queues(self, role: str, queues: set[str]) -> None:
-        return await self.qca.set_queues(role=role, queues=queues)
-
-    async def get_all_queues(self) -> list[str]:
-        return await self.qca.get_all_queues()
-
-    async def get_all_roles(self) -> list[str]:
-        return await self.qca.get_all_roles()
-
-    async def get_queue_config(self, queue: str) -> QueueConfig:
-        return await self.qca.get_queue_config(queue=queue)
-
-    async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
-        return await self.qca.get_queue_limits(queues=queues)
-
-    async def task_exists(self, task_id: ULID) -> bool:
-        return await self.ta.task_exists(task_id=task_id)
-
-    async def get_all_tasks(self) -> list[Task]:
-        return await self.ta.get_all_tasks()
-
-    async def get_task(self, task_id: ULID) -> Task | None:
-        return await self.ta.get_task(task_id=task_id)
-
     async def submit_task(self, task: Task) -> None:
+        config = await self.qca.get_queue_config(queue=task.queue)
+
         def extra_check(pipe: Pipeline) -> bool:
             # The submission linter will add operations to the pipe transaction
+            if not config:
+                return True  # No config means no rate limiting
             if self.submission_limiter.has_room_in_queue_queue(task.queue):
                 self.submission_limiter.add_task_to_queue(task, pipe=pipe)
                 return True
@@ -272,28 +249,24 @@ class SubmissionRateLimiter:
 
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
 
-    def __init__(self, state_manager: StateManager):
-        self.data_store = state_manager.data_store
-        self.sm = state_manager
+    def __init__(self, queue_config_adapter: QueueConfigAdapter):
+        self.data_store = queue_config_adapter.data_store
+        self.qca = queue_config_adapter
 
-    async def has_room_in_queue_queue(self, queue: str) -> bool:
+    async def has_room_in_queue_queue(self, queue: QueueConfig) -> bool:
         """Check if there is room in the queue for a task."""
-        config = await self.sm.get_queue_config(queue=queue)
-        if not config:
-            return True  # No config means no rate limiting
-
-        if config.rate_numerator and config.rate_denominator and config.rate_period:
+        if queue.rate_numerator and queue.rate_denominator and queue.rate_period:
             now = dt.datetime.now(dt.timezone.utc)
             # May be better as a lua script to include adding the task to the queue in the same transaction
-            earliest_time = now - dt.timedelta(seconds=config.period_in_seconds() or 0)
+            earliest_time = now - dt.timedelta(seconds=queue.period_in_seconds() or 0)
             # Count the number of tasks in the queue that are older than the earliest time
             task_count = await self.data_store.zcount(
-                self.QUEUE_RATE_LIMITER(queue=queue),
+                self.QUEUE_RATE_LIMITER(queue=queue.name),
                 min=earliest_time.timestamp(),
                 max=now.timestamp(),
             )
 
-            if task_count >= config.rate_numerator:
+            if task_count >= queue.rate_numerator:
                 return False
 
         return True
@@ -313,7 +286,7 @@ class SubmissionRateLimiter:
         queues_to_use = set()
         # TODO: Consider ways to check each queue in a single transaction or in parallel
         for queue in task_queues:
-            config = await self.sm.get_queue_config(queue=queue)
+            config = await self.qca.get_queue_config(queue=queue)
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
                     queues_to_use.add(queue)
