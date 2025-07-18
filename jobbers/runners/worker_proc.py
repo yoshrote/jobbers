@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 
 from jobbers.state_manager import StateManager, build_sm
 from jobbers.task_generator import TaskGenerator
@@ -28,12 +29,20 @@ async def main() -> None:
     num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
     state_manager: StateManager = build_sm()
     task_generator = build_task_generator(state_manager)
+    task_processor = TaskProcessor(state_manager)
 
     async def worker_factory(tg: TaskGenerator) -> None:
         async for task in tg:
-            await TaskProcessor(state_manager).process(task)
+            await task_processor.process(task)
 
     async with asyncio.TaskGroup() as group:
+        def graceful_shutdown(signum, frame) -> None:
+            task_generator.stop()
+            task_processor.stop()
+
+        # Attempt an orderly shutdown generally
+        signal.signal(signal.SIGTERM, graceful_shutdown)
+
         for _ in range(num_concurrent):
             group.create_task(worker_factory(task_generator))
 

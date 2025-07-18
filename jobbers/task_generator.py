@@ -93,6 +93,7 @@ class TaskGenerator:
         self.max_task_check = MaxTaskCounter(max_tasks)
         self.task_queues: set[str] = set()
         self.refresh_tag: ULID | None = None
+        self._run: bool = True
 
     async def find_queues(self) -> set[str]:
         """Find all queues we should listen to via Redis."""
@@ -131,10 +132,15 @@ class TaskGenerator:
             logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
         return await self.filter_by_worker_queue_capacity(self.task_queues)
 
+    def stop(self):
+        self._run = False
+
     def __aiter__(self) -> AsyncIterator[Task]:
         return self
 
     async def __anext__(self) -> Task:
+        if not self._run:
+            raise StopAsyncIteration
         with self.max_task_check:
             task_queues = await self.queues()
             task = await self.state_manager.get_next_task(task_queues)

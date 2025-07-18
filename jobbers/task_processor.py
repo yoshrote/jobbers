@@ -16,6 +16,10 @@ class TaskProcessor:
     def __init__(self, state_manager: StateManager):
         self.state_manager = state_manager
 
+    def stop() -> None:
+        # TODO
+        pass
+
     async def process(self, task: Task) -> Task:
         """Process the task and return the result."""
         logger.debug("Task %s details: %s", task.id, task)
