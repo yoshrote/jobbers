@@ -1,13 +1,14 @@
 import logging
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.params import Query
 from opentelemetry import metrics
 from ulid import ULID
 
 from jobbers import db
 from jobbers.models import Task
-from jobbers.state_manager import QueueConfigAdapter, TaskAdapter, TaskException
+from jobbers.state_manager import QueueConfigAdapter, TaskAdapter, TaskException, TaskPagination
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -44,10 +45,10 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     raise HTTPException(status_code=404, detail="Task not found")
 
 @app.get("/task-list")
-async def get_task_list() -> dict[str, Any]:
+async def get_task_list(filter_query: Annotated[TaskPagination, Query()]) -> dict[str, Any]:
     """Retrieve the list of all tasks."""
     logger.info("Getting all tasks")
-    tasks = await TaskAdapter(db.get_client()).get_all_tasks()
+    tasks = await TaskAdapter(db.get_client()).get_all_tasks(filter_query)
     return {"tasks": tasks}
 
 @app.get("/queues/{role}")

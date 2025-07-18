@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, cast
 
+from pydantic import BaseModel, Field
 from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
@@ -89,6 +90,18 @@ class QueueConfigAdapter:
             if conf is not None
         }
 
+# TODO: test pagination
+class TaskPagination(BaseModel):
+    "Pagination details."
+
+    limit: int = Field(100, gt=0, le=100)
+    start: ULID | None
+
+    def start_param(self) -> int:
+        if not self.start:
+            return 0
+        return self.start.datetime.timestamp()
+
 class TaskAdapter:
     """
     Manages how tasks can be added, pulled, or queried from a Redis data store.
@@ -129,8 +142,12 @@ class TaskAdapter:
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
         return does_exists == 1
 
-    async def get_all_tasks(self) -> list[Task]:
-        task_ids = await self.data_store.zrange(self.TASKS_BY_QUEUE(queue="default"), 0, -1)
+    async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
+        task_ids = await self.data_store.zrangebyscore(
+            self.TASKS_BY_QUEUE(queue="default"),
+            pagination.start_param(), -1,
+            num=pagination.limit
+        )
         if not task_ids:
             return []
         results: list[Task] = []
