@@ -54,9 +54,12 @@ A tool that could do this would run at some cadence to monitor for tasks in a re
 
 ## Planned features
 
+- Validate the APIs against registered tasks and queues?
+- Wrap task functions can be called via `foo.delay()` like Celery does to submit jobs
+- Authentication for the API
 - Worker crash recovery
   - on shutdown (SIGTERM, SIGQUIT)
-    - best effort to finish current tasks or update their state to know they died, otherwise more clever recovery code will be needed.
+    - best effort to finish current tasks, re-enqueue, or update their state to know they died.
 - task state
   - DAG
     - maps what to do (python function)

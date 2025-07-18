@@ -38,14 +38,20 @@ async def main() -> None:
             group.create_task(worker_factory(task_generator))
 
 def run() -> None:
+    import importlib
     import sys
 
     from jobbers.utils.otel import enable_otel
+
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-worker")
     logging.basicConfig(level=logging.INFO, handlers=handlers)
     logging.getLogger("jobbers").setLevel(logging.DEBUG)
+
+    # register tasks
+    task_module = sys.argv[1]
+    importlib.import_module(task_module)
 
     logger = logging.getLogger(__name__)
     try:

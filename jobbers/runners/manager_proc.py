@@ -1,4 +1,5 @@
 # Run the server using uvicorn
+import importlib
 import logging
 import sys
 
@@ -21,8 +22,13 @@ def run() -> None:
     logging.basicConfig(level=logging.INFO, handlers=handlers)
     logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
+
     # Initialize the database client
     db.get_client()
+
+    # register tasks so we can validate submitted task signatures
+    task_module = sys.argv[1]
+    importlib.import_module(task_module)
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
