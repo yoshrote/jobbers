@@ -3,6 +3,7 @@ import datetime as dt
 from ulid import ULID
 
 from jobbers.models.task import Task, TaskStatus
+from jobbers.models.task_config import TaskConfig
 from jobbers.utils.serialization import EMPTY_DICT, NONE
 
 
@@ -31,6 +32,41 @@ def test_task_serialization_and_deserialization():
 
     # Assert that the original task and deserialized task are equal
     assert task == deserialized_task
+
+def test_valid_params():
+    task_id = ULID()
+    task = Task(
+        id=task_id,
+        name="Test Task",
+        version=1,
+        parameters={},
+        results={},
+        error=None,
+        status=TaskStatus.UNSUBMITTED,
+        submitted_at=None,
+        started_at=None,
+        heartbeat_at=None,
+        completed_at=None,
+    )
+
+    def task_function(foo: str, bar: int|None=5):
+        pass
+
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        max_retries=3,
+    )
+    task.parameters = {"foo": "spam", "bar": 5}
+    assert task.valid_task_params(task_config)
+
+    task.parameters = {"foo": "spam", "bar": None}
+    assert task.valid_task_params(task_config)
+
+    task.parameters = {"foo": "spam", "bar": "baz"}
+    assert not task.valid_task_params(task_config)
 
 
 def test_task_serialization_with_none_values():

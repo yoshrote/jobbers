@@ -12,6 +12,7 @@ from ulid import ULID
 
 from jobbers.models import Task, TaskStatus
 from jobbers.models.queue_config import QueueConfig
+from jobbers.registry import get_task_config
 
 logger = logging.getLogger(__name__)
 
@@ -224,11 +225,15 @@ class StateManager:
     # Proxy methods
 
     async def submit_task(self, task: Task) -> None:
-        config = await self.qca.get_queue_config(queue=task.queue)
+        task_config = get_task_config(task.name, task.version)
+        if not task.valid_task_params(task_config):
+            raise Exception(f"Invalid parameters for task {task.name} v{task.version}")
+
+        queue_config = await self.qca.get_queue_config(queue=task.queue)
 
         def extra_check(pipe: Pipeline) -> bool:
             # The submission linter will add operations to the pipe transaction
-            if not config:
+            if not queue_config:
                 return True  # No config means no rate limiting
             if self.submission_limiter.has_room_in_queue_queue(task.queue):
                 self.submission_limiter.add_task_to_queue(task, pipe=pipe)

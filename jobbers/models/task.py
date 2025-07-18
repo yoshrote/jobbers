@@ -1,4 +1,5 @@
 import datetime as dt
+import inspect
 from typing import Any, Self
 
 from pydantic import BaseModel, Field
@@ -33,6 +34,13 @@ class Task(BaseModel):
     started_at: dt.datetime | None = None
     heartbeat_at: dt.datetime | None = None
     completed_at: dt.datetime | None = None
+
+    def valid_task_params(self, task_config: TaskConfig) -> bool:
+        signature = inspect.get_annotations(task_config.function)
+        for param, psig in signature.items():
+            if not isinstance(self.parameters[param], psig):
+                return False
+        return True
 
     def should_retry(self, task_config: TaskConfig) -> bool:
         return self.retry_attempt < task_config.max_retries
