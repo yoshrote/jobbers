@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 
 TIME_ZERO = dt.datetime.fromtimestamp(0, dt.timezone.utc)
 
+class TaskException(Exception):
+    "Top-level exception for stuff gone wrong."
+
+    pass
+
 class QueueConfigAdapter:
     """
     Manages queue configuration in a Redis data store.
@@ -227,7 +232,7 @@ class StateManager:
     async def submit_task(self, task: Task) -> None:
         task_config = get_task_config(task.name, task.version)
         if not task.valid_task_params(task_config):
-            raise Exception(f"Invalid parameters for task {task.name} v{task.version}")
+            raise TaskException(f"Invalid parameters for task {task.name} v{task.version}")
 
         queue_config = await self.qca.get_queue_config(queue=task.queue)
 

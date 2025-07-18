@@ -7,7 +7,7 @@ from ulid import ULID
 
 from jobbers import db
 from jobbers.models import Task
-from jobbers.state_manager import QueueConfigAdapter, TaskAdapter
+from jobbers.state_manager import QueueConfigAdapter, TaskAdapter, TaskException
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -24,7 +24,10 @@ async def read_root() -> dict[str, Any]:
 async def submit_task(task: Task) -> dict[str, Any]:
     """Handle task submission."""
     logger.info("Submitting a task")
-    await TaskAdapter(db.get_client()).submit_task(task)
+    try:
+        await TaskAdapter(db.get_client()).submit_task(task)
+    except TaskException:
+        raise HTTPException(status_code=400, detail="Invalid task parameters")
     return {
         "message": "Task submitted successfully",
         "task": task.summarized(),
