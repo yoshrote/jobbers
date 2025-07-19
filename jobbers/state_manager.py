@@ -145,7 +145,8 @@ class TaskAdapter:
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         task_ids = await self.data_store.zrangebyscore(
             self.TASKS_BY_QUEUE(queue="default"),
-            pagination.start_param(), -1,
+            pagination.start_param(), '+inf',
+            start=pagination.start_param(),
             num=pagination.limit
         )
         if not task_ids:
@@ -217,6 +218,9 @@ class StateManager:
             # TODO: Do we need to clean this up before handle_success?
             # Need to consider interactions with callbacks of the task
             self.current_tasks_by_queue[task.queue].remove(task.id)
+
+    async def cancel_task(self, task: Task):
+        pass
 
     async def clean(self, rate_limit_age: dt.timedelta | None=None, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None) -> None:
         """Clean up the state manager."""

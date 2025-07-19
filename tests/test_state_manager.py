@@ -10,7 +10,7 @@ from ulid import ULID
 
 from jobbers.models import Task, TaskStatus
 from jobbers.models.queue_config import QueueConfig, RatePeriod
-from jobbers.state_manager import QueueConfigAdapter, StateManager, TaskAdapter
+from jobbers.state_manager import QueueConfigAdapter, StateManager, TaskAdapter, TaskPagination
 from jobbers.utils.serialization import EMPTY_DICT, serialize
 
 FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -114,7 +114,7 @@ async def test_get_all_tasks(redis, task_adapter):
     await redis.hset(f"task:{ULID1}", mapping={b"name": b"Task 1", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME})
     await redis.hset(f"task:{ULID2}", mapping={b"name": b"Task 2", b"status": b"completed", b"submitted_at": ISO_FROZEN_TIME})
     # Retrieve all tasks
-    tasks = await task_adapter.get_all_tasks()
+    tasks = await task_adapter.get_all_tasks(TaskPagination())
     assert len(tasks) == 2
     assert tasks == unordered([
         Task(id=ULID1, name="Task 1", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME),
@@ -124,7 +124,7 @@ async def test_get_all_tasks(redis, task_adapter):
 @pytest.mark.asyncio
 async def test_get_all_tasks_empty(task_adapter):
     """Test retrieving tasks when no tasks exist."""
-    tasks = await task_adapter.get_all_tasks()
+    tasks = await task_adapter.get_all_tasks(TaskPagination())
     assert tasks == []
 
 @pytest.mark.asyncio
