@@ -52,7 +52,7 @@ def test_valid_params():
     def task_function(foo: str, bar: int|None=5):
         pass
 
-    task_config = TaskConfig(
+    task.task_config = TaskConfig(
         name="test_task",
         version=1,
         function=task_function,
@@ -60,13 +60,13 @@ def test_valid_params():
         max_retries=3,
     )
     task.parameters = {"foo": "spam", "bar": 5}
-    assert task.valid_task_params(task_config)
+    assert task.valid_task_params()
 
     task.parameters = {"foo": "spam", "bar": None}
-    assert task.valid_task_params(task_config)
+    assert task.valid_task_params()
 
     task.parameters = {"foo": "spam", "bar": "baz"}
-    assert not task.valid_task_params(task_config)
+    assert not task.valid_task_params()
 
 
 def test_task_serialization_with_none_values():

@@ -94,8 +94,8 @@ class QueueConfigAdapter:
 class TaskPagination(BaseModel):
     "Pagination details."
 
-    limit: int = Field(100, gt=0, le=100)
-    start: ULID | None
+    limit: int = Field(default=10, gt=0, le=100)
+    start: ULID | None = Field(default=None)
 
     def start_param(self) -> int:
         if not self.start:
@@ -247,8 +247,9 @@ class StateManager:
     # Proxy methods
 
     async def submit_task(self, task: Task) -> None:
-        task_config = get_task_config(task.name, task.version)
-        if not task.valid_task_params(task_config):
+        task.task_config = get_task_config(task.name, task.version)
+
+        if not task.valid_task_params():
             raise TaskException(f"Invalid parameters for task {task.name} v{task.version}")
 
         queue_config = await self.qca.get_queue_config(queue=task.queue)

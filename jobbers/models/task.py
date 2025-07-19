@@ -35,15 +35,23 @@ class Task(BaseModel):
     heartbeat_at: dt.datetime | None = None
     completed_at: dt.datetime | None = None
 
-    def valid_task_params(self, task_config: TaskConfig) -> bool:
-        signature = inspect.get_annotations(task_config.function)
+    task_config: TaskConfig | None = Field(default=None, exclude=True)
+
+    def valid_task_params(self) -> bool:
+        if not self.task_config:
+            # safer to fail here than chance something funky downstream
+            return False
+        signature = inspect.get_annotations(self.task_config.function)
         for param, psig in signature.items():
             if not isinstance(self.parameters[param], psig):
                 return False
         return True
 
-    def should_retry(self, task_config: TaskConfig) -> bool:
-        return self.retry_attempt < task_config.max_retries
+    def should_retry(self) -> bool:
+        if not self.task_config:
+            # safer to fail here than chance something funky downstream
+            return False
+        return self.retry_attempt < self.task_config.max_retries
 
     def has_callbacks(self) -> bool:
         return False

@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -15,7 +15,7 @@ class TaskConfig(BaseModel):
     retry_delay: int | None = Field(default=None)  # Delay before retrying the task in seconds
 
     # The actual function to execute for this task, used internally by the worker
-    function: Callable[..., Any] = Field(exclude=True)
+    function: Callable[..., Awaitable[Any]] = Field(exclude=True)
 
     # The tuple of expected exceptions that can be handled by the task processor
     expected_exceptions: tuple[type[Exception]] | None = Field(default=None)
