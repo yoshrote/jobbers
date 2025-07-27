@@ -152,6 +152,7 @@ class TaskAdapter:
         if not task_ids:
             return []
         results: list[Task] = []
+        # TODO: do some batching in case there are tons of tasks
         async with TaskGroup() as group:
             for task_id in task_ids:
                 group.create_task(self._add_task_to_results(ULID(task_id), results))
@@ -186,6 +187,8 @@ class TaskAdapter:
             earliest_time = min_queue_age or TIME_ZERO
             latest_time = max_queue_age or now
             for queue in queues:
+                # TODO: Batch X queues together per pipeline. Just can't let X be so big that
+                # the pipeline grows too large.
                 pipe = self.data_store.pipeline(transaction=True)
                 if earliest_time <= latest_time:
                     pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=earliest_time.timestamp(), max=latest_time.timestamp())

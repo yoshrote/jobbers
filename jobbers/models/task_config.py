@@ -3,6 +3,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+
 
 class TaskConfig(BaseModel):
     """Configuration for a task."""
@@ -13,6 +15,7 @@ class TaskConfig(BaseModel):
     timeout: int | None = Field(default=None)  # Timeout for the task in seconds, if applicable
     max_retries: int = Field(default=3)  # Maximum number of retries for the task
     retry_delay: int | None = Field(default=None)  # Delay before retrying the task in seconds
+    on_shutdown: TaskShutdownPolicy = Field(default=TaskShutdownPolicy.STOP)
 
     # The actual function to execute for this task, used internally by the worker
     function: Callable[..., Awaitable[Any]] = Field(exclude=True)

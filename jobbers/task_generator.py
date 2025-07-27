@@ -143,7 +143,10 @@ class TaskGenerator:
             raise StopAsyncIteration
         with self.max_task_check:
             task_queues = await self.queues()
+            # try:
             task = await self.state_manager.get_next_task(task_queues)
+            # except asyncio.CancelledError:
+            #    # put task back on queue
         if not task:
             # TODO: We need to monitor how often the generator dies this way
             logger.warning("Strange stop")

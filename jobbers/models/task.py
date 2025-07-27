@@ -5,6 +5,7 @@ from typing import Any, Self
 from pydantic import BaseModel, Field
 from ulid import ULID
 
+from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.utils.serialization import (
     EMPTY_DICT,
     NONE,
@@ -46,6 +47,15 @@ class Task(BaseModel):
             if not isinstance(self.parameters[param], psig):
                 return False
         return True
+
+    def shutdown(self):
+        match self.task_config.on_shutdown:
+            # TODO: a task that is forced to continue would require wrapping it in shield()
+            case TaskShutdownPolicy.STOP:
+                self.status = TaskStatus.CANCELLED
+                self.completed_at = dt.datetime.now(dt.timezone.utc)
+            case TaskShutdownPolicy.RESUBMIT:
+                self.status = TaskStatus.UNSUBMITTED
 
     def should_retry(self) -> bool:
         if not self.task_config:

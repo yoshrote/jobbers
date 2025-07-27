@@ -4,7 +4,6 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from jobbers.models.task import Task
-from jobbers.models.task_config import TaskConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import get_task_config
 from jobbers.state_manager import StateManager
@@ -20,10 +19,6 @@ class TaskProcessor:
     def __init__(self, state_manager: StateManager):
         self.state_manager = state_manager
         self._current_promise: Awaitable[Any] | None = None
-
-    def stop() -> None:
-        # TODO
-        pass
 
     async def process(self, task: Task) -> Task:
         """Process the task and return the result."""
@@ -74,9 +69,8 @@ class TaskProcessor:
 
         # TODO: configure max concurrent callbacks
         # Monitor for when fan-out becomes problematic
-        # callback_pool = TaskPool()
         # callback_pool.map(self.state_manager.submit_task, task.generate_callbacks(), num_concurrent=5)
-        # await callback_pool.gather_and_close()
+
 
     def handle_dropped_task(self, task: Task) -> None:
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
@@ -85,8 +79,7 @@ class TaskProcessor:
 
     def handle_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled.", task.id)
-        task.status = TaskStatus.CANCELLED
-        task.completed_at = dt.datetime.now(dt.timezone.utc)
+        task.shutdown()
 
     def handle_unexpected_exception(self, task: Task, exc: Exception) -> None:
         logger.exception("Exception occurred while processing task %s: %s", task.id, exc)
