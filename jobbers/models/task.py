@@ -50,7 +50,11 @@ class Task(BaseModel):
 
     def shutdown(self):
         match self.task_config.on_shutdown:
-            # TODO: a task that is forced to continue would require wrapping it in shield()
+            case TaskShutdownPolicy.CONTINUE:
+                # NOOP: The execution of the task function needs to be wrapped 
+                # in `shield()` already.
+                # TODO: maybe warn or panic since this should be unreachable
+                pass
             case TaskShutdownPolicy.STOP:
                 self.status = TaskStatus.CANCELLED
                 self.completed_at = dt.datetime.now(dt.timezone.utc)

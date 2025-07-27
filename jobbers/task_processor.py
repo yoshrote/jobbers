@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from jobbers.models.task import Task
+from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import get_task_config
 from jobbers.state_manager import StateManager
@@ -34,6 +35,8 @@ class TaskProcessor:
                 with self.state_manager.task_in_registry(task):
                     async with asyncio.timeout(task.task_config.timeout):
                         self._current_promise = task.task_config.function(**task.parameters)
+                        if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
+                            self._current_promise = asyncio.shield(self._current_promise)
                         task.results = await self._current_promise
             except asyncio.TimeoutError:
                 self.handle_timeout_exception(task)

@@ -5,6 +5,7 @@ from typing import Self
 class TaskShutdownPolicy(StrEnum):
     """Possible ways to handle tasks when the worker is being shut down."""
 
+    CONTINUE = "continue"
     STOP = "stop"
     RESUBMIT = "resubmit"
 
