@@ -33,10 +33,10 @@ class TaskProcessor:
             try:
                 task = await self.mark_task_as_started(task)
                 with self.state_manager.task_in_registry(task):
+                    self._current_promise = task.task_config.function(**task.parameters)
+                    if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
+                        self._current_promise = asyncio.shield(self._current_promise)
                     async with asyncio.timeout(task.task_config.timeout):
-                        self._current_promise = task.task_config.function(**task.parameters)
-                        if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
-                            self._current_promise = asyncio.shield(self._current_promise)
                         task.results = await self._current_promise
             except asyncio.TimeoutError:
                 self.handle_timeout_exception(task)
