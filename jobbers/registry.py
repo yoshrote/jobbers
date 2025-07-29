@@ -49,4 +49,4 @@ def get_task_config(name: str, version: int) -> TaskConfig | None:
     return _task_function_map.get((name, version))
 
 def get_tasks() -> Iterator[tuple[str, int]]:
-    return _task_function_map.keys()
+    return iter(_task_function_map.keys())

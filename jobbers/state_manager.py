@@ -100,7 +100,7 @@ class TaskPagination(BaseModel):
     def start_param(self) -> int:
         if not self.start:
             return 0
-        return self.start.datetime.timestamp()
+        return int(self.start.datetime.timestamp())
 
 class TaskAdapter:
     """
@@ -222,9 +222,6 @@ class StateManager:
             # Need to consider interactions with callbacks of the task
             self.current_tasks_by_queue[task.queue].remove(task.id)
 
-    async def cancel_task(self, task: Task):
-        pass
-
     async def clean(self, rate_limit_age: dt.timedelta | None=None, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.timezone.utc)
@@ -265,7 +262,7 @@ class StateManager:
             # The submission linter will add operations to the pipe transaction
             if not queue_config:
                 return True  # No config means no rate limiting
-            if self.submission_limiter.has_room_in_queue_queue(task.queue):
+            if self.submission_limiter.has_room_in_queue_queue(queue_config):
                 self.submission_limiter.add_task_to_queue(task, pipe=pipe)
                 return True
             return False
@@ -306,9 +303,9 @@ class SubmissionRateLimiter:
 
         return True
 
-    def add_task_to_queue(self, task: Task, pipe: Pipeline | None=None) -> Redis | Pipeline:
+    def add_task_to_queue(self, task: Task, pipe: Pipeline | None=None) -> Pipeline:
         """Add a task to the queue."""
-        pipe = pipe or self.data_store
+        pipe = pipe or self.data_store.pipeline()
 
         # Add the task to the rate limiter for the queue
         if task.submitted_at:

@@ -48,7 +48,9 @@ class Task(BaseModel):
                 return False
         return True
 
-    def shutdown(self):
+    def shutdown(self) -> None:
+        if self.task_config is None:
+            return
         match self.task_config.on_shutdown:
             case TaskShutdownPolicy.CONTINUE:
                 # NOOP: The execution of the task function needs to be wrapped

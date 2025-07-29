@@ -134,7 +134,7 @@ class TaskGenerator:
             logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
         return await self.filter_by_worker_queue_capacity(self.task_queues)
 
-    def stop(self):
+    def stop(self) -> None:
         self._run = False
 
     def __aiter__(self) -> AsyncIterator[Task]:

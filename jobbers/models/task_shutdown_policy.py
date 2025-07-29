@@ -1,5 +1,4 @@
 from enum import StrEnum
-from typing import Self
 
 
 class TaskShutdownPolicy(StrEnum):
@@ -10,7 +9,7 @@ class TaskShutdownPolicy(StrEnum):
     RESUBMIT = "resubmit"
 
     @classmethod
-    def from_bytes(cls, raw_status: bytes | None) -> Self:
+    def from_bytes(cls, raw_status: bytes | None) -> "TaskShutdownPolicy":
         if not raw_status:
             return cls.STOP
         return cls(raw_status.decode())

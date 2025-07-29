@@ -27,12 +27,14 @@ class TaskProcessor:
         task.task_config = get_task_config(task.name, task.version)
         ex: BaseException | None = None
 
-        if not task.task_config:
+        if task.task_config is None:
             self.handle_dropped_task(task)
         else:
             try:
                 task = await self.mark_task_as_started(task)
                 with self.state_manager.task_in_registry(task):
+                    # the assert is to make mypy play nice.
+                    assert task.task_config  # noqa: S101
                     self._current_promise = task.task_config.function(**task.parameters)
                     if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                         self._current_promise = asyncio.shield(self._current_promise)
@@ -44,7 +46,7 @@ class TaskProcessor:
                 ex = exc
                 self.handle_cancelled_task(task)
             except Exception as exc:
-                if task.task_config.expected_exceptions and isinstance(exc, task.task_config.expected_exceptions):
+                if task.task_config and task.task_config.expected_exceptions and isinstance(exc, task.task_config.expected_exceptions):
                     self.handle_expected_exception(task, exc)
                 else:
                     self.handle_unexpected_exception(task, exc)
@@ -102,8 +104,12 @@ class TaskProcessor:
             task.completed_at = dt.datetime.now(dt.timezone.utc)
 
     def handle_timeout_exception(self, task: Task) -> None:
-        timeout = task.task_config.timeout
-        logger.warning("Task %s timed out after %d seconds.", task.id, timeout)
+        timeout: int | None
+        if task.task_config is None:
+            timeout = None
+        else:
+            timeout = task.task_config.timeout
+        logger.warning("Task %s timed out after %s seconds.", task.id, timeout)
         task.error = f"Task {task.id} timed out after {timeout} seconds"
         if task.should_retry():
             # Task status will change to submitted when re-enqueued
