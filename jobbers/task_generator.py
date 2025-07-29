@@ -108,9 +108,11 @@ class TaskGenerator:
 
         active_tasks = self.state_manager.active_tasks_per_queue
         queue_worker_limits = await self.query_config_adapter.get_queue_limits(queues)
+        logger.debug("Queues: %s; Active: %s; Limits: %s", queues, active_tasks, queue_worker_limits)
+        # TODO: write tests to make sure this filters correctly
         return {
             q for q in queues
-            if not queue_worker_limits.get(q, 0) or active_tasks.get(q, 0) > (queue_worker_limits.get(q) or 0)
+            if not queue_worker_limits.get(q, 0) or active_tasks.get(q, 0) < (queue_worker_limits.get(q) or 0)
         }
 
     async def queues(self) -> set[str]:
@@ -143,6 +145,7 @@ class TaskGenerator:
             raise StopAsyncIteration
         with self.max_task_check:
             task_queues = await self.queues()
+            logger.debug("Checking queues %s", task_queues)
             # try:
             task = await self.state_manager.get_next_task(task_queues)
             # except asyncio.CancelledError:
