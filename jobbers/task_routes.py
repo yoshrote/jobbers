@@ -6,7 +6,7 @@ from fastapi.params import Query
 from opentelemetry import metrics
 from ulid import ULID
 
-from jobbers import db
+from jobbers import db, registry
 from jobbers.models import Task
 from jobbers.state_manager import QueueConfigAdapter, TaskAdapter, TaskException, TaskPagination
 
@@ -19,7 +19,10 @@ hit_counter = meter.create_up_down_counter("hit_counter")
 async def read_root() -> dict[str, Any]:
     """Serve the index page."""
     logger.info("Serving the index page")
-    return {"message": "Welcome to Task Manager!"}
+    return {
+        "message": "Welcome to Task Manager!",
+        "tasks": list(registry.get_tasks())
+    }
 
 @app.post("/submit-task")
 async def submit_task(task: Task) -> dict[str, Any]:

@@ -51,7 +51,7 @@ class Task(BaseModel):
     def shutdown(self):
         match self.task_config.on_shutdown:
             case TaskShutdownPolicy.CONTINUE:
-                # NOOP: The execution of the task function needs to be wrapped 
+                # NOOP: The execution of the task function needs to be wrapped
                 # in `shield()` already.
                 # TODO: maybe warn or panic since this should be unreachable
                 pass

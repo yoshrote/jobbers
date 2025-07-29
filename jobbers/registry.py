@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from jobbers.models import TaskConfig
@@ -47,3 +47,6 @@ def register_task(
 def get_task_config(name: str, version: int) -> TaskConfig | None:
     """Retrieve a task function given its name."""
     return _task_function_map.get((name, version))
+
+def get_tasks() -> Iterator[tuple[str, int]]:
+    return _task_function_map.keys()
