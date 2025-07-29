@@ -3,9 +3,6 @@ import logging
 import os
 import signal
 
-from asyncio_taskpool import TaskPool
-
-from jobbers.models.task import Task
 from jobbers.state_manager import StateManager, build_sm
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
@@ -31,12 +28,12 @@ def build_task_generator(state_manager: StateManager) -> TaskGenerator:
 async def main(state_manager: StateManager, task_generator: TaskGenerator) -> None:
     num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
 
-    async def worker_factory(task: Task) -> None:
-        await TaskProcessor(state_manager).process(task)
+    async def worker() -> None:
+        async for task in task_generator:
+            await TaskProcessor(state_manager).process(task)
 
-    pool = TaskPool()
-    pool.map(worker_factory, task_generator, num_concurrent=num_concurrent)
-    await pool.gather_and_close()
+    workers = [asyncio.create_task(worker()) for _ in range(num_concurrent)]
+    await asyncio.gather(*workers)
 
 def run() -> None:
     import importlib
@@ -59,11 +56,9 @@ def run() -> None:
     task_generator = build_task_generator(state_manager)
     main_coroutine = main(state_manager, task_generator)
 
-    def graceful_shutdown(signum, frame) -> None:
+    def graceful_shutdown(signum: int, frame: object) -> None:
         # turn off the faucet of tasks
         task_generator.stop()
-        # propagates CancelledError to workers in task group
-        main_coroutine.cancel()
 
     # Attempt an orderly shutdown generally
     signal.signal(signal.SIGTERM, graceful_shutdown)
