@@ -5,12 +5,14 @@ services:
       - ./otel-config.yaml:/etc/otelcol-contrib/config.yaml
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     ports:
-      - "4317:4317"
+      - "4317:4317" # OTLP gRPC endpoint
+      - "4318:4318" # OTLP HTTP endpoint
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
+      test: ["CMD", "curl", "-f", "http://collector:4318/"] # Example: Check OTLP HTTP endpoint
+      interval: 10s
       timeout: 5s
-      retries: 3      
+      retries: 5
+      start_period: 30s    
   redis:
     image: redis:latest
     ports:
@@ -23,7 +25,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-
   manager:
     build: .
     environment:
@@ -34,7 +35,7 @@ services:
       OTEL_LOGS_EXPORTER: "otlp"
       OTEL_PYTHON_LOG_CORRELATION: "true"
       REDIS_URL: "redis://redis:6379"
-    command: /usr/local/bin/jobbers_manager
+    command: /usr/local/bin/jobbers_manager end2end
     ports:
       - "8000:8000"
     volumes:
@@ -42,7 +43,12 @@ services:
     depends_on:
       - redis
       - collector
-
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://manager:8000/"] # Example: Check OTLP HTTP endpoint
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
   worker:
     build: .
     environment:
@@ -53,12 +59,11 @@ services:
       OTEL_LOGS_EXPORTER: "otlp"
       OTEL_PYTHON_LOG_CORRELATION: "true"
       REDIS_URL: "redis://redis:6379"
-    command: /usr/local/bin/jobbers_worker
+    command: /usr/local/bin/jobbers_worker end2end
     volumes:
       - .:/usr/src/app
     depends_on:
       - redis
       - collector
-
 volumes:
   redis_data:
