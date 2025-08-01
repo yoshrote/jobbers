@@ -40,11 +40,12 @@ class Task(BaseModel):
 
     def valid_task_params(self) -> bool:
         if not self.task_config:
-            # TODO: would safer to fail here than chance something funky downstream
-            return True
+            # Safer to fail here than chance something funky downstream
+            return False
         signature = inspect.get_annotations(self.task_config.function)
         for param, psig in signature.items():
-            if not isinstance(self.parameters[param], psig):
+            # Skip the return type annotation
+            if param != "return" and not isinstance(self.parameters[param], psig):
                 return False
         return True
 

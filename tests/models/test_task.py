@@ -49,7 +49,7 @@ def test_valid_params():
         completed_at=None,
     )
 
-    def task_function(foo: str, bar: int|None=5):
+    def task_function(foo: str, bar: int|None=5) -> None:
         pass
 
     task.task_config = TaskConfig(
