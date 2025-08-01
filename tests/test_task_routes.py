@@ -53,11 +53,11 @@ async def test_submit_valid_task(redis_db):
 
     This task may flake out if there is a worker listening to the queue
     """
-    async def task_function() -> None:
+    async def task_function(foo: int) -> None:
         pass
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
-    task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={})
+    task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=test_task_config):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -86,7 +86,7 @@ async def test_submit_invalid_task(redis_db):
     """Test the task submission fails when given bad input."""
     # jobber_registry.register_task("test_task", test_task_function, parameters=["foo"])
     # add a task config with a function that requires a parameter to the jobber registry
-    async def task_function() -> None:
+    async def task_function(foo: int) -> None:
         pass
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
