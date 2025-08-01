@@ -11,9 +11,9 @@ from pydantic import BaseModel, Field
 from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
+from jobbers import registry
 from jobbers.models import Task, TaskStatus
 from jobbers.models.queue_config import QueueConfig
-from jobbers.registry import get_task_config
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +251,12 @@ class StateManager:
     # Proxy methods
 
     async def submit_task(self, task: Task) -> None:
+        try:
+            task.task_config = registry.get_task_config(task.name, task.version)
+        except KeyError as ex:
+            logger.error("Task configuration not found for task %s version %d", task.name, task.version)
+            raise TaskException(f"Unregistered task {task.name} version {task.version}") from ex
+
         if not task.valid_task_params():
             raise TaskException(f"Invalid parameters for task {task.name} v{task.version}")
 

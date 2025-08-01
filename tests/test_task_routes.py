@@ -38,10 +38,15 @@ async def test_submit_valid_task(redis_db):
 
     This task may flake out if there is a worker listening to the queue
     """
+    async def task_function() -> None:
+        pass
+
+    test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={})
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))
+    with patch("jobbers.registry.get_task_config", return_value=test_task_config):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))
 
     response_data = response.json()
     assert response.status_code == 200
@@ -60,12 +65,23 @@ async def test_submit_valid_task(redis_db):
     # Check that it actually exists in redis
     assert simplify(task_data) == simplify(await TaskAdapter(redis_db).get_task(task_data.id))
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post("/submit-task", data=task_data.model_dump_json())
+@pytest.mark.asyncio
+# @pytest.mark.skip(reason="Need to add a registered task with a param to hit this error")
+async def test_submit_invalid_task(redis_db):
+    """Test the task submission fails when given bad input."""
+    # jobber_registry.register_task("test_task", test_task_function, parameters=["foo"])
+    # add a task config with a function that requires a parameter to the jobber registry
+    async def task_function() -> None:
+        pass
 
-        assert response.status_code == 200
-        assert response.json() == {"message": "Task submitted successfully", "task": summarized_data}
-        mock_task_adapter.submit_task.assert_called_once_with(task_data)
+    test_task_config = TaskConfig(name="Test Task", function=task_function)
+    task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": "bar"})
+    # try to submit a task without the required parameter
+    with patch("jobbers.registry.get_task_config", return_value=test_task_config):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))
+    # this should raise a validation error
+    assert response.status_code == 400
 
 @pytest.mark.asyncio
 async def test_get_task_status_found(redis_db):

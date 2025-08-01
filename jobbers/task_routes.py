@@ -31,7 +31,7 @@ async def submit_task(task: Task) -> dict[str, Any]:
     try:
         await StateManager(db.get_client()).submit_task(task)
     except TaskException as ex:
-        raise HTTPException(status_code=400, detail=f"Invalid task parameters: {ex}")
+        raise HTTPException(status_code=400, detail=f"Invalid task parameters: {ex}") from ex
     return {
         "message": "Task submitted successfully",
         "task": task.summarized(),
@@ -44,7 +44,7 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     task_uid: ULID = ULID.from_str(task_id)
     task = await TaskAdapter(db.get_client()).get_task(task_uid)
     if task:
-        return {"task_id": str(task.id), "status": task.status}
+        return task.summarized()
     raise HTTPException(status_code=404, detail="Task not found")
 
 @app.get("/task-list")
