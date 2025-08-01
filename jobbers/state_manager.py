@@ -251,8 +251,6 @@ class StateManager:
     # Proxy methods
 
     async def submit_task(self, task: Task) -> None:
-        task.task_config = get_task_config(task.name, task.version)
-
         if not task.valid_task_params():
             raise TaskException(f"Invalid parameters for task {task.name} v{task.version}")
 
