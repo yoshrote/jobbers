@@ -30,6 +30,21 @@ def patch_redis(redis_db):
      with patch("jobbers.task_routes.db.get_client", return_value=redis_db):
          yield
 
+@pytest.mark.asyncio
+async def test_main_page(redis_db):
+    """
+    Test the task submission and status endpoints.
+
+    This task may flake out if there is a worker listening to the queue
+    """
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/")
+
+    response_data = response.json()
+    assert response.status_code == 200
+    # check that the task details are the same as task_data other than status and submitted_at
+    assert response_data["message"] ==  "Welcome to Task Manager!"
+    assert response_data["tasks"] == []
 
 @pytest.mark.asyncio
 async def test_submit_valid_task(redis_db):
