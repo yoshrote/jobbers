@@ -3,6 +3,8 @@ import datetime as dt
 import logging
 from typing import TYPE_CHECKING, Any
 
+from opentelemetry import metrics
+
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
@@ -13,6 +15,10 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable
 
 logger = logging.getLogger(__name__)
+meter = metrics.get_meter(__name__)
+tasks_processed = meter.create_counter("tasks_processed", unit="1")
+execution_time = meter.create_histogram("task_execution_time", unit="s")
+end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="s")
 
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
@@ -55,6 +61,18 @@ class TaskProcessor:
 
         await self.state_manager.submit_task(task)
 
+        tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
+        if task.started_at and task.completed_at:
+            execution_time.record(
+                (task.completed_at - task.started_at).total_seconds(),
+                {"queue": task.queue, "task": task.name, "status": task.status}
+            )
+        if task.submitted_at and task.completed_at:
+            end_to_end_latency.record(
+                (task.completed_at - task.submitted_at).total_seconds(),
+                {"queue": task.queue, "task": task.name, "status": task.status}
+            )
+
         if task.status == TaskStatus.COMPLETED:
             await self.post_process(task)
         elif ex is not None:
@@ -89,6 +107,7 @@ class TaskProcessor:
     def handle_unexpected_exception(self, task: Task, exc: Exception) -> None:
         logger.exception("Exception occurred while processing task %s: %s", task.id, exc)
         task.status = TaskStatus.FAILED
+        task.completed_at = dt.datetime.now(dt.timezone.utc)
         task.error = str(exc)
 
     def handle_expected_exception(self, task: Task, exc: Exception) -> None:

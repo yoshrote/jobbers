@@ -3,6 +3,8 @@ import logging
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
+from opentelemetry import metrics
+
 from jobbers.models.task import Task
 from jobbers.state_manager import QueueConfigAdapter, StateManager
 
@@ -10,6 +12,9 @@ if TYPE_CHECKING:
     from ulid import ULID
 
 logger = logging.getLogger(__name__)
+meter = metrics.get_meter(__name__)
+time_in_queue = meter.create_histogram("time_in_queue", unit="s")
+tasks_selected = meter.create_counter("tasks_selected", unit="1")
 
 class LocalTTL:
     """
@@ -154,4 +159,17 @@ class TaskGenerator:
             # TODO: We need to monitor how often the generator dies this way
             logger.warning("Strange stop")
             raise StopAsyncIteration
+        metric_tags = {
+            "queue": task.queue,
+            "role": self.role,
+            "task": task.name,
+        }
+        if task.submitted_at is None: # This should never happen
+            logger.fatal("Task %s v%s id=%s is missing a submitted_at timestamp.", task.name, task.version, task.id)
+            raise RuntimeError("Pulled a task that was never submitted")
+        time_in_queue.record(
+            (dt.datetime.now(dt.timezone.utc) - task.submitted_at).total_seconds(),
+            metric_tags
+        )
+        tasks_selected.add(1, metric_tags)
         return task
