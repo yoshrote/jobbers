@@ -3,6 +3,34 @@
 A task/workflow framework similar to Celery/Airflow. The name is inspired by
 the many wrestlers who anonymously do the work to make the stars look good.
 
+OpenTelemetry Metrics
+aggregated by task and queue
+
+| metric | type | description |
+| ------ | ---- | ----------- |
+|  tasks_retried      | COUNT| number of retries |
+
+aggregated by task, queue, and status
+
+| metric | type | description |
+| ------ | ---- | ----------- |
+|  tasks_processed    | COUNT| number of tasks |
+|  execution_time     | HIST | time from task start to task finish |
+|  end_to_end_latency | HIST | time from enqueue to task finish |
+
+aggregated by task, queue, and role
+
+| metric | type | description |
+| ------ | ---- | ----------- |
+|  time_in_queue   |HIST  | time from enqueue to task start |
+|  tasks_selected  |COUNT | number of tasks |
+
+Useful Insights via OTEL
+time_in_queue
+
+- judge if more or less workers should be deployed
+- judge if tasks may be merged into a single queue or should be separated for scaling
+
 ## How it works
 
 Jobbers is split into two applications and a cleanup utility.
@@ -47,6 +75,9 @@ A tool that could do this would run at some cadence to monitor for tasks in a re
   - capacity limits per worker per queue (TBD config)
 - Basic retry policy (re-enqueue, but no backoff yet)
 - The state of the queues and the last known state of tasks are stored for diagnostic and recovery purposes.
+- Worker crash recovery
+  - on SIGTERM, a worker will handle currently running tasks according to their shutdown policy
+  - policies: finish, re-enqueue, or fail.
 
 ## Other niceties
 
@@ -54,20 +85,7 @@ A tool that could do this would run at some cadence to monitor for tasks in a re
 
 ## Planned features
 
-- Validate the APIs against registered tasks and queues?
-- Wrap task functions can be called via `foo.delay()` like Celery does to submit jobs
-- Authentication for the API
-- Worker crash recovery
-  - on shutdown (SIGTERM, SIGQUIT)
-    - best effort to finish current tasks, re-enqueue, or update their state to know they died.
-- task state
-  - DAG
-    - maps what to do (python function)
-    - distribution strategy for 1 parent:N child tasks
-      - round-robin, hash by key, etc
-    - decide whether to inline multiple tasks in the same worker for 1:1 tasks or throw subtasks on the queue
-  - current location within DAG (and summary/audit of where it's been)
-  - temp result location (in memory, local/remote file, etc)
+- system/smoke tests
 - Long-running tasks can issue a heartbeat so that a user can differentiate between
 a slow task and a frozen task
 - on task read
@@ -79,7 +97,16 @@ a slow task and a frozen task
      - depending on the expected duration of the task. a slow task would want a record, but a fast task may not
      - TODO: more high contention on updating any shared heartbeat
   4. pass along the work to the next node in the DAG
+- Validate the APIs against registered queues to avoid garbage input
 - implement task search and retry tools for debugging and recovery (generalize work from StateManager.clean)
+- Wrap task functions can be called via `foo.delay()` like Celery does to submit jobs
+- Authentication for the API
+- task DAG
+  - maps what to do (python function)
+  - distribution strategy for 1 parent:N child tasks
+    - round-robin, hash by key, etc
+  - decide whether to inline multiple tasks in the same worker for 1:1 tasks or throw subtasks on the queue
+  - current location within DAG (and summary/audit of where it's been)
 
 Tech stack
 

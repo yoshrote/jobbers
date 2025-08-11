@@ -17,8 +17,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 tasks_processed = meter.create_counter("tasks_processed", unit="1")
-execution_time = meter.create_histogram("task_execution_time", unit="s")
-end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="s")
+tasks_retried = meter.create_counter("tasks_retried", unit="1")
+execution_time = meter.create_histogram("task_execution_time", unit="ms")
+end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms")
 
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
@@ -62,14 +63,16 @@ class TaskProcessor:
         await self.state_manager.submit_task(task)
 
         tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
+        if task.status != TaskStatus.UNSUBMITTED:
+            tasks_retried.add(task.retry_attempt, {"queue": task.queue, "task": task.name})
         if task.started_at and task.completed_at:
             execution_time.record(
-                (task.completed_at - task.started_at).total_seconds(),
+                (task.completed_at - task.started_at).total_seconds() * 1000,
                 {"queue": task.queue, "task": task.name, "status": task.status}
             )
         if task.submitted_at and task.completed_at:
             end_to_end_latency.record(
-                (task.completed_at - task.submitted_at).total_seconds(),
+                (task.completed_at - task.submitted_at).total_seconds() * 1000,
                 {"queue": task.queue, "task": task.name, "status": task.status}
             )
 

@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
-time_in_queue = meter.create_histogram("time_in_queue", unit="s")
+time_in_queue = meter.create_histogram("time_in_queue", unit="ms")
 tasks_selected = meter.create_counter("tasks_selected", unit="1")
 
 class LocalTTL:
@@ -168,7 +168,7 @@ class TaskGenerator:
             logger.fatal("Task %s v%s id=%s is missing a submitted_at timestamp.", task.name, task.version, task.id)
             raise RuntimeError("Pulled a task that was never submitted")
         time_in_queue.record(
-            (dt.datetime.now(dt.timezone.utc) - task.submitted_at).total_seconds(),
+            (dt.datetime.now(dt.timezone.utc) - task.submitted_at).total_seconds() * 1000,
             metric_tags
         )
         tasks_selected.add(1, metric_tags)
