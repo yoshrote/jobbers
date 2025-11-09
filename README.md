@@ -3,7 +3,8 @@
 A task/workflow framework similar to Celery/Airflow. The name is inspired by
 the many wrestlers who anonymously do the work to make the stars look good.
 
-OpenTelemetry Metrics
+## OpenTelemetry Metrics
+
 aggregated by task and queue
 
 | metric | type | description |
@@ -25,11 +26,34 @@ aggregated by task, queue, and role
 |  time_in_queue   |HIST  | time from enqueue to task start |
 |  tasks_selected  |COUNT | number of tasks |
 
-Useful Insights via OTEL
-time_in_queue
+### Useful Insights via OTEL
+
+`time_in_queue`
 
 - judge if more or less workers should be deployed
 - judge if tasks may be merged into a single queue or should be separated for scaling
+
+`tasks_processed[status=dropped]`
+
+- workers are losing or dropping tasks. possibly an old worker receiving new tasks or a bad client sending garbage.
+
+### Common Operational Questions/Issues TODO
+
+Task Health and Management
+
+- (API) status state
+- Detect, halt, and recover frozen tasks (e.g. stalled import/export tasks)
+  - Heartbeats provide a way to detect if a task is frozen.
+  - Including checkpoint info could allow a recovering task to skip redundant work.
+- Detect and recover jobs whose worker were killed (e.g. deployments or aggressive restarts)
+  - Either a new worker should spin up to take over for the dead one or the jobs need to be re-enqueued to be distributed among the remaining workers.
+- which tasks are currently being run, where, and for how long thus far?
+Queue Health and Management
+- (redis q) how long are the queues? ZCARD queue
+- (otel) how fast are tasks submitted?
+Worker Health:
+- (otel) worker uptime
+- (API) which tasks are running/ran on which worker?
 
 ## How it works
 
