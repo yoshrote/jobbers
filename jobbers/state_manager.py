@@ -234,9 +234,15 @@ class StateManager:
             await self.ta.clean(queues, now, min_queue_age, max_queue_age)
 
     # TODO: refactor the refresh tag to be an implementation detail of QueueConfigAdapter
-    async def get_refresh_tag(self, role: str) -> ULID | None:
-        tag = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
-        return ULID.from_bytes(tag) if tag else ULID()
+    async def get_refresh_tag(self, role: str) -> ULID:
+        tag: bytes|None = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
+        if tag:
+            return ULID(tag)
+
+        # initialize the refresh tag
+        init_tag = ULID()
+        await self.data_store.set(f"worker-queues:{role}:refresh_tag", bytes(init_tag))
+        return init_tag
 
     async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""

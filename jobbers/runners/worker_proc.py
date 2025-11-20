@@ -18,22 +18,28 @@ Rate limiting should be implemented by limiting the creation of tasks rather
 than on the consumption of tasks.
 """
 
-def build_task_generator(state_manager: StateManager) -> TaskGenerator:
-    """Consume tasks from the Redis list 'task-list'."""
+async def main() -> None:
+    num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
     role = os.environ.get("WORKER_ROLE", "default")
     worker_ttl = int(os.environ.get("WORKER_TTL", 50)) # if 0, will run indefinitely
 
-    return TaskGenerator(state_manager, state_manager.qca, role, max_tasks=worker_ttl)
-
-async def main(state_manager: StateManager, task_generator: TaskGenerator) -> None:
-    num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
+    state_manager: StateManager = build_sm()
+    task_generator = TaskGenerator(state_manager, state_manager.qca, role, max_tasks=worker_ttl)
+    await task_generator.queues() # warm up the refresh tag
 
     async def worker() -> None:
         async for task in task_generator:
             await TaskProcessor(state_manager).process(task)
+        logger.info("worker X stopping")
 
-    workers = [asyncio.create_task(worker()) for _ in range(num_concurrent)]
-    await asyncio.gather(*workers)
+    workers = [asyncio.create_task(worker(), name=f"jobber-worker-{i}") for i in range(num_concurrent)]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        logger.info("Worker tasks cancelled; shutting down")
+        task_generator.stop()
+        for w in workers:
+            w.cancel()
 
 def run() -> None:
     import importlib
@@ -44,27 +50,34 @@ def run() -> None:
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-worker")
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
-    logging.getLogger("jobbers").setLevel(logging.DEBUG)
+    logging.basicConfig(level=logging.DEBUG, handlers=handlers)
+    # logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
     # register tasks
     task_module = sys.argv[1]
     importlib.import_module(task_module)
 
     logger = logging.getLogger(__name__)
-    state_manager: StateManager = build_sm()
-    task_generator = build_task_generator(state_manager)
-    main_coroutine = main(state_manager, task_generator)
+    asyncio.run(main(), debug=True)
+    # main_coroutine = asyncio.ensure_future(main())
 
-    def graceful_shutdown(signum: int, frame: object) -> None:
-        # turn off the faucet of tasks
-        task_generator.stop()
+    # loop = asyncio.get_event_loop()
+    # def graceful_shutdown() -> None:
+    #     # turn off the faucet of tasks
+    #     logger.info("Task consumer is shutting down gracefully.")
+    #     main_coroutine.cancel()
+    #     # loop.stop()
+    #     # pending = asyncio.all_tasks()
+    #     # loop.run_until_complete(asyncio.gather(*pending))
+    #     # loop.close()
+    #     logger.info("Task consumer has shut down gracefully.")
 
-    # Attempt an orderly shutdown generally
-    signal.signal(signal.SIGTERM, graceful_shutdown)
+    # loop.add_signal_handler(signal.SIGTERM, graceful_shutdown)
+    # loop.add_signal_handler(signal.SIGINT, graceful_shutdown)
 
-    try:
-        logger.info("Task consumer started.")
-        asyncio.run(main_coroutine)
-    except KeyboardInterrupt:
-        logger.info("Task consumer stopped.")
+    # try:
+    #     loop.run_until_complete(main_coroutine)
+    # except RuntimeError:
+    #     # loop was stopped
+    #     pass
+    logger.info("Task consumer stopped.")

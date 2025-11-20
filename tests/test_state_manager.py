@@ -608,5 +608,25 @@ async def test_add_task_to_queue_no_submitted_at(redis, rate_limiter):
     members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
     assert members == []
 
+def test_task_in_registry(state_manager):
+    """Test that a task is correctly identified as being in the active tasks registry."""
+    task = Task(
+        id=ULID2,
+        name="No Submitted At",
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        submitted_at=None,
+    )
+
+    # Initially, the task should not be in the registry
+    assert task.id not in state_manager.current_tasks_by_queue[task.queue]
+
+    # Add the task to the registry
+    with state_manager.task_in_registry(task):
+        assert task.id in state_manager.current_tasks_by_queue[task.queue]
+
+    # Now, the task should be removed from the registry
+    assert task.id not in state_manager.current_tasks_by_queue[task.queue]
+
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])

@@ -46,6 +46,8 @@ class TaskProcessor:
                     if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                         self._current_promise = asyncio.shield(self._current_promise)
                     async with asyncio.timeout(task.task_config.timeout):
+                        # TEMPORARY FOR TESTING
+                        await asyncio.sleep(5)
                         task.results = await self._current_promise
             except asyncio.TimeoutError:
                 self.handle_timeout_exception(task)

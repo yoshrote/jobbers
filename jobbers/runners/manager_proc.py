@@ -4,6 +4,7 @@ import logging
 import sys
 
 import uvicorn
+from fastapi.staticfiles import StaticFiles
 
 ENABLE_OTEL = True
 def run() -> None:
@@ -29,6 +30,8 @@ def run() -> None:
     # register tasks so we can validate submitted task signatures
     task_module = sys.argv[1]
     importlib.import_module(task_module)
+
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
