@@ -279,6 +279,11 @@ class StateManager:
 
         return await self.ta.submit_task(task=task, extra_check=extra_check)
 
+    async def save_task(self, task: Task) -> Task:
+        """Save the task state without extra validation."""
+        await self.ta.submit_task(task=task, extra_check=None)
+        return task
+
 class SubmissionRateLimiter:
     """
     Rate limiter for tasks in a Redis data store.

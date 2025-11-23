@@ -37,33 +37,34 @@ class TaskProcessor:
         if task.task_config is None:
             self.handle_dropped_task(task)
         else:
-            try:
-                task = await self.mark_task_as_started(task)
-                with self.state_manager.task_in_registry(task):
-                    # the assert is to make mypy play nice.
-                    assert task.task_config  # noqa: S101
-                    self._current_promise = task.task_config.function(**task.parameters)
-                    if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
-                        self._current_promise = asyncio.shield(self._current_promise)
+            task = await self.mark_task_as_started(task)
+            with self.state_manager.task_in_registry(task):
+                # the assert is to make mypy play nice.
+                assert task.task_config  # noqa: S101
+                self._current_promise = task.task_config.function(**task.parameters)
+                if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
+                    self._current_promise = asyncio.shield(self._current_promise)
+
+                # Run the task and handle exceptions
+                try:
                     async with asyncio.timeout(task.task_config.timeout):
-                        # TEMPORARY FOR TESTING
-                        await asyncio.sleep(5)
                         task.results = await self._current_promise
-            except asyncio.TimeoutError:
-                self.handle_timeout_exception(task)
-            except asyncio.CancelledError as exc:
-                ex = exc
-                self.handle_cancelled_task(task)
-            except Exception as exc:
-                if task.task_config and task.task_config.expected_exceptions and isinstance(exc, task.task_config.expected_exceptions):
-                    self.handle_expected_exception(task, exc)
+                except asyncio.TimeoutError:
+                    self.handle_timeout_exception(task)
+                except asyncio.CancelledError as exc:
+                    ex = exc
+                    self.handle_cancelled_task(task)
+                except Exception as exc:
+                    if task.task_config and task.task_config.expected_exceptions and isinstance(exc, task.task_config.expected_exceptions):
+                        self.handle_expected_exception(task, exc)
+                    else:
+                        self.handle_unexpected_exception(task, exc)
                 else:
-                    self.handle_unexpected_exception(task, exc)
-            else:
-                self.handle_success(task)
+                    self.handle_success(task)
 
-        await self.state_manager.submit_task(task)
+        await self.state_manager.save_task(task)
 
+        # Metrics recording
         tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
         if task.status != TaskStatus.UNSUBMITTED:
             tasks_retried.add(task.retry_attempt, {"queue": task.queue, "task": task.name})
@@ -88,7 +89,7 @@ class TaskProcessor:
     async def mark_task_as_started(self, task: Task) -> Task:
         task.started_at = dt.datetime.now(dt.timezone.utc)
         task.status = TaskStatus.STARTED
-        await self.state_manager.submit_task(task)
+        await self.state_manager.save_task(task)
         return task
 
     async def post_process(self, task: Task) -> None:

@@ -50,3 +50,7 @@ def get_task_config(name: str, version: int) -> TaskConfig | None:
 
 def get_tasks() -> Iterator[tuple[str, int]]:
     return iter(_task_function_map.keys())
+
+def clear_registry() -> None:
+    """Clear all registered tasks (for testing purposes)."""
+    _task_function_map.clear()

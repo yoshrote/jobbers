@@ -5,10 +5,20 @@ import pytest
 
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
-from jobbers.registry import TaskConfig
+from jobbers.registry import TaskConfig, clear_registry, register_task
 from jobbers.state_manager import StateManager
 from jobbers.task_processor import TaskProcessor
 
+
+@pytest.fixture(autouse=True)
+def register_test_task():
+    @register_task(name="test_task", version=1)
+    def test_function(): # pragma: no cover
+        pass
+
+    yield
+
+    clear_registry()
 
 @pytest.mark.asyncio
 async def test_task_processor_success():
@@ -39,7 +49,7 @@ async def test_task_processor_success():
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(task), call(result_task)])
 
 
 @pytest.mark.asyncio
@@ -60,7 +70,7 @@ async def test_task_processor_dropped_task():
     assert result_task.status == TaskStatus.DROPPED
     assert result_task.completed_at is not None
     # Once when starting
-    state_manager.submit_task.assert_called_once_with(result_task)
+    state_manager.save_task.assert_called_once_with(result_task)
 
 
 
@@ -94,7 +104,7 @@ async def test_task_processor_expected_exception_with_retry():
     assert result_task.retry_attempt == 1
     assert "Expected error" in result_task.error
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
 @pytest.mark.asyncio
 async def test_task_processor_expected_exception_without_retry():
@@ -126,7 +136,7 @@ async def test_task_processor_expected_exception_without_retry():
     assert result_task.retry_attempt == 0
     assert "Expected error" in result_task.error
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
 
 @pytest.mark.asyncio
@@ -157,7 +167,7 @@ async def test_task_processor_unexpected_exception():
     assert result_task.status == TaskStatus.FAILED
     assert "Unexpected error" in result_task.error
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
 
 
@@ -188,7 +198,7 @@ async def test_task_processor_timeout_with_retry():
     assert result_task.status == TaskStatus.UNSUBMITTED
     assert "timed out" in result_task.error
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
 
 @pytest.mark.asyncio
@@ -219,7 +229,7 @@ async def test_task_processor_timeout_without_retry():
     assert result_task.completed_at is not None, "Failed tasks should have a completed_at timestamp"
     assert "timed out" in result_task.error
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
 
 @pytest.mark.asyncio
@@ -251,7 +261,7 @@ async def test_task_processor_cancelled():
     assert task.status == TaskStatus.CANCELLED
     assert task.completed_at is not None, "Cancelled tasks should have a completed_at timestamp"
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(task), call(task)])
+    state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 @pytest.mark.asyncio
@@ -285,7 +295,7 @@ async def test_task_processor_cancelled_with_stop_policy():
     assert task.status == TaskStatus.CANCELLED
     assert task.completed_at is not None
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(task), call(task)])
+    state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 @pytest.mark.asyncio
@@ -319,7 +329,7 @@ async def test_task_processor_cancelled_with_resubmit_policy():
     assert task.status == TaskStatus.UNSUBMITTED
     assert task.completed_at is None  # Should not be completed when resubmitted
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(task), call(task)])
+    state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 @pytest.mark.asyncio
@@ -354,7 +364,7 @@ async def test_task_processor_cancelled_with_continue_policy():
     assert task.status == TaskStatus.STARTED  # Should remain as started (set before cancellation happened)
     assert task.completed_at is None  # Should not be completed for CONTINUE policy
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(task), call(task)])
+    state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 @pytest.mark.asyncio
@@ -395,7 +405,7 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
     assert result_task.results == {"result": "success"}
 
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
 
 @pytest.mark.asyncio
@@ -436,7 +446,7 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
     assert result_task.results == {"result": "success"}
 
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
 
 @pytest.mark.asyncio
@@ -477,5 +487,5 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
     assert result_task.results == {"result": "success"}
 
     # Once when starting and once when done
-    state_manager.submit_task.assert_has_calls([call(result_task), call(result_task)])
+    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
