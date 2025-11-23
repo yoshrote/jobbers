@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import signal
 
 from jobbers.state_manager import StateManager, build_sm
 from jobbers.task_generator import TaskGenerator
@@ -47,7 +46,6 @@ def run() -> None:
 
     from jobbers.utils.otel import enable_otel
 
-
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-worker")
     logging.basicConfig(level=logging.DEBUG, handlers=handlers)
@@ -57,27 +55,4 @@ def run() -> None:
     task_module = sys.argv[1]
     importlib.import_module(task_module)
 
-    logger = logging.getLogger(__name__)
     asyncio.run(main(), debug=True)
-    # main_coroutine = asyncio.ensure_future(main())
-
-    # loop = asyncio.get_event_loop()
-    # def graceful_shutdown() -> None:
-    #     # turn off the faucet of tasks
-    #     logger.info("Task consumer is shutting down gracefully.")
-    #     main_coroutine.cancel()
-    #     # loop.stop()
-    #     # pending = asyncio.all_tasks()
-    #     # loop.run_until_complete(asyncio.gather(*pending))
-    #     # loop.close()
-    #     logger.info("Task consumer has shut down gracefully.")
-
-    # loop.add_signal_handler(signal.SIGTERM, graceful_shutdown)
-    # loop.add_signal_handler(signal.SIGINT, graceful_shutdown)
-
-    # try:
-    #     loop.run_until_complete(main_coroutine)
-    # except RuntimeError:
-    #     # loop was stopped
-    #     pass
-    logger.info("Task consumer stopped.")
