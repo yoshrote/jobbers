@@ -24,14 +24,16 @@ async def main() -> None:
 
     state_manager: StateManager = build_sm()
     task_generator = TaskGenerator(state_manager, state_manager.qca, role, max_tasks=worker_ttl)
-    await task_generator.queues() # warm up the refresh tag
+    await task_generator.queues() # warm up the refresh tag once for all workers
 
-    async def worker() -> None:
+    async def worker(name: str) -> None:
+        logger.info("%s starting", name)
         async for task in task_generator:
+            logger.debug("%s running task: %s[%sv%s]", name, task.id, task.name, task.version)
             await TaskProcessor(state_manager).process(task)
-        logger.info("worker X stopping")
+        logger.info("%s stopping", name)
 
-    workers = [asyncio.create_task(worker(), name=f"jobber-worker-{i}") for i in range(num_concurrent)]
+    workers = [asyncio.create_task(worker(f"jobber-worker-{i}"), name=f"jobber-worker-{i}") for i in range(num_concurrent)]
     try:
         await asyncio.gather(*workers)
     finally:

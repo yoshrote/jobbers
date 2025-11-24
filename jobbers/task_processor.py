@@ -37,7 +37,9 @@ class TaskProcessor:
         if task.task_config is None:
             self.handle_dropped_task(task)
         else:
-            task = await self.mark_task_as_started(task)
+            self.mark_task_as_started(task)
+            await self.state_manager.save_task(task)
+
             with self.state_manager.task_in_registry(task):
                 # the assert is to make mypy play nice.
                 assert task.task_config  # noqa: S101
@@ -86,20 +88,18 @@ class TaskProcessor:
 
         return task
 
-    async def mark_task_as_started(self, task: Task) -> Task:
+    def mark_task_as_started(self, task: Task) -> None:
         task.started_at = dt.datetime.now(dt.timezone.utc)
         task.status = TaskStatus.STARTED
-        await self.state_manager.save_task(task)
-        return task
 
     async def post_process(self, task: Task) -> None:
-        if not task.has_callbacks():
-            return
+        pass
+        # if not task.has_callbacks():
+        #     return
 
         # TODO: configure max concurrent callbacks
         # Monitor for when fan-out becomes problematic
         # callback_pool.map(self.state_manager.submit_task, task.generate_callbacks(), num_concurrent=5)
-
 
     def handle_dropped_task(self, task: Task) -> None:
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
