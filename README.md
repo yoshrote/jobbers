@@ -1,7 +1,20 @@
 # Jobbers
 
-A task/workflow framework similar to Celery/Airflow. The name is inspired by
-the many wrestlers who anonymously do the work to make the stars look good.
+A task execution framework similar to Celery, but with a focus on providing
+support to track and handle the recovery of long running tasks that stall or
+fail.
+
+The name is inspired by the many pro wrestlers who anonymously do the work to
+make the stars look good. A future feature would be to implement an Airflow
+Executor for this.
+
+This framework is intended to allow tasks to make use of asyncio and aims to
+help manage and recover from failures or hang ups that can occur in long running
+tasks.
+
+Long running jobs may hang indefinitely for any number of reasons given the
+arbitrary code that may be running. Detecting workers in this state and having
+tools to provide options to recover or kill the tasks are useful to handle these kinds of operational issues.
 
 ## OpenTelemetry Metrics
 

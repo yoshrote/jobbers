@@ -129,6 +129,8 @@ class TaskAdapter:
         if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
             if extra_check is None or extra_check(pipe):
                 task.set_status(TaskStatus.SUBMITTED)
+                # the assert is to make mypy play nice.
+                assert task.submitted_at  # noqa: S101
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
