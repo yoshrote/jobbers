@@ -128,8 +128,7 @@ class TaskAdapter:
         # Avoid pushing a task onto the queue multiple times
         if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
             if extra_check is None or extra_check(pipe):
-                task.submitted_at = dt.datetime.now(dt.timezone.utc)
-                task.status = TaskStatus.SUBMITTED
+                task.set_status(TaskStatus.SUBMITTED)
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())

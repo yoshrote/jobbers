@@ -106,8 +106,7 @@ class TaskProcessor:
             raise # Re-raise to exit the TaskGroup in run()
 
     def mark_task_as_started(self, task: Task) -> None:
-        task.started_at = dt.datetime.now(dt.timezone.utc)
-        task.status = TaskStatus.STARTED
+        task.set_status(TaskStatus.STARTED)
 
     async def post_process(self, task: Task) -> None:
         pass
@@ -120,8 +119,7 @@ class TaskProcessor:
 
     def handle_dropped_task(self, task: Task) -> None:
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
-        task.status = TaskStatus.DROPPED
-        task.completed_at = dt.datetime.now(dt.timezone.utc)
+        task.set_status(TaskStatus.DROPPED)
 
     def handle_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled.", task.id)
@@ -129,13 +127,11 @@ class TaskProcessor:
 
     def handle_user_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled by user.", task.id)
-        task.status = TaskStatus.CANCELLED
-        task.completed_at = dt.datetime.now(dt.timezone.utc)
+        task.set_status(TaskStatus.CANCELLED)
 
     def handle_unexpected_exception(self, task: Task, exc: Exception) -> None:
         logger.exception("Exception occurred while processing task %s: %s", task.id, exc)
-        task.status = TaskStatus.FAILED
-        task.completed_at = dt.datetime.now(dt.timezone.utc)
+        task.set_status(TaskStatus.FAILED)
         task.error = str(exc)
 
     def handle_expected_exception(self, task: Task, exc: Exception) -> None:
@@ -143,12 +139,9 @@ class TaskProcessor:
         # TODO: Set metrics to track expected exceptions
         task.error = str(exc)
         if task.should_retry():
-            # Task status will change to submitted when re-enqueued
-            task.retry_attempt += 1
-            task.status = TaskStatus.UNSUBMITTED
+            task.set_to_retry()
         else:
-            task.status = TaskStatus.FAILED
-            task.completed_at = dt.datetime.now(dt.timezone.utc)
+            task.set_status(TaskStatus.FAILED)
 
     def handle_timeout_exception(self, task: Task) -> None:
         timeout: int | None
@@ -159,14 +152,10 @@ class TaskProcessor:
         logger.warning("Task %s timed out after %s seconds.", task.id, timeout)
         task.error = f"Task {task.id} timed out after {timeout} seconds"
         if task.should_retry():
-            # Task status will change to submitted when re-enqueued
-            task.status = TaskStatus.UNSUBMITTED
-            task.retry_attempt += 1
+            task.set_to_retry()
         else:
-            task.status = TaskStatus.FAILED
-            task.completed_at = dt.datetime.now(dt.timezone.utc)
+            task.set_status(TaskStatus.FAILED)
 
     def handle_success(self, task: Task) -> None:
         logger.info("Task %s completed.", task.id)
-        task.status = TaskStatus.COMPLETED
-        task.completed_at = dt.datetime.now(dt.timezone.utc)
+        task.set_status(TaskStatus.COMPLETED)

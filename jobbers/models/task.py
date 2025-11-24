@@ -111,3 +111,21 @@ class Task(BaseModel):
             b"heartbeat_at": serialize(self.heartbeat_at),
             b"completed_at": serialize(self.completed_at),
         }
+
+    def set_status(self, status: TaskStatus) -> None:
+        match status:
+            case TaskStatus.STARTED:
+                if not self.started_at:
+                    self.started_at = dt.datetime.now(dt.timezone.utc)
+                else:
+                    self.retried_at = dt.datetime.now(dt.timezone.utc)
+            case TaskStatus.SUBMITTED:
+                self.submitted_at = dt.datetime.now(dt.timezone.utc)
+            case TaskStatus.COMPLETED | TaskStatus.FAILED | \
+                 TaskStatus.CANCELLED | TaskStatus.STALLED | TaskStatus.DROPPED:
+                self.completed_at = dt.datetime.now(dt.timezone.utc)
+        self.status = status
+
+    def set_to_retry(self) -> None:
+        self.status = TaskStatus.UNSUBMITTED
+        self.retry_attempt += 1
