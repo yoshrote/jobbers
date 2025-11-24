@@ -59,7 +59,7 @@ class Task(BaseModel):
                 # TODO: maybe warn or panic since this should be unreachable
                 pass
             case TaskShutdownPolicy.STOP:
-                self.status = TaskStatus.CANCELLED
+                self.status = TaskStatus.STALLED
                 self.completed_at = dt.datetime.now(dt.timezone.utc)
             case TaskShutdownPolicy.RESUBMIT:
                 self.status = TaskStatus.UNSUBMITTED

@@ -9,7 +9,8 @@ class TaskStatus(StrEnum):
     STARTED = "started"
     HEARTBEAT = "heartbeat"
     COMPLETED = "completed"
-    CANCELLED = "cancelled"
+    CANCELLED = "cancelled" # cancelled by the user
+    STALLED = "stalled" # cancelled by the system
     FAILED = "failed"
     DROPPED = "dropped"
 

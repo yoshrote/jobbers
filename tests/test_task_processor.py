@@ -233,7 +233,7 @@ async def test_task_processor_timeout_without_retry():
 
 
 @pytest.mark.asyncio
-async def test_task_processor_cancelled():
+async def test_task_processor_stalled():
     """Test that TaskProcessor handles a timeout exception."""
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -258,14 +258,14 @@ async def test_task_processor_cancelled():
             await processor.process(task)
 
     # the task should have been updated via side effects
-    assert task.status == TaskStatus.CANCELLED
+    assert task.status == TaskStatus.STALLED
     assert task.completed_at is not None, "Cancelled tasks should have a completed_at timestamp"
     # Once when starting and once when done
     state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 @pytest.mark.asyncio
-async def test_task_processor_cancelled_with_stop_policy():
+async def test_task_processor_stalled_with_stop_policy():
     """Test that TaskProcessor handles CancelledError with TaskShutdownPolicy.STOP."""
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -292,7 +292,7 @@ async def test_task_processor_cancelled_with_stop_policy():
             await processor.process(task)
 
     # Task should be marked as cancelled due to STOP policy
-    assert task.status == TaskStatus.CANCELLED
+    assert task.status == TaskStatus.STALLED
     assert task.completed_at is not None
     # Once when starting and once when done
     state_manager.save_task.assert_has_calls([call(task), call(task)])

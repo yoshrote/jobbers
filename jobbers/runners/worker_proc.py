@@ -30,7 +30,7 @@ async def main() -> None:
         logger.info("%s starting", name)
         async for task in task_generator:
             logger.debug("%s running task: %s[%sv%s]", name, task.id, task.name, task.version)
-            await TaskProcessor(state_manager).process(task)
+            await TaskProcessor(state_manager).run(task)
         logger.info("%s stopping", name)
 
     workers = [asyncio.create_task(worker(f"jobber-worker-{i}"), name=f"jobber-worker-{i}") for i in range(num_concurrent)]

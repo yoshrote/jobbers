@@ -24,6 +24,11 @@ class TaskException(Exception):
 
     pass
 
+class UserCancellationError(Exception):
+    """Exception raised when a task is cancelled by user request."""
+
+    pass
+
 class QueueConfigAdapter:
     """
     Manages queue configuration in a Redis data store.
@@ -283,6 +288,15 @@ class StateManager:
         """Save the task state without extra validation."""
         await self.ta.submit_task(task=task, extra_check=None)
         return task
+
+    async def monitor_task_cancellation(self, task_id: ULID) -> None:
+        """Monitor for user cancellation of the task."""
+        async with self.data_store.pubsub() as pubsub:
+            await pubsub.subscribe(f"task_cancel_{task_id}")
+            message = await pubsub.get_message(ignore_subscribe_messages=True)
+            if message is not None:
+                logger.info("Received cancellation for task %s", task_id)
+                raise UserCancellationError(f"Task {task_id} was cancelled by user request.")
 
 class SubmissionRateLimiter:
     """

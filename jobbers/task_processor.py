@@ -9,7 +9,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import get_task_config
-from jobbers.state_manager import StateManager
+from jobbers.state_manager import StateManager, UserCancellationError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -27,6 +27,14 @@ class TaskProcessor:
     def __init__(self, state_manager: StateManager):
         self.state_manager = state_manager
         self._current_promise: Awaitable[Any] | None = None
+
+    async def run(self, task: Task) -> None:
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self.process(task))
+                tg.create_task(self.monitor_task_cancellation(task))
+        except UserCancellationError:
+            pass
 
     async def process(self, task: Task) -> Task:
         """Process the task and return the result."""
@@ -88,6 +96,15 @@ class TaskProcessor:
 
         return task
 
+    async def monitor_task_cancellation(self, task: Task) -> None:
+        """Monitor for task cancellation and handle it."""
+        try:
+            await self.state_manager.monitor_task_cancellation(task.id)
+        except UserCancellationError:
+            self.handle_user_cancelled_task(task)
+            await self.state_manager.save_task(task)
+            raise # Re-raise to exit the TaskGroup in run()
+
     def mark_task_as_started(self, task: Task) -> None:
         task.started_at = dt.datetime.now(dt.timezone.utc)
         task.status = TaskStatus.STARTED
@@ -109,6 +126,11 @@ class TaskProcessor:
     def handle_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled.", task.id)
         task.shutdown()
+
+    def handle_user_cancelled_task(self, task: Task) -> None:
+        logger.info("Task %s was cancelled by user.", task.id)
+        task.status = TaskStatus.CANCELLED
+        task.completed_at = dt.datetime.now(dt.timezone.utc)
 
     def handle_unexpected_exception(self, task: Task, exc: Exception) -> None:
         logger.exception("Exception occurred while processing task %s: %s", task.id, exc)
