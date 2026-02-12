@@ -14,7 +14,8 @@ def register_task(
         timeout: int | None=None,
         max_retries: int=3,
         retry_delay: int | None=None,
-        expected_exceptions: tuple[Exception] | None=None
+        expected_exceptions: tuple[Exception] | None=None,
+        max_heartbeat_interval: int | None=None
     ) -> Callable[..., Any]:
     """Register a task function with the given name and version."""
 
@@ -39,6 +40,7 @@ def register_task(
             max_retries=max_retries,
             retry_delay=retry_delay,
             expected_exceptions=expected_exceptions,
+            max_heartbeat_interval=max_heartbeat_interval,
         )
         _task_function_map[(name, version)] = task_conf
         return func

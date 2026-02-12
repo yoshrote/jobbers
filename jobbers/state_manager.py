@@ -139,7 +139,7 @@ class StateManager:
                 task_config = registry.get_task_config(task_type, task_version)
                 if task_config and task_config.max_heartbeat_interval:
                     for task in tasks:
-                        if task.heartbeat_at and (now - task.heartbeat_at) > task_config.max_heartbeat_interval:
+                        if task.heartbeat_at and (now - task.heartbeat_at).total_seconds() > task_config.max_heartbeat_interval:
                             task.status = TaskStatus.STALLED
                             await self.save_task(task)
 
