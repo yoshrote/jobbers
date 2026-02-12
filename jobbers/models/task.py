@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from ulid import ULID
 
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+from jobbers.state_manager import StateManager
 from jobbers.utils.serialization import (
     EMPTY_DICT,
     NONE,
@@ -80,6 +81,12 @@ class Task(BaseModel):
         summary = self.model_dump(include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"})
         summary["id"] = str(self.id)
         return summary
+
+    @property
+    def _sm(self) -> StateManager:
+        from jobbers.db import get_state_manager
+
+        return get_state_manager()
 
     @classmethod
     def from_redis(cls, task_id: ULID, raw_task_data: dict[bytes, bytes]) -> Self:
