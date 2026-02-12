@@ -22,3 +22,7 @@ class TaskStatus(StrEnum):
 
     def to_bytes(self) -> bytes:
         return self.value.encode()
+
+    @classmethod
+    def active_statuses(cls) -> set["TaskStatus"]:
+        return {cls.SUBMITTED, cls.STARTED, cls.HEARTBEAT}

@@ -172,6 +172,7 @@ class TaskAdapter:
     TASKS_BY_QUEUE = "task-queues:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
     HEARTBEAT_SCORES = "task-heartbeats:{queue}".format
+    TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
 
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
@@ -188,6 +189,11 @@ class TaskAdapter:
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
+        if task.status in TaskStatus.active_statuses():
+            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        else:
+            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
         await pipe.execute()
 
     async def get_task(self, task_id: ULID) -> Task | None:
