@@ -8,7 +8,7 @@ import redis.asyncio as redis
 from httpx import ASGITransport, AsyncClient
 from ulid import ULID
 
-from jobbers.models import Task
+from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.state_manager import TaskAdapter
 from jobbers.task_routes import app

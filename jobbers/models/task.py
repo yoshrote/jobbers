@@ -14,7 +14,8 @@ from jobbers.utils.serialization import (
     serialize,
 )
 
-from . import TaskConfig, TaskStatus
+from .task_config import TaskConfig
+from .task_status import TaskStatus
 
 
 class Task(BaseModel):

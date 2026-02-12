@@ -2,7 +2,7 @@ import logging
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from jobbers.models import TaskConfig
+from jobbers.models.task_config import TaskConfig
 
 logger = logging.getLogger(__name__)
 _task_function_map : dict[tuple[str, int], TaskConfig] = {}

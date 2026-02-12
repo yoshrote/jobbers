@@ -1,6 +1,6 @@
 import pytest
 
-from jobbers.models import TaskConfig
+from jobbers.models.task_config import TaskConfig
 from jobbers.registry import get_task_config, register_task
 
 

@@ -1,4 +1,4 @@
-import datetime
+import datetime as dt
 from collections import defaultdict
 from unittest.mock import patch
 
@@ -8,8 +8,9 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
-from jobbers.models import Task, TaskStatus
 from jobbers.models.queue_config import QueueConfig, RatePeriod
+from jobbers.models.task import Task
+from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import QueueConfigAdapter, StateManager, TaskAdapter, TaskPagination
 from jobbers.utils.serialization import EMPTY_DICT, serialize
 
@@ -39,6 +40,17 @@ def task_adapter(redis):
 def queue_config_adapter(redis):
     """Fixture to provide a QueueConfigAdapter instance with a fake Redis data store."""
     return QueueConfigAdapter(redis)
+
+@pytest.fixture
+def sample_task():
+    """Create a sample task for testing."""
+    return Task(
+        id=ULID(),
+        name="test_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=dt.datetime.now(dt.timezone.utc)
+    )
 
 @pytest.mark.asyncio
 async def test_submit_task(redis, task_adapter):
@@ -273,7 +285,7 @@ async def test_rate_limiter_has_room_nonempty(redis, rate_limiter):
         rate_period=RatePeriod.MINUTE
     )
 
-    with patch("datetime.datetime") as mock_datetime:
+    with patch("dt.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is True
@@ -290,7 +302,7 @@ async def test_rate_limiter_has_room_older_jobs(redis, rate_limiter):
         rate_period=RatePeriod.MINUTE
     )
 
-    with patch("datetime.datetime") as mock_datetime:
+    with patch("dt.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is True
@@ -307,7 +319,7 @@ async def test_rate_limiter_no_room(redis, rate_limiter):
         rate_period=RatePeriod.MINUTE
     )
 
-    with patch("datetime.datetime") as mock_datetime:
+    with patch("dt.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is False
@@ -357,9 +369,9 @@ async def test_clean_rate_limit_age(redis, state_manager):
     await redis.zadd("rate-limiter:queue2", {ULID2.bytes: FROZEN_TIME.timestamp() - 1800})
 
     # Call the clean method with a rate_limit_age of 1 hour
-    with patch("datetime.datetime") as mock_datetime:
+    with patch("dt.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
-        await state_manager.clean(rate_limit_age=datetime.timedelta(hours=1))
+        await state_manager.clean(rate_limit_age=dt.timedelta(hours=1))
 
     # Verify tasks older than 1 hour were removed
     queue1_tasks = await redis.zrange("rate-limiter:queue1", 0, -1)
@@ -378,9 +390,9 @@ async def test_clean_min_queue_age(redis, state_manager):
     })
 
     # Call the clean method with a min_queue_age of 30 minutes
-    with patch("datetime.datetime") as mock_datetime:
+    with patch("dt.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
-        await state_manager.clean(min_queue_age=FROZEN_TIME-datetime.timedelta(minutes=30))
+        await state_manager.clean(min_queue_age=FROZEN_TIME-dt.timedelta(minutes=30))
 
     # Verify tasks older than 30 minutes remain
     queue1_tasks = await redis.zrange("task-queues:queue1", 0, -1, withscores=True)
@@ -397,9 +409,9 @@ async def test_clean_max_queue_age(redis, state_manager):
     })
 
     # Call the clean method with a max_queue_age of 1 hour
-    with patch("datetime.datetime") as mock_datetime:
+    with patch("dt.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
-        await state_manager.clean(max_queue_age=FROZEN_TIME-datetime.timedelta(hours=1))
+        await state_manager.clean(max_queue_age=FROZEN_TIME-dt.timedelta(hours=1))
 
     # Verify tasks newer than 1 hour remain
     queue1_tasks = await redis.zrange("task-queues:queue1", 0, -1, withscores=True)
@@ -416,11 +428,11 @@ async def test_clean_min_and_max_queue_age(redis, state_manager):
     })
 
     # Call the clean method with a min_queue_age of 30 minutes and max_queue_age of 1 hour
-    with patch("datetime.datetime") as mock_datetime:
+    with patch("dt.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         await state_manager.clean(
-            min_queue_age=FROZEN_TIME-datetime.timedelta(minutes=30),
-            max_queue_age=FROZEN_TIME-datetime.timedelta(hours=1),
+            min_queue_age=FROZEN_TIME-dt.timedelta(minutes=30),
+            max_queue_age=FROZEN_TIME-dt.timedelta(hours=1),
         )
 
     # Verify only tasks within the age range remain

@@ -12,8 +12,9 @@ from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.models import Task, TaskStatus
 from jobbers.models.queue_config import QueueConfig
+from jobbers.models.task import Task
+from jobbers.models.task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
 

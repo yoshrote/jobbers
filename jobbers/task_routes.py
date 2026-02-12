@@ -7,7 +7,7 @@ from opentelemetry import metrics
 from ulid import ULID
 
 from jobbers import db, registry
-from jobbers.models import Task
+from jobbers.models.task import Task
 from jobbers.state_manager import QueueConfigAdapter, StateManager, TaskAdapter, TaskException, TaskPagination
 
 app = FastAPI()
