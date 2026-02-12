@@ -16,6 +16,7 @@ class TaskConfig(BaseModel):
     max_retries: int = Field(default=3)  # Maximum number of retries for the task
     retry_delay: int | None = Field(default=None)  # Delay before retrying the task in seconds
     on_shutdown: TaskShutdownPolicy = Field(default=TaskShutdownPolicy.STOP)
+    max_heartbeat_interval: int | None = Field(default=None)  # Interval for sending heartbeats in seconds, if applicable
 
     # The actual function to execute for this task, used internally by the worker
     function: Callable[..., Awaitable[Any]] = Field(exclude=True)

@@ -131,10 +131,17 @@ class StateManager:
             await self.ta.clean(queues, now, min_queue_age, max_queue_age)
 
         if stale_time:
+            stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
             async for task in self.ta.get_stale_tasks(queues, stale_time):
-                logger.warning("Task %s is stale; cancelling", task.id)
-                task.status = TaskStatus.STALLED
-                await self.save_task(task)
+                stale_tasks_by_type[(task.name, task.version)].append(task)
+
+            for (task_type, task_version), tasks in stale_tasks_by_type.items():
+                task_config = registry.get_task_config(task_type, task_version)
+                if task_config and task_config.max_heartbeat_interval:
+                    for task in tasks:
+                        if task.heartbeat_at and (now - task.heartbeat_at) > task_config.max_heartbeat_interval:
+                            task.status = TaskStatus.STALLED
+                            await self.save_task(task)
 
     # TODO: refactor the refresh tag to be an implementation detail of QueueConfigAdapter
     async def get_refresh_tag(self, role: str) -> ULID:
