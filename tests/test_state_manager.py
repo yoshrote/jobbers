@@ -9,12 +9,12 @@ from pytest_unordered import unordered
 from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
-from jobbers.models.task import Task
+from jobbers.models.task import Task, TaskAdapter, TaskPagination
 from jobbers.models.task_status import TaskStatus
-from jobbers.state_manager import QueueConfigAdapter, StateManager, TaskAdapter, TaskPagination
+from jobbers.state_manager import QueueConfigAdapter, StateManager
 from jobbers.utils.serialization import EMPTY_DICT, serialize
 
-FROZEN_TIME = datetime.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
+FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ISO_FROZEN_TIME = serialize(FROZEN_TIME)
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
@@ -47,7 +47,9 @@ def sample_task():
     return Task(
         id=ULID(),
         name="test_task",
+        version=1,
         queue="default",
+        parameters={},
         status=TaskStatus.STARTED,
         started_at=dt.datetime.now(dt.timezone.utc)
     )
@@ -285,7 +287,7 @@ async def test_rate_limiter_has_room_nonempty(redis, rate_limiter):
         rate_period=RatePeriod.MINUTE
     )
 
-    with patch("dt.datetime") as mock_datetime:
+    with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is True
@@ -302,7 +304,7 @@ async def test_rate_limiter_has_room_older_jobs(redis, rate_limiter):
         rate_period=RatePeriod.MINUTE
     )
 
-    with patch("dt.datetime") as mock_datetime:
+    with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is True
@@ -319,7 +321,7 @@ async def test_rate_limiter_no_room(redis, rate_limiter):
         rate_period=RatePeriod.MINUTE
     )
 
-    with patch("dt.datetime") as mock_datetime:
+    with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         result = await rate_limiter.has_room_in_queue_queue(default_queue)
     assert result is False
@@ -369,7 +371,7 @@ async def test_clean_rate_limit_age(redis, state_manager):
     await redis.zadd("rate-limiter:queue2", {ULID2.bytes: FROZEN_TIME.timestamp() - 1800})
 
     # Call the clean method with a rate_limit_age of 1 hour
-    with patch("dt.datetime") as mock_datetime:
+    with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         await state_manager.clean(rate_limit_age=dt.timedelta(hours=1))
 
@@ -390,7 +392,7 @@ async def test_clean_min_queue_age(redis, state_manager):
     })
 
     # Call the clean method with a min_queue_age of 30 minutes
-    with patch("dt.datetime") as mock_datetime:
+    with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         await state_manager.clean(min_queue_age=FROZEN_TIME-dt.timedelta(minutes=30))
 
@@ -409,7 +411,7 @@ async def test_clean_max_queue_age(redis, state_manager):
     })
 
     # Call the clean method with a max_queue_age of 1 hour
-    with patch("dt.datetime") as mock_datetime:
+    with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         await state_manager.clean(max_queue_age=FROZEN_TIME-dt.timedelta(hours=1))
 
@@ -428,7 +430,7 @@ async def test_clean_min_and_max_queue_age(redis, state_manager):
     })
 
     # Call the clean method with a min_queue_age of 30 minutes and max_queue_age of 1 hour
-    with patch("dt.datetime") as mock_datetime:
+    with patch("datetime.datetime") as mock_datetime:
         mock_datetime.now.return_value = FROZEN_TIME
         await state_manager.clean(
             min_queue_age=FROZEN_TIME-dt.timedelta(minutes=30),
@@ -639,6 +641,181 @@ def test_task_in_registry(state_manager):
 
     # Now, the task should be removed from the registry
     assert task.id not in state_manager.current_tasks_by_queue[task.queue]
+
+class TestUpdateTaskHeartbeat:
+    """Tests for StateManager.update_task_heartbeat."""
+
+    @pytest.mark.asyncio
+    async def test_update_task_heartbeat_sets_timestamp(self, task_adapter, sample_task):
+        """Test that heartbeat timestamp is updated in task details."""
+        # Arrange
+        await task_adapter.submit_task(sample_task, extra_check=None)
+        sample_task.heartbeat_at = dt.datetime.now(dt.timezone.utc)
+
+        # Act
+        await task_adapter.update_task_heartbeat(sample_task)
+
+        # Assert
+        updated_task = await task_adapter.get_task(sample_task.id)
+        assert updated_task.heartbeat_at == sample_task.heartbeat_at
+
+    @pytest.mark.asyncio
+    async def test_update_task_heartbeat_adds_to_scores(self, task_adapter, sample_task):
+        """Test that heartbeat score is added to the sorted set."""
+        # Arrange
+        await task_adapter.submit_task(sample_task, extra_check=None)
+        sample_task.heartbeat_at = dt.datetime.now(dt.timezone.utc)
+
+        # Act
+        await task_adapter.update_task_heartbeat(sample_task)
+
+        # Assert
+        scores = await task_adapter.data_store.zrange(
+            task_adapter.HEARTBEAT_SCORES(queue=sample_task.queue),
+            0, -1, withscores=True
+        )
+        assert any(bytes(sample_task.id) == task_id for task_id, _ in scores)
+
+    @pytest.mark.asyncio
+    async def test_update_task_heartbeat_updates_existing_score(self, task_adapter, sample_task):
+        """Test that updating heartbeat overwrites the previous score."""
+        # Arrange
+        await task_adapter.submit_task(sample_task, extra_check=None)
+        first_time = dt.datetime.now(dt.timezone.utc)
+        sample_task.heartbeat_at = first_time
+        await task_adapter.update_task_heartbeat(sample_task)
+
+        # Act
+        second_time = first_time + dt.timedelta(seconds=10)
+        sample_task.heartbeat_at = second_time
+        await task_adapter.update_task_heartbeat(sample_task)
+
+        # Assert
+        scores = await task_adapter.data_store.zrange(
+            task_adapter.HEARTBEAT_SCORES(queue=sample_task.queue),
+            0, -1, withscores=True
+        )
+        score = next(score for task_id, score in scores if bytes(sample_task.id) == task_id)
+        assert score == second_time.timestamp()
+
+class TestGetStaleTasks:
+    """Tests for StateManager.get_stale_tasks."""
+
+    @pytest.mark.asyncio
+    async def test_get_stale_tasks_returns_stale_tasks(self, task_adapter):
+        """Test that stale tasks are returned."""
+        # Arrange
+        now = dt.datetime.now(dt.timezone.utc)
+        stale_time = dt.timedelta(minutes=5)
+
+        # Create a stale task (heartbeat 10 minutes ago)
+        stale_task = Task(
+            id=ULID(),
+            name="stale_task",
+            queue="default",
+            status=TaskStatus.STARTED,
+            started_at=now,
+            heartbeat_at=now - dt.timedelta(minutes=10)
+        )
+        await task_adapter.submit_task(stale_task, extra_check=None)
+        await task_adapter.update_task_heartbeat(stale_task)
+
+        # Act
+        stale_tasks = [task async for task in task_adapter.get_stale_tasks({"default"}, stale_time)]
+
+        # Assert
+        assert len(stale_tasks) == 1
+        assert stale_tasks[0].id == stale_task.id
+
+    @pytest.mark.asyncio
+    async def test_get_stale_tasks_excludes_recent_tasks(self, task_adapter):
+        """Test that recent tasks are not returned."""
+        # Arrange
+        now = dt.datetime.now(dt.timezone.utc)
+        stale_time = dt.timedelta(minutes=5)
+
+        # Create a recent task (heartbeat 1 minute ago)
+        recent_task = Task(
+            id=ULID(),
+            name="recent_task",
+            queue="default",
+            status=TaskStatus.STARTED,
+            started_at=now,
+            heartbeat_at=now - dt.timedelta(minutes=1)
+        )
+        await task_adapter.submit_task(recent_task, extra_check=None)
+        await task_adapter.update_task_heartbeat(recent_task)
+
+        # Act
+        stale_tasks = [task async for task in task_adapter.get_stale_tasks({"default"}, stale_time)]
+
+        # Assert
+        assert len(stale_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_get_stale_tasks_handles_multiple_queues(self, task_adapter):
+        """Test that stale tasks from multiple queues are returned."""
+        # Arrange
+        now = dt.datetime.now(dt.timezone.utc)
+        stale_time = dt.timedelta(minutes=5)
+
+        # Create stale tasks in different queues
+        stale_task_1 = Task(
+            id=ULID(),
+            name="task_1",
+            queue="default",
+            status=TaskStatus.STARTED,
+            started_at=now,
+            heartbeat_at=now - dt.timedelta(minutes=10)
+        )
+        stale_task_2 = Task(
+            id=ULID(),
+            name="task_2",
+            queue="high_priority",
+            status=TaskStatus.STARTED,
+            started_at=now,
+            heartbeat_at=now - dt.timedelta(minutes=10)
+        )
+        await task_adapter.submit_task(stale_task_1, extra_check=None)
+        await task_adapter.submit_task(stale_task_2, extra_check=None)
+        await task_adapter.update_task_heartbeat(stale_task_1)
+        await task_adapter.update_task_heartbeat(stale_task_2)
+
+        # Act
+        stale_tasks = [task async for task in task_adapter.get_stale_tasks({"default", "high_priority"}, stale_time)]
+
+        # Assert
+        assert len(stale_tasks) == 2
+        stale_task_ids = {task.id for task in stale_tasks}
+        assert stale_task_1.id in stale_task_ids
+        assert stale_task_2.id in stale_task_ids
+
+    @pytest.mark.asyncio
+    async def test_get_stale_tasks_returns_none_for_missing_tasks(self, task_adapter, monkeypatch):
+        """Test that None results are filtered out."""
+        # Arrange
+        now = dt.datetime.now(dt.timezone.utc)
+        stale_time = dt.timedelta(minutes=5)
+
+        stale_task = Task(
+            id=ULID(),
+            name="stale_task",
+            queue="default",
+            status=TaskStatus.STARTED,
+            started_at=now,
+            heartbeat_at=now - dt.timedelta(minutes=10)
+        )
+        await task_adapter.submit_task(stale_task, extra_check=None)
+        await task_adapter.update_task_heartbeat(stale_task)
+
+        # Delete the task from storage to simulate a missing task
+        await task_adapter.data_store.delete(task_adapter.TASK_DETAILS(task_id=stale_task.id))
+
+        # Act
+        stale_tasks = [task async for task in task_adapter.get_stale_tasks({"default"}, stale_time)]
+
+        # Assert
+        assert len(stale_tasks) == 0
 
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])

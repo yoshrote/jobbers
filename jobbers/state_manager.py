@@ -1,24 +1,20 @@
 import asyncio
 import datetime as dt
 import logging
-from asyncio import TaskGroup
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager
 from typing import Any, cast
 
-from pydantic import BaseModel, Field
 from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 from jobbers import registry
 from jobbers.models.queue_config import QueueConfig
-from jobbers.models.task import Task
+from jobbers.models.task import Task, TaskAdapter
 from jobbers.models.task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
-
-TIME_ZERO = dt.datetime.fromtimestamp(0, dt.timezone.utc)
 
 class TaskException(Exception):
     "Top-level exception for stuff gone wrong."
@@ -96,113 +92,7 @@ class QueueConfigAdapter:
             if conf is not None
         }
 
-# TODO: test pagination
-class TaskPagination(BaseModel):
-    "Pagination details."
 
-    limit: int = Field(default=10, gt=0, le=100)
-    start: ULID | None = Field(default=None)
-
-    def start_param(self) -> int:
-        if not self.start:
-            return 0
-        return int(self.start.datetime.timestamp())
-
-class TaskAdapter:
-    """
-    Manages how tasks can be added, pulled, or queried from a Redis data store.
-
-    - `task-queues:<queue>`: Sorted set of task ID => submitted at timestamp for each queue
-        - ZPOPMIN to get the oldest task from a set of queues
-    - `task:<task_id>`: Hash containing the task state (name, status, etc).
-    """
-
-    TASKS_BY_QUEUE = "task-queues:{queue}".format
-    TASK_DETAILS = "task:{task_id}".format
-
-    def __init__(self, data_store: Redis) -> None:
-        self.data_store: Redis = data_store
-
-    async def submit_task(self, task: Task, extra_check: Callable[[Pipeline], bool] | None) -> None:
-        """Submit a task to the Redis data store."""
-        pipe = self.data_store.pipeline(transaction=True)
-        # Avoid pushing a task onto the queue multiple times
-        if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
-            if extra_check is None or extra_check(pipe):
-                task.set_status(TaskStatus.SUBMITTED)
-                # the assert is to make mypy play nice.
-                assert task.submitted_at  # noqa: S101
-                pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
-
-        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
-        await pipe.execute()
-
-    async def get_task(self, task_id: ULID) -> Task | None:
-        raw_task_data: dict[bytes, Any] = await cast("Awaitable[dict[bytes, Any]]", self.data_store.hgetall(self.TASK_DETAILS(task_id=task_id)))
-
-        if raw_task_data:
-            return Task.from_redis(task_id, raw_task_data)
-
-        return None
-
-    async def task_exists(self, task_id: ULID) -> bool:
-        does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
-        return does_exists == 1
-
-    async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
-        task_ids = await self.data_store.zrangebyscore(
-            self.TASKS_BY_QUEUE(queue="default"),
-            pagination.start_param(), '+inf',
-            start=pagination.start_param(),
-            num=pagination.limit
-        )
-        if not task_ids:
-            return []
-        results: list[Task] = []
-        # TODO: do some batching in case there are tons of tasks
-        async with TaskGroup() as group:
-            for task_id in task_ids:
-                group.create_task(self._add_task_to_results(ULID(task_id), results))
-        return results
-
-    async def _add_task_to_results(self, task_id: ULID, results: list[Task]) -> list[Task]:
-        task = await self.get_task(task_id)
-        if task:
-            results.append(task)
-        return results
-
-    async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
-        """Get the next task from the queues in order of priority (first in the list is highest priority)."""
-        # Try to pop from each queue until we find a task
-        # TODO: Shuffle/rotate the order of queues to avoid starving any of them
-        # see https://redis.io/docs/latest/commands/blpop/#what-key-is-served-first-what-client-what-element-priority-ordering-details
-        # for details of how the order of keys impact how tasks are popped
-        task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
-        task_id = await self.data_store.bzpopmin(task_queues, timeout=timeout)
-        if task_id:
-            task = await self.get_task(ULID.from_bytes(task_id[1]))
-            if task:
-                return task
-            logger.warning("Task with ID %s not found.", task_id)
-        else:
-            logger.info("task query timed out")
-        return None
-
-    async def clean(self, queues: set[bytes], now: dt.datetime, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None) -> None:
-        """Clean up the state manager."""
-        if max_queue_age or min_queue_age:
-            earliest_time = min_queue_age or TIME_ZERO
-            latest_time = max_queue_age or now
-            for queue in queues:
-                # TODO: Batch X queues together per pipeline. Just can't let X be so big that
-                # the pipeline grows too large.
-                pipe = self.data_store.pipeline(transaction=True)
-                if earliest_time <= latest_time:
-                    pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=earliest_time.timestamp(), max=latest_time.timestamp())
-                else:
-                    pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=0, max=earliest_time.timestamp())
-                    pipe.zremrangebyscore(self.TASKS_BY_QUEUE(queue=queue.decode()), min=latest_time.timestamp(), max=now.timestamp())
-                await pipe.execute()
 
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
@@ -229,7 +119,7 @@ class StateManager:
             # Need to consider interactions with callbacks of the task
             self.current_tasks_by_queue[task.queue].remove(task.id)
 
-    async def clean(self, rate_limit_age: dt.timedelta | None=None, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None) -> None:
+    async def clean(self, rate_limit_age: dt.timedelta | None=None, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None, stale_time: dt.timedelta | None=None) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.timezone.utc)
         queues = await self.data_store.smembers(self.qca.ALL_QUEUES)
@@ -239,6 +129,12 @@ class StateManager:
 
         if max_queue_age or min_queue_age:
             await self.ta.clean(queues, now, min_queue_age, max_queue_age)
+
+        if stale_time:
+            async for task in self.ta.get_stale_tasks(queues, stale_time):
+                logger.warning("Task %s is stale; cancelling", task.id)
+                task.status = TaskStatus.STALLED
+                await self.save_task(task)
 
     # TODO: refactor the refresh tag to be an implementation detail of QueueConfigAdapter
     async def get_refresh_tag(self, role: str) -> ULID:
@@ -250,6 +146,8 @@ class StateManager:
         init_tag = ULID()
         await self.data_store.set(f"worker-queues:{role}:refresh_tag", bytes(init_tag))
         return init_tag
+
+
 
     async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
