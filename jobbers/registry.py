@@ -1,3 +1,4 @@
+import datetime as dt
 import logging
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -15,7 +16,7 @@ def register_task(
         max_retries: int=3,
         retry_delay: int | None=None,
         expected_exceptions: tuple[Exception] | None=None,
-        max_heartbeat_interval: int | None=None
+        max_heartbeat_interval: dt.timedelta | None=None
     ) -> Callable[..., Any]:
     """Register a task function with the given name and version."""
 

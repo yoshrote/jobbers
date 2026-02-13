@@ -178,3 +178,28 @@ Top Problems:
   - aggregate task execution time (possibly per task+queue in case the queue assignment is significant)
   - task completion rates (per task or per task per queue)
 - discover and handle when role -> queue mapping changes
+
+## Task Heartbeat Configuration
+
+The heartbeat function allows you to monitor the health and progress of long-running tasks. Here's how to configure and use it:
+
+### Basic Setup
+
+```python
+import datetime as dt
+from jobbers.registry import register_task
+
+# Create a task
+@register_task(
+  name="Long Running Job", 
+  version=1, 
+  max_heartbeat_interval=dt.timedelta(minutes=5)
+)
+def long_running_task(task):
+  for chunk in get_list_of_things():
+    do_the_thing(chunk)
+    task.heartbeat()
+```
+
+If the task does not update its heartbeat within 5 minutes it may be detected
+as having stalled and we can detect that and react.
