@@ -123,12 +123,13 @@ async def test_task_exists(redis, task_adapter):
 @pytest.mark.asyncio
 async def test_get_all_tasks(redis, task_adapter):
     """Test retrieving all tasks from Redis."""
+    queue = "default"
     # Add tasks to Redis
-    await redis.zadd("task-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp(), bytes(ULID2): FROZEN_TIME.timestamp()})
+    await redis.zadd(f"task-queues:{queue}", {bytes(ULID1): FROZEN_TIME.timestamp(), bytes(ULID2): FROZEN_TIME.timestamp()})
     await redis.hset(f"task:{ULID1}", mapping={b"name": b"Task 1", b"status": b"started", b"submitted_at": ISO_FROZEN_TIME})
     await redis.hset(f"task:{ULID2}", mapping={b"name": b"Task 2", b"status": b"completed", b"submitted_at": ISO_FROZEN_TIME})
     # Retrieve all tasks
-    tasks = await task_adapter.get_all_tasks(TaskPagination())
+    tasks = await task_adapter.get_all_tasks(TaskPagination(queue=queue))
     assert len(tasks) == 2
     assert tasks == unordered([
         Task(id=ULID1, name="Task 1", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME),
@@ -138,7 +139,7 @@ async def test_get_all_tasks(redis, task_adapter):
 @pytest.mark.asyncio
 async def test_get_all_tasks_empty(task_adapter):
     """Test retrieving tasks when no tasks exist."""
-    tasks = await task_adapter.get_all_tasks(TaskPagination())
+    tasks = await task_adapter.get_all_tasks(TaskPagination(queue="default"))
     assert tasks == []
 
 @pytest.mark.asyncio

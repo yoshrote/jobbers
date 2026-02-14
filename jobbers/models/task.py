@@ -151,6 +151,7 @@ class Task(BaseModel):
 class TaskPagination(BaseModel):
     "Pagination details."
 
+    queue: str = Field()
     limit: int = Field(default=10, gt=0, le=100)
     start: ULID | None = Field(default=None)
 
@@ -239,7 +240,7 @@ class TaskAdapter:
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         task_ids = await self.data_store.zrangebyscore(
-            self.TASKS_BY_QUEUE(queue="default"),
+            self.TASKS_BY_QUEUE(pagination.queue),
             pagination.start_param(), '+inf',
             start=pagination.start_param(),
             num=pagination.limit

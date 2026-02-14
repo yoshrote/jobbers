@@ -138,7 +138,7 @@ async def test_get_task_list():
 
     with patch("jobbers.task_routes.TaskAdapter", return_value=mock_task_adapter):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/task-list")
+            response = await client.get("/task-list", params={"queue": "default"})
 
         assert response.status_code == 200
         assert response.json() == {
