@@ -240,7 +240,7 @@ class TaskAdapter:
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         task_ids = await self.data_store.zrangebyscore(
-            self.TASKS_BY_QUEUE(pagination.queue),
+            self.TASKS_BY_QUEUE(queue=pagination.queue),
             pagination.start_param(), '+inf',
             start=pagination.start_param(),
             num=pagination.limit
