@@ -13,6 +13,8 @@ from jobbers.state_manager import StateManager, UserCancellationError
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
+    from jobbers.models.task_scheduler import TaskScheduler
+
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 tasks_processed = meter.create_counter("tasks_processed", unit="1")
@@ -23,8 +25,9 @@ end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms"
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
 
-    def __init__(self, state_manager: StateManager):
+    def __init__(self, state_manager: StateManager, scheduler: "TaskScheduler") -> None:
         self.state_manager = state_manager
+        self.scheduler = scheduler
         self._current_promise: Awaitable[Any] | None = None
 
     async def run(self, task: Task) -> None:
@@ -138,7 +141,7 @@ class TaskProcessor:
         # TODO: Set metrics to track expected exceptions
         task.error = str(exc)
         if task.should_retry():
-            task.set_to_retry()
+            self._retry(task)
         else:
             task.set_status(TaskStatus.FAILED)
 
@@ -151,9 +154,20 @@ class TaskProcessor:
         logger.warning("Task %s timed out after %s seconds.", task.id, timeout)
         task.error = f"Task {task.id} timed out after {timeout} seconds"
         if task.should_retry():
-            task.set_to_retry()
+            self._retry(task)
         else:
             task.set_status(TaskStatus.FAILED)
+
+    def _retry(self, task: Task) -> None:
+        """Schedule a delayed retry when a scheduler and retry_delay are configured, else requeue immediately."""
+        if task.task_config is not None and task.task_config.retry_delay is not None:
+            run_at = task.task_config.compute_retry_at(task.retry_attempt + 1)
+            task.set_to_scheduled()
+            self.scheduler.add(task, run_at)
+            logger.info("Task %s scheduled for retry at %s.", task.id, run_at)
+        else:
+            task.set_to_retry()
+
 
     def handle_success(self, task: Task) -> None:
         logger.info("Task %s completed.", task.id)

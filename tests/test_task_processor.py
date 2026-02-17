@@ -1,9 +1,10 @@
 import asyncio
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from jobbers.models.task import Task, TaskStatus
+from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
 from jobbers.state_manager import StateManager
@@ -489,3 +490,164 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
     # Once when starting and once when done
     state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
 
+
+# ── scheduled-retry tests (TaskScheduler present + retry_delay configured) ───
+
+def _make_scheduler():
+    """Return a mock TaskScheduler."""
+    return MagicMock()
+
+
+def _retryable_config(backoff_strategy=BackoffStrategy.CONSTANT, max_retries=3):
+    async def task_function(**_):  # pragma: no cover
+        pass
+
+    return TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        max_retries=max_retries,
+        retry_delay=5,
+        backoff_strategy=backoff_strategy,
+        expected_exceptions=(ValueError,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_scheduled_with_backoff():
+    """With a scheduler + retry_delay, a retryable exception → SCHEDULED, not UNSUBMITTED."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.UNSUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = AsyncMock(spec=StateManager)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config()
+    task_config = task_config.model_copy(update={"function": task_function})
+    scheduler = _make_scheduler()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, scheduler)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.SCHEDULED
+    assert result.retry_attempt == 1
+    scheduler.add.assert_called_once()
+    scheduled_task, run_at = scheduler.add.call_args.args
+    assert scheduled_task.id == task.id
+
+
+@pytest.mark.asyncio
+async def test_timeout_scheduled_with_backoff():
+    """With a scheduler + retry_delay, a retryable timeout → SCHEDULED, not UNSUBMITTED."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = AsyncMock(spec=StateManager)
+    task_function = AsyncMock(side_effect=asyncio.TimeoutError)
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=1,
+        max_retries=3,
+        retry_delay=5,
+        backoff_strategy=BackoffStrategy.CONSTANT,
+    )
+    scheduler = _make_scheduler()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, scheduler)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.SCHEDULED
+    assert result.retry_attempt == 1
+    scheduler.add.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_no_scheduler_still_unsubmitted():
+    """Without a scheduler, a retryable exception requeues immediately as UNSUBMITTED."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.UNSUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = AsyncMock(spec=StateManager)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config()
+    task_config = task_config.model_copy(update={"function": task_function})
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, scheduler=None)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.UNSUBMITTED
+    assert result.retry_attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_max_retries_fails_even_with_scheduler():
+    """At max_retries, the task is FAILED regardless of whether a scheduler is present."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.UNSUBMITTED,
+        retry_attempt=3,
+    )
+    state_manager = AsyncMock(spec=StateManager)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config(max_retries=3)
+    task_config = task_config.model_copy(update={"function": task_function})
+    scheduler = _make_scheduler()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, scheduler)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.retry_attempt == 3
+    scheduler.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_timeout_max_retries_fails_even_with_scheduler():
+    """At max_retries, a timed-out task is FAILED regardless of scheduler."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=3,
+    )
+    state_manager = AsyncMock(spec=StateManager)
+    task_function = AsyncMock(side_effect=asyncio.TimeoutError)
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=1,
+        max_retries=3,
+        retry_delay=5,
+        backoff_strategy=BackoffStrategy.CONSTANT,
+    )
+    scheduler = _make_scheduler()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, scheduler)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.completed_at is not None
+    scheduler.add.assert_not_called()

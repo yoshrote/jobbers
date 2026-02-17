@@ -98,13 +98,13 @@ class QueueConfigAdapter:
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
 
-    def __init__(self, data_store: Any) -> None:
+    def __init__(self, data_store: Any, task_scheduler: TaskScheduler) -> None:
         self.data_store = data_store
         self.qca = QueueConfigAdapter(data_store)
         self.ta = TaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
-        self.task_scheduler = TaskScheduler("task_schedule.db")
+        self.task_scheduler = task_scheduler
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -276,4 +276,4 @@ class SubmissionRateLimiter:
 
 def build_sm() -> StateManager:
     from jobbers import db
-    return StateManager(db.get_client())
+    return db.get_state_manager()

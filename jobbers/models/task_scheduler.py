@@ -67,7 +67,7 @@ class TaskScheduler:
             WHERE task_id = (
                 SELECT task_id FROM schedule
                 WHERE run_at <= ? AND queue IN ({placeholders}) AND acquired = 0
-                ORDER BY run_at LIMIT 1
+                ORDER BY run_at, task_id LIMIT 1
             )
             RETURNING task
             """,

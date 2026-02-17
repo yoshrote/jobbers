@@ -27,9 +27,10 @@ async def redis():
     await fake_store.close()
 
 @pytest.fixture
-def state_manager(redis):
+def state_manager(redis, tmp_path):
     """Fixture to provide a StateManager instance with a fake Redis data store."""
-    return StateManager(redis)
+    from jobbers.models.task_scheduler import TaskScheduler
+    return StateManager(redis, task_scheduler=TaskScheduler(tmp_path / "schedule.db"))
 
 @pytest.fixture
 def task_adapter(redis):
