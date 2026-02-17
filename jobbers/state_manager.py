@@ -12,6 +12,7 @@ from ulid import ULID
 from jobbers import registry
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskAdapter
+from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,7 @@ class StateManager:
         self.ta = TaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
+        self.task_scheduler = TaskScheduler("task_schedule.db")
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -164,6 +166,9 @@ class StateManager:
 
         queues = await self.submission_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
 
+        scheduled_task = self.task_scheduler.next_due(queues=list(queues))
+        if scheduled_task:
+            return scheduled_task
         return await self.ta.get_next_task(queues, timeout)
 
     # Proxy methods
