@@ -3,6 +3,7 @@ import inspect
 import logging
 from asyncio import TaskGroup
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from enum import StrEnum
 from typing import Any, Self, cast
 
 from pydantic import BaseModel, Field
@@ -147,13 +148,20 @@ class Task(BaseModel):
         self.status = TaskStatus.UNSUBMITTED
         self.retry_attempt += 1
 
-# TODO: test pagination
+class PaginationOrder(StrEnum):
+    "Supported fields to order task list by."
+
+    SUBMITTED_AT = "submitted_at"
+    TASK_ID = "task_id"
+
 class TaskPagination(BaseModel):
     "Pagination details."
 
     queue: str = Field()
     limit: int = Field(default=10, gt=0, le=100)
     start: ULID | None = Field(default=None)
+    order_by: PaginationOrder = Field(default=PaginationOrder.SUBMITTED_AT)
+    # status: TaskStatus | None = Field(default=None)
 
     def start_param(self) -> int:
         if not self.start:
@@ -239,12 +247,21 @@ class TaskAdapter:
         return does_exists == 1
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
-        task_ids = await self.data_store.zrangebyscore(
-            self.TASKS_BY_QUEUE(queue=pagination.queue),
-            pagination.start_param(), '+inf',
-            start=pagination.start_param(),
-            num=pagination.limit
-        )
+        if pagination.order_by == "submitted_at":
+            # tasks will be ordered by SUBMISSION time
+            task_ids = await self.data_store.zrangebyscore(
+                self.TASKS_BY_QUEUE(queue=pagination.queue),
+                pagination.start_param(), '+inf',
+                start=pagination.start_param(),
+                num=pagination.limit
+            )
+        else:
+            # tasks will be ordered by TASK ID, which is roughly creation time but not exactly
+            task_ids = await self.data_store.zrange(
+                self.TASKS_BY_QUEUE(queue=pagination.queue),
+                pagination.start_param(), int(dt.datetime.now(dt.timezone.utc).timestamp()),
+                num=pagination.limit
+            )
         if not task_ids:
             return []
         results: list[Task] = []
