@@ -148,6 +148,10 @@ class Task(BaseModel):
         self.status = TaskStatus.UNSUBMITTED
         self.retry_attempt += 1
 
+    def set_to_scheduled(self) -> None:
+        self.status = TaskStatus.SCHEDULED
+        self.retry_attempt += 1
+
 class PaginationOrder(StrEnum):
     "Supported fields to order task list by."
 
