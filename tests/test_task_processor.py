@@ -555,7 +555,7 @@ async def test_timeout_scheduled_with_backoff():
         retry_attempt=0,
     )
     state_manager = _make_state_manager()
-    
+
     task_function = AsyncMock(side_effect=asyncio.TimeoutError)
     task_config = TaskConfig(
         name="test_task",

@@ -26,7 +26,7 @@ class TaskProcessor:
 
     def __init__(self, state_manager: StateManager) -> None:
         self.state_manager = state_manager
-        self.scheduler = state_manager.scheduler
+        self.scheduler = state_manager.task_scheduler
         self._current_promise: Awaitable[Any] | None = None
 
     async def run(self, task: Task) -> None:
