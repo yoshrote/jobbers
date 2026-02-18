@@ -497,7 +497,7 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
 def _make_state_manager():
     """Return a mock StateManager."""
     state_manager = AsyncMock(spec=StateManager)
-    state_manager.scheduler = AsyncMock(spec=TaskScheduler)
+    state_manager.task_scheduler = AsyncMock(spec=TaskScheduler)
     return state_manager
 
 
@@ -531,7 +531,7 @@ async def test_expected_exception_scheduled_with_backoff():
     task_function = AsyncMock(side_effect=ValueError("boom"))
     task_config = _retryable_config()
     task_config = task_config.model_copy(update={"function": task_function})
-    scheduler = state_manager.scheduler
+    scheduler = state_manager.task_scheduler
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
@@ -566,7 +566,7 @@ async def test_timeout_scheduled_with_backoff():
         retry_delay=5,
         backoff_strategy=BackoffStrategy.CONSTANT,
     )
-    scheduler = state_manager.scheduler
+    scheduler = state_manager.task_scheduler
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
@@ -591,7 +591,7 @@ async def test_expected_exception_max_retries_fails_even_with_scheduler():
     task_function = AsyncMock(side_effect=ValueError("boom"))
     task_config = _retryable_config(max_retries=3)
     task_config = task_config.model_copy(update={"function": task_function})
-    scheduler = state_manager.scheduler
+    scheduler = state_manager.task_scheduler
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
@@ -623,7 +623,7 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
         retry_delay=5,
         backoff_strategy=BackoffStrategy.CONSTANT,
     )
-    scheduler = state_manager.scheduler
+    scheduler = state_manager.task_scheduler
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
