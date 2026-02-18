@@ -1,10 +1,11 @@
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
+from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
 from jobbers.state_manager import StateManager
@@ -32,7 +33,7 @@ async def test_task_processor_success():
         status=TaskStatus.SUBMITTED,
         queue="test_queue",
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(return_value={"result": "success"})
 
     task_config = TaskConfig(
@@ -62,7 +63,7 @@ async def test_task_processor_dropped_task():
         version=1,
         status=TaskStatus.UNSUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
 
     with patch("jobbers.task_processor.get_task_config", return_value=None):
         processor = TaskProcessor(state_manager)
@@ -86,7 +87,7 @@ async def test_task_processor_expected_exception_with_retry():
         status=TaskStatus.UNSUBMITTED,
         retry_attempt=0,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=ValueError("Expected error"))
     task_config = TaskConfig(
         name="test_task",
@@ -118,7 +119,7 @@ async def test_task_processor_expected_exception_without_retry():
         status=TaskStatus.UNSUBMITTED,
         retry_attempt=0,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=ValueError("Expected error"))
     task_config = TaskConfig(
         name="test_task",
@@ -150,7 +151,7 @@ async def test_task_processor_unexpected_exception():
         parameters={"param1": "value1"},
         status=TaskStatus.UNSUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=RuntimeError("Unexpected error"))
     task_config = TaskConfig(
         name="test_task",
@@ -182,7 +183,7 @@ async def test_task_processor_timeout_with_retry():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=asyncio.TimeoutError)
     task_config = TaskConfig(
         name="test_task",
@@ -212,7 +213,7 @@ async def test_task_processor_timeout_without_retry():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=asyncio.TimeoutError)
     task_config = TaskConfig(
         name="test_task",
@@ -243,7 +244,7 @@ async def test_task_processor_stalled():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=asyncio.CancelledError)
     task_config = TaskConfig(
         name="test_task",
@@ -275,7 +276,7 @@ async def test_task_processor_stalled_with_stop_policy():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=asyncio.CancelledError())
 
     task_config = TaskConfig(
@@ -309,7 +310,7 @@ async def test_task_processor_cancelled_with_resubmit_policy():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=asyncio.CancelledError())
 
     task_config = TaskConfig(
@@ -343,7 +344,7 @@ async def test_task_processor_cancelled_with_continue_policy():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=asyncio.CancelledError())
 
     task_config = TaskConfig(
@@ -378,7 +379,7 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
 
     # Mock the task function to succeed
     task_function = AsyncMock(return_value={"result": "success"})
@@ -419,7 +420,7 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
 
     # Mock the task function to succeed
     task_function = AsyncMock(return_value={"result": "success"})
@@ -460,7 +461,7 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
         parameters={"param1": "value1"},
         status=TaskStatus.SUBMITTED,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
 
     # Mock the task function to succeed
     task_function = AsyncMock(return_value={"result": "success"})
@@ -493,9 +494,11 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
 
 # ── scheduled-retry tests (TaskScheduler present + retry_delay configured) ───
 
-def _make_scheduler():
-    """Return a mock TaskScheduler."""
-    return MagicMock()
+def _make_state_manager():
+    """Return a mock StateManager."""
+    state_manager = AsyncMock(spec=StateManager)
+    state_manager.scheduler = AsyncMock(spec=TaskScheduler)
+    return state_manager
 
 
 def _retryable_config(backoff_strategy=BackoffStrategy.CONSTANT, max_retries=3):
@@ -524,14 +527,14 @@ async def test_expected_exception_scheduled_with_backoff():
         status=TaskStatus.UNSUBMITTED,
         retry_attempt=0,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=ValueError("boom"))
     task_config = _retryable_config()
     task_config = task_config.model_copy(update={"function": task_function})
-    scheduler = _make_scheduler()
+    scheduler = state_manager.scheduler
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
-        processor = TaskProcessor(state_manager, scheduler)
+        processor = TaskProcessor(state_manager)
         result = await processor.process(task)
 
     assert result.status == TaskStatus.SCHEDULED
@@ -551,7 +554,8 @@ async def test_timeout_scheduled_with_backoff():
         status=TaskStatus.SUBMITTED,
         retry_attempt=0,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
+    
     task_function = AsyncMock(side_effect=asyncio.TimeoutError)
     task_config = TaskConfig(
         name="test_task",
@@ -562,38 +566,15 @@ async def test_timeout_scheduled_with_backoff():
         retry_delay=5,
         backoff_strategy=BackoffStrategy.CONSTANT,
     )
-    scheduler = _make_scheduler()
+    scheduler = state_manager.scheduler
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
-        processor = TaskProcessor(state_manager, scheduler)
+        processor = TaskProcessor(state_manager)
         result = await processor.process(task)
 
     assert result.status == TaskStatus.SCHEDULED
     assert result.retry_attempt == 1
     scheduler.add.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_expected_exception_no_scheduler_still_unsubmitted():
-    """Without a scheduler, a retryable exception requeues immediately as UNSUBMITTED."""
-    task = Task(
-        id="01JQC31AJP7TSA9X8AEP64XG08",
-        name="test_task",
-        version=1,
-        status=TaskStatus.UNSUBMITTED,
-        retry_attempt=0,
-    )
-    state_manager = AsyncMock(spec=StateManager)
-    task_function = AsyncMock(side_effect=ValueError("boom"))
-    task_config = _retryable_config()
-    task_config = task_config.model_copy(update={"function": task_function})
-
-    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
-        processor = TaskProcessor(state_manager, scheduler=None)
-        result = await processor.process(task)
-
-    assert result.status == TaskStatus.UNSUBMITTED
-    assert result.retry_attempt == 1
 
 
 @pytest.mark.asyncio
@@ -606,14 +587,14 @@ async def test_expected_exception_max_retries_fails_even_with_scheduler():
         status=TaskStatus.UNSUBMITTED,
         retry_attempt=3,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=ValueError("boom"))
     task_config = _retryable_config(max_retries=3)
     task_config = task_config.model_copy(update={"function": task_function})
-    scheduler = _make_scheduler()
+    scheduler = state_manager.scheduler
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
-        processor = TaskProcessor(state_manager, scheduler)
+        processor = TaskProcessor(state_manager)
         result = await processor.process(task)
 
     assert result.status == TaskStatus.FAILED
@@ -631,7 +612,7 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
         status=TaskStatus.SUBMITTED,
         retry_attempt=3,
     )
-    state_manager = AsyncMock(spec=StateManager)
+    state_manager = _make_state_manager()
     task_function = AsyncMock(side_effect=asyncio.TimeoutError)
     task_config = TaskConfig(
         name="test_task",
@@ -642,10 +623,10 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
         retry_delay=5,
         backoff_strategy=BackoffStrategy.CONSTANT,
     )
-    scheduler = _make_scheduler()
+    scheduler = state_manager.scheduler
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
-        processor = TaskProcessor(state_manager, scheduler)
+        processor = TaskProcessor(state_manager)
         result = await processor.process(task)
 
     assert result.status == TaskStatus.FAILED

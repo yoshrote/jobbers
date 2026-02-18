@@ -13,7 +13,6 @@ from jobbers.state_manager import StateManager, UserCancellationError
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
-    from jobbers.models.task_scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -25,9 +24,9 @@ end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms"
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
 
-    def __init__(self, state_manager: StateManager, scheduler: "TaskScheduler") -> None:
+    def __init__(self, state_manager: StateManager) -> None:
         self.state_manager = state_manager
-        self.scheduler = scheduler
+        self.scheduler = state_manager.scheduler
         self._current_promise: Awaitable[Any] | None = None
 
     async def run(self, task: Task) -> None:
