@@ -18,19 +18,20 @@ tools to provide options to recover or kill the tasks are useful to handle these
 
 ## OpenTelemetry Metrics
 
-aggregated by task and queue
+aggregated by task, version, and queue
 
 | metric | type | description |
 | ------ | ---- | ----------- |
-|  tasks_retried      | COUNT| number of retries |
+|  tasks_retried      | COUNT| one per retry event (expected exception or timeout) |
+|  tasks_dead_lettered | COUNT | tasks moved to the dead letter queue |
 
 aggregated by task, queue, and status
 
 | metric | type | description |
 | ------ | ---- | ----------- |
 |  tasks_processed    | COUNT| number of tasks |
-|  execution_time     | HIST | time from task start to task finish |
-|  end_to_end_latency | HIST | time from enqueue to task finish |
+|  execution_time     | HIST | time from task start to task finish (ms) |
+|  end_to_end_latency | HIST | time from enqueue to task finish (ms) |
 
 aggregated by task, queue, and role
 
