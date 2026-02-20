@@ -2,6 +2,7 @@ import datetime as dt
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import fakeredis
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis
@@ -20,7 +21,7 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 @pytest_asyncio.fixture
 async def redis_db():
     # Connect to a test Redis instance (e.g., managed by pytest-redis)
-    client = redis.Redis(host='localhost', port=6379, db=1)
+    client = fakeredis.aioredis.FakeRedis()
     yield client
     # Clean up after the test (e.g., flush the database)
     await client.flushdb()
