@@ -8,6 +8,7 @@ import pytest_asyncio
 from pytest_unordered import unordered
 from ulid import ULID
 
+from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task, TaskAdapter, TaskPagination
 from jobbers.models.task_status import TaskStatus
@@ -30,7 +31,10 @@ async def redis():
 def state_manager(redis, tmp_path):
     """Fixture to provide a StateManager instance with a fake Redis data store."""
     from jobbers.models.task_scheduler import TaskScheduler
-    return StateManager(redis, task_scheduler=TaskScheduler(tmp_path / "schedule.db"))
+    return StateManager(redis, 
+        task_scheduler=TaskScheduler(tmp_path / "schedule.db"),
+        dead_queue=DeadQueue(tmp_path / "dead_queue.db"),
+    )
 
 @pytest.fixture
 def task_adapter(redis):

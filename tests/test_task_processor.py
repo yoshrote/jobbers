@@ -50,8 +50,9 @@ async def test_task_processor_success():
 
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(task), call(result_task)])
+    # save_task called once when starting; complete_task called when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.complete_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -71,8 +72,7 @@ async def test_task_processor_dropped_task():
 
     assert result_task.status == TaskStatus.DROPPED
     assert result_task.completed_at is not None
-    # Once when starting
-    state_manager.save_task.assert_called_once_with(result_task)
+    state_manager.save_task.assert_called_once_with(task)
 
 
 
@@ -105,8 +105,9 @@ async def test_task_processor_expected_exception_with_retry():
     assert result_task.status == TaskStatus.UNSUBMITTED
     assert result_task.retry_attempt == 1
     assert "Expected error" in result_task.error
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
+    # save_task called when starting; retry_task called when retrying
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.retry_task.assert_called_once_with(task)
 
 @pytest.mark.asyncio
 async def test_task_processor_expected_exception_without_retry():
@@ -137,8 +138,9 @@ async def test_task_processor_expected_exception_without_retry():
     assert result_task.status == TaskStatus.FAILED
     assert result_task.retry_attempt == 0
     assert "Expected error" in result_task.error
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
+    # save_task called when starting; fail_task called when failing
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.fail_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -168,8 +170,9 @@ async def test_task_processor_unexpected_exception():
 
     assert result_task.status == TaskStatus.FAILED
     assert "Unexpected error" in result_task.error
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
+    # save_task called when starting; fail_task called when failing
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.fail_task.assert_called_once_with(task)
 
 
 
@@ -199,8 +202,9 @@ async def test_task_processor_timeout_with_retry():
 
     assert result_task.status == TaskStatus.UNSUBMITTED
     assert "timed out" in result_task.error
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
+    # save_task called when starting; retry_task called when retrying
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.retry_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -230,8 +234,9 @@ async def test_task_processor_timeout_without_retry():
     assert result_task.status == TaskStatus.FAILED
     assert result_task.completed_at is not None, "Failed tasks should have a completed_at timestamp"
     assert "timed out" in result_task.error
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
+    # save_task called when starting; fail_task called when failing
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.fail_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -262,7 +267,7 @@ async def test_task_processor_stalled():
     # the task should have been updated via side effects
     assert task.status == TaskStatus.STALLED
     assert task.completed_at is not None, "Cancelled tasks should have a completed_at timestamp"
-    # Once when starting and once when done
+    # save_task called when starting and when handling cancellation
     state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
@@ -293,10 +298,10 @@ async def test_task_processor_stalled_with_stop_policy():
         with pytest.raises(asyncio.CancelledError):
             await processor.process(task)
 
-    # Task should be marked as cancelled due to STOP policy
+    # Task should be marked as stalled due to STOP policy
     assert task.status == TaskStatus.STALLED
     assert task.completed_at is not None
-    # Once when starting and once when done
+    # save_task called when starting and when handling cancellation
     state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
@@ -330,7 +335,7 @@ async def test_task_processor_cancelled_with_resubmit_policy():
     # Task should be marked for resubmission due to RESUBMIT policy
     assert task.status == TaskStatus.UNSUBMITTED
     assert task.completed_at is None  # Should not be completed when resubmitted
-    # Once when starting and once when done
+    # save_task called when starting and when handling cancellation
     state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
@@ -361,11 +366,10 @@ async def test_task_processor_cancelled_with_continue_policy():
         with pytest.raises(asyncio.CancelledError):
             await processor.process(task)
 
-    # With CONTINUE policy, the task should be in STARTED state (marked before cancellation)
-    # The shutdown() method does nothing for CONTINUE policy, so task keeps the status from before cancellation
+    # With CONTINUE policy, shutdown() is a NOOP so task remains in STARTED state
     assert task.status == TaskStatus.STARTED  # Should remain as started (set before cancellation happened)
     assert task.completed_at is None  # Should not be completed for CONTINUE policy
-    # Once when starting and once when done
+    # save_task called when starting and when handling cancellation
     state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
@@ -406,8 +410,9 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
 
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
+    # save_task called when starting; complete_task called when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.complete_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -447,8 +452,9 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
 
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
+    # save_task called when starting; complete_task called when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.complete_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -488,16 +494,29 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
 
-    # Once when starting and once when done
-    state_manager.save_task.assert_has_calls([call(result_task), call(result_task)])
+    # save_task called when starting; complete_task called when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.complete_task.assert_called_once_with(task)
 
 
 # ── scheduled-retry tests (TaskScheduler present + retry_delay configured) ───
 
 def _make_state_manager():
-    """Return a mock StateManager."""
+    """Return a mock StateManager whose retry_task mirrors the real SM behaviour."""
     state_manager = AsyncMock(spec=StateManager)
     state_manager.task_scheduler = AsyncMock(spec=TaskScheduler)
+
+    async def _retry_task(task: Task) -> Task:
+        """Mimic StateManager.retry_task: set the correct status and schedule if needed."""
+        if task.task_config is not None and task.task_config.retry_delay is not None:
+            task.set_status(TaskStatus.SCHEDULED)
+            run_at = task.task_config.compute_retry_at(task.retry_attempt)
+            state_manager.task_scheduler.add(task, run_at)
+        else:
+            task.set_status(TaskStatus.UNSUBMITTED)
+        return task
+
+    state_manager.retry_task.side_effect = _retry_task
     return state_manager
 
 
@@ -539,6 +558,7 @@ async def test_expected_exception_scheduled_with_backoff():
 
     assert result.status == TaskStatus.SCHEDULED
     assert result.retry_attempt == 1
+    state_manager.retry_task.assert_called_once_with(task)
     scheduler.add.assert_called_once()
     scheduled_task, run_at = scheduler.add.call_args.args
     assert scheduled_task.id == task.id
@@ -574,6 +594,7 @@ async def test_timeout_scheduled_with_backoff():
 
     assert result.status == TaskStatus.SCHEDULED
     assert result.retry_attempt == 1
+    state_manager.retry_task.assert_called_once_with(task)
     scheduler.add.assert_called_once()
 
 
@@ -599,6 +620,7 @@ async def test_expected_exception_max_retries_fails_even_with_scheduler():
 
     assert result.status == TaskStatus.FAILED
     assert result.retry_attempt == 3
+    state_manager.fail_task.assert_called_once_with(task)
     scheduler.add.assert_not_called()
 
 
@@ -631,4 +653,5 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
 
     assert result.status == TaskStatus.FAILED
     assert result.completed_at is not None
+    state_manager.fail_task.assert_called_once_with(task)
     scheduler.add.assert_not_called()

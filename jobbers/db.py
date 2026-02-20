@@ -2,6 +2,7 @@ import os
 
 import redis.asyncio as redis
 
+from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.state_manager import StateManager
 
@@ -32,5 +33,10 @@ def get_state_manager() -> StateManager:
     global _state_manager
     if _state_manager is None:
         scheduler_db_path = os.environ.get("SCHEDULER_DB_PATH", "task_schedule.db")
-        _state_manager = StateManager(get_client(), task_scheduler=TaskScheduler(scheduler_db_path))
+        dead_queue_db_path = os.environ.get("DEAD_QUEUE_DB_PATH", "dead_queue.db")
+        _state_manager = StateManager(
+            get_client(),
+            task_scheduler=TaskScheduler(scheduler_db_path),
+            dead_queue=DeadQueue(dead_queue_db_path)
+        )
     return _state_manager

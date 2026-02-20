@@ -10,8 +10,10 @@ from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 from jobbers import registry
+from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskAdapter
+from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
@@ -98,12 +100,13 @@ class QueueConfigAdapter:
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
 
-    def __init__(self, data_store: Any, task_scheduler: TaskScheduler) -> None:
+    def __init__(self, data_store: Any, task_scheduler: TaskScheduler, dead_queue: DeadQueue) -> None:
         self.data_store = data_store
         self.qca = QueueConfigAdapter(data_store)
         self.ta = TaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
+        self.dead_queue = dead_queue
         self.task_scheduler = task_scheduler
 
     @property
@@ -198,7 +201,34 @@ class StateManager:
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
-        await self.ta.submit_task(task=task, extra_check=None)
+        await self.ta.save_task(task=task)
+        return task
+
+    async def fail_task(self, task: Task) -> Task:
+        """Persist a failed task, handling any dead letter queue side effects."""
+        if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
+            logger.info("Task %s sent to dead letter queue.", task.id)
+            self.dead_queue.add(task, dt.datetime.now(dt.timezone.utc))
+        return await self.save_task(task)
+
+    async def complete_task(self, task: Task) -> Task:
+        """Persist a completed task."""
+        #TODO set a ttl for the data in redis after completion
+        return await self.save_task(task)
+
+    async def retry_task(self, task: Task) -> Task:
+        """Mark a task as scheduled for retry and save it."""
+        if task.task_config is not None and task.task_config.retry_delay is not None:
+            task.set_status(TaskStatus.SCHEDULED)
+            run_at = task.task_config.compute_retry_at(task.retry_attempt + 1)
+            self.task_scheduler.add(task, run_at)
+            logger.info("Task %s scheduled for retry at %s.", task.id, run_at)
+            await self.save_task(task)
+        else:
+            task.set_status(TaskStatus.UNSUBMITTED)
+            run_at = dt.datetime.now(dt.timezone.utc)
+            logger.info("Task %s requeued for immediate retry.", task.id)
+            await self.submit_task(task)
         return task
 
     async def monitor_task_cancellation(self, task_id: ULID) -> None:

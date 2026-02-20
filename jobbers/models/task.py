@@ -142,15 +142,10 @@ class Task(BaseModel):
             case TaskStatus.COMPLETED | TaskStatus.FAILED | \
                  TaskStatus.CANCELLED | TaskStatus.STALLED | TaskStatus.DROPPED:
                 self.completed_at = dt.datetime.now(dt.timezone.utc)
+            case TaskStatus.SCHEDULED | TaskStatus.UNSUBMITTED:
+                self.retry_attempt += 1
         self.status = status
 
-    def set_to_retry(self) -> None:
-        self.status = TaskStatus.UNSUBMITTED
-        self.retry_attempt += 1
-
-    def set_to_scheduled(self) -> None:
-        self.status = TaskStatus.SCHEDULED
-        self.retry_attempt += 1
 
 class PaginationOrder(StrEnum):
     "Supported fields to order task list by."
@@ -201,6 +196,18 @@ class TaskAdapter:
                 assert task.submitted_at  # noqa: S101
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
+        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
+        if task.status in TaskStatus.active_statuses():
+            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        else:
+            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
+        await pipe.execute()
+
+    async def save_task(self, task: Task) -> None:
+        """Submit a task to the Redis data store."""
+        pipe = self.data_store.pipeline(transaction=True)
+        # Avoid pushing a task onto the queue multiple times
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
         if task.status in TaskStatus.active_statuses():
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
