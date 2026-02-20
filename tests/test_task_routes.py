@@ -1,6 +1,6 @@
 import datetime as dt
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -10,6 +10,7 @@ from ulid import ULID
 
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
+from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import TaskAdapter
 from jobbers.task_routes import app
 
@@ -203,3 +204,86 @@ async def test_get_all_roles():
         assert response.status_code == 200
         assert response.json() == {"roles": ["role1", "role2"]}
         mock_queue_adapter.get_all_roles.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_by_ids():
+    """Test resubmitting DLQ tasks by explicit task ID list."""
+    task = Task(id=ULID1, name="Test Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.dead_queue.get_by_ids.return_value = [task]
+    mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/dead-letter-queue/resubmit",
+                json={"task_ids": [str(ULID1)]},
+            )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["resubmitted"] == 1
+    assert len(data["tasks"]) == 1
+    mock_sm.dead_queue.get_by_ids.assert_called_once_with([str(ULID1)])
+    mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=True)
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_by_filter():
+    """Test resubmitting DLQ tasks by filter criteria."""
+    task = Task(id=ULID2, name="My Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.dead_queue.get_by_filter.return_value = [task]
+    mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/dead-letter-queue/resubmit",
+                json={"queue": "default", "task_name": "My Task"},
+            )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["resubmitted"] == 1
+    mock_sm.dead_queue.get_by_filter.assert_called_once_with(
+        queue="default",
+        task_name="My Task",
+        task_version=None,
+        limit=100,
+    )
+    mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=True)
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_no_filter_returns_400():
+    """Test that omitting all filter criteria returns 400."""
+    mock_sm = MagicMock()
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/dead-letter-queue/resubmit", json={})
+
+    assert response.status_code == 400
+    assert "Provide task_ids" in response.json()["detail"]
+    mock_sm.dead_queue.get_by_ids.assert_not_called()
+    mock_sm.dead_queue.get_by_filter.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_reset_retry_false():
+    """Test that reset_retry_count=False is forwarded to resubmit_dead_tasks."""
+    task = Task(id=ULID1, name="Test Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.dead_queue.get_by_ids.return_value = [task]
+    mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/dead-letter-queue/resubmit",
+                json={"task_ids": [str(ULID1)], "reset_retry_count": False},
+            )
+
+    assert response.status_code == 200
+    mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=False)

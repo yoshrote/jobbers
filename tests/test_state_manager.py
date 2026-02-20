@@ -31,7 +31,8 @@ async def redis():
 def state_manager(redis, tmp_path):
     """Fixture to provide a StateManager instance with a fake Redis data store."""
     from jobbers.models.task_scheduler import TaskScheduler
-    return StateManager(redis, 
+    return StateManager(
+        redis,
         task_scheduler=TaskScheduler(tmp_path / "schedule.db"),
         dead_queue=DeadQueue(tmp_path / "dead_queue.db"),
     )

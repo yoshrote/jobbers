@@ -137,18 +137,18 @@ class TaskProcessor:
         logger.warning("Task %s failed with error: %s", task.id, exc)
         # TODO: Set metrics to track expected exceptions
         task.error = str(exc)
-        if task.should_retry():
-            if task.should_schedule():
-                task.set_status(TaskStatus.SCHEDULED)
-                run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
-                return await self.state_manager.schedule_retry_task(task, run_at)
-            else:
-                task.set_status(TaskStatus.UNSUBMITTED)
-                return await self.state_manager.queue_retry_task(task)
-        else:
+        if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)
             return task
+
+        if task.should_schedule():
+            task.set_status(TaskStatus.SCHEDULED)
+            run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
+            return await self.state_manager.schedule_retry_task(task, run_at)
+        else:
+            task.set_status(TaskStatus.UNSUBMITTED)
+            return await self.state_manager.queue_retry_task(task)
 
     async def handle_timeout_exception(self, task: Task) -> Task:
         timeout: int | None
@@ -158,18 +158,18 @@ class TaskProcessor:
             timeout = task.task_config.timeout
         logger.warning("Task %s timed out after %s seconds.", task.id, timeout)
         task.error = f"Task {task.id} timed out after {timeout} seconds"
-        if task.should_retry():
-            if task.should_schedule():
-                task.set_status(TaskStatus.SCHEDULED)
-                run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
-                return await self.state_manager.schedule_retry_task(task, run_at)
-            else:
-                task.set_status(TaskStatus.UNSUBMITTED)
-                return await self.state_manager.queue_retry_task(task)
-        else:
+        if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)
             return task
+
+        if task.should_schedule():
+            task.set_status(TaskStatus.SCHEDULED)
+            run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
+            return await self.state_manager.schedule_retry_task(task, run_at)
+        else:
+            task.set_status(TaskStatus.UNSUBMITTED)
+            return await self.state_manager.queue_retry_task(task)
 
     async def handle_success(self, task: Task) -> None:
         logger.info("Task %s completed.", task.id)

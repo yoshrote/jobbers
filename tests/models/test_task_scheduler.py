@@ -1,7 +1,6 @@
 import datetime as dt
 
 import pytest
-from ulid import ULID
 
 from jobbers.models.task import Task
 from jobbers.models.task_scheduler import TaskScheduler

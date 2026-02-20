@@ -4,6 +4,7 @@ from typing import Annotated, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.params import Query
 from opentelemetry import metrics
+from pydantic import BaseModel, Field
 from ulid import ULID
 
 from jobbers import db, registry
@@ -74,6 +75,50 @@ async def get_all_queues() -> dict[str, Any]:
     logger.info("Getting all queues")
     queues = await QueueConfigAdapter(db.get_client()).get_all_queues()
     return {"queues": queues}
+
+class DLQResubmitRequest(BaseModel):
+    """
+    Filter criteria for bulk resubmission from the dead letter queue.
+
+    Provide either `task_ids` for an explicit list, or one or more of `queue`,
+    `task_name`, and `task_version` to select by filter. At least one field
+    must be set to prevent accidentally resubmitting the entire queue.
+    """
+
+    task_ids: list[str] | None = Field(default=None, description="Explicit list of task IDs to resubmit.")
+    queue: str | None = Field(default=None, description="Resubmit only tasks from this queue.")
+    task_name: str | None = Field(default=None, description="Resubmit only tasks with this name.")
+    task_version: int | None = Field(default=None, description="Resubmit only tasks with this version.")
+    reset_retry_count: bool = Field(default=True, description="Reset retry_attempt to 0 before resubmitting.")
+    limit: int = Field(default=100, gt=0, le=1000, description="Maximum number of tasks to resubmit (filter mode only).")
+
+
+@app.post("/dead-letter-queue/resubmit")
+async def resubmit_from_dlq(request: DLQResubmitRequest) -> dict[str, Any]:
+    """Bulk resubmit tasks from the dead letter queue back into their active queues."""
+    sm = db.get_state_manager()
+
+    if request.task_ids is not None:
+        tasks = sm.dead_queue.get_by_ids(request.task_ids)
+    elif request.queue or request.task_name or request.task_version is not None:
+        tasks = sm.dead_queue.get_by_filter(
+            queue=request.queue,
+            task_name=request.task_name,
+            task_version=request.task_version,
+            limit=request.limit,
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide task_ids or at least one of: queue, task_name, task_version.",
+        )
+
+    resubmitted = await sm.resubmit_dead_tasks(tasks, reset_retry_count=request.reset_retry_count)
+    return {
+        "resubmitted": len(resubmitted),
+        "tasks": [t.summarized() for t in resubmitted],
+    }
+
 
 @app.get("/roles")
 async def get_all_roles() -> dict[str, Any]:

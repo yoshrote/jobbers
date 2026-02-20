@@ -216,6 +216,19 @@ class StateManager:
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return await self.save_task(task)
 
+    async def resubmit_dead_tasks(self, tasks: list[Task], reset_retry_count: bool = True) -> list[Task]:
+        """Re-enqueue tasks from the dead letter queue into their active queues."""
+        resubmitted = []
+        for task in tasks:
+            if reset_retry_count:
+                task.retry_attempt = 0
+            task.error = None
+            task.set_status(TaskStatus.SUBMITTED)
+            await self.ta.requeue_task(task)
+            self.dead_queue.remove(str(task.id))
+            resubmitted.append(task)
+        return resubmitted
+
     async def complete_task(self, task: Task) -> Task:
         """Persist a completed task."""
         #TODO set a ttl for the data in redis after completion

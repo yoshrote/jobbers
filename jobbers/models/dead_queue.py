@@ -46,6 +46,47 @@ class DeadQueue:
                 (str(task.id), task.model_dump_json(), task.queue, task.name, task.version, failed_at.isoformat(), task.error),
             )
 
+    def get_by_ids(self, task_ids: list[str]) -> list[Task]:
+        """Fetch DLQ entries by explicit task ID list."""
+        placeholders = ",".join("?" * len(task_ids))
+        rows = self._conn.execute(
+            f"SELECT task FROM dead_queue WHERE task_id IN ({placeholders})",
+            task_ids,
+        ).fetchall()
+        return [Task.model_validate_json(row["task"]) for row in rows]
+
+    def get_by_filter(
+        self,
+        queue: str | None = None,
+        task_name: str | None = None,
+        task_version: int | None = None,
+        limit: int = 100,
+    ) -> list[Task]:
+        """Fetch DLQ entries matching the given filter criteria."""
+        conditions: list[str] = []
+        params: list[Any] = []
+        if queue is not None:
+            conditions.append("queue = ?")
+            params.append(queue)
+        if task_name is not None:
+            conditions.append("task_name = ?")
+            params.append(task_name)
+        if task_version is not None:
+            conditions.append("task_version = ?")
+            params.append(task_version)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT task FROM dead_queue {where} LIMIT ?",
+            params,
+        ).fetchall()
+        return [Task.model_validate_json(row["task"]) for row in rows]
+
+    def remove(self, task_id: str) -> None:
+        """Remove a single entry from the dead letter queue."""
+        with self._conn:
+            self._conn.execute("DELETE FROM dead_queue WHERE task_id = ?", (task_id,))
+
     def clean(self, earlier_than: dt.datetime) -> None:
         """Remove failed tasks older than the specified datetime."""
         with self._conn:
