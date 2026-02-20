@@ -94,7 +94,7 @@ class Task(BaseModel):
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"})
         summary["id"] = str(self.id)
-        if self.errors[-1]:
+        if self.errors:
             summary["last_error"] =  self.errors[-1]
         return summary
 
