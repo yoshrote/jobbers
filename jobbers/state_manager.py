@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager
 from typing import Any, cast
 
+from opentelemetry import metrics
 from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
@@ -18,6 +19,8 @@ from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
+meter = metrics.get_meter(__name__)
+tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
 
 class TaskException(Exception):
     "Top-level exception for stuff gone wrong."
@@ -210,6 +213,7 @@ class StateManager:
         if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
             logger.info("Task %s sent to dead letter queue.", task.id)
             self.dead_queue.add(task, dt.datetime.now(dt.timezone.utc))
+            tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return await self.save_task(task)
 
     async def complete_task(self, task: Task) -> Task:
