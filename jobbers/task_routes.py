@@ -8,8 +8,9 @@ from pydantic import BaseModel, Field
 from ulid import ULID
 
 from jobbers import db, registry
+from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task, TaskAdapter, TaskPagination
-from jobbers.state_manager import QueueConfigAdapter, TaskException
+from jobbers.state_manager import TaskException
 
 app = FastAPI()
 logger = logging.getLogger(__name__)

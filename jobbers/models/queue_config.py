@@ -10,7 +10,7 @@ from jobbers.utils.serialization import NONE, deserialize
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Iterator
 
-    from redis.client import Pipeline
+    from redis.asyncio.client import Pipeline
 
 
 class RatePeriod(StrEnum):

@@ -10,7 +10,6 @@ from jobbers.models.task import Task, TaskAdapter, TaskPagination, TaskStatus
 from jobbers.models.task_config import TaskConfig
 from jobbers.utils.serialization import EMPTY_DICT, NONE, serialize
 
-
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ISO_FROZEN_TIME = serialize(FROZEN_TIME)
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")

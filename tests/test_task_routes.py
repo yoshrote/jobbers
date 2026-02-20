@@ -5,13 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import fakeredis
 import pytest
 import pytest_asyncio
-import redis.asyncio as redis
 from httpx import ASGITransport, AsyncClient
 from ulid import ULID
 
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
-from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import TaskAdapter
 from jobbers.task_routes import app
 

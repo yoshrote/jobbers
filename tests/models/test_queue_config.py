@@ -1,6 +1,7 @@
 import fakeredis.aioredis as fakeredis
 import pytest
 import pytest_asyncio
+
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.state_manager import QueueConfigAdapter
 from jobbers.utils.serialization import serialize
