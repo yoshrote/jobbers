@@ -63,6 +63,7 @@ def sample_task():
 async def test_submit_task(redis, task_adapter):
     """Test submitting a task to Redis."""
     task = Task(id=ULID1, name="Test Task", status=TaskStatus.UNSUBMITTED, queue="default")
+    task.set_status(TaskStatus.SUBMITTED)  # SM sets this before calling the adapter
     await task_adapter.submit_task(task, extra_check=None)
     # Verify the task was added to Redis
     task_list = await redis.zrange("task-queues:default", 0, -1)
@@ -75,6 +76,7 @@ async def test_submit_task_twice_updates_only(redis, task_adapter):
     """Test that submitting a task twice updates the task but does not add it to the task-list again."""
     # Submit the task for the first time
     task = Task(id=ULID1, name="Initial Task", status="unsubmitted")
+    task.set_status(TaskStatus.SUBMITTED)  # SM sets this before calling the adapter
     await task_adapter.submit_task(task, extra_check=None)
 
     # Submit the task again with updated details

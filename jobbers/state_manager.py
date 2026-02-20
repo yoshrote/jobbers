@@ -145,7 +145,7 @@ class StateManager:
                 if task_config and task_config.max_heartbeat_interval:
                     for task in tasks:
                         if task.heartbeat_at and (now - task.heartbeat_at) > task_config.max_heartbeat_interval:
-                            task.status = TaskStatus.STALLED
+                            task.set_status(TaskStatus.STALLED)
                             await self.save_task(task)
 
     # TODO: refactor the refresh tag to be an implementation detail of QueueConfigAdapter
@@ -197,6 +197,7 @@ class StateManager:
                 return True
             return False
 
+        task.set_status(TaskStatus.SUBMITTED)
         return await self.ta.submit_task(task=task, extra_check=extra_check)
 
     async def save_task(self, task: Task) -> Task:
@@ -216,19 +217,18 @@ class StateManager:
         #TODO set a ttl for the data in redis after completion
         return await self.save_task(task)
 
-    async def retry_task(self, task: Task) -> Task:
-        """Mark a task as scheduled for retry and save it."""
-        if task.task_config is not None and task.task_config.retry_delay is not None:
-            task.set_status(TaskStatus.SCHEDULED)
-            run_at = task.task_config.compute_retry_at(task.retry_attempt + 1)
-            self.task_scheduler.add(task, run_at)
-            logger.info("Task %s scheduled for retry at %s.", task.id, run_at)
-            await self.save_task(task)
-        else:
-            task.set_status(TaskStatus.UNSUBMITTED)
-            run_at = dt.datetime.now(dt.timezone.utc)
-            logger.info("Task %s requeued for immediate retry.", task.id)
-            await self.submit_task(task)
+    async def schedule_retry_task(self, task: Task, run_at: dt.datetime) -> Task:
+        """Persist a delayed retry: add to the task scheduler and save."""
+        self.task_scheduler.add(task, run_at)
+        logger.info("Task %s scheduled for retry at %s.", task.id, run_at)
+        await self.save_task(task)
+        return task
+
+    async def queue_retry_task(self, task: Task) -> Task:
+        """Persist an immediate retry: re-enqueue the task without full re-validation."""
+        task.set_status(TaskStatus.SUBMITTED)
+        logger.info("Task %s requeued for immediate retry.", task.id)
+        await self.ta.requeue_task(task)
         return task
 
     async def monitor_task_cancellation(self, task_id: ULID) -> None:

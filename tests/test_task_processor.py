@@ -1,5 +1,6 @@
 import asyncio
-from unittest.mock import AsyncMock, call, patch
+import datetime as dt
+from unittest.mock import ANY, AsyncMock, call, patch
 
 import pytest
 
@@ -102,12 +103,12 @@ async def test_task_processor_expected_exception_with_retry():
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
-    assert result_task.status == TaskStatus.UNSUBMITTED
+    assert result_task.status == TaskStatus.SUBMITTED
     assert result_task.retry_attempt == 1
     assert "Expected error" in result_task.error
-    # save_task called when starting; retry_task called when retrying
+    # save_task called when starting; queue_retry_task called for immediate retry (no retry_delay)
     state_manager.save_task.assert_called_once_with(task)
-    state_manager.retry_task.assert_called_once_with(task)
+    state_manager.queue_retry_task.assert_called_once_with(task)
 
 @pytest.mark.asyncio
 async def test_task_processor_expected_exception_without_retry():
@@ -200,11 +201,11 @@ async def test_task_processor_timeout_with_retry():
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
-    assert result_task.status == TaskStatus.UNSUBMITTED
+    assert result_task.status == TaskStatus.SUBMITTED
     assert "timed out" in result_task.error
-    # save_task called when starting; retry_task called when retrying
+    # save_task called when starting; queue_retry_task called for immediate retry (no retry_delay)
     state_manager.save_task.assert_called_once_with(task)
-    state_manager.retry_task.assert_called_once_with(task)
+    state_manager.queue_retry_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -506,17 +507,18 @@ def _make_state_manager():
     state_manager = AsyncMock(spec=StateManager)
     state_manager.task_scheduler = AsyncMock(spec=TaskScheduler)
 
-    async def _retry_task(task: Task) -> Task:
-        """Mimic StateManager.retry_task: set the correct status and schedule if needed."""
-        if task.task_config is not None and task.task_config.retry_delay is not None:
-            task.set_status(TaskStatus.SCHEDULED)
-            run_at = task.task_config.compute_retry_at(task.retry_attempt)
-            state_manager.task_scheduler.add(task, run_at)
-        else:
-            task.set_status(TaskStatus.UNSUBMITTED)
+    async def _schedule_retry_task(task: Task, run_at: dt.datetime) -> Task:
+        """Mimic StateManager.schedule_retry_task: add to scheduler with the provided run_at."""
+        state_manager.task_scheduler.add(task, run_at)
         return task
 
-    state_manager.retry_task.side_effect = _retry_task
+    async def _queue_retry_task(task: Task) -> Task:
+        """Mimic StateManager.queue_retry_task: set SUBMITTED and requeue."""
+        task.set_status(TaskStatus.SUBMITTED)
+        return task
+
+    state_manager.schedule_retry_task.side_effect = _schedule_retry_task
+    state_manager.queue_retry_task.side_effect = _queue_retry_task
     return state_manager
 
 
@@ -558,7 +560,7 @@ async def test_expected_exception_scheduled_with_backoff():
 
     assert result.status == TaskStatus.SCHEDULED
     assert result.retry_attempt == 1
-    state_manager.retry_task.assert_called_once_with(task)
+    state_manager.schedule_retry_task.assert_called_once_with(task, ANY)
     scheduler.add.assert_called_once()
     scheduled_task, run_at = scheduler.add.call_args.args
     assert scheduled_task.id == task.id
@@ -594,7 +596,7 @@ async def test_timeout_scheduled_with_backoff():
 
     assert result.status == TaskStatus.SCHEDULED
     assert result.retry_attempt == 1
-    state_manager.retry_task.assert_called_once_with(task)
+    state_manager.schedule_retry_task.assert_called_once_with(task, ANY)
     scheduler.add.assert_called_once()
 
 

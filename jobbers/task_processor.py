@@ -26,7 +26,6 @@ class TaskProcessor:
 
     def __init__(self, state_manager: StateManager) -> None:
         self.state_manager = state_manager
-        self.scheduler = state_manager.task_scheduler
         self._current_promise: Awaitable[Any] | None = None
 
     async def run(self, task: Task) -> None:
@@ -139,7 +138,13 @@ class TaskProcessor:
         # TODO: Set metrics to track expected exceptions
         task.error = str(exc)
         if task.should_retry():
-            return await self.state_manager.retry_task(task)
+            if task.should_schedule():
+                task.set_status(TaskStatus.SCHEDULED)
+                run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
+                return await self.state_manager.schedule_retry_task(task, run_at)
+            else:
+                task.set_status(TaskStatus.UNSUBMITTED)
+                return await self.state_manager.queue_retry_task(task)
         else:
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)
@@ -154,7 +159,13 @@ class TaskProcessor:
         logger.warning("Task %s timed out after %s seconds.", task.id, timeout)
         task.error = f"Task {task.id} timed out after {timeout} seconds"
         if task.should_retry():
-            return await self.state_manager.retry_task(task)
+            if task.should_schedule():
+                task.set_status(TaskStatus.SCHEDULED)
+                run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
+                return await self.state_manager.schedule_retry_task(task, run_at)
+            else:
+                task.set_status(TaskStatus.UNSUBMITTED)
+                return await self.state_manager.queue_retry_task(task)
         else:
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)

@@ -67,9 +67,9 @@ class Task(BaseModel):
                 # TODO: maybe warn or panic since this should be unreachable
                 pass
             case TaskShutdownPolicy.STOP:
-                self.status = TaskStatus.STALLED
-                self.completed_at = dt.datetime.now(dt.timezone.utc)
+                self.set_status(TaskStatus.STALLED)
             case TaskShutdownPolicy.RESUBMIT:
+                # Direct assignment: shutdown-triggered resubmit should not increment retry_attempt
                 self.status = TaskStatus.UNSUBMITTED
 
     def should_retry(self) -> bool:
@@ -77,6 +77,12 @@ class Task(BaseModel):
             # safer to fail here than chance something funky downstream
             return False
         return self.retry_attempt < self.task_config.max_retries
+
+    def should_schedule(self) -> bool:
+        """Return True if the retry should be delayed (SCHEDULED) rather than immediate (UNSUBMITTED)."""
+        if not self.task_config:
+            return False
+        return self.task_config.retry_delay is not None
 
     def has_callbacks(self) -> bool:
         return False
@@ -186,13 +192,11 @@ class TaskAdapter:
         self.data_store: Redis = data_store
 
     async def submit_task(self, task: Task, extra_check: Callable[[Pipeline], bool] | None) -> None:
-        """Submit a task to the Redis data store."""
+        """Submit a new task to the Redis data store. Status must already be SUBMITTED."""
         pipe = self.data_store.pipeline(transaction=True)
-        # Avoid pushing a task onto the queue multiple times
-        if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
+        # Only enqueue if this is a new SUBMITTED task (SM sets SUBMITTED before calling here)
+        if task.status == TaskStatus.SUBMITTED and not await self.task_exists(task.id):
             if extra_check is None or extra_check(pipe):
-                task.set_status(TaskStatus.SUBMITTED)
-                # the assert is to make mypy play nice.
                 assert task.submitted_at  # noqa: S101
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
@@ -202,6 +206,18 @@ class TaskAdapter:
         else:
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
 
+        await pipe.execute()
+
+    async def requeue_task(self, task: Task) -> None:
+        """Re-enqueue an existing task for retry (bypasses the new-task existence check)."""
+        assert task.submitted_at  # noqa: S101
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
+        if task.status in TaskStatus.active_statuses():
+            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        else:
+            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         await pipe.execute()
 
     async def save_task(self, task: Task) -> None:
