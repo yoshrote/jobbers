@@ -105,7 +105,7 @@ async def test_task_processor_expected_exception_with_retry():
 
     assert result_task.status == TaskStatus.SUBMITTED
     assert result_task.retry_attempt == 1
-    assert "Expected error" in result_task.error
+    assert any("Expected error" in e for e in result_task.errors)
     # save_task called when starting; queue_retry_task called for immediate retry (no retry_delay)
     state_manager.save_task.assert_called_once_with(task)
     state_manager.queue_retry_task.assert_called_once_with(task)
@@ -138,7 +138,7 @@ async def test_task_processor_expected_exception_without_retry():
 
     assert result_task.status == TaskStatus.FAILED
     assert result_task.retry_attempt == 0
-    assert "Expected error" in result_task.error
+    assert any("Expected error" in e for e in result_task.errors)
     # save_task called when starting; fail_task called when failing
     state_manager.save_task.assert_called_once_with(task)
     state_manager.fail_task.assert_called_once_with(task)
@@ -170,7 +170,7 @@ async def test_task_processor_unexpected_exception():
         result_task = await processor.process(task)
 
     assert result_task.status == TaskStatus.FAILED
-    assert "Unexpected error" in result_task.error
+    assert any("Unexpected error" in e for e in result_task.errors)
     # save_task called when starting; fail_task called when failing
     state_manager.save_task.assert_called_once_with(task)
     state_manager.fail_task.assert_called_once_with(task)
@@ -202,7 +202,7 @@ async def test_task_processor_timeout_with_retry():
         result_task = await processor.process(task)
 
     assert result_task.status == TaskStatus.SUBMITTED
-    assert "timed out" in result_task.error
+    assert any("timed out" in e for e in result_task.errors)
     # save_task called when starting; queue_retry_task called for immediate retry (no retry_delay)
     state_manager.save_task.assert_called_once_with(task)
     state_manager.queue_retry_task.assert_called_once_with(task)
@@ -234,7 +234,7 @@ async def test_task_processor_timeout_without_retry():
 
     assert result_task.status == TaskStatus.FAILED
     assert result_task.completed_at is not None, "Failed tasks should have a completed_at timestamp"
-    assert "timed out" in result_task.error
+    assert any("timed out" in e for e in result_task.errors)
     # save_task called when starting; fail_task called when failing
     state_manager.save_task.assert_called_once_with(task)
     state_manager.fail_task.assert_called_once_with(task)

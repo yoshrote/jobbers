@@ -212,7 +212,8 @@ class StateManager:
         """Persist a failed task, handling any dead letter queue side effects."""
         if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
             logger.info("Task %s sent to dead letter queue.", task.id)
-            self.dead_queue.add(task, dt.datetime.now(dt.timezone.utc))
+            now = dt.datetime.now(dt.timezone.utc)
+            self.dead_queue.add(task, now)
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return await self.save_task(task)
 
@@ -222,7 +223,7 @@ class StateManager:
         for task in tasks:
             if reset_retry_count:
                 task.retry_attempt = 0
-            task.error = None
+            task.errors = []
             task.set_status(TaskStatus.SUBMITTED)
             await self.ta.requeue_task(task)
             self.dead_queue.remove(str(task.id))

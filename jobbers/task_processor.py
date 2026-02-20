@@ -130,13 +130,13 @@ class TaskProcessor:
     async def handle_unexpected_exception(self, task: Task, exc: Exception) -> None:
         logger.exception("Exception occurred while processing task %s: %s", task.id, exc)
         task.set_status(TaskStatus.FAILED)
-        task.error = str(exc)
+        task.errors.append(str(exc))
         await self.state_manager.fail_task(task)
 
     async def handle_expected_exception(self, task: Task, exc: Exception) -> Task:
         logger.warning("Task %s failed with error: %s", task.id, exc)
-        # TODO: Set metrics to track expected exceptions
-        task.error = str(exc)
+        task.errors.append(str(exc))
+        tasks_retried.add(1, {"queue": task.queue, "task": task.name})
         if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)
@@ -157,7 +157,8 @@ class TaskProcessor:
         else:
             timeout = task.task_config.timeout
         logger.warning("Task %s timed out after %s seconds.", task.id, timeout)
-        task.error = f"Task {task.id} timed out after {timeout} seconds"
+        task.errors.append(f"Task {task.id} timed out after {timeout} seconds")
+        tasks_retried.add(1, {"queue": task.queue, "task": task.name})
         if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)

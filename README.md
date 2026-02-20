@@ -110,7 +110,8 @@ A tool that could do this would run at some cadence to monitor for tasks in a re
     The number of worker processes and restarting them is left to other tools.
   - worker concurrency (env: WORKER_CONCURRENT_TASKS)
   - capacity limits per worker per queue (TBD config)
-- Basic retry policy (re-enqueue, but no backoff yet)
+- Configurable retry backoff policy (constant, linear, exponential, exponential with jitter)
+- Dead letter queue with per-task failure history and bulk resubmission API
 - The state of the queues and the last known state of tasks are stored for diagnostic and recovery purposes.
 - Worker crash recovery
   - on SIGTERM, a worker will handle currently running tasks according to their shutdown policy
@@ -166,7 +167,6 @@ Top Problems:
 
 - example task
 - heartbeat reporting hook for example task
-- task retry backoff policy
 - rate limiting per task + params per pool (check on submission)
 - batch fetching tasks off the queue to optimize large numbers of small tasks
 - task chaining (DAG support)
@@ -178,6 +178,77 @@ Top Problems:
   - aggregate task execution time (possibly per task+queue in case the queue assignment is significant)
   - task completion rates (per task or per task per queue)
 - discover and handle when role -> queue mapping changes
+
+## Retry and Dead Letter Queue Configuration
+
+### TaskConfig retry fields
+
+| field | type | default | description |
+| ----- | ---- | ------- | ----------- |
+| `max_retries` | `int` | `3` | Maximum number of retry attempts before the task is failed permanently |
+| `retry_delay` | `int \| None` | `None` | Base delay in seconds between retries. When `None`, retries are immediate (no backoff). |
+| `backoff_strategy` | `BackoffStrategy` | `exponential` | How the delay grows with each attempt (see below) |
+| `max_retry_delay` | `int` | `3600` | Upper bound on the computed delay in seconds (1 hour) |
+| `dead_letter_policy` | `DeadLetterPolicy` | `none` | Whether to persist permanently failed tasks for later inspection |
+
+### BackoffStrategy
+
+| value | behaviour |
+| ----- | --------- |
+| `constant` | Fixed delay of `retry_delay` seconds each attempt |
+| `linear` | `retry_delay * attempt` seconds |
+| `exponential` | `retry_delay * 2^attempt` seconds |
+| `exponential_jitter` | Uniform random value in `[0, retry_delay * 2^attempt]` to spread out thundering-herd retries |
+
+All strategies are capped at `max_retry_delay`.
+
+### DeadLetterPolicy
+
+| value | behaviour |
+| ----- | --------- |
+| `none` | Failed tasks stay in FAILED status in Redis only |
+| `save` | Failed tasks are also written to the SQLite dead letter queue for later inspection and resubmission. Each failure event is appended to the task's audit history. |
+
+### Example
+
+```python
+from jobbers.registry import register_task
+from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy
+
+@register_task(
+    name="my_task",
+    version=1,
+    max_retries=5,
+    retry_delay=10,                        # 10s base delay
+    backoff_strategy=BackoffStrategy.EXPONENTIAL_JITTER,
+    max_retry_delay=300,                   # cap at 5 minutes
+    dead_letter_policy=DeadLetterPolicy.SAVE,
+)
+async def my_task(**kwargs):
+    ...
+```
+
+### Dead Letter Queue API
+
+| method | path | description |
+| ------ | ---- | ----------- |
+| `GET`  | `/dead-letter-queue` | Search DLQ entries; filter by `queue`, `task_name`, `task_version`, `limit` |
+| `GET`  | `/dead-letter-queue/{task_id}/history` | Full chronological failure history for a task |
+| `POST` | `/dead-letter-queue/resubmit` | Bulk resubmit DLQ tasks by explicit IDs or filter criteria |
+| `GET`  | `/scheduled-tasks` | List tasks currently waiting for a delayed retry |
+
+#### `POST /dead-letter-queue/resubmit` request body
+
+| field | type | default | description |
+| ----- | ---- | ------- | ----------- |
+| `task_ids` | `list[str] \| null` | `null` | Explicit list of task IDs to resubmit |
+| `queue` | `str \| null` | `null` | Filter: resubmit tasks from this queue |
+| `task_name` | `str \| null` | `null` | Filter: resubmit tasks with this name |
+| `task_version` | `int \| null` | `null` | Filter: resubmit tasks with this version |
+| `reset_retry_count` | `bool` | `true` | Reset `retry_attempt` to 0 before resubmitting |
+| `limit` | `int` | `100` | Maximum tasks to resubmit when using filter mode (max 1000) |
+
+Provide either `task_ids` **or** at least one filter field (`queue`, `task_name`, `task_version`).
 
 ## Task Heartbeat Configuration
 

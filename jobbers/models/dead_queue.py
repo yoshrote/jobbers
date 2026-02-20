@@ -31,6 +31,7 @@ class DeadQueue:
         CREATE INDEX IF NOT EXISTS dead_queue_failed_at
         ON dead_queue (failed_at)
     """
+
     def __init__(self, db_path: str | Path) -> None:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -39,12 +40,24 @@ class DeadQueue:
             self._conn.execute(self._CREATE_INDEX)
 
     def add(self, task: Task, failed_at: dt.datetime) -> None:
-        """Insert or replace a task in the schedule."""
+        """Insert or replace the current DLQ entry for a task (latest failure wins)."""
+        last_error = task.errors[-1] if task.errors else None
         with self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO dead_queue (task_id, task, queue, task_name, task_version, failed_at, error_message) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(task.id), task.model_dump_json(), task.queue, task.name, task.version, failed_at.isoformat(), task.error),
+                (str(task.id), task.model_dump_json(), task.queue, task.name, task.version, failed_at.isoformat(), last_error),
             )
+
+    def get_history(self, task_id: str) -> list[dict[str, Any]]:
+        """Return the per-attempt error history for a DLQ task from its stored task blob."""
+        row = self._conn.execute(
+            "SELECT task FROM dead_queue WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return []
+        task = Task.model_validate_json(row["task"])
+        return [{"attempt": i, "error": e} for i, e in enumerate(task.errors)]
 
     def get_by_ids(self, task_ids: list[str]) -> list[Task]:
         """Fetch DLQ entries by explicit task ID list."""

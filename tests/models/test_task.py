@@ -4,7 +4,7 @@ from ulid import ULID
 
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import TaskConfig
-from jobbers.utils.serialization import EMPTY_DICT, NONE
+from jobbers.utils.serialization import EMPTY_DICT, NONE, serialize
 
 
 def test_task_serialization_and_deserialization():
@@ -16,7 +16,7 @@ def test_task_serialization_and_deserialization():
         version=1,
         parameters={"key": "value"},
         results={"result_key": "result_value"},
-        error=None,
+        errors=[],
         status=TaskStatus.STARTED,
         submitted_at=dt.datetime(2025, 4, 4, 12, 0, 0),
         started_at=dt.datetime(2025, 4, 4, 12, 5, 0),
@@ -41,7 +41,7 @@ def test_valid_params():
         version=1,
         parameters={},
         results={},
-        error=None,
+        errors=[],
         status=TaskStatus.UNSUBMITTED,
         submitted_at=None,
         started_at=None,
@@ -78,7 +78,6 @@ def test_task_serialization_with_none_values():
         version=1,
         parameters={},
         results={},
-        error=None,
         status=TaskStatus.UNSUBMITTED,
         submitted_at=None,
         started_at=None,
@@ -92,7 +91,7 @@ def test_task_serialization_with_none_values():
     # Assert that None values are serialized as expected
     assert redis_data[b"parameters"] == EMPTY_DICT
     assert redis_data[b"results"] == EMPTY_DICT
-    assert redis_data[b"error"] == NONE
+    assert redis_data[b"errors"] == serialize([])
     assert redis_data[b"started_at"] == NONE
     assert redis_data[b"heartbeat_at"] == NONE
     assert redis_data[b"completed_at"] == NONE
@@ -113,7 +112,7 @@ def test_task_serialization_with_non_none_values():
         version=1,
         parameters={"key": "value"},
         results={"result_key": "result_value"},
-        error="Some error occurred",
+        errors=["Some error occurred"],
         status=TaskStatus.COMPLETED,
         submitted_at=dt.datetime(2025, 4, 4, 12, 0, 0),
         started_at=dt.datetime(2025, 4, 4, 12, 5, 0),
@@ -127,7 +126,7 @@ def test_task_serialization_with_non_none_values():
     # Assert that non-None values are serialized as expected
     assert redis_data[b"parameters"] == b"\x81\xa3key\xa5value"
     assert redis_data[b"results"] == b"\x81\xaaresult_key\xacresult_value"
-    assert redis_data[b"error"] == b"\xb3Some error occurred"
+    assert redis_data[b"errors"] == serialize(["Some error occurred"])
     assert redis_data[b"status"] == b"completed"
     assert redis_data[b"submitted_at"] == b"\xc7\x13\x012025-04-04T12:00:00"
     assert redis_data[b"started_at"] == b"\xc7\x13\x012025-04-04T12:05:00"

@@ -76,6 +76,47 @@ async def get_all_queues() -> dict[str, Any]:
     queues = await QueueConfigAdapter(db.get_client()).get_all_queues()
     return {"queues": queues}
 
+class DLQFilter(BaseModel):
+    """Filter criteria for searching the dead letter queue."""
+
+    queue: str | None = Field(default=None, description="Filter by queue name.")
+    task_name: str | None = Field(default=None, description="Filter by task name.")
+    task_version: int | None = Field(default=None, description="Filter by task version.")
+    limit: int = Field(default=100, gt=0, le=1000, description="Maximum number of entries to return.")
+
+
+@app.get("/dead-letter-queue")
+async def get_dead_letter_queue(filter_query: Annotated[DLQFilter, Query()]) -> dict[str, Any]:
+    """
+    Search the dead letter queue.
+
+    Returns tasks that have exhausted retries or been permanently failed, optionally
+    filtered by queue, task name, or version. Results include the task summary and
+    the most recent error message.
+    """
+    sm = db.get_state_manager()
+    tasks = sm.dead_queue.get_by_filter(
+        queue=filter_query.queue,
+        task_name=filter_query.task_name,
+        task_version=filter_query.task_version,
+        limit=filter_query.limit,
+    )
+    return {"tasks": [t.summarized() for t in tasks]}
+
+
+@app.get("/dead-letter-queue/{task_id}/history")
+async def get_dlq_task_history(task_id: str) -> dict[str, Any]:
+    """
+    Retrieve the full failure history for a dead-lettered task.
+
+    Returns every recorded failure event for the task in chronological order,
+    including the retry attempt number, timestamp, and error message for each failure.
+    """
+    sm = db.get_state_manager()
+    history = sm.dead_queue.get_history(task_id)
+    return {"task_id": task_id, "history": history}
+
+
 class DLQResubmitRequest(BaseModel):
     """
     Filter criteria for bulk resubmission from the dead letter queue.

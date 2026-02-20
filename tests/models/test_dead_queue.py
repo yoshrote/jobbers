@@ -18,6 +18,7 @@ def make_task(
     name: str = "my_task",
     version: int = 1,
     queue: str = "default",
+    retry_attempt: int = 0,
 ) -> Task:
     return Task(
         id=task_id,
@@ -25,7 +26,8 @@ def make_task(
         version=version,
         queue=queue,
         status=TaskStatus.FAILED,
-        error="something went wrong",
+        retry_attempt=retry_attempt,
+        errors=["something went wrong"],
     )
 
 
@@ -175,3 +177,42 @@ def test_remove_leaves_other_entries_intact(dq):
 def test_remove_nonexistent_is_silent(dq):
     """Removing a task that was never added should not raise."""
     dq.remove(str(ULID3))  # no exception
+
+
+# ── get_history ───────────────────────────────────────────────────────────────
+
+def test_get_history_returns_errors_from_task_blob(dq):
+    task = make_task()
+    task.errors = ["first error", "second error", "third error"]
+    dq.add(task, FAILED_AT)
+
+    history = dq.get_history(str(ULID1))
+    assert len(history) == 3
+    assert history[0] == {"attempt": 0, "error": "first error"}
+    assert history[1] == {"attempt": 1, "error": "second error"}
+    assert history[2] == {"attempt": 2, "error": "third error"}
+
+
+def test_get_history_empty_when_no_errors(dq):
+    task = make_task()
+    task.errors = []
+    dq.add(task, FAILED_AT)
+
+    history = dq.get_history(str(ULID1))
+    assert history == []
+
+
+def test_get_history_empty_for_unknown_task(dq):
+    assert dq.get_history(str(ULID3)) == []
+
+
+def test_get_history_isolated_by_task_id(dq):
+    task_a = make_task(task_id=ULID1)
+    task_a.errors = ["error a"]
+    task_b = make_task(task_id=ULID2)
+    task_b.errors = ["error b1", "error b2"]
+    dq.add(task_a, FAILED_AT)
+    dq.add(task_b, FAILED_AT)
+
+    assert len(dq.get_history(str(ULID1))) == 1
+    assert len(dq.get_history(str(ULID2))) == 2
