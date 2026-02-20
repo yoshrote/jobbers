@@ -14,6 +14,8 @@ class TaskScheduler:
     _CREATE_TABLE = """
         CREATE TABLE IF NOT EXISTS schedule (
             task_id  TEXT    PRIMARY KEY,
+            task_name  TEXT    NOT NULL,
+            task_version INTEGER    NOT NULL,
             task     TEXT    NOT NULL,
             queue    TEXT    NOT NULL,
             run_at   TEXT    NOT NULL,
@@ -27,6 +29,12 @@ class TaskScheduler:
         WHERE acquired = 0
     """
 
+    # Support efficient aggregation and querying of scheduled tasks by queue and task type.
+    _CREATE_INDEX = """
+        CREATE INDEX IF NOT EXISTS schedule_queue_categories
+        ON schedule (queue, task_name, task_version)
+    """
+
     def __init__(self, db_path: str | Path) -> None:
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -38,8 +46,8 @@ class TaskScheduler:
         """Insert or replace a task in the schedule."""
         with self._conn:
             self._conn.execute(
-                "INSERT OR REPLACE INTO schedule (task_id, task, queue, run_at) VALUES (?, ?, ?, ?)",
-                (str(task.id), task.model_dump_json(), task.queue, run_at.isoformat()),
+                "INSERT OR REPLACE INTO schedule (task_id, task_name, task_version, task, queue, run_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (str(task.id), task.name, task.version, task.model_dump_json(), task.queue, run_at.isoformat()),
             )
 
     def remove(self, task_id: ULID) -> None:
@@ -49,6 +57,43 @@ class TaskScheduler:
                 "DELETE FROM schedule WHERE task_id = ?",
                 (str(task_id),),
             )
+
+    def get_by_filter(
+        self,
+        queue: str | None = None,
+        task_name: str | None = None,
+        task_version: int | None = None,
+        limit: int = 100,
+        start_after: str | None = None,
+    ) -> list[Task]:
+        """
+        Fetch schedule entries matching the given filter criteria.
+
+        ``start_after`` is an exclusive ULID cursor: only tasks whose
+        ``task_id`` sorts after this value are returned, enabling
+        page-by-page iteration over large result sets.
+        """
+        conditions: list[str] = []
+        params: list[Any] = []
+        if queue is not None:
+            conditions.append("queue = ?")
+            params.append(queue)
+        if task_name is not None:
+            conditions.append("task_name = ?")
+            params.append(task_name)
+        if task_version is not None:
+            conditions.append("task_version = ?")
+            params.append(task_version)
+        if start_after is not None:
+            conditions.append("task_id > ?")
+            params.append(start_after)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT task FROM schedule {where} ORDER BY task_id LIMIT ?",
+            params,
+        ).fetchall()
+        return [Task.model_validate_json(row["task"]) for row in rows]
 
     def next_due(self, queues: list[str]) -> Task | None:
         """

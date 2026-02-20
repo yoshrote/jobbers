@@ -166,6 +166,8 @@ class TaskPagination(BaseModel):
     limit: int = Field(default=10, gt=0, le=100)
     start: ULID | None = Field(default=None)
     order_by: PaginationOrder = Field(default=PaginationOrder.SUBMITTED_AT)
+    task_name: str | None = Field(default=None)
+    task_version: int | None = Field(default=None)
     # status: TaskStatus | None = Field(default=None)
 
     def start_param(self) -> int:

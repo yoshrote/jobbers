@@ -206,6 +206,96 @@ async def test_get_all_roles():
         mock_queue_adapter.get_all_roles.assert_called_once()
 
 @pytest.mark.asyncio
+async def test_get_scheduled_tasks_no_optional_filters():
+    """Test fetching scheduled tasks with only queue uses all-None optional filters."""
+    task1 = Task(id=ULID1, name="Task 1", status="submitted", parameters={})
+    task2 = Task(id=ULID2, name="Task 2", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.task_scheduler.get_by_filter.return_value = [task1, task2]
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/scheduled-tasks", params={"queue": "default"})
+
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 2
+    mock_sm.task_scheduler.get_by_filter.assert_called_once_with(
+        queue="default",
+        task_name=None,
+        task_version=None,
+        limit=10,
+        start_after=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_scheduled_tasks_by_filter():
+    """Test fetching scheduled tasks with queue, task_name, task_version, and limit filters."""
+    task = Task(id=ULID1, name="My Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.task_scheduler.get_by_filter.return_value = [task]
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                "/scheduled-tasks",
+                params={"queue": "high", "task_name": "My Task", "task_version": 2, "limit": 10},
+            )
+
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 1
+    mock_sm.task_scheduler.get_by_filter.assert_called_once_with(
+        queue="high",
+        task_name="My Task",
+        task_version=2,
+        limit=10,
+        start_after=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_scheduled_tasks_empty():
+    """Test fetching scheduled tasks returns an empty list when none match."""
+    mock_sm = MagicMock()
+    mock_sm.task_scheduler.get_by_filter.return_value = []
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/scheduled-tasks", params={"queue": "nonexistent"})
+
+    assert response.status_code == 200
+    assert response.json() == {"tasks": []}
+
+
+@pytest.mark.asyncio
+async def test_get_scheduled_tasks_with_start_cursor():
+    """Test that the start ULID is forwarded as start_after for cursor pagination."""
+    task = Task(id=ULID2, name="Task 2", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.task_scheduler.get_by_filter.return_value = [task]
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                "/scheduled-tasks",
+                params={"queue": "default", "start": str(ULID1)},
+            )
+
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 1
+    mock_sm.task_scheduler.get_by_filter.assert_called_once_with(
+        queue="default",
+        task_name=None,
+        task_version=None,
+        limit=10,
+        start_after=str(ULID1),
+    )
+
+
+@pytest.mark.asyncio
 async def test_resubmit_from_dlq_by_ids():
     """Test resubmitting DLQ tasks by explicit task ID list."""
     task = Task(id=ULID1, name="Test Task", status="submitted", parameters={})
