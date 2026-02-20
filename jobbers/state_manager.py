@@ -164,18 +164,25 @@ class StateManager:
 
 
 
-    async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
-        """Get the next task from the queues in order of priority (first in the list is highest priority)."""
+    async def get_next_task(self, queues: set[str], timeout: int=0) -> tuple[Task | None, bool | None]:
+        """
+        Get the next task from the queues in order of priority (first in the list is highest priority).
+
+        Scheduled tasks are treated with a higher priority than non-scheduled tasks, so if a scheduled
+        task is due to run it will be returned before any non-scheduled tasks, regardless of the order
+        of the queues.
+        The boolean in the return value indicates whether the task was a from a queue or not.
+        """
         if not queues:
             logger.info("no queues defined")
-            return None
+            return None, None
 
         queues = await self.submission_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
 
         scheduled_task = self.task_scheduler.next_due(queues=list(queues))
         if scheduled_task:
-            return scheduled_task
-        return await self.ta.get_next_task(queues, timeout)
+            return scheduled_task, False
+        return await self.ta.get_next_task(queues, timeout), True
 
     # Proxy methods
 

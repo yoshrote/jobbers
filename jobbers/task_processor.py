@@ -1,4 +1,5 @@
 import asyncio
+import datetime as dt
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -72,8 +73,6 @@ class TaskProcessor:
 
         # Metrics recording
         tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
-        if task.status != TaskStatus.UNSUBMITTED:
-            tasks_retried.add(task.retry_attempt, {"queue": task.queue, "task": task.name})
         if task.started_at and task.completed_at:
             execution_time.record(
                 (task.completed_at - task.started_at).total_seconds() * 1000,
@@ -136,12 +135,12 @@ class TaskProcessor:
     async def handle_expected_exception(self, task: Task, exc: Exception) -> Task:
         logger.warning("Task %s failed with error: %s", task.id, exc)
         task.errors.append(str(exc))
-        tasks_retried.add(1, {"queue": task.queue, "task": task.name})
         if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)
             return task
 
+        tasks_retried.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         if task.should_schedule():
             task.set_status(TaskStatus.SCHEDULED)
             run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
@@ -158,12 +157,12 @@ class TaskProcessor:
             timeout = task.task_config.timeout
         logger.warning("Task %s timed out after %s seconds.", task.id, timeout)
         task.errors.append(f"Task {task.id} timed out after {timeout} seconds")
-        tasks_retried.add(1, {"queue": task.queue, "task": task.name})
         if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)
             return task
 
+        tasks_retried.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         if task.should_schedule():
             task.set_status(TaskStatus.SCHEDULED)
             run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]

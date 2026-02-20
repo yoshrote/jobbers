@@ -237,9 +237,10 @@ async def test_get_next_task_returns_task(redis, state_manager):
     await redis.hset(f"task:{task_id}", mapping=task_data)
 
     # Call the method
-    task = await state_manager.get_next_task(["queue1", "queue2"])
+    task, ad_hoc = await state_manager.get_next_task(["queue1", "queue2"])
 
     # Assert the result
+    assert ad_hoc
     assert task is not None
     assert task.id == task_id
     assert task.name == "Test Task"
@@ -251,10 +252,11 @@ async def test_get_next_task_no_task_found(redis, state_manager):
     """Test that get_next_task returns None if no task is found."""
     # Call the method with no tasks in the queues
     # Use a timeout to avoid blocking forever
-    task = await state_manager.get_next_task(["queue1", "queue2"], timeout=1)
+    task, ad_hoc = await state_manager.get_next_task(["queue1", "queue2"], timeout=1)
 
     # Assert the result
     assert task is None
+    assert ad_hoc is True
 
 
 @pytest.mark.asyncio
@@ -265,10 +267,11 @@ async def test_get_next_task_missing_task_data(redis, state_manager):
     await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
 
     # Call the method
-    task = await state_manager.get_next_task(["queue1", "queue2"])
+    task, ad_hoc = await state_manager.get_next_task(["queue1", "queue2"])
 
     # Assert the result
     assert task is None
+    assert ad_hoc is True
 
 @pytest.fixture
 def rate_limiter(state_manager):

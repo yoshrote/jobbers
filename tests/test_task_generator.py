@@ -60,7 +60,7 @@ async def test_task_generator_iteration():
         status=TaskStatus.SUBMITTED,
         submitted_at=datetime.now(tz=timezone.utc)
     )
-    state_manager.get_next_task.return_value = task
+    state_manager.get_next_task.return_value = task, True
     state_manager.active_tasks_per_queue = {}
     queue_config_adapter = Mock(spec=QueueConfigAdapter)
     queue_config_adapter.get_queue_limits.return_value = {}
@@ -74,7 +74,7 @@ async def test_task_generator_iteration():
 async def test_task_generator_stops_iteration():
     """Test that TaskGenerator stops iteration when no tasks are available."""
     state_manager = AsyncMock(spec=StateManager)
-    state_manager.get_next_task.return_value = None
+    state_manager.get_next_task.return_value = None, None
     state_manager.active_tasks_per_queue = {}
     queue_config_adapter = Mock(spec=QueueConfigAdapter)
     queue_config_adapter.get_queue_limits.return_value = {}
@@ -96,9 +96,9 @@ async def test_task_generator_stops_after_max_tasks():
     # Mock get_next_task to return a new Task
     state_manager.get_next_task = AsyncMock(
         side_effect=[
-            Task(id=ULID(), name="task1", version=1, submitted_at=datetime.now(tz=timezone.utc)),
-            Task(id=ULID(), name="task2", version=1, submitted_at=datetime.now(tz=timezone.utc)),
-            Task(id=ULID(), name="task3", version=1, submitted_at=datetime.now(tz=timezone.utc)),
+            (Task(id=ULID(), name="task1", version=1, submitted_at=datetime.now(tz=timezone.utc)), True),
+            (Task(id=ULID(), name="task2", version=1, submitted_at=datetime.now(tz=timezone.utc)), True),
+            (Task(id=ULID(), name="task3", version=1, submitted_at=datetime.now(tz=timezone.utc)), True),
         ]
     )
 
