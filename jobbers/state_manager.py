@@ -1,18 +1,17 @@
-import asyncio
 import datetime as dt
 import logging
 from collections import defaultdict
-from collections.abc import Awaitable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any
 
 from opentelemetry import metrics
-from redis.asyncio.client import Pipeline, Redis
+from redis.asyncio.client import Pipeline
 from ulid import ULID
 
 from jobbers import registry
 from jobbers.models.dead_queue import DeadQueue
-from jobbers.models.queue_config import QueueConfig
+from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task import Task, TaskAdapter
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_scheduler import TaskScheduler
@@ -31,73 +30,6 @@ class UserCancellationError(Exception):
     """Exception raised when a task is cancelled by user request."""
 
     pass
-
-class QueueConfigAdapter:
-    """
-    Manages queue configuration in a Redis data store.
-
-    - `worker-queues:<role>`: Set of queues for a given role, used to manage which queues are available for task submission.
-    - `queue-config:<queue>`: Hash of queue configuration data which is shared for by all roles using this queue
-    - `all_queues`: a list of all queues used across all roles.
-    """
-
-    QUEUES_BY_ROLE = "worker-queues:{role}".format
-    QUEUE_CONFIG = "queue-config:{queue}".format
-    ALL_QUEUES = "all-queues"
-
-    def __init__(self, data_store: Redis) -> None:
-        self.data_store: Redis = data_store
-
-    async def get_queues(self, role: str) -> set[str]:
-        return {role.decode() for role in await cast("Awaitable[set[bytes]]", self.data_store.smembers(self.QUEUES_BY_ROLE(role=role)))}
-
-    async def set_queues(self, role: str, queues: set[str]) -> None:
-        pipe: Pipeline = self.data_store.pipeline(transaction=True)
-        pipe.delete(self.QUEUES_BY_ROLE(role=role))
-        pipe.sadd(self.ALL_QUEUES, *queues)
-        pipe.sadd(self.QUEUES_BY_ROLE(role=role), *queues)
-        await pipe.execute()
-
-    async def get_all_queues(self) -> list[str]:
-        # find the union of the queues for all roles
-        # this query approach is not ideal for large numbers of roles or queues
-        roles = await self.get_all_roles()
-        if not roles:
-            return []
-
-        return [
-            queue.decode()
-            for queue in await cast("Awaitable[list[bytes]]", self.data_store.sunion(
-                [self.QUEUES_BY_ROLE(role=role) for role in roles]
-            ))
-        ]
-
-    async def get_all_roles(self) -> list[str]:
-        roles = []
-        async for key in self.data_store.scan_iter(match=self.QUEUES_BY_ROLE(role="*").encode()):
-            roles.append(key.decode().split(":")[1])
-        return roles
-
-    async def get_queue_config(self, queue: str) -> QueueConfig:
-        raw_data: dict[bytes, Any] = await cast(
-            "Awaitable[dict[bytes, Any]]",
-            self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))
-        )  # Ensure the queue config exists in the store
-        return QueueConfig.from_redis(queue, raw_data)
-
-    async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
-        # TODO: replace with a redis query
-        result_gen: Iterator[Awaitable[QueueConfig | None]] = (
-            self.get_queue_config(q)
-            for q in queues
-        )
-
-        return {
-            conf.name: conf.max_concurrent
-            for conf in await asyncio.gather(*result_gen)
-            if conf is not None
-        }
-
 
 
 class StateManager:
