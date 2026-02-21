@@ -95,28 +95,38 @@ class TaskScheduler:
         ).fetchall()
         return [Task.model_validate_json(row["task"]) for row in rows]
 
-    def next_due(self, queues: list[str]) -> Task | None:
+    def next_due(self, queues: list[str] | None = None) -> Task | None:
         """
-        Atomically acquire and return the earliest due task in the given queues, or None.
+        Atomically acquire and return the earliest due task, or None.
 
         Sets acquired = 1 on the selected row so no other TaskScheduler instance
         can return the same task.
+
+        - ``queues=None`` — match any queue (used by the scheduler runner)
+        - ``queues=[]`` — return None immediately (no queues to match)
+        - ``queues=[...]`` — only match tasks in the given queues
         """
-        if not queues:
+        if queues is not None and not queues:
             return None
         now = dt.datetime.now(dt.timezone.utc).isoformat()
-        placeholders = ",".join("?" * len(queues))
+        if queues is None:
+            queue_filter = ""
+            params: tuple[object, ...] = (now,)
+        else:
+            placeholders = ",".join("?" * len(queues))
+            queue_filter = f"AND queue IN ({placeholders})"
+            params = (now, *queues)
         row = self._conn.execute(
             f"""
             UPDATE schedule SET acquired = 1
             WHERE task_id = (
                 SELECT task_id FROM schedule
-                WHERE run_at <= ? AND queue IN ({placeholders}) AND acquired = 0
+                WHERE run_at <= ? {queue_filter} AND acquired = 0
                 ORDER BY run_at, task_id LIMIT 1
             )
             RETURNING task
             """,
-            (now, *queues),
+            params,
         ).fetchone()
         if row is None:
             return None

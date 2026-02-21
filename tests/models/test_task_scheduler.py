@@ -128,3 +128,45 @@ def test_next_due_returns_earliest_run_at(scheduler):
     result = scheduler.next_due(["default"])
     assert result is not None
     assert result.id == earlier.id
+
+
+# ── queues=None (all-queues mode) ─────────────────────────────────────────────
+
+def test_next_due_no_args_returns_due_task(scheduler):
+    """next_due() with no arguments matches any queue."""
+    scheduler.add(make_task(queue="alpha"), PAST)
+    assert scheduler.next_due() is not None
+
+
+def test_next_due_none_returns_due_task(scheduler):
+    """next_due(None) matches any queue."""
+    scheduler.add(make_task(queue="beta"), PAST)
+    assert scheduler.next_due(None) is not None
+
+
+def test_next_due_none_skips_future_task(scheduler):
+    """next_due(None) does not return a task whose run_at is in the future."""
+    scheduler.add(make_task(), FUTURE)
+    assert scheduler.next_due(None) is None
+
+
+def test_next_due_none_acquires_once(scheduler):
+    """next_due(None) will not return the same task twice."""
+    scheduler.add(make_task(), PAST)
+    assert scheduler.next_due(None) is not None
+    assert scheduler.next_due(None) is None
+
+
+def test_next_due_none_returns_across_multiple_queues(scheduler):
+    """next_due(None) returns tasks from all queues."""
+    scheduler.add(make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1"), PAST)
+    scheduler.add(make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", queue="q2"), PAST)
+    first = scheduler.next_due(None)
+    second = scheduler.next_due(None)
+    assert first is not None
+    assert second is not None
+    assert {first.id, second.id} == {
+        make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01").id,
+        make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02").id,
+    }
+    assert scheduler.next_due(None) is None
