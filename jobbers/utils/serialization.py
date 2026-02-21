@@ -4,6 +4,7 @@ from typing import Any
 import msgpack
 
 EMPTY_DICT = b"\x80"
+EMPTY_LIST = b"\x90"
 NONE = b"\xc0"
 
 

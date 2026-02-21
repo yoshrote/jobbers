@@ -13,6 +13,7 @@ from jobbers.state_manager import StateManager, UserCancellationError
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
+
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 tasks_processed = meter.create_counter("tasks_processed", unit="1")
@@ -23,7 +24,7 @@ end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms"
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
 
-    def __init__(self, state_manager: StateManager):
+    def __init__(self, state_manager: StateManager) -> None:
         self.state_manager = state_manager
         self._current_promise: Awaitable[Any] | None = None
 
@@ -42,14 +43,12 @@ class TaskProcessor:
         ex: BaseException | None = None
 
         if task.task_config is None:
-            self.handle_dropped_task(task)
+            await self.handle_dropped_task(task)
         else:
             self.mark_task_as_started(task)
             await self.state_manager.save_task(task)
 
             with self.state_manager.task_in_registry(task):
-                # the assert is to make mypy play nice.
-                assert task.task_config  # noqa: S101
                 self._current_promise = task.task_config.function(**task.parameters)
                 if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                     self._current_promise = asyncio.shield(self._current_promise)
@@ -59,24 +58,20 @@ class TaskProcessor:
                     async with asyncio.timeout(task.task_config.timeout):
                         task.results = await self._current_promise
                 except asyncio.TimeoutError:
-                    self.handle_timeout_exception(task)
+                    task = await self.handle_timeout_exception(task)
                 except asyncio.CancelledError as exc:
                     ex = exc
-                    self.handle_cancelled_task(task)
+                    await self.handle_system_cancelled_task(task)
                 except Exception as exc:
                     if task.task_config and task.task_config.expected_exceptions and isinstance(exc, task.task_config.expected_exceptions):
-                        self.handle_expected_exception(task, exc)
+                        task = await self.handle_expected_exception(task, exc)
                     else:
-                        self.handle_unexpected_exception(task, exc)
+                        await self.handle_unexpected_exception(task, exc)
                 else:
-                    self.handle_success(task)
-
-        await self.state_manager.save_task(task)
+                    await self.handle_success(task)
 
         # Metrics recording
         tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
-        if task.status != TaskStatus.UNSUBMITTED:
-            tasks_retried.add(task.retry_attempt, {"queue": task.queue, "task": task.name})
         if task.started_at and task.completed_at:
             execution_time.record(
                 (task.completed_at - task.started_at).total_seconds() * 1000,
@@ -100,8 +95,7 @@ class TaskProcessor:
         try:
             await self.state_manager.monitor_task_cancellation(task.id)
         except UserCancellationError:
-            self.handle_user_cancelled_task(task)
-            await self.state_manager.save_task(task)
+            await self.handle_user_cancelled_task(task)
             raise # Re-raise to exit the TaskGroup in run()
 
     def mark_task_as_started(self, task: Task) -> None:
@@ -116,45 +110,67 @@ class TaskProcessor:
         # Monitor for when fan-out becomes problematic
         # callback_pool.map(self.state_manager.submit_task, task.generate_callbacks(), num_concurrent=5)
 
-    def handle_dropped_task(self, task: Task) -> None:
+    async def handle_dropped_task(self, task: Task) -> None:
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
         task.set_status(TaskStatus.DROPPED)
+        await self.state_manager.save_task(task)
 
-    def handle_cancelled_task(self, task: Task) -> None:
+    async def handle_system_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled.", task.id)
         task.shutdown()
+        await self.state_manager.save_task(task)
 
-    def handle_user_cancelled_task(self, task: Task) -> None:
+    async def handle_user_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled by user.", task.id)
         task.set_status(TaskStatus.CANCELLED)
+        await self.state_manager.save_task(task)
 
-    def handle_unexpected_exception(self, task: Task, exc: Exception) -> None:
+    async def handle_unexpected_exception(self, task: Task, exc: Exception) -> None:
         logger.exception("Exception occurred while processing task %s: %s", task.id, exc)
         task.set_status(TaskStatus.FAILED)
-        task.error = str(exc)
+        task.errors.append(str(exc))
+        await self.state_manager.fail_task(task)
 
-    def handle_expected_exception(self, task: Task, exc: Exception) -> None:
+    async def handle_expected_exception(self, task: Task, exc: Exception) -> Task:
         logger.warning("Task %s failed with error: %s", task.id, exc)
-        # TODO: Set metrics to track expected exceptions
-        task.error = str(exc)
-        if task.should_retry():
-            task.set_to_retry()
-        else:
+        task.errors.append(str(exc))
+        if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
+            await self.state_manager.fail_task(task)
+            return task
 
-    def handle_timeout_exception(self, task: Task) -> None:
+        tasks_retried.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
+        if task.should_schedule():
+            task.set_status(TaskStatus.SCHEDULED)
+            run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
+            return await self.state_manager.schedule_retry_task(task, run_at)
+        else:
+            task.set_status(TaskStatus.UNSUBMITTED)
+            return await self.state_manager.queue_retry_task(task)
+
+    async def handle_timeout_exception(self, task: Task) -> Task:
         timeout: int | None
         if task.task_config is None:
             timeout = None
         else:
             timeout = task.task_config.timeout
         logger.warning("Task %s timed out after %s seconds.", task.id, timeout)
-        task.error = f"Task {task.id} timed out after {timeout} seconds"
-        if task.should_retry():
-            task.set_to_retry()
-        else:
+        task.errors.append(f"Task {task.id} timed out after {timeout} seconds")
+        if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
+            await self.state_manager.fail_task(task)
+            return task
 
-    def handle_success(self, task: Task) -> None:
+        tasks_retried.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
+        if task.should_schedule():
+            task.set_status(TaskStatus.SCHEDULED)
+            run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
+            return await self.state_manager.schedule_retry_task(task, run_at)
+        else:
+            task.set_status(TaskStatus.UNSUBMITTED)
+            return await self.state_manager.queue_retry_task(task)
+
+    async def handle_success(self, task: Task) -> None:
         logger.info("Task %s completed.", task.id)
         task.set_status(TaskStatus.COMPLETED)
+        await self.state_manager.complete_task(task)

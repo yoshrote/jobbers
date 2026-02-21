@@ -13,6 +13,7 @@ class TaskStatus(StrEnum):
     STALLED = "stalled" # cancelled by the system
     FAILED = "failed"
     DROPPED = "dropped"
+    SCHEDULED = "scheduled" # waiting in the delay queue for a future retry
 
     @classmethod
     def from_bytes(cls, raw_status: bytes | None) -> "TaskStatus":
@@ -25,4 +26,4 @@ class TaskStatus(StrEnum):
 
     @classmethod
     def active_statuses(cls) -> set["TaskStatus"]:
-        return {cls.SUBMITTED, cls.STARTED, cls.HEARTBEAT}
+        return {cls.SUBMITTED, cls.STARTED, cls.HEARTBEAT, cls.SCHEDULED}
