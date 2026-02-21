@@ -95,6 +95,41 @@ class TaskScheduler:
         ).fetchall()
         return [Task.model_validate_json(row["task"]) for row in rows]
 
+    def next_due_bulk(self, n: int, queues: list[str] | None = None) -> list[Task]:
+        """
+        Atomically acquire and return up to n due tasks, or an empty list.
+
+        Sets acquired = 1 on the selected rows so no other TaskScheduler instance
+        can return the same tasks.
+
+        - ``queues=None`` — match any queue
+        - ``queues=[]`` — return [] immediately
+        - ``queues=[...]`` — only match tasks in the given queues
+        """
+        if queues is not None and not queues:
+            return []
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        if queues is None:
+            queue_filter = ""
+            params: tuple[object, ...] = (now, n)
+        else:
+            placeholders = ",".join("?" * len(queues))
+            queue_filter = f"AND queue IN ({placeholders})"
+            params = (now, *queues, n)
+        rows = self._conn.execute(
+            f"""
+            UPDATE schedule SET acquired = 1
+            WHERE task_id IN (
+                SELECT task_id FROM schedule
+                WHERE run_at <= ? {queue_filter} AND acquired = 0
+                ORDER BY run_at, task_id LIMIT ?
+            )
+            RETURNING task
+            """,
+            params,
+        ).fetchall()
+        return [Task.model_validate_json(row["task"]) for row in rows]
+
     def next_due(self, queues: list[str] | None = None) -> Task | None:
         """
         Atomically acquire and return the earliest due task, or None.
