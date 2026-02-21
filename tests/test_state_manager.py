@@ -65,10 +65,9 @@ async def test_get_next_task_returns_task(redis, state_manager):
     await redis.hset(f"task:{task_id}", mapping=task_data)
 
     # Call the method
-    task, ad_hoc = await state_manager.get_next_task(["queue1", "queue2"])
+    task = await state_manager.get_next_task(["queue1", "queue2"])
 
     # Assert the result
-    assert ad_hoc
     assert task is not None
     assert task.id == task_id
     assert task.name == "Test Task"
@@ -80,11 +79,10 @@ async def test_get_next_task_no_task_found(redis, state_manager):
     """Test that get_next_task returns None if no task is found."""
     # Call the method with no tasks in the queues
     # Use a timeout to avoid blocking forever
-    task, ad_hoc = await state_manager.get_next_task(["queue1", "queue2"], timeout=1)
+    task = await state_manager.get_next_task(["queue1", "queue2"], timeout=1)
 
     # Assert the result
     assert task is None
-    assert ad_hoc is True
 
 
 @pytest.mark.asyncio
@@ -95,11 +93,10 @@ async def test_get_next_task_missing_task_data(redis, state_manager):
     await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
 
     # Call the method
-    task, ad_hoc = await state_manager.get_next_task(["queue1", "queue2"])
+    task = await state_manager.get_next_task(["queue1", "queue2"])
 
     # Assert the result
     assert task is None
-    assert ad_hoc is True
 
 @pytest.fixture
 def rate_limiter(state_manager):
@@ -316,6 +313,24 @@ async def test_add_task_to_queue_no_submitted_at(redis, rate_limiter):
     # Should not add anything to the sorted set
     members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
     assert members == []
+
+@pytest.mark.asyncio
+async def test_dispatch_scheduled_task(redis, state_manager):
+    """dispatch_scheduled_task moves a due task from the scheduler into its Redis queue."""
+    task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
+    run_at = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+    state_manager.task_scheduler.add(task, run_at)
+
+    due = state_manager.task_scheduler.next_due(None)
+    assert due is not None
+    await state_manager.dispatch_scheduled_task(due)
+
+    # Task must now be in the Redis sorted set for its queue
+    queue_members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) in queue_members
+    # Task must be removed from the scheduler (acquired row cleaned up)
+    assert state_manager.task_scheduler.next_due(None) is None
+
 
 def test_task_in_registry(state_manager):
     """Test that a task is correctly identified as being in the active tasks registry."""

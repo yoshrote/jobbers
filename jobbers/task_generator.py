@@ -153,7 +153,7 @@ class TaskGenerator:
             task_queues = await self.queues()
             logger.debug("Checking queues %s", task_queues)
             # try:
-            task, scheduled = await self.state_manager.get_next_task(task_queues)
+            task = await self.state_manager.get_next_task(task_queues)
             # except asyncio.CancelledError:
             #    # put task back on queue
         if not task:
@@ -168,10 +168,9 @@ class TaskGenerator:
         if task.submitted_at is None: # This should never happen
             logger.fatal("Task %s v%s id=%s is missing a submitted_at timestamp.", task.name, task.version, task.id)
             raise RuntimeError("Pulled a task that was never submitted")
-        if not scheduled:
-            time_in_queue.record(
-                (dt.datetime.now(dt.timezone.utc) - task.submitted_at).total_seconds() * 1000,
-                metric_tags
-            )
+        time_in_queue.record(
+            (dt.datetime.now(dt.timezone.utc) - task.submitted_at).total_seconds() * 1000,
+            metric_tags
+        )
         tasks_selected.add(1, metric_tags)
         return task
