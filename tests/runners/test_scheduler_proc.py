@@ -13,16 +13,18 @@ from jobbers.runners.scheduler_proc import main
 def make_task() -> Task:
     return Task(id=ULID(), name="retry_task", version=1, queue="default", status=TaskStatus.SCHEDULED)
 
+def make_state_manager_with_tasks(tasks: list[Task]) -> MagicMock:
+    state_manager = MagicMock()
+    state_manager.task_scheduler.next_due_bulk = MagicMock(side_effect=[tasks, []])  # return tasks first, then None
+    state_manager.qca.get_queues = AsyncMock(return_value={"default"})
+    state_manager.dispatch_scheduled_task = AsyncMock(side_effect=lambda t: t)
+    return state_manager
 
 @pytest.mark.asyncio
 async def test_scheduler_dispatches_due_task():
     """When next_due() returns a task the runner dispatches it and does not sleep first."""
     task = make_task()
-    state_manager = MagicMock()
-    # First call returns the task; second call (after dispatch) returns None so the loop sleeps
-    state_manager.task_scheduler.next_due.side_effect = [task, None]
-    state_manager.qca.get_queues = AsyncMock(return_value={"default"})
-    state_manager.dispatch_scheduled_task = AsyncMock(return_value=task)
+    state_manager = make_state_manager_with_tasks([task])
 
     sleep_calls: list[float] = []
 
@@ -33,7 +35,7 @@ async def test_scheduler_dispatches_due_task():
     with patch("jobbers.runners.scheduler_proc.get_state_manager", return_value=state_manager), \
          patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep):
         try:
-            await main(poll_interval=1.0, role="default")
+            await main(poll_interval=1.0, role="default", batch_size=1)
         except asyncio.CancelledError:
             pass
 
@@ -45,10 +47,7 @@ async def test_scheduler_dispatches_due_task():
 @pytest.mark.asyncio
 async def test_scheduler_sleeps_when_no_task():
     """When next_due() returns None the runner sleeps for poll_interval."""
-    state_manager = MagicMock()
-    state_manager.task_scheduler.next_due.return_value = None
-    state_manager.qca.get_queues = AsyncMock(return_value={"default"})
-    state_manager.dispatch_scheduled_task = AsyncMock()
+    state_manager = make_state_manager_with_tasks([])
 
     sleep_calls: list[float] = []
 
@@ -59,7 +58,7 @@ async def test_scheduler_sleeps_when_no_task():
     with patch("jobbers.runners.scheduler_proc.get_state_manager", return_value=state_manager), \
          patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep):
         try:
-            await main(poll_interval=7.5, role="default")
+            await main(poll_interval=7.5, role="default", batch_size=1)
         except asyncio.CancelledError:
             pass
 
@@ -73,10 +72,7 @@ async def test_scheduler_runs_multiple_iterations():
     task1 = make_task()
     task2 = make_task()
     # Sequence: task, task, None (sleep → cancel)
-    state_manager = MagicMock()
-    state_manager.task_scheduler.next_due.side_effect = [task1, task2, None]
-    state_manager.qca.get_queues = AsyncMock(return_value={"default"})
-    state_manager.dispatch_scheduled_task = AsyncMock(side_effect=lambda t: t)
+    state_manager = make_state_manager_with_tasks([task1, task2])
 
     async def fake_sleep(interval: float) -> None:
         raise asyncio.CancelledError  # stop on first idle
@@ -84,7 +80,7 @@ async def test_scheduler_runs_multiple_iterations():
     with patch("jobbers.runners.scheduler_proc.get_state_manager", return_value=state_manager), \
          patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep):
         try:
-            await main(poll_interval=1.0, role="default")
+            await main(poll_interval=1.0, role="default", batch_size=1)
         except asyncio.CancelledError:
             pass
 
@@ -96,10 +92,7 @@ async def test_scheduler_uses_env_var_poll_interval(monkeypatch):
     """SCHEDULER_POLL_INTERVAL env var controls the sleep duration passed to main()."""
     monkeypatch.setenv("SCHEDULER_POLL_INTERVAL", "42.0")
 
-    state_manager = MagicMock()
-    state_manager.task_scheduler.next_due.return_value = None
-    state_manager.qca.get_queues = AsyncMock(return_value={"default"})
-    state_manager.dispatch_scheduled_task = AsyncMock()
+    state_manager = make_state_manager_with_tasks([])
 
     received_intervals: list[float] = []
 
@@ -113,7 +106,7 @@ async def test_scheduler_uses_env_var_poll_interval(monkeypatch):
          patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep):
         try:
             poll_interval = float(os.environ.get("SCHEDULER_POLL_INTERVAL", "5.0"))
-            await main(poll_interval=poll_interval, role="default")
+            await main(poll_interval=poll_interval, role="default", batch_size=1)
         except asyncio.CancelledError:
             pass
 
