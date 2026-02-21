@@ -10,10 +10,13 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import sys
 from typing import TYPE_CHECKING
+
+from opentelemetry import metrics
 
 from jobbers.db import get_state_manager
 
@@ -21,6 +24,12 @@ if TYPE_CHECKING:
     from jobbers.state_manager import StateManager
 
 logger = logging.getLogger(__name__)
+meter = metrics.get_meter(__name__)
+dispatch_latency = meter.create_histogram(
+    "scheduled_task_dispatch_latency_seconds",
+    unit="s",
+    description="Seconds between a task's scheduled run_at and when it is dispatched to its queue.",
+)
 
 
 async def main(poll_interval: float, role: str, batch_size: int) -> None:
@@ -28,10 +37,18 @@ async def main(poll_interval: float, role: str, batch_size: int) -> None:
     queues: list[str] = list(await state_manager.qca.get_queues(role))
     logger.info("Scheduler starting; poll_interval=%.1fs batch_size=%d", poll_interval, batch_size)
     while True:
-        tasks = state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues)
-        if tasks:
-            logger.info("Dispatching %d scheduled task(s)", len(tasks))
-            await asyncio.gather(*(state_manager.dispatch_scheduled_task(t) for t in tasks))
+        task_entries = state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues)
+        if task_entries:
+            logger.info("Dispatching %d scheduled task(s)", len(task_entries))
+            await asyncio.gather(
+                *(state_manager.dispatch_scheduled_task(task) for task, _ in task_entries)
+            )
+            now = dt.datetime.now(dt.timezone.utc)
+            for task, run_at in task_entries:
+                dispatch_latency.record(
+                    (now - run_at).total_seconds(),
+                    {"queue": task.queue, "task_name": task.name},
+                )
         else:
             await asyncio.sleep(poll_interval)
 

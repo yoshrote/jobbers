@@ -1,5 +1,6 @@
 """Unit tests for jobbers/runners/scheduler_proc.py."""
 import asyncio
+import datetime as dt
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,13 +10,16 @@ from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 from jobbers.runners.scheduler_proc import main
 
+PAST = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+
 
 def make_task() -> Task:
     return Task(id=ULID(), name="retry_task", version=1, queue="default", status=TaskStatus.SCHEDULED)
 
 def make_state_manager_with_tasks(tasks: list[Task]) -> MagicMock:
+    entries = [(t, PAST) for t in tasks]
     state_manager = MagicMock()
-    state_manager.task_scheduler.next_due_bulk = MagicMock(side_effect=[tasks, []])  # return tasks first, then None
+    state_manager.task_scheduler.next_due_bulk = MagicMock(side_effect=[entries, []])
     state_manager.qca.get_queues = AsyncMock(return_value={"default"})
     state_manager.dispatch_scheduled_task = AsyncMock(side_effect=lambda t: t)
     return state_manager

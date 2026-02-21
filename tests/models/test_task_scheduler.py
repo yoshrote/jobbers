@@ -170,3 +170,45 @@ def test_next_due_none_returns_across_multiple_queues(scheduler):
         make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02").id,
     }
     assert scheduler.next_due(None) is None
+
+
+# ── next_due_bulk ──────────────────────────────────────────────────────────────
+
+def test_next_due_bulk_returns_task_run_at_tuples(scheduler):
+    """next_due_bulk returns (Task, datetime) pairs."""
+    scheduler.add(make_task(), PAST)
+    results = scheduler.next_due_bulk(10)
+    assert len(results) == 1
+    task, run_at = results[0]
+    assert task.id == make_task().id
+    assert isinstance(run_at, dt.datetime)
+    assert run_at.tzinfo is not None
+
+
+def test_next_due_bulk_run_at_matches_scheduled_time(scheduler):
+    """The run_at in each tuple equals the datetime passed to add()."""
+    scheduled_time = dt.datetime(2020, 6, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
+    scheduler.add(make_task(), scheduled_time)
+    (_, run_at), = scheduler.next_due_bulk(10)
+    assert run_at == scheduled_time
+
+
+def test_next_due_bulk_respects_limit(scheduler):
+    """next_due_bulk returns at most n tasks."""
+    scheduler.add(make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01"), PAST)
+    scheduler.add(make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02"), PAST)
+    scheduler.add(make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03"), PAST)
+    assert len(scheduler.next_due_bulk(2)) == 2
+
+
+def test_next_due_bulk_empty_queue_list_returns_empty(scheduler):
+    """next_due_bulk(queues=[]) returns [] without touching the DB."""
+    scheduler.add(make_task(), PAST)
+    assert scheduler.next_due_bulk(10, queues=[]) == []
+
+
+def test_next_due_bulk_acquires_so_second_call_returns_empty(scheduler):
+    """Tasks returned by next_due_bulk are marked acquired and not returned again."""
+    scheduler.add(make_task(), PAST)
+    assert len(scheduler.next_due_bulk(10)) == 1
+    assert scheduler.next_due_bulk(10) == []

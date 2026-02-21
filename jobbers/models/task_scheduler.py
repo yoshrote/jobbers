@@ -95,9 +95,13 @@ class TaskScheduler:
         ).fetchall()
         return [Task.model_validate_json(row["task"]) for row in rows]
 
-    def next_due_bulk(self, n: int, queues: list[str] | None = None) -> list[Task]:
+    def next_due_bulk(self, n: int, queues: list[str] | None = None) -> list[tuple[Task, dt.datetime]]:
         """
-        Atomically acquire and return up to n due tasks, or an empty list.
+        Atomically acquire and return up to n due tasks paired with their scheduled run_at time.
+
+        Each element is a ``(task, run_at)`` tuple where ``run_at`` is the UTC datetime
+        the task was originally scheduled for.  Callers can use ``run_at`` to measure
+        dispatch latency (``now - run_at``).
 
         Sets acquired = 1 on the selected rows so no other TaskScheduler instance
         can return the same tasks.
@@ -124,11 +128,14 @@ class TaskScheduler:
                 WHERE run_at <= ? {queue_filter} AND acquired = 0
                 ORDER BY run_at, task_id LIMIT ?
             )
-            RETURNING task
+            RETURNING task, run_at
             """,
             params,
         ).fetchall()
-        return [Task.model_validate_json(row["task"]) for row in rows]
+        return [
+            (Task.model_validate_json(row["task"]), dt.datetime.fromisoformat(row["run_at"]))
+            for row in rows
+        ]
 
     def next_due(self, queues: list[str] | None = None) -> Task | None:
         """
