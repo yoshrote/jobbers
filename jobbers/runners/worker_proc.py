@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import TYPE_CHECKING
 
 from jobbers.db import get_state_manager
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
+
+if TYPE_CHECKING:
+    from jobbers.models.task import Task
 
 logger = logging.getLogger(__name__)
 """
@@ -25,23 +29,37 @@ async def main() -> None:
     worker_ttl = int(os.environ.get("WORKER_TTL", 50)) # if 0, will run indefinitely
     state_manager = get_state_manager()
     task_generator = TaskGenerator(state_manager, state_manager.qca, role, max_tasks=worker_ttl)
-    await task_generator.queues() # warm up the refresh tag once for all workers
+    await task_generator.queues() # warm up the refresh tag once
 
-    async def worker(name: str) -> None:
-        logger.info("%s starting", name)
-        async for task in task_generator:
-            logger.debug("%s running task: %s[%sv%s]", name, task.id, task.name, task.version)
+    semaphore = asyncio.Semaphore(num_concurrent)
+    active: set[asyncio.Task[None]] = set()
+
+    async def run_task(task: Task) -> None:
+        logger.debug("Running task: %s[%sv%s]", task.id, task.name, task.version)
+        try:
             await TaskProcessor(state_manager).run(task)
-        logger.info("%s stopping", name)
+        finally:
+            semaphore.release()
 
-    workers = [asyncio.create_task(worker(f"jobber-worker-{i}"), name=f"jobber-worker-{i}") for i in range(num_concurrent)]
     try:
-        await asyncio.gather(*workers)
+        while True:
+            await semaphore.acquire()
+            try:
+                task = await anext(task_generator)
+            except StopAsyncIteration:
+                semaphore.release()
+                break
+            t = asyncio.create_task(run_task(task))
+            active.add(t)
+            t.add_done_callback(active.discard)
+        await asyncio.gather(*active, return_exceptions=True)
     finally:
-        logger.info("Worker tasks cancelled; shutting down")
+        logger.info("Worker shutting down")
         task_generator.stop()
-        for w in workers:
-            w.cancel()
+        for t in active:
+            t.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
 
 def run() -> None:
     import importlib
