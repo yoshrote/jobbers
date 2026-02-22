@@ -23,5 +23,5 @@ def test_from_bytes_with_valid_bytes():
 
 def test_from_bytes_with_invalid_bytes():
     """Test from_bytes with invalid bytes input."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="is not a valid TaskStatus"):
         TaskStatus.from_bytes(b"invalid_status")

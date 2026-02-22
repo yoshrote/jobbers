@@ -3,7 +3,7 @@ import logging
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from jobbers.models.task_config import TaskConfig
+from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
 
 logger = logging.getLogger(__name__)
 _task_function_map : dict[tuple[str, int], TaskConfig] = {}
@@ -16,7 +16,9 @@ def register_task(
         max_retries: int=3,
         retry_delay: int | None=None,
         expected_exceptions: tuple[Exception] | None=None,
-        max_heartbeat_interval: dt.timedelta | None=None
+        max_heartbeat_interval: dt.timedelta | None=None,
+        backoff_strategy: BackoffStrategy=BackoffStrategy.EXPONENTIAL,
+        dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE
     ) -> Callable[..., Any]:
     """Register a task function with the given name and version."""
 
@@ -42,6 +44,8 @@ def register_task(
             retry_delay=retry_delay,
             expected_exceptions=expected_exceptions,
             max_heartbeat_interval=max_heartbeat_interval,
+            backoff_strategy=backoff_strategy,
+            dead_letter_policy=dead_letter_policy
         )
         _task_function_map[(name, version)] = task_conf
         return func

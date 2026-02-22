@@ -14,6 +14,7 @@ from jobbers.constants import TIME_ZERO
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.utils.serialization import (
     EMPTY_DICT,
+    EMPTY_LIST,
     NONE,
     deserialize,
     serialize,
@@ -34,7 +35,7 @@ class Task(BaseModel):
     version: int = 0
     parameters: dict[Any, Any] = {}
     results: dict[Any, Any] = {}
-    error: str | None = None
+    errors: list[str] = []
     # status fields
     retry_attempt: int = 0  # Number of times this task has been retried
     status: TaskStatus = Field(default=TaskStatus.UNSUBMITTED)
@@ -67,9 +68,9 @@ class Task(BaseModel):
                 # TODO: maybe warn or panic since this should be unreachable
                 pass
             case TaskShutdownPolicy.STOP:
-                self.status = TaskStatus.STALLED
-                self.completed_at = dt.datetime.now(dt.timezone.utc)
+                self.set_status(TaskStatus.STALLED)
             case TaskShutdownPolicy.RESUBMIT:
+                # Direct assignment: shutdown-triggered resubmit should not increment retry_attempt
                 self.status = TaskStatus.UNSUBMITTED
 
     def should_retry(self) -> bool:
@@ -77,6 +78,12 @@ class Task(BaseModel):
             # safer to fail here than chance something funky downstream
             return False
         return self.retry_attempt < self.task_config.max_retries
+
+    def should_schedule(self) -> bool:
+        """Return True if the retry should be delayed (SCHEDULED) rather than immediate (UNSUBMITTED)."""
+        if not self.task_config:
+            return False
+        return self.task_config.retry_delay is not None
 
     def has_callbacks(self) -> bool:
         return False
@@ -87,6 +94,8 @@ class Task(BaseModel):
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"})
         summary["id"] = str(self.id)
+        if self.errors:
+            summary["last_error"] =  self.errors[-1]
         return summary
 
     @property
@@ -108,7 +117,7 @@ class Task(BaseModel):
             version=int(raw_task_data.get(b"version", b"0")),
             parameters=deserialize(raw_task_data.get(b"parameters") or EMPTY_DICT),
             results=deserialize(raw_task_data.get(b"results") or EMPTY_DICT),
-            error=deserialize(raw_task_data.get(b"error") or NONE),
+            errors=deserialize(raw_task_data.get(b"errors") or EMPTY_LIST),
             status=TaskStatus.from_bytes(raw_task_data.get(b"status")),
             submitted_at=deserialize(raw_task_data.get(b"submitted_at") or NONE),
             started_at=deserialize(raw_task_data.get(b"started_at") or NONE),
@@ -122,7 +131,7 @@ class Task(BaseModel):
             b"version": self.version,
             b"parameters": serialize(self.parameters or {}),
             b"results": serialize(self.results or {}),
-            b"error": serialize(self.error),
+            b"errors": serialize(self.errors),
             b"status": self.status.to_bytes(),
             b"submitted_at": serialize(self.submitted_at),
             b"started_at": serialize(self.started_at),
@@ -142,11 +151,10 @@ class Task(BaseModel):
             case TaskStatus.COMPLETED | TaskStatus.FAILED | \
                  TaskStatus.CANCELLED | TaskStatus.STALLED | TaskStatus.DROPPED:
                 self.completed_at = dt.datetime.now(dt.timezone.utc)
+            case TaskStatus.SCHEDULED | TaskStatus.UNSUBMITTED:
+                self.retry_attempt += 1
         self.status = status
 
-    def set_to_retry(self) -> None:
-        self.status = TaskStatus.UNSUBMITTED
-        self.retry_attempt += 1
 
 class PaginationOrder(StrEnum):
     "Supported fields to order task list by."
@@ -161,6 +169,8 @@ class TaskPagination(BaseModel):
     limit: int = Field(default=10, gt=0, le=100)
     start: ULID | None = Field(default=None)
     order_by: PaginationOrder = Field(default=PaginationOrder.SUBMITTED_AT)
+    task_name: str | None = Field(default=None)
+    task_version: int | None = Field(default=None)
     # status: TaskStatus | None = Field(default=None)
 
     def start_param(self) -> int:
@@ -187,16 +197,38 @@ class TaskAdapter:
         self.data_store: Redis = data_store
 
     async def submit_task(self, task: Task, extra_check: Callable[[Pipeline], bool] | None) -> None:
-        """Submit a task to the Redis data store."""
+        """Submit a new task to the Redis data store. Status must already be SUBMITTED."""
         pipe = self.data_store.pipeline(transaction=True)
-        # Avoid pushing a task onto the queue multiple times
-        if task.status == TaskStatus.UNSUBMITTED and not await self.task_exists(task.id):
+        # Only enqueue if this is a new SUBMITTED task (SM sets SUBMITTED before calling here)
+        if task.status == TaskStatus.SUBMITTED and not await self.task_exists(task.id):
             if extra_check is None or extra_check(pipe):
-                task.set_status(TaskStatus.SUBMITTED)
-                # the assert is to make mypy play nice.
                 assert task.submitted_at  # noqa: S101
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 
+        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
+        if task.status in TaskStatus.active_statuses():
+            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        else:
+            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
+        await pipe.execute()
+
+    async def requeue_task(self, task: Task) -> None:
+        """Re-enqueue an existing task for retry (bypasses the new-task existence check)."""
+        assert task.submitted_at  # noqa: S101
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
+        if task.status in TaskStatus.active_statuses():
+            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        else:
+            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        await pipe.execute()
+
+    async def save_task(self, task: Task) -> None:
+        """Submit a task to the Redis data store."""
+        pipe = self.data_store.pipeline(transaction=True)
+        # Avoid pushing a task onto the queue multiple times
         pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
         if task.status in TaskStatus.active_statuses():
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))

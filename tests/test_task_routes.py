@@ -1,10 +1,10 @@
 import datetime as dt
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import fakeredis
 import pytest
 import pytest_asyncio
-import redis.asyncio as redis
 from httpx import ASGITransport, AsyncClient
 from ulid import ULID
 
@@ -19,7 +19,7 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 @pytest_asyncio.fixture
 async def redis_db():
     # Connect to a test Redis instance (e.g., managed by pytest-redis)
-    client = redis.Redis(host='localhost', port=6379, db=1)
+    client = fakeredis.aioredis.FakeRedis()
     yield client
     # Clean up after the test (e.g., flush the database)
     await client.flushdb()
@@ -203,3 +203,176 @@ async def test_get_all_roles():
         assert response.status_code == 200
         assert response.json() == {"roles": ["role1", "role2"]}
         mock_queue_adapter.get_all_roles.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_get_scheduled_tasks_no_optional_filters():
+    """Test fetching scheduled tasks with only queue uses all-None optional filters."""
+    task1 = Task(id=ULID1, name="Task 1", status="submitted", parameters={})
+    task2 = Task(id=ULID2, name="Task 2", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.task_scheduler.get_by_filter.return_value = [task1, task2]
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/scheduled-tasks", params={"queue": "default"})
+
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 2
+    mock_sm.task_scheduler.get_by_filter.assert_called_once_with(
+        queue="default",
+        task_name=None,
+        task_version=None,
+        limit=10,
+        start_after=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_scheduled_tasks_by_filter():
+    """Test fetching scheduled tasks with queue, task_name, task_version, and limit filters."""
+    task = Task(id=ULID1, name="My Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.task_scheduler.get_by_filter.return_value = [task]
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                "/scheduled-tasks",
+                params={"queue": "high", "task_name": "My Task", "task_version": 2, "limit": 10},
+            )
+
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 1
+    mock_sm.task_scheduler.get_by_filter.assert_called_once_with(
+        queue="high",
+        task_name="My Task",
+        task_version=2,
+        limit=10,
+        start_after=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_scheduled_tasks_empty():
+    """Test fetching scheduled tasks returns an empty list when none match."""
+    mock_sm = MagicMock()
+    mock_sm.task_scheduler.get_by_filter.return_value = []
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/scheduled-tasks", params={"queue": "nonexistent"})
+
+    assert response.status_code == 200
+    assert response.json() == {"tasks": []}
+
+
+@pytest.mark.asyncio
+async def test_get_scheduled_tasks_with_start_cursor():
+    """Test that the start ULID is forwarded as start_after for cursor pagination."""
+    task = Task(id=ULID2, name="Task 2", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.task_scheduler.get_by_filter.return_value = [task]
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                "/scheduled-tasks",
+                params={"queue": "default", "start": str(ULID1)},
+            )
+
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 1
+    mock_sm.task_scheduler.get_by_filter.assert_called_once_with(
+        queue="default",
+        task_name=None,
+        task_version=None,
+        limit=10,
+        start_after=str(ULID1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_by_ids():
+    """Test resubmitting DLQ tasks by explicit task ID list."""
+    task = Task(id=ULID1, name="Test Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.dead_queue.get_by_ids.return_value = [task]
+    mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/dead-letter-queue/resubmit",
+                json={"task_ids": [str(ULID1)]},
+            )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["resubmitted"] == 1
+    assert len(data["tasks"]) == 1
+    mock_sm.dead_queue.get_by_ids.assert_called_once_with([str(ULID1)])
+    mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=True)
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_by_filter():
+    """Test resubmitting DLQ tasks by filter criteria."""
+    task = Task(id=ULID2, name="My Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.dead_queue.get_by_filter.return_value = [task]
+    mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/dead-letter-queue/resubmit",
+                json={"queue": "default", "task_name": "My Task"},
+            )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["resubmitted"] == 1
+    mock_sm.dead_queue.get_by_filter.assert_called_once_with(
+        queue="default",
+        task_name="My Task",
+        task_version=None,
+        limit=100,
+    )
+    mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=True)
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_no_filter_returns_400():
+    """Test that omitting all filter criteria returns 400."""
+    mock_sm = MagicMock()
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/dead-letter-queue/resubmit", json={})
+
+    assert response.status_code == 400
+    assert "Provide task_ids" in response.json()["detail"]
+    mock_sm.dead_queue.get_by_ids.assert_not_called()
+    mock_sm.dead_queue.get_by_filter.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_reset_retry_false():
+    """Test that reset_retry_count=False is forwarded to resubmit_dead_tasks."""
+    task = Task(id=ULID1, name="Test Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.dead_queue.get_by_ids.return_value = [task]
+    mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/dead-letter-queue/resubmit",
+                json={"task_ids": [str(ULID1)], "reset_retry_count": False},
+            )
+
+    assert response.status_code == 200
+    mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=False)

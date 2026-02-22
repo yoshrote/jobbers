@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
 
+from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task
-from jobbers.state_manager import QueueConfigAdapter, StateManager
+from jobbers.state_manager import StateManager
 
 if TYPE_CHECKING:
     from ulid import ULID
