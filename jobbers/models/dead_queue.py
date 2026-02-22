@@ -100,6 +100,14 @@ class DeadQueue:
         with self._conn:
             self._conn.execute("DELETE FROM dead_queue WHERE task_id = ?", (task_id,))
 
+    def remove_many(self, task_ids: list[str]) -> None:
+        """Remove multiple entries from the dead letter queue in a single transaction."""
+        if not task_ids:
+            return
+        placeholders = ",".join("?" * len(task_ids))
+        with self._conn:
+            self._conn.execute(f"DELETE FROM dead_queue WHERE task_id IN ({placeholders})", task_ids)
+
     def clean(self, earlier_than: dt.datetime) -> None:
         """Remove failed tasks older than the specified datetime."""
         with self._conn:

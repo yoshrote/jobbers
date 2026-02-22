@@ -179,6 +179,46 @@ def test_remove_nonexistent_is_silent(dq):
     dq.remove(str(ULID3))  # no exception
 
 
+# ── remove_many ───────────────────────────────────────────────────────────────
+
+def test_remove_many_deletes_all(dq):
+    dq.add(make_task(task_id=ULID1), FAILED_AT)
+    dq.add(make_task(task_id=ULID2), FAILED_AT)
+    dq.remove_many([str(ULID1), str(ULID2)])
+
+    assert dq.get_by_ids([str(ULID1), str(ULID2)]) == []
+
+
+def test_remove_many_leaves_unmentioned_entries_intact(dq):
+    dq.add(make_task(task_id=ULID1), FAILED_AT)
+    dq.add(make_task(task_id=ULID2), FAILED_AT)
+    dq.add(make_task(task_id=ULID3), FAILED_AT)
+    dq.remove_many([str(ULID1), str(ULID2)])
+
+    assert dq.get_by_ids([str(ULID1), str(ULID2)]) == []
+    assert len(dq.get_by_ids([str(ULID3)])) == 1
+
+
+def test_remove_many_empty_list_is_silent(dq):
+    """Passing an empty list should not raise and should not modify anything."""
+    dq.add(make_task(), FAILED_AT)
+    dq.remove_many([])
+
+    assert len(dq.get_by_ids([str(ULID1)])) == 1
+
+
+def test_remove_many_nonexistent_ids_are_silent(dq):
+    """IDs that don't exist should not raise."""
+    dq.remove_many([str(ULID1), str(ULID2)])  # no exception
+
+
+def test_remove_many_partial_match(dq):
+    dq.add(make_task(task_id=ULID1), FAILED_AT)
+    dq.remove_many([str(ULID1), str(ULID2)])  # ULID2 doesn't exist
+
+    assert dq.get_by_ids([str(ULID1)]) == []
+
+
 # ── get_history ───────────────────────────────────────────────────────────────
 
 def test_get_history_returns_errors_from_task_blob(dq):

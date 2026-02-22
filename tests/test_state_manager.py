@@ -10,6 +10,7 @@ from ulid import ULID
 from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
+from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import StateManager
 from jobbers.utils.serialization import EMPTY_DICT, serialize
@@ -354,3 +355,147 @@ def test_task_in_registry(state_manager):
 
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def dummy_fn():
+    pass
+
+
+def make_task_config(dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE) -> TaskConfig:
+    return TaskConfig(name="my_task", function=dummy_fn, dead_letter_policy=dead_letter_policy)
+
+
+# ── fail_task ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_fail_task_no_dlq_writes_redis_only(redis, state_manager):
+    """fail_task with NONE policy updates Redis but does not touch the DLQ."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
+    task.task_config = make_task_config(DeadLetterPolicy.NONE)
+
+    await state_manager.fail_task(task)
+
+    raw = await redis.hgetall(f"task:{ULID1}")
+    assert raw[b"status"] == b"failed"
+    assert state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
+
+
+@pytest.mark.asyncio
+async def test_fail_task_with_dlq_writes_both_stores(redis, state_manager):
+    """fail_task with SAVE policy updates Redis and writes to the DLQ."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
+    task.task_config = make_task_config(DeadLetterPolicy.SAVE)
+
+    await state_manager.fail_task(task)
+
+    raw = await redis.hgetall(f"task:{ULID1}")
+    assert raw[b"status"] == b"failed"
+    dlq = state_manager.dead_queue.get_by_ids([str(ULID1)])
+    assert len(dlq) == 1
+    assert dlq[0].id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_fail_task_redis_written_before_dlq(redis, state_manager):
+    """If the DLQ write crashes, Redis is already updated (write-first ordering)."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
+    task.task_config = make_task_config(DeadLetterPolicy.SAVE)
+
+    with patch.object(state_manager.dead_queue, "add", side_effect=RuntimeError("simulated crash")):
+        with pytest.raises(RuntimeError):
+            await state_manager.fail_task(task)
+
+    # Redis must reflect the FAILED status even though the DLQ write never happened.
+    raw = await redis.hgetall(f"task:{ULID1}")
+    assert raw[b"status"] == b"failed"
+
+
+# ── resubmit_dead_tasks ───────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_resubmit_dead_tasks_requeues_and_clears_dlq(redis, state_manager):
+    """All tasks are enqueued in Redis and removed from the DLQ."""
+    task1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
+    task2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e2"])
+    state_manager.dead_queue.add(task1, FROZEN_TIME)
+    state_manager.dead_queue.add(task2, FROZEN_TIME)
+
+    await state_manager.resubmit_dead_tasks([task1, task2])
+
+    queue_members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) in queue_members
+    assert bytes(ULID2) in queue_members
+    assert state_manager.dead_queue.get_by_ids([str(ULID1), str(ULID2)]) == []
+
+
+@pytest.mark.asyncio
+async def test_resubmit_dead_tasks_redis_written_before_dlq_delete(redis, state_manager):
+    """If the batch DLQ delete crashes, all tasks are already live in Redis (safe ordering)."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
+    state_manager.dead_queue.add(task, FROZEN_TIME)
+
+    with patch.object(state_manager.dead_queue, "remove_many", side_effect=RuntimeError("simulated crash")):
+        with pytest.raises(RuntimeError):
+            await state_manager.resubmit_dead_tasks([task])
+
+    # Task must be in Redis queue despite the DLQ crash.
+    queue_members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) in queue_members
+    # Stale DLQ entry remains — acceptable; re-running resubmit is idempotent.
+    assert len(state_manager.dead_queue.get_by_ids([str(ULID1)])) == 1
+
+
+@pytest.mark.asyncio
+async def test_resubmit_dead_tasks_is_idempotent(redis, state_manager):
+    """Re-running resubmit for a task already in Redis does not raise and clears the DLQ."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
+    state_manager.dead_queue.add(task, FROZEN_TIME)
+
+    # First run — normal path.
+    await state_manager.resubmit_dead_tasks([task])
+
+    # Operator re-adds to DLQ and retries (simulates the crash scenario above recovering).
+    task2 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
+    state_manager.dead_queue.add(task2, FROZEN_TIME)
+    await state_manager.resubmit_dead_tasks([task2])
+
+    queue_members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) in queue_members
+    assert state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
+
+
+# ── schedule_retry_task / dispatch_scheduled_task ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_schedule_retry_task_self_heals_via_dispatch(redis, state_manager):
+    """If the Redis write in schedule_retry_task was missed (crash), the scheduler dispatch recovers."""
+    task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.STARTED, retry_attempt=1)
+    run_at = FROZEN_TIME
+
+    # Simulate: only the SQLite write completed (crash before save_task).
+    state_manager.task_scheduler.add(task, run_at)
+
+    # Scheduler picks it up and dispatches — this should update Redis.
+    due = state_manager.task_scheduler.next_due(None)
+    assert due is not None
+    await state_manager.dispatch_scheduled_task(due)
+
+    queue_members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) in queue_members
+    assert state_manager.task_scheduler.next_due(None) is None
+
+
+def test_dispatch_stale_acquired_record_not_requeued(state_manager):
+    """A leftover acquired=1 row (crash between Redis write and SQLite delete) is not re-dispatched."""
+    task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
+    run_at = FROZEN_TIME
+
+    state_manager.task_scheduler.add(task, run_at)
+    # Acquire the row, simulating dispatch_scheduled_task completing the Redis write
+    # but crashing before the SQLite delete.
+    state_manager.task_scheduler.next_due(None)  # sets acquired=1
+
+    # next_due must not return the already-acquired row.
+    assert state_manager.task_scheduler.next_due(None) is None
