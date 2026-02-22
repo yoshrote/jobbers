@@ -11,6 +11,7 @@ from jobbers import db, registry
 from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task, TaskAdapter, TaskPagination
 from jobbers.state_manager import TaskException
+from jobbers.validation import ValidationError, validate_task
 
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -30,6 +31,10 @@ async def read_root() -> dict[str, Any]:
 async def submit_task(task: Task) -> dict[str, Any]:
     """Handle task submission."""
     logger.info("Submitting a task")
+    try:
+        validate_task(task)
+    except ValidationError as ex:
+        raise HTTPException(status_code=400, detail=str(ex)) from ex
     try:
         await db.get_state_manager().submit_task(task)
     except TaskException as ex:

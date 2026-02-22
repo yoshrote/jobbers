@@ -94,8 +94,6 @@ class StateManager:
         await self.data_store.set(f"worker-queues:{role}:refresh_tag", bytes(init_tag))
         return init_tag
 
-
-
     async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
         if not queues:
@@ -109,15 +107,6 @@ class StateManager:
     # Proxy methods
 
     async def submit_task(self, task: Task) -> None:
-        try:
-            task.task_config = registry.get_task_config(task.name, task.version)
-        except KeyError as ex:
-            logger.error("Task configuration not found for task %s version %d", task.name, task.version)
-            raise TaskException(f"Unregistered task {task.name} version {task.version}") from ex
-
-        if not task.valid_task_params():
-            raise TaskException(f"Invalid parameters for task {task.name} v{task.version}")
-
         queue_config = await self.qca.get_queue_config(queue=task.queue)
 
         def extra_check(pipe: Pipeline) -> bool:
