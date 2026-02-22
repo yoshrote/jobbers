@@ -3,12 +3,9 @@ requires = [
     "hatchling", 
     "packaging",
     "tomli>=1.2.1; python_version<'3.11'",
-    "trove-classifiers==2025.3.19.19",
+    "trove-classifiers==2026.1.14.14",
 ]
 build-backend = "hatchling.build"
-
-[tool.hatch.version]
-path = "jobbers/__init__.py"
 
 [project]
 name = "jobbers"
@@ -40,15 +37,8 @@ dependencies = [
     "uvicorn",
     "opentelemetry-sdk",
     "opentelemetry-exporter-otlp",
-    "opentelemetry-instrumentation-fastapi",
-    "pytest",
-    "pytest-asyncio",
-    "pytest-redis",
-    "pytest-cov",
-    "fakeredis",
-    "pytest_unordered",
+    "opentelemetry-instrumentation-fastapi",    
     "pydantic>=2.10.5",
-    "httpx",
     "redis",
     "python_on_whales",
     "msgpack",
@@ -56,6 +46,22 @@ dependencies = [
     "asyncio-taskpool",
     "msgpack-types",
 ]
+
+[project.optional-dependencies]
+test = [
+    "fakeredis",
+    "httpx",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-redis",
+    "pytest-cov",
+    "pytest_unordered",
+    "ruff",
+    "mypy",
+]
+
+[tool.hatch.version]
+path = "jobbers/__init__.py"
 
 [project.urls]
 Homepage = "https://github.com/yoshrote/jobbers"
