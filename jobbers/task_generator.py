@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 import logging
 from collections.abc import AsyncIterator
@@ -152,10 +153,13 @@ class TaskGenerator:
         with self.max_task_check:
             task_queues = await self.queues()
             logger.debug("Checking queues %s", task_queues)
-            # try:
-            task = await self.state_manager.get_next_task(task_queues)
-            # except asyncio.CancelledError:
-            #    # put task back on queue
+            task = None
+            try:
+                task = await self.state_manager.get_next_task(task_queues)
+            except asyncio.CancelledError:
+                if task:
+                    await self.state_manager.ta.requeue_task(task)
+                raise
         if not task:
             # TODO: We need to monitor how often the generator dies this way
             logger.warning("Strange stop")
