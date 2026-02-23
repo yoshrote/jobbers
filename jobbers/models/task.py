@@ -2,24 +2,22 @@ import datetime as dt
 import inspect
 import logging
 from asyncio import TaskGroup
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable
 from enum import StrEnum
 from typing import Any, Self, cast
 
 from pydantic import BaseModel, Field
-from redis.asyncio.client import Pipeline, Redis
+from redis.asyncio.client import Redis
 from ulid import ULID
 
 from jobbers.constants import TIME_ZERO
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.utils.serialization import (
-    EMPTY_DICT,
-    EMPTY_LIST,
-    NONE,
     deserialize,
     serialize,
 )
 
+from .queue_config import QueueConfig
 from .task_config import TaskConfig
 from .task_status import TaskStatus
 
@@ -108,36 +106,44 @@ class Task(BaseModel):
         self.heartbeat_at = dt.datetime.now(dt.timezone.utc)
         await self._ta.update_task_heartbeat(self)
 
+    def pack(self) -> bytes:
+        """Serialize all task fields to a single msgpack blob for Redis storage."""
+        return serialize({
+            "name": self.name,
+            "queue": self.queue,
+            "version": self.version,
+            "parameters": self.parameters or {},
+            "results": self.results or {},
+            "errors": self.errors,
+            "retry_attempt": self.retry_attempt,
+            "status": self.status,
+            "submitted_at": self.submitted_at,
+            "retried_at": self.retried_at,
+            "started_at": self.started_at,
+            "heartbeat_at": self.heartbeat_at,
+            "completed_at": self.completed_at,
+        })
+
     @classmethod
-    def from_redis(cls, task_id: ULID, raw_task_data: dict[bytes, bytes]) -> Self:
-        # Try to set good defaults for missing fields so when new fields are added to the task model, we don't break
+    def unpack(cls, task_id: ULID, data: bytes) -> "Self":
+        """Deserialize a task from a single msgpack blob."""
+        raw = deserialize(data)
         return cls(
             id=task_id,
-            name=raw_task_data.get(b"name", b"").decode(),
-            version=int(raw_task_data.get(b"version", b"0")),
-            parameters=deserialize(raw_task_data.get(b"parameters") or EMPTY_DICT),
-            results=deserialize(raw_task_data.get(b"results") or EMPTY_DICT),
-            errors=deserialize(raw_task_data.get(b"errors") or EMPTY_LIST),
-            status=TaskStatus.from_bytes(raw_task_data.get(b"status")),
-            submitted_at=deserialize(raw_task_data.get(b"submitted_at") or NONE),
-            started_at=deserialize(raw_task_data.get(b"started_at") or NONE),
-            heartbeat_at=deserialize(raw_task_data.get(b"heartbeat_at") or NONE),
-            completed_at=deserialize(raw_task_data.get(b"completed_at") or NONE),
+            name=raw.get("name", ""),
+            queue=raw.get("queue", "default"),
+            version=raw.get("version", 0),
+            parameters=raw.get("parameters") or {},
+            results=raw.get("results") or {},
+            errors=raw.get("errors") or [],
+            retry_attempt=raw.get("retry_attempt", 0),
+            status=raw.get("status", TaskStatus.UNSUBMITTED),
+            submitted_at=raw.get("submitted_at"),
+            retried_at=raw.get("retried_at"),
+            started_at=raw.get("started_at"),
+            heartbeat_at=raw.get("heartbeat_at"),
+            completed_at=raw.get("completed_at"),
         )
-
-    def to_redis(self) -> dict[bytes, bytes | int]:
-        return {
-            b"name": self.name.encode(),
-            b"version": self.version,
-            b"parameters": serialize(self.parameters or {}),
-            b"results": serialize(self.results or {}),
-            b"errors": serialize(self.errors),
-            b"status": self.status.to_bytes(),
-            b"submitted_at": serialize(self.submitted_at),
-            b"started_at": serialize(self.started_at),
-            b"heartbeat_at": serialize(self.heartbeat_at),
-            b"completed_at": serialize(self.completed_at),
-        }
 
     def set_status(self, status: TaskStatus) -> None:
         match status:
@@ -185,40 +191,132 @@ class TaskAdapter:
 
     - `task-queues:<queue>`: Sorted set of task ID => submitted at timestamp for each queue
         - ZPOPMIN to get the oldest task from a set of queues
-    - `task:<task_id>`: Hash containing the task state (name, status, etc).
+    - `task:<task_id>`: String containing the packed task state (name, status, etc).
     """
 
     TASKS_BY_QUEUE = "task-queues:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
     HEARTBEAT_SCORES = "task-heartbeats:{queue}".format
     TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
+    QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
+
+    # Atomically enqueue a new task (no rate limiting).
+    # Skips the ZADD if the task details key already exists (idempotent re-submit guard).
+    # KEYS[1] = task-queues:{queue}
+    # KEYS[2] = task:{task_id}
+    # KEYS[3] = task-type-idx:{name}
+    # ARGV[1] = submitted_at timestamp (score for the queue sorted set)
+    # ARGV[2] = task_id bytes (member for sorted sets)
+    # ARGV[3] = '1' to SADD the type index, '0' to SREM
+    # ARGV[4] = packed task blob (msgpack)
+    SUBMIT_SCRIPT = """
+        local exists = redis.call('EXISTS', KEYS[2])
+        if exists == 0 then
+            redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+        end
+        redis.call('SET', KEYS[2], ARGV[4])
+        if ARGV[3] == '1' then
+            redis.call('SADD', KEYS[3], ARGV[2])
+        else
+            redis.call('SREM', KEYS[3], ARGV[2])
+        end
+        return 1
+    """
+
+    # Atomically check the rate limit and enqueue a new task.
+    # Skips the queue ZADD when either the task already exists or the rate limit is reached.
+    # Always writes task details (SET) and updates the type index.
+    # KEYS[1] = rate-limiter:{queue}
+    # KEYS[2] = task-queues:{queue}
+    # KEYS[3] = task:{task_id}
+    # KEYS[4] = task-type-idx:{name}
+    # ARGV[1] = earliest_time (entries with score <= this are outside the window)
+    # ARGV[2] = rate_numerator (max tasks allowed in the window)
+    # ARGV[3] = submitted_at timestamp (score for rate-limiter and task-queues sorted sets)
+    # ARGV[4] = task_id bytes (member for sorted sets)
+    # ARGV[5] = '1' to SADD the type index, '0' to SREM
+    # ARGV[6] = packed task blob (msgpack)
+    # Returns: 1 if enqueued, 0 if rate-limited (task details always updated)
+    SUBMIT_RATE_LIMITED_SCRIPT = """
+        local enqueued = 0
+        local exists = redis.call('EXISTS', KEYS[3])
+        if exists == 0 then
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+            local count = redis.call('ZCARD', KEYS[1])
+            if count < tonumber(ARGV[2]) then
+                redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+                redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+                enqueued = 1
+            end
+        end
+        redis.call('SET', KEYS[3], ARGV[6])
+        if ARGV[5] == '1' then
+            redis.call('SADD', KEYS[4], ARGV[4])
+        else
+            redis.call('SREM', KEYS[4], ARGV[4])
+        end
+        return enqueued
+    """
 
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
 
-    async def submit_task(self, task: Task, extra_check: Callable[[Pipeline], Awaitable[bool]] | None) -> None:
-        """Submit a new task to the Redis data store. Status must already be SUBMITTED."""
-        pipe = self.data_store.pipeline(transaction=True)
-        # Only enqueue if this is a new SUBMITTED task (SM sets SUBMITTED before calling here)
-        if task.status == TaskStatus.SUBMITTED and not await self.task_exists(task.id):
-            if extra_check is None or await extra_check(pipe):
-                assert task.submitted_at  # noqa: S101
-                pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+    async def submit_task(self, task: "Task") -> bool:
+        """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
+        assert task.submitted_at  # noqa: S101
+        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        result: str = await cast(
+            "Awaitable[str]",
+            self.data_store.eval(
+                self.SUBMIT_SCRIPT,
+                3,
+                self.TASKS_BY_QUEUE(queue=task.queue),    # KEYS[1]
+                self.TASK_DETAILS(task_id=task.id),       # KEYS[2]
+                self.TASK_BY_TYPE_IDX(name=task.name),    # KEYS[3]
+                str(task.submitted_at.timestamp()),       # ARGV[1]
+                bytes(task.id),                      # ARGV[2]
+                is_active,                                # ARGV[3]
+                task.pack(),                         # ARGV[4]
+            )
+        )
+        return result == "1"
 
-        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
-        if task.status in TaskStatus.active_statuses():
-            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
-        else:
-            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+    async def submit_rate_limited_task(self, task: "Task", queue_config: QueueConfig) -> bool:
+        """
+        Atomically check the rate limit and enqueue the task if there is room.
 
-        await pipe.execute()
+        Returns True if the task was enqueued, False if the rate limit was reached.
+        Task details are always written regardless of the rate limit outcome.
+        """
+        assert task.submitted_at  # noqa: S101
+        now = dt.datetime.now(dt.timezone.utc)
+        earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
+        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        result: str = await cast(
+            "Awaitable[str]",
+            self.data_store.eval(
+                self.SUBMIT_RATE_LIMITED_SCRIPT,
+                4,
+                self.QUEUE_RATE_LIMITER(queue=task.queue),  # KEYS[1]
+                self.TASKS_BY_QUEUE(queue=task.queue),      # KEYS[2]
+                self.TASK_DETAILS(task_id=task.id),         # KEYS[3]
+                self.TASK_BY_TYPE_IDX(name=task.name),      # KEYS[4]
+                str(earliest_time.timestamp()),             # ARGV[1]
+                str(queue_config.rate_numerator),           # ARGV[2]
+                str(task.submitted_at.timestamp()),         # ARGV[3]
+                bytes(task.id),                             # ARGV[4]
+                is_active,                                  # ARGV[5]
+                task.pack(),                                # ARGV[6]
+            )
+        )
+        return result == "1"
 
     async def requeue_task(self, task: Task) -> None:
         """Re-enqueue an existing task for retry (bypasses the new-task existence check)."""
         assert task.submitted_at  # noqa: S101
         pipe = self.data_store.pipeline(transaction=True)
         pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
-        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
+        pipe.set(self.TASK_DETAILS(task_id=task.id), task.pack())
         if task.status in TaskStatus.active_statuses():
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
@@ -228,25 +326,24 @@ class TaskAdapter:
     async def save_task(self, task: Task) -> None:
         """Submit a task to the Redis data store."""
         pipe = self.data_store.pipeline(transaction=True)
-        # Avoid pushing a task onto the queue multiple times
-        pipe.hset(self.TASK_DETAILS(task_id=task.id), mapping=task.to_redis())
+        pipe.set(self.TASK_DETAILS(task_id=task.id), task.pack())
         if task.status in TaskStatus.active_statuses():
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
-
         await pipe.execute()
 
     async def get_task(self, task_id: ULID) -> Task | None:
-        raw_task_data: dict[bytes, Any] = await cast("Awaitable[dict[bytes, Any]]", self.data_store.hgetall(self.TASK_DETAILS(task_id=task_id)))
-        heartbeat_score: float | None = await self.data_store.zscore(self.HEARTBEAT_SCORES(queue="default"), bytes(task_id))
-        if raw_task_data and heartbeat_score is not None:
-            raw_task_data[b"heartbeat_at"] = serialize(dt.datetime.fromtimestamp(heartbeat_score, dt.timezone.utc))
-
-        if raw_task_data:
-            return Task.from_redis(task_id, raw_task_data)
-
-        return None
+        raw_data: bytes | None = await self.data_store.get(self.TASK_DETAILS(task_id=task_id))
+        if not raw_data:
+            return None
+        task = Task.unpack(task_id, raw_data)
+        heartbeat_score: float | None = await self.data_store.zscore(
+            self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id)
+        )
+        if heartbeat_score is not None:
+            task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.timezone.utc)
+        return task
 
     async def update_task_heartbeat(self, task: Task) -> None:
         """Update the heartbeat for a task."""
