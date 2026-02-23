@@ -269,8 +269,8 @@ class TaskAdapter:
         """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
         assert task.submitted_at  # noqa: S101
         is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
-        result: str = await cast(
-            "Awaitable[str]",
+        result: int = await cast(
+            "Awaitable[int]",
             self.data_store.eval(
                 self.SUBMIT_SCRIPT,
                 3,
@@ -296,8 +296,8 @@ class TaskAdapter:
         now = dt.datetime.now(dt.timezone.utc)
         earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
         is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
-        result: str = await cast(
-            "Awaitable[str]",
+        result: int = await cast(
+            "Awaitable[int]",
             self.data_store.eval(
                 self.SUBMIT_RATE_LIMITED_SCRIPT,
                 4,
