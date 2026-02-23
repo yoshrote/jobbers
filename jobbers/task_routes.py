@@ -17,6 +17,7 @@ app = FastAPI()
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 hit_counter = meter.create_up_down_counter("hit_counter")
+cancellations_requested = meter.create_counter("cancellations_requested", unit="1")
 
 @app.get("/")
 async def read_root() -> dict[str, Any]:
@@ -53,6 +54,49 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     if task:
         return task.summarized()
     raise HTTPException(status_code=404, detail="Task not found")
+
+@app.post("/task/{task_id}/cancel")
+async def cancel_task(task_id: str) -> dict[str, Any]:
+    """Cancel a running task by publishing to its cancellation channel."""
+    logger.info("Requesting cancellation for task ID %s", task_id)
+    task_uid: ULID = ULID.from_str(task_id)
+    sm = db.get_state_manager()
+    try:
+        task = await sm.request_task_cancellation(task_uid)
+    except TaskException as ex:
+        raise HTTPException(status_code=409, detail=str(ex)) from ex
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    cancellations_requested.add(1, {"queue": task.queue, "task": task.name})
+    return {"message": "Cancellation request sent", "task": task.summarized()}
+
+
+class BulkCancelRequest(BaseModel):
+    """Request body for bulk task cancellation."""
+
+    task_ids: list[str] = Field(description="List of task IDs to cancel.")
+
+
+@app.post("/tasks/cancel")
+async def cancel_tasks(request: BulkCancelRequest) -> dict[str, Any]:
+    """Cancel multiple tasks by publishing to each task's cancellation channel."""
+    logger.info("Requesting cancellation for %d tasks", len(request.task_ids))
+    sm = db.get_state_manager()
+    results = []
+    for task_id_str in request.task_ids:
+        try:
+            task_uid: ULID = ULID.from_str(task_id_str)
+            task = await sm.request_task_cancellation(task_uid)
+        except TaskException as ex:
+            results.append({"task_id": task_id_str, "status": "error", "detail": str(ex)})
+            continue
+        if task is None:
+            results.append({"task_id": task_id_str, "status": "not_found"})
+        else:
+            cancellations_requested.add(1, {"queue": task.queue, "task": task.name})
+            results.append({"task_id": task_id_str, "status": "cancellation_requested"})
+    return {"results": results}
+
 
 @app.get("/task-list")
 async def get_task_list(filter_query: Annotated[TaskPagination, Query()]) -> dict[str, Any]:

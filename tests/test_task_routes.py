@@ -376,3 +376,127 @@ async def test_resubmit_from_dlq_reset_retry_false():
 
     assert response.status_code == 200
     mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=False)
+
+
+# --- Cancellation tests ---
+
+@pytest.mark.asyncio
+async def test_cancel_task_submitted():
+    """Test cancelling a task in SUBMITTED status returns 200."""
+    task = Task(id=ULID1, name="Test Task", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.request_task_cancellation = AsyncMock(return_value=task)
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(f"/task/{ULID1}/cancel")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["message"] == "Cancellation request sent"
+    assert data["task"]["id"] == str(ULID1)
+    mock_sm.request_task_cancellation.assert_called_once_with(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_started():
+    """Test cancelling a task in STARTED status returns 200."""
+    task = Task(id=ULID1, name="Test Task", status="started", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.request_task_cancellation = AsyncMock(return_value=task)
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(f"/task/{ULID1}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "Cancellation request sent"
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_not_found():
+    """Test cancelling a non-existent task returns 404."""
+    mock_sm = MagicMock()
+    mock_sm.request_task_cancellation = AsyncMock(return_value=None)
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(f"/task/{ULID1}/cancel")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Task not found"}
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_not_cancellable():
+    """Test cancelling a completed task returns 409."""
+    from jobbers.state_manager import TaskException
+
+    mock_sm = MagicMock()
+    mock_sm.request_task_cancellation = AsyncMock(
+        side_effect=TaskException("Task has status 'completed' and cannot be cancelled.")
+    )
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(f"/task/{ULID1}/cancel")
+
+    assert response.status_code == 409
+    assert "cannot be cancelled" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_tasks_all_success():
+    """Test bulk cancellation when all tasks are cancellable."""
+    task1 = Task(id=ULID1, name="Task 1", status="submitted", parameters={})
+    task2 = Task(id=ULID2, name="Task 2", status="started", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.request_task_cancellation = AsyncMock(side_effect=[task1, task2])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/tasks/cancel",
+                json={"task_ids": [str(ULID1), str(ULID2)]},
+            )
+
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert len(results) == 2
+    assert all(r["status"] == "cancellation_requested" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_cancel_tasks_mixed_results():
+    """Test bulk cancellation with a mix of success, not found, and not cancellable."""
+    from jobbers.state_manager import TaskException
+
+    task1 = Task(id=ULID1, name="Task 1", status="submitted", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.request_task_cancellation = AsyncMock(
+        side_effect=[
+            task1,
+            None,
+            TaskException("Task has status 'completed' and cannot be cancelled."),
+        ]
+    )
+
+    ulid3 = ULID.from_str("01KJ6CGYRS5WXNW66WEYQ7QTHV")
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/tasks/cancel",
+                json={"task_ids": [str(ULID1), str(ULID2), str(ulid3)]},
+            )
+
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert results[0]["status"] == "cancellation_requested"
+    assert results[1]["status"] == "not_found"
+    assert results[2]["status"] == "error"
+    assert "cannot be cancelled" in results[2]["detail"]

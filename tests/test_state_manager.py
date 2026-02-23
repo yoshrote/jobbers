@@ -393,3 +393,24 @@ def test_dispatch_stale_acquired_record_not_requeued(state_manager):
 
     # next_due must not return the already-acquired row.
     assert state_manager.task_scheduler.next_due(None) is None
+
+
+# ── request_task_cancellation ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_cancel_scheduled_task(state_manager):
+    """Cancelling a SCHEDULED task removes it from the scheduler and marks it CANCELLED in Redis."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+    state_manager.task_scheduler.add(task, run_at)
+    await state_manager.save_task(task)
+
+    result = await state_manager.request_task_cancellation(ULID1)
+
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    # Removed from the scheduler
+    assert state_manager.task_scheduler.next_due(None) is None
+    # Persisted to Redis
+    saved = await state_manager.ta.get_task(ULID1)
+    assert saved.status == TaskStatus.CANCELLED

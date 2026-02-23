@@ -206,6 +206,27 @@ class StateManager:
         self.task_scheduler.remove(task.id)
         return task
 
+    async def request_task_cancellation(self, task_id: ULID) -> "Task | None":
+        """
+        Publish a cancellation request for a task.
+
+        Returns None if the task does not exist.
+        Raises TaskException if the task status does not permit cancellation.
+        """
+        task = await self.ta.get_task(task_id)
+        if task is None:
+            return None
+        if task.status == TaskStatus.SCHEDULED:
+            # For scheduled tasks, we can just remove them from the scheduler without a pub/sub dance
+            self.task_scheduler.remove(task_id)
+            task.set_status(TaskStatus.CANCELLED)
+            await self.save_task(task)
+            return task
+        if task.status not in {TaskStatus.SUBMITTED, TaskStatus.STARTED}:
+            raise TaskException(f"Task has status '{task.status}' and cannot be cancelled.")
+        await self.data_store.publish(f"task_cancel_{task_id}", "cancel")
+        return task
+
     async def monitor_task_cancellation(self, task_id: ULID) -> None:
         """Monitor for user cancellation of the task."""
         async with self.data_store.pubsub() as pubsub:
