@@ -236,21 +236,25 @@ class TaskAdapter:
     # ARGV[4] = task_id bytes (member for sorted sets)
     # ARGV[5] = '1' to SADD the type index, '0' to SREM
     # ARGV[6] = packed task blob (msgpack)
-    # Returns: 1 if enqueued, 0 if rate-limited (task details always updated)
+    # Returns: 1 if enqueued, 0 if rate-limited
     SUBMIT_RATE_LIMITED_SCRIPT = """
         local enqueued = 0
         local exists = redis.call('EXISTS', KEYS[3])
+        local numerator = tonumber(ARGV[2])
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
         if exists == 0 then
-            redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
             local count = redis.call('ZCARD', KEYS[1])
-            if count < tonumber(ARGV[2]) then
+            if numerator ~= 0 and count < numerator then
                 redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
                 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+                redis.call('SET', KEYS[3], ARGV[6])
                 enqueued = 1
             end
+        else
+            redis.call('SET', KEYS[3], ARGV[6])
+            enqueued = 1
         end
-        redis.call('SET', KEYS[3], ARGV[6])
-        if ARGV[5] == '1' then
+        if enqueued == 1 and ARGV[5] == '1' then
             redis.call('SADD', KEYS[4], ARGV[4])
         else
             redis.call('SREM', KEYS[4], ARGV[4])
@@ -273,20 +277,20 @@ class TaskAdapter:
                 self.TASKS_BY_QUEUE(queue=task.queue),    # KEYS[1]
                 self.TASK_DETAILS(task_id=task.id),       # KEYS[2]
                 self.TASK_BY_TYPE_IDX(name=task.name),    # KEYS[3]
-                str(task.submitted_at.timestamp()),       # ARGV[1]
-                bytes(task.id),                      # ARGV[2]
+                task.submitted_at.timestamp(),            # ARGV[1]
+                bytes(task.id),                           # ARGV[2]
                 is_active,                                # ARGV[3]
-                task.pack(),                         # ARGV[4]
+                task.pack(),                              # ARGV[4]
             )
         )
-        return result == "1"
+        return result == 1
 
     async def submit_rate_limited_task(self, task: "Task", queue_config: QueueConfig) -> bool:
         """
         Atomically check the rate limit and enqueue the task if there is room.
 
         Returns True if the task was enqueued, False if the rate limit was reached.
-        Task details are always written regardless of the rate limit outcome.
+        Task details are only written if the task is enqueued.
         """
         assert task.submitted_at  # noqa: S101
         now = dt.datetime.now(dt.timezone.utc)
@@ -301,15 +305,15 @@ class TaskAdapter:
                 self.TASKS_BY_QUEUE(queue=task.queue),      # KEYS[2]
                 self.TASK_DETAILS(task_id=task.id),         # KEYS[3]
                 self.TASK_BY_TYPE_IDX(name=task.name),      # KEYS[4]
-                str(earliest_time.timestamp()),             # ARGV[1]
-                str(queue_config.rate_numerator),           # ARGV[2]
-                str(task.submitted_at.timestamp()),         # ARGV[3]
+                earliest_time.timestamp(),                  # ARGV[1]
+                queue_config.rate_numerator or 0,           # ARGV[2]
+                task.submitted_at.timestamp(),              # ARGV[3]
                 bytes(task.id),                             # ARGV[4]
                 is_active,                                  # ARGV[5]
                 task.pack(),                                # ARGV[6]
             )
         )
-        return result == "1"
+        return result == 1
 
     async def requeue_task(self, task: Task) -> None:
         """Re-enqueue an existing task for retry (bypasses the new-task existence check)."""

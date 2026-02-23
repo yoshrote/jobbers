@@ -472,7 +472,7 @@ async def test_submit_rate_limited_prunes_expired_entries(redis, task_adapter):
 
 @pytest.mark.asyncio
 async def test_submit_rate_limited_rejects_when_full(redis, task_adapter):
-    """Task is not enqueued when rate limit is reached; task details are still written."""
+    """Task is not enqueued and task details are not written when rate limit is reached."""
     await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp() - 1})
     await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp() - 2})
     new_id = ULID()
@@ -483,7 +483,7 @@ async def test_submit_rate_limited_rejects_when_full(redis, task_adapter):
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
     assert result is False
     assert new_id.bytes not in await redis.zrange("task-queues:default", 0, -1)
-    assert await redis.exists(f"task:{new_id}")  # details always written
+    assert not await redis.exists(f"task:{new_id}")
 
 
 @pytest.mark.asyncio
