@@ -3,10 +3,9 @@ import logging
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
 
 from opentelemetry import metrics
-from redis.asyncio.client import Pipeline
+from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 from jobbers import registry
@@ -35,7 +34,7 @@ class UserCancellationError(Exception):
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
 
-    def __init__(self, data_store: Any, task_scheduler: TaskScheduler, dead_queue: DeadQueue) -> None:
+    def __init__(self, data_store: Redis, task_scheduler: TaskScheduler, dead_queue: DeadQueue) -> None:
         self.data_store = data_store
         self.qca = QueueConfigAdapter(data_store)
         self.ta = TaskAdapter(data_store)
@@ -109,14 +108,10 @@ class StateManager:
     async def submit_task(self, task: Task) -> None:
         queue_config = await self.qca.get_queue_config(queue=task.queue)
 
-        def extra_check(pipe: Pipeline) -> bool:
-            # The submission linter will add operations to the pipe transaction
+        async def extra_check(_pipe: Pipeline) -> bool:
             if not queue_config:
                 return True  # No config means no rate limiting
-            if self.submission_limiter.has_room_in_queue_queue(queue_config):
-                self.submission_limiter.add_task_to_queue(task, pipe=pipe)
-                return True
-            return False
+            return await self.submission_limiter.check_and_add_to_rate_limiter(task, queue_config)
 
         task.set_status(TaskStatus.SUBMITTED)
         return await self.ta.submit_task(task=task, extra_check=extra_check)
@@ -234,37 +229,54 @@ class SubmissionRateLimiter:
 
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
 
+    # Atomic Lua script: removes stale window entries, then checks and conditionally adds.
+    # KEYS[1]: rate-limiter sorted set key
+    # ARGV[1]: earliest timestamp (entries with score <= this are outside the window)
+    # ARGV[2]: submitted_at timestamp (score for the new entry)
+    # ARGV[3]: task id bytes (member name)
+    # ARGV[4]: rate limit (max number of tasks allowed in the window)
+    # Returns 1 if the task was added (rate limit not exceeded), 0 otherwise.
+    RATE_LIMITER_SCRIPT = """
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+        local count = redis.call('ZCARD', KEYS[1])
+        if count < tonumber(ARGV[4]) then
+            redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+            return 1
+        else
+            return 0
+        end
+    """
+
     def __init__(self, queue_config_adapter: QueueConfigAdapter):
         self.data_store = queue_config_adapter.data_store
         self.qca = queue_config_adapter
 
-    async def has_room_in_queue_queue(self, queue: QueueConfig) -> bool:
-        """Check if there is room in the queue for a task."""
-        if queue.rate_numerator and queue.rate_denominator and queue.rate_period:
-            now = dt.datetime.now(dt.timezone.utc)
-            # May be better as a lua script to include adding the task to the queue in the same transaction
-            earliest_time = now - dt.timedelta(seconds=queue.period_in_seconds() or 0)
-            # Count the number of tasks in the queue that are older than the earliest time
-            task_count = await self.data_store.zcount(
-                self.QUEUE_RATE_LIMITER(queue=queue.name),
-                min=earliest_time.timestamp(),
-                max=now.timestamp(),
-            )
+    async def check_and_add_to_rate_limiter(self, task: Task, queue: QueueConfig) -> bool:
+        """
+        Atomically check the rate limit and add the task if there is room.
 
-            if task_count >= queue.rate_numerator:
-                return False
+        Returns True if the task was accepted (rate limit not exceeded),
+        False if the rate limit is already reached.
+        """
+        if not (queue.rate_numerator and queue.rate_denominator and queue.rate_period):
+            return True  # No rate limiting configured
 
-        return True
+        if not task.submitted_at:
+            return False
 
-    def add_task_to_queue(self, task: Task, pipe: Pipeline | None=None) -> Pipeline:
-        """Add a task to the queue."""
-        pipe = pipe or self.data_store.pipeline()
+        now = dt.datetime.now(dt.timezone.utc)
+        earliest_time = now - dt.timedelta(seconds=queue.period_in_seconds() or 0)
 
-        # Add the task to the rate limiter for the queue
-        if task.submitted_at:
-            pipe.zadd(self.QUEUE_RATE_LIMITER(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
-
-        return pipe
+        result: int = await self.data_store.eval(
+            self.RATE_LIMITER_SCRIPT,
+            1,
+            self.QUEUE_RATE_LIMITER(queue=queue.name),  # KEYS[1]
+            str(earliest_time.timestamp()),             # ARGV[1]
+            str(task.submitted_at.timestamp()),         # ARGV[2]
+            str(task.id),                               # ARGV[3]
+            str(queue.rate_numerator),                  # ARGV[4]
+        )
+        return result == 1
 
     async def concurrency_limits(self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]) -> set[str]:
         """Limit the number of concurrent tasks in each queue."""

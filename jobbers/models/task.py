@@ -196,12 +196,12 @@ class TaskAdapter:
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
 
-    async def submit_task(self, task: Task, extra_check: Callable[[Pipeline], bool] | None) -> None:
+    async def submit_task(self, task: Task, extra_check: Callable[[Pipeline], Awaitable[bool]] | None) -> None:
         """Submit a new task to the Redis data store. Status must already be SUBMITTED."""
         pipe = self.data_store.pipeline(transaction=True)
         # Only enqueue if this is a new SUBMITTED task (SM sets SUBMITTED before calling here)
         if task.status == TaskStatus.SUBMITTED and not await self.task_exists(task.id):
-            if extra_check is None or extra_check(pipe):
+            if extra_check is None or await extra_check(pipe):
                 assert task.submitted_at  # noqa: S101
                 pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
 

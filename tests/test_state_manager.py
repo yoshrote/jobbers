@@ -103,66 +103,101 @@ async def test_get_next_task_missing_task_data(redis, state_manager):
 def rate_limiter(state_manager):
     return state_manager.submission_limiter
 
+def _make_rate_task(task_id: ULID, submitted_at: dt.datetime) -> Task:
+    return Task(id=task_id, name="test", queue="default", status=TaskStatus.SUBMITTED, submitted_at=submitted_at)
+
+def _default_queue_config(rate_numerator: int = 2) -> QueueConfig:
+    return QueueConfig(name="default", rate_numerator=rate_numerator, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+
+
 @pytest.mark.asyncio
-async def test_rate_limiter_has_room_empty(redis, rate_limiter):
-    result = await rate_limiter.has_room_in_queue_queue(QueueConfig(
-        name="default",
-        # 2 tasks per minute
-        rate_numerator=2,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE
-    ))
+async def test_check_and_add_empty_queue(redis, rate_limiter):
+    """Atomically accepts and records the task when the rate-limiter set is empty."""
+    task = _make_rate_task(ULID1, FROZEN_TIME)
+    with patch("jobbers.state_manager.dt") as mock_dt:
+        mock_dt.datetime.now.return_value = FROZEN_TIME
+        mock_dt.timedelta = dt.timedelta
+        result = await rate_limiter.check_and_add_to_rate_limiter(task, _default_queue_config())
     assert result is True
+    members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
+    assert members == [(ULID1.bytes, FROZEN_TIME.timestamp())]
+
 
 @pytest.mark.asyncio
-async def test_rate_limiter_has_room_nonempty(redis, rate_limiter):
-    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-1})
-    default_queue = QueueConfig(
-        name="default",
-        # 2 tasks per minute
-        rate_numerator=2,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE
-    )
-
-    with patch("datetime.datetime") as mock_datetime:
-        mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue(default_queue)
+async def test_check_and_add_with_room(redis, rate_limiter):
+    """Accepts the task when one slot is already used out of two."""
+    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp() - 1})
+    task = _make_rate_task(ULID2, FROZEN_TIME)
+    with patch("jobbers.state_manager.dt") as mock_dt:
+        mock_dt.datetime.now.return_value = FROZEN_TIME
+        mock_dt.timedelta = dt.timedelta
+        result = await rate_limiter.check_and_add_to_rate_limiter(task, _default_queue_config())
     assert result is True
+    members = await redis.zrange("rate-limiter:default", 0, -1)
+    assert ULID2.bytes in members
+
 
 @pytest.mark.asyncio
-async def test_rate_limiter_has_room_older_jobs(redis, rate_limiter):
-    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-60})
-    await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp()-61})
-    default_queue = QueueConfig(
-        name="default",
-        # 2 tasks per minute
-        rate_numerator=2,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE
-    )
-
-    with patch("datetime.datetime") as mock_datetime:
-        mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue(default_queue)
+async def test_check_and_add_ignores_expired_entries(redis, rate_limiter):
+    """Expired entries (outside the window) are pruned; the new task is accepted."""
+    # Both entries are > 60 s old, so outside the 1-minute window
+    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp() - 60})
+    await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp() - 61})
+    new_id = ULID()
+    task = _make_rate_task(new_id, FROZEN_TIME)
+    with patch("jobbers.state_manager.dt") as mock_dt:
+        mock_dt.datetime.now.return_value = FROZEN_TIME
+        mock_dt.timedelta = dt.timedelta
+        result = await rate_limiter.check_and_add_to_rate_limiter(task, _default_queue_config())
     assert result is True
+    members = await redis.zrange("rate-limiter:default", 0, -1)
+    assert new_id.bytes in members
+
 
 @pytest.mark.asyncio
-async def test_rate_limiter_no_room(redis, rate_limiter):
-    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-1})
-    await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp()-2})
-    default_queue = QueueConfig(
-        name="default",
-        # 2 tasks per minute
-        rate_numerator=2,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE
-    )
-
-    with patch("datetime.datetime") as mock_datetime:
-        mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue(default_queue)
+async def test_check_and_add_rejects_when_full(redis, rate_limiter):
+    """Rejects the task without modifying the set when the rate limit is reached."""
+    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp() - 1})
+    await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp() - 2})
+    new_id = ULID()
+    task = _make_rate_task(new_id, FROZEN_TIME)
+    with patch("jobbers.state_manager.dt") as mock_dt:
+        mock_dt.datetime.now.return_value = FROZEN_TIME
+        mock_dt.timedelta = dt.timedelta
+        result = await rate_limiter.check_and_add_to_rate_limiter(task, _default_queue_config())
     assert result is False
+    members = await redis.zrange("rate-limiter:default", 0, -1)
+    assert new_id.bytes not in members
+
+
+@pytest.mark.asyncio
+async def test_check_and_add_no_rate_config(redis, rate_limiter):
+    """Returns True immediately when the queue has no rate limiting configured."""
+    task = _make_rate_task(ULID1, FROZEN_TIME)
+    result = await rate_limiter.check_and_add_to_rate_limiter(
+        task, QueueConfig(name="default")  # no rate_numerator/period
+    )
+    assert result is True
+    assert await redis.zcard("rate-limiter:default") == 0
+
+
+@pytest.mark.asyncio
+async def test_check_and_add_concurrent_respects_limit(redis, rate_limiter):
+    """Concurrent calls must not collectively exceed the rate limit."""
+    import asyncio
+
+    now = dt.datetime.now(dt.timezone.utc)
+    limit = 5
+    queue_config = _default_queue_config(rate_numerator=limit)
+    tasks = [_make_rate_task(ULID(), now) for _ in range(10)]
+
+    results = await asyncio.gather(
+        *[rate_limiter.check_and_add_to_rate_limiter(t, queue_config) for t in tasks]
+    )
+
+    accepted = sum(1 for r in results if r)
+    assert accepted == limit
+    assert await redis.zcard("rate-limiter:default") == limit
 
 @pytest.mark.asyncio
 async def test_concurrency_limits_no_limits(rate_limiter):
@@ -280,40 +315,12 @@ async def test_clean_min_and_max_queue_age(redis, state_manager):
     assert queue1_tasks == []
 
 @pytest.mark.asyncio
-async def test_add_task_to_queue_adds_task_to_rate_limiter(redis, rate_limiter):
-    """Test that add_task_to_queue adds the task to the rate limiter sorted set."""
-    task = Task(
-        id=ULID1,
-        name="Test Task",
-        status=TaskStatus.SUBMITTED,
-        queue="default",
-        submitted_at=FROZEN_TIME,
-    )
-    pipe = redis.pipeline()
-    rate_limiter.add_task_to_queue(task, pipe=pipe)
-    await pipe.execute()
-
-    # Check that the task was added to the correct sorted set with the correct score
-    members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
-    assert members == [(bytes(ULID1), FROZEN_TIME.timestamp())]
-
-@pytest.mark.asyncio
-async def test_add_task_to_queue_no_submitted_at(redis, rate_limiter):
-    """Test that add_task_to_queue does not add the task if submitted_at is None."""
-    task = Task(
-        id=ULID2,
-        name="No Submitted At",
-        status=TaskStatus.SUBMITTED,
-        queue="default",
-        submitted_at=None,
-    )
-    pipe = redis.pipeline()
-    rate_limiter.add_task_to_queue(task, pipe=pipe)
-    await pipe.execute()
-
-    # Should not add anything to the sorted set
-    members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
-    assert members == []
+async def test_check_and_add_no_submitted_at(redis, rate_limiter):
+    """Returns False without modifying Redis when submitted_at is not set."""
+    task = Task(id=ULID2, name="no-ts", status=TaskStatus.SUBMITTED, queue="default", submitted_at=None)
+    result = await rate_limiter.check_and_add_to_rate_limiter(task, _default_queue_config())
+    assert result is False
+    assert await redis.zcard("rate-limiter:default") == 0
 
 @pytest.mark.asyncio
 async def test_dispatch_scheduled_task(redis, state_manager):
