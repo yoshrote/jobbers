@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 import logging
 from collections.abc import AsyncIterator
@@ -32,10 +33,10 @@ class LocalTTL:
     def __init__(self, config_ttl: int):
         self.config_ttl = config_ttl
         self.last_refreshed: dt.datetime | None = None
-        self._now: dt.datetime = dt.datetime.now(dt.timezone.utc)
+        self._now: dt.datetime = dt.datetime.now(dt.UTC)
 
     def __enter__(self) -> bool:
-        self._now = dt.datetime.now(dt.timezone.utc)
+        self._now = dt.datetime.now(dt.UTC)
         return self._older_than_ttl(self._now)
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None) -> None:
@@ -152,10 +153,13 @@ class TaskGenerator:
         with self.max_task_check:
             task_queues = await self.queues()
             logger.debug("Checking queues %s", task_queues)
-            # try:
-            task = await self.state_manager.get_next_task(task_queues)
-            # except asyncio.CancelledError:
-            #    # put task back on queue
+            task = None
+            try:
+                task = await self.state_manager.get_next_task(task_queues)
+            except asyncio.CancelledError:
+                if task:
+                    await self.state_manager.ta.requeue_task(task)
+                raise
         if not task:
             # TODO: We need to monitor how often the generator dies this way
             logger.warning("Strange stop")
@@ -169,7 +173,7 @@ class TaskGenerator:
             logger.fatal("Task %s v%s id=%s is missing a submitted_at timestamp.", task.name, task.version, task.id)
             raise RuntimeError("Pulled a task that was never submitted")
         time_in_queue.record(
-            (dt.datetime.now(dt.timezone.utc) - task.submitted_at).total_seconds() * 1000,
+            (dt.datetime.now(dt.UTC) - task.submitted_at).total_seconds() * 1000,
             metric_tags
         )
         tasks_selected.add(1, metric_tags)

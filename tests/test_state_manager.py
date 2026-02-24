@@ -8,15 +8,12 @@ import pytest_asyncio
 from ulid import ULID
 
 from jobbers.models.dead_queue import DeadQueue
-from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import StateManager
-from jobbers.utils.serialization import EMPTY_DICT, serialize
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
-ISO_FROZEN_TIME = serialize(FROZEN_TIME)
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
@@ -55,15 +52,9 @@ async def test_get_next_task_returns_task(redis, state_manager):
     """Test that get_next_task retrieves the next task from the queues."""
     # Set up the fake Redis data
     task_id = ULID()
-    task_data = {
-        b"name": b"Test Task",
-        b"status": b"submitted",
-        b"parameters": EMPTY_DICT,
-        b"version": b"1",
-        b"submitted_at": ISO_FROZEN_TIME,
-    }
+    task_obj = Task(id=task_id, name="Test Task", queue="queue1", version=1, status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
     await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
-    await redis.hset(f"task:{task_id}", mapping=task_data)
+    await redis.set(f"task:{task_id}", task_obj.pack())
 
     # Call the method
     task = await state_manager.get_next_task(["queue1", "queue2"])
@@ -102,67 +93,6 @@ async def test_get_next_task_missing_task_data(redis, state_manager):
 @pytest.fixture
 def rate_limiter(state_manager):
     return state_manager.submission_limiter
-
-@pytest.mark.asyncio
-async def test_rate_limiter_has_room_empty(redis, rate_limiter):
-    result = await rate_limiter.has_room_in_queue_queue(QueueConfig(
-        name="default",
-        # 2 tasks per minute
-        rate_numerator=2,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE
-    ))
-    assert result is True
-
-@pytest.mark.asyncio
-async def test_rate_limiter_has_room_nonempty(redis, rate_limiter):
-    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-1})
-    default_queue = QueueConfig(
-        name="default",
-        # 2 tasks per minute
-        rate_numerator=2,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE
-    )
-
-    with patch("datetime.datetime") as mock_datetime:
-        mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue(default_queue)
-    assert result is True
-
-@pytest.mark.asyncio
-async def test_rate_limiter_has_room_older_jobs(redis, rate_limiter):
-    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-60})
-    await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp()-61})
-    default_queue = QueueConfig(
-        name="default",
-        # 2 tasks per minute
-        rate_numerator=2,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE
-    )
-
-    with patch("datetime.datetime") as mock_datetime:
-        mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue(default_queue)
-    assert result is True
-
-@pytest.mark.asyncio
-async def test_rate_limiter_no_room(redis, rate_limiter):
-    await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp()-1})
-    await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp()-2})
-    default_queue = QueueConfig(
-        name="default",
-        # 2 tasks per minute
-        rate_numerator=2,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE
-    )
-
-    with patch("datetime.datetime") as mock_datetime:
-        mock_datetime.now.return_value = FROZEN_TIME
-        result = await rate_limiter.has_room_in_queue_queue(default_queue)
-    assert result is False
 
 @pytest.mark.asyncio
 async def test_concurrency_limits_no_limits(rate_limiter):
@@ -280,46 +210,10 @@ async def test_clean_min_and_max_queue_age(redis, state_manager):
     assert queue1_tasks == []
 
 @pytest.mark.asyncio
-async def test_add_task_to_queue_adds_task_to_rate_limiter(redis, rate_limiter):
-    """Test that add_task_to_queue adds the task to the rate limiter sorted set."""
-    task = Task(
-        id=ULID1,
-        name="Test Task",
-        status=TaskStatus.SUBMITTED,
-        queue="default",
-        submitted_at=FROZEN_TIME,
-    )
-    pipe = redis.pipeline()
-    rate_limiter.add_task_to_queue(task, pipe=pipe)
-    await pipe.execute()
-
-    # Check that the task was added to the correct sorted set with the correct score
-    members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
-    assert members == [(bytes(ULID1), FROZEN_TIME.timestamp())]
-
-@pytest.mark.asyncio
-async def test_add_task_to_queue_no_submitted_at(redis, rate_limiter):
-    """Test that add_task_to_queue does not add the task if submitted_at is None."""
-    task = Task(
-        id=ULID2,
-        name="No Submitted At",
-        status=TaskStatus.SUBMITTED,
-        queue="default",
-        submitted_at=None,
-    )
-    pipe = redis.pipeline()
-    rate_limiter.add_task_to_queue(task, pipe=pipe)
-    await pipe.execute()
-
-    # Should not add anything to the sorted set
-    members = await redis.zrange("rate-limiter:default", 0, -1, withscores=True)
-    assert members == []
-
-@pytest.mark.asyncio
 async def test_dispatch_scheduled_task(redis, state_manager):
     """dispatch_scheduled_task moves a due task from the scheduler into its Redis queue."""
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
-    run_at = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+    run_at = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
     state_manager.task_scheduler.add(task, run_at)
 
     due = state_manager.task_scheduler.next_due(None)
@@ -377,8 +271,8 @@ async def test_fail_task_no_dlq_writes_redis_only(redis, state_manager):
 
     await state_manager.fail_task(task)
 
-    raw = await redis.hgetall(f"task:{ULID1}")
-    assert raw[b"status"] == b"failed"
+    saved = await state_manager.ta.get_task(ULID1)
+    assert saved.status == TaskStatus.FAILED
     assert state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
 
 
@@ -390,8 +284,8 @@ async def test_fail_task_with_dlq_writes_both_stores(redis, state_manager):
 
     await state_manager.fail_task(task)
 
-    raw = await redis.hgetall(f"task:{ULID1}")
-    assert raw[b"status"] == b"failed"
+    saved = await state_manager.ta.get_task(ULID1)
+    assert saved.status == TaskStatus.FAILED
     dlq = state_manager.dead_queue.get_by_ids([str(ULID1)])
     assert len(dlq) == 1
     assert dlq[0].id == ULID1
@@ -408,8 +302,8 @@ async def test_fail_task_redis_written_before_dlq(redis, state_manager):
             await state_manager.fail_task(task)
 
     # Redis must reflect the FAILED status even though the DLQ write never happened.
-    raw = await redis.hgetall(f"task:{ULID1}")
-    assert raw[b"status"] == b"failed"
+    saved = await state_manager.ta.get_task(ULID1)
+    assert saved.status == TaskStatus.FAILED
 
 
 # ── resubmit_dead_tasks ───────────────────────────────────────────────────────
@@ -499,3 +393,24 @@ def test_dispatch_stale_acquired_record_not_requeued(state_manager):
 
     # next_due must not return the already-acquired row.
     assert state_manager.task_scheduler.next_due(None) is None
+
+
+# ── request_task_cancellation ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_cancel_scheduled_task(state_manager):
+    """Cancelling a SCHEDULED task removes it from the scheduler and marks it CANCELLED in Redis."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+    state_manager.task_scheduler.add(task, run_at)
+    await state_manager.save_task(task)
+
+    result = await state_manager.request_task_cancellation(ULID1)
+
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    # Removed from the scheduler
+    assert state_manager.task_scheduler.next_due(None) is None
+    # Persisted to Redis
+    saved = await state_manager.ta.get_task(ULID1)
+    assert saved.status == TaskStatus.CANCELLED

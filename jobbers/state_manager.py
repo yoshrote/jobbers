@@ -1,17 +1,17 @@
 import datetime as dt
 import logging
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import cast
 
 from opentelemetry import metrics
-from redis.asyncio.client import Pipeline
+from redis.asyncio.client import Redis
 from ulid import ULID
 
 from jobbers import registry
 from jobbers.models.dead_queue import DeadQueue
-from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
+from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task, TaskAdapter
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_scheduler import TaskScheduler
@@ -35,8 +35,8 @@ class UserCancellationError(Exception):
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
 
-    def __init__(self, data_store: Any, task_scheduler: TaskScheduler, dead_queue: DeadQueue) -> None:
-        self.data_store = data_store
+    def __init__(self, data_store: Redis, task_scheduler: TaskScheduler, dead_queue: DeadQueue) -> None:
+        self.data_store: Redis = data_store
         self.qca = QueueConfigAdapter(data_store)
         self.ta = TaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(self.qca)
@@ -61,8 +61,8 @@ class StateManager:
 
     async def clean(self, rate_limit_age: dt.timedelta | None=None, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None, stale_time: dt.timedelta | None=None) -> None:
         """Clean up the state manager."""
-        now = dt.datetime.now(dt.timezone.utc)
-        queues = await self.data_store.smembers(self.qca.ALL_QUEUES)
+        now = dt.datetime.now(dt.UTC)
+        queues = await cast("Awaitable[set[bytes]]", self.data_store.smembers(self.qca.ALL_QUEUES))
 
         if rate_limit_age:
             await self.submission_limiter.clean(queues, now, rate_limit_age)
@@ -72,7 +72,7 @@ class StateManager:
 
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
-            async for task in self.ta.get_stale_tasks(queues, stale_time):
+            async for task in self.ta.get_stale_tasks({q.decode() for q in queues}, stale_time):
                 stale_tasks_by_type[(task.name, task.version)].append(task)
 
             for (task_type, task_version), tasks in stale_tasks_by_type.items():
@@ -94,7 +94,7 @@ class StateManager:
         await self.data_store.set(f"worker-queues:{role}:refresh_tag", bytes(init_tag))
         return init_tag
 
-    async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
+    async def get_next_task(self, queues: set[str], pop_timeout: int=0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
         if not queues:
             logger.info("no queues defined")
@@ -102,24 +102,17 @@ class StateManager:
 
         queues = await self.submission_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
 
-        return await self.ta.get_next_task(queues, timeout)
+        return await self.ta.get_next_task(queues, pop_timeout)
 
     # Proxy methods
 
     async def submit_task(self, task: Task) -> None:
         queue_config = await self.qca.get_queue_config(queue=task.queue)
-
-        def extra_check(pipe: Pipeline) -> bool:
-            # The submission linter will add operations to the pipe transaction
-            if not queue_config:
-                return True  # No config means no rate limiting
-            if self.submission_limiter.has_room_in_queue_queue(queue_config):
-                self.submission_limiter.add_task_to_queue(task, pipe=pipe)
-                return True
-            return False
-
         task.set_status(TaskStatus.SUBMITTED)
-        return await self.ta.submit_task(task=task, extra_check=extra_check)
+        if queue_config and queue_config.rate_numerator and queue_config.rate_denominator and queue_config.rate_period:
+            await self.ta.submit_rate_limited_task(task=task, queue_config=queue_config)
+        else:
+            await self.ta.submit_task(task=task)
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
@@ -139,7 +132,7 @@ class StateManager:
         result = await self.save_task(task)
         if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
             logger.info("Task %s sent to dead letter queue.", task.id)
-            now = dt.datetime.now(dt.timezone.utc)
+            now = dt.datetime.now(dt.UTC)
             self.dead_queue.add(task, now)
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return result
@@ -213,6 +206,27 @@ class StateManager:
         self.task_scheduler.remove(task.id)
         return task
 
+    async def request_task_cancellation(self, task_id: ULID) -> "Task | None":
+        """
+        Publish a cancellation request for a task.
+
+        Returns None if the task does not exist.
+        Raises TaskException if the task status does not permit cancellation.
+        """
+        task = await self.ta.get_task(task_id)
+        if task is None:
+            return None
+        if task.status == TaskStatus.SCHEDULED:
+            # For scheduled tasks, we can just remove them from the scheduler without a pub/sub dance
+            self.task_scheduler.remove(task_id)
+            task.set_status(TaskStatus.CANCELLED)
+            await self.save_task(task)
+            return task
+        if task.status not in {TaskStatus.SUBMITTED, TaskStatus.STARTED}:
+            raise TaskException(f"Task has status '{task.status}' and cannot be cancelled.")
+        await self.data_store.publish(f"task_cancel_{task_id}", "cancel")
+        return task
+
     async def monitor_task_cancellation(self, task_id: ULID) -> None:
         """Monitor for user cancellation of the task."""
         async with self.data_store.pubsub() as pubsub:
@@ -237,34 +251,6 @@ class SubmissionRateLimiter:
     def __init__(self, queue_config_adapter: QueueConfigAdapter):
         self.data_store = queue_config_adapter.data_store
         self.qca = queue_config_adapter
-
-    async def has_room_in_queue_queue(self, queue: QueueConfig) -> bool:
-        """Check if there is room in the queue for a task."""
-        if queue.rate_numerator and queue.rate_denominator and queue.rate_period:
-            now = dt.datetime.now(dt.timezone.utc)
-            # May be better as a lua script to include adding the task to the queue in the same transaction
-            earliest_time = now - dt.timedelta(seconds=queue.period_in_seconds() or 0)
-            # Count the number of tasks in the queue that are older than the earliest time
-            task_count = await self.data_store.zcount(
-                self.QUEUE_RATE_LIMITER(queue=queue.name),
-                min=earliest_time.timestamp(),
-                max=now.timestamp(),
-            )
-
-            if task_count >= queue.rate_numerator:
-                return False
-
-        return True
-
-    def add_task_to_queue(self, task: Task, pipe: Pipeline | None=None) -> Pipeline:
-        """Add a task to the queue."""
-        pipe = pipe or self.data_store.pipeline()
-
-        # Add the task to the rate limiter for the queue
-        if task.submitted_at:
-            pipe.zadd(self.QUEUE_RATE_LIMITER(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
-
-        return pipe
 
     async def concurrency_limits(self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]) -> set[str]:
         """Limit the number of concurrent tasks in each queue."""

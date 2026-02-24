@@ -22,23 +22,24 @@ aggregated by task, version, and queue
 
 | metric | type | description |
 | ------ | ---- | ----------- |
-|  tasks_retried      | COUNT| one per retry event (expected exception or timeout) |
-|  tasks_dead_lettered | COUNT | tasks moved to the dead letter queue |
+| tasks_retried | COUNT | one per retry event (expected exception or timeout) |
+| tasks_dead_lettered | COUNT | tasks moved to the dead letter queue |
+| cancellations_requested | COUNT | cancel signals published (does not guarantee the task stopped) |
 
 aggregated by task, queue, and status
 
 | metric | type | description |
 | ------ | ---- | ----------- |
-|  tasks_processed    | COUNT| number of tasks |
-|  execution_time     | HIST | time from task start to task finish (ms) |
-|  end_to_end_latency | HIST | time from enqueue to task finish (ms) |
+| tasks_processed | COUNT | number of tasks |
+| execution_time | HIST | time from task start to task finish (ms) |
+| end_to_end_latency | HIST | time from enqueue to task finish (ms) |
 
 aggregated by task, queue, and role
 
 | metric | type | description |
 | ------ | ---- | ----------- |
-|  time_in_queue   |HIST  | time from enqueue to task start |
-|  tasks_selected  |COUNT | number of tasks |
+| time_in_queue | HIST | time from enqueue to task start |
+| tasks_selected | COUNT | number of tasks |
 
 ### Useful Insights via OTEL
 
@@ -113,6 +114,7 @@ A tool that could do this would run at some cadence to monitor for tasks in a re
   - capacity limits per worker per queue (TBD config)
 - Configurable retry backoff policy (constant, linear, exponential, exponential with jitter)
 - Dead letter queue with per-task failure history and bulk resubmission API
+- Task cancellation API (single and bulk) for running and queued tasks
 - The state of the queues and the last known state of tasks are stored for diagnostic and recovery purposes.
 - Worker crash recovery
   - on SIGTERM, a worker will handle currently running tasks according to their shutdown policy
@@ -233,10 +235,10 @@ async def my_task(**kwargs):
 
 | method | path | description |
 | ------ | ---- | ----------- |
-| `GET`  | `/dead-letter-queue` | Search DLQ entries; filter by `queue`, `task_name`, `task_version`, `limit` |
-| `GET`  | `/dead-letter-queue/{task_id}/history` | Full chronological failure history for a task |
+| `GET` | `/dead-letter-queue` | Search DLQ entries; filter by `queue`, `task_name`, `task_version`, `limit` |
+| `GET` | `/dead-letter-queue/{task_id}/history` | Full chronological failure history for a task |
 | `POST` | `/dead-letter-queue/resubmit` | Bulk resubmit DLQ tasks by explicit IDs or filter criteria |
-| `GET`  | `/scheduled-tasks` | List tasks currently waiting for a delayed retry |
+| `GET` | `/scheduled-tasks` | List tasks currently waiting for a delayed retry |
 
 #### `POST /dead-letter-queue/resubmit` request body
 
@@ -250,6 +252,70 @@ async def my_task(**kwargs):
 | `limit` | `int` | `100` | Maximum tasks to resubmit when using filter mode (max 1000) |
 
 Provide either `task_ids` **or** at least one filter field (`queue`, `task_name`, `task_version`).
+
+## Task Cancellation
+
+Tasks in `SUBMITTED`, `STARTED`, or `SCHEDULED` status can be cancelled via the API.
+
+### How cancellation works
+
+| task status | what happens |
+| ----------- | ------------ |
+| `SUBMITTED` / `STARTED` | A cancel signal is published to a Redis pubsub channel (`task_cancel_{task_id}`). The worker monitoring that channel interrupts the task and finalises it according to its [shutdown policy](#task-shutdown-policy-on-cancellation). The API returns immediately — poll `/task-status/{task_id}` to confirm the task has stopped. |
+| `SCHEDULED` | Removed from the delay queue and marked `CANCELLED` synchronously in the same API call. |
+| anything else | Returns `409 Conflict`. |
+
+### Cancellation API
+
+| method | path | description |
+| ------ | ---- | ----------- |
+| `POST` | `/task/{task_id}/cancel` | Cancel a single task |
+| `POST` | `/tasks/cancel` | Cancel multiple tasks in one request |
+
+#### `POST /task/{task_id}/cancel`
+
+Returns `200` with the task summary if a cancel signal was sent (or for `SCHEDULED` tasks, after synchronous cancellation). Returns `404` if the task does not exist. Returns `409` if the task cannot be cancelled.
+
+```json
+{
+  "message": "Cancellation request sent",
+  "task": { "id": "01ABC...", "name": "my_task", "status": "started", ... }
+}
+```
+
+#### `POST /tasks/cancel`
+
+Accepts a list of task IDs and returns a per-task result for each one. Always returns `200` — individual errors are reported inline.
+
+Request body:
+
+```json
+{ "task_ids": ["01ABC...", "01DEF...", "01GHI..."] }
+```
+
+Response:
+
+```json
+{
+  "results": [
+    { "task_id": "01ABC...", "status": "cancellation_requested" },
+    { "task_id": "01DEF...", "status": "not_found" },
+    { "task_id": "01GHI...", "status": "error", "detail": "Task has status 'completed' and cannot be cancelled." }
+  ]
+}
+```
+
+Possible `status` values per task: `cancellation_requested`, `not_found`, `error`.
+
+## Task shutdown policy on **system-triggered** cancellation
+
+When a running task receives the cancellation signal its final state depends on the `on_shutdown` policy set in `TaskConfig`:
+
+| policy | behaviour |
+| ------ | --------- |
+| `stop` (default) | Task is interrupted at the next `await` point and marked `STALLED`. |
+| `resubmit` | Task is interrupted and re-enqueued (`UNSUBMITTED`) for another worker to pick up. |
+| `continue` | The running coroutine is shielded from cancellation and runs to completion; the cancel signal is effectively ignored. |
 
 ## Task Heartbeat Configuration
 

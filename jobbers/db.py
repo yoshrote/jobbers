@@ -12,7 +12,7 @@ _state_manager: StateManager | None = None
 def get_client() -> redis.Redis:
     global _client
     if _client is None:
-        _client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))  # type: ignore
+        _client = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
     return _client
 
 def set_client(new_client: redis.Redis) -> redis.Redis:

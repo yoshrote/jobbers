@@ -33,8 +33,12 @@ class TaskProcessor:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self.process(task))
                 tg.create_task(self.monitor_task_cancellation(task))
-        except UserCancellationError:
-            pass
+        except ExceptionGroup as eg:
+            for exc in eg.exceptions:
+                # Treat UserCancellationError as a normal control flow signal to exit the TaskGroup;
+                # re-raise any other exceptions.
+                if not isinstance(exc, UserCancellationError):
+                    raise  # Re-raise to exit the TaskGroup in run()
 
     async def process(self, task: Task) -> Task:
         """Process the task and return the result."""
@@ -57,7 +61,7 @@ class TaskProcessor:
                 try:
                     async with asyncio.timeout(task.task_config.timeout):
                         task.results = await self._current_promise
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     task = await self.handle_timeout_exception(task)
                 except asyncio.CancelledError as exc:
                     ex = exc
@@ -96,7 +100,7 @@ class TaskProcessor:
             await self.state_manager.monitor_task_cancellation(task.id)
         except UserCancellationError:
             await self.handle_user_cancelled_task(task)
-            raise # Re-raise to exit the TaskGroup in run()
+            raise  # Re-raise to exit the TaskGroup in run()
 
     def mark_task_as_started(self, task: Task) -> None:
         task.set_status(TaskStatus.STARTED)

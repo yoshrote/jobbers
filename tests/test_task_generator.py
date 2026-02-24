@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -58,7 +58,7 @@ async def test_task_generator_iteration():
         name="test_task",
         version=1,
         status=TaskStatus.SUBMITTED,
-        submitted_at=datetime.now(tz=timezone.utc)
+        submitted_at=datetime.now(tz=UTC)
     )
     state_manager.get_next_task.return_value = task
     state_manager.active_tasks_per_queue = {}
@@ -96,9 +96,9 @@ async def test_task_generator_stops_after_max_tasks():
     # Mock get_next_task to return a new Task
     state_manager.get_next_task = AsyncMock(
         side_effect=[
-            Task(id=ULID(), name="task1", version=1, submitted_at=datetime.now(tz=timezone.utc)),
-            Task(id=ULID(), name="task2", version=1, submitted_at=datetime.now(tz=timezone.utc)),
-            Task(id=ULID(), name="task3", version=1, submitted_at=datetime.now(tz=timezone.utc)),
+            Task(id=ULID(), name="task1", version=1, submitted_at=datetime.now(tz=UTC)),
+            Task(id=ULID(), name="task2", version=1, submitted_at=datetime.now(tz=UTC)),
+            Task(id=ULID(), name="task3", version=1, submitted_at=datetime.now(tz=UTC)),
         ]
     )
 

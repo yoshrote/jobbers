@@ -6,8 +6,8 @@ from jobbers.models.task import Task
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
-PAST = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
-FUTURE = dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc)
+PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+FUTURE = dt.datetime(2099, 1, 1, tzinfo=dt.UTC)
 
 
 def make_task(task_id: str = "01JQC31AJP7TSA9X8AEP64XG08", queue: str = "default") -> Task:
@@ -120,8 +120,8 @@ def test_same_run_at_ordered_by_task_id(scheduler):
 def test_next_due_returns_earliest_run_at(scheduler):
     earlier = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     later = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
-    earlier_time = dt.datetime(2020, 3, 1, tzinfo=dt.timezone.utc)
-    later_time = dt.datetime(2020, 6, 1, tzinfo=dt.timezone.utc)
+    earlier_time = dt.datetime(2020, 3, 1, tzinfo=dt.UTC)
+    later_time = dt.datetime(2020, 6, 1, tzinfo=dt.UTC)
     # Insert in reverse order to prove sorting is by run_at, not insertion order
     scheduler.add(later, later_time)
     scheduler.add(earlier, earlier_time)
@@ -187,7 +187,7 @@ def test_next_due_bulk_returns_task_run_at_tuples(scheduler):
 
 def test_next_due_bulk_run_at_matches_scheduled_time(scheduler):
     """The run_at in each tuple equals the datetime passed to add()."""
-    scheduled_time = dt.datetime(2020, 6, 15, 12, 0, 0, tzinfo=dt.timezone.utc)
+    scheduled_time = dt.datetime(2020, 6, 15, 12, 0, 0, tzinfo=dt.UTC)
     scheduler.add(make_task(), scheduled_time)
     (_, run_at), = scheduler.next_due_bulk(10)
     assert run_at == scheduled_time
