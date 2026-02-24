@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import datetime as dt
 from unittest.mock import ANY, AsyncMock, call, patch
 
+import fakeredis.aioredis as fakeredis
 import pytest
 
 from jobbers.models.task import Task, TaskStatus
@@ -9,7 +11,7 @@ from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
-from jobbers.state_manager import StateManager
+from jobbers.state_manager import StateManager, UserCancellationError
 from jobbers.task_processor import TaskProcessor
 
 
@@ -657,3 +659,97 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
     assert result.completed_at is not None
     state_manager.fail_task.assert_called_once_with(task)
     scheduler.add.assert_not_called()
+
+
+# ── pubsub cancellation ───────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_task_processor_run_exits_early_on_pubsub_cancel():
+    """
+    TaskProcessor.run exits cleanly when a cancel signal is published to the task's pubsub channel.
+
+    Sequence:
+    1. monitor raises UserCancellationError → handle_user_cancelled_task sets CANCELLED.
+    2. TaskGroup cancels process → handle_system_cancelled_task sets STALLED (default STOP policy).
+    3. TaskGroup raises ExceptionGroup([UserCancellationError]) → run() catches and suppresses it.
+    run() returns normally (no exception); the task is not COMPLETED.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+
+    fake_store = fakeredis.FakeRedis()
+    task_started = asyncio.Event()
+
+    async def slow_task():
+        task_started.set()
+        await asyncio.sleep(30)  # long-running; will be cancelled before this finishes
+        return {}  # pragma: no cover
+
+    task_config = TaskConfig(name="test_task", version=1, function=slow_task, timeout=60)
+    state_manager = _make_state_manager()
+
+    async def pubsub_monitor(task_id: str) -> None:
+        """Real pubsub listener — loops until a cancel message arrives."""
+        async with fake_store.pubsub() as pubsub:
+            await pubsub.subscribe(f"task_cancel_{task_id}")
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True)
+                if msg is not None:
+                    raise UserCancellationError(str(task_id))
+                await asyncio.sleep(0.01)
+
+    state_manager.monitor_task_cancellation.side_effect = pubsub_monitor
+
+    async def publish_cancel() -> None:
+        await task_started.wait()
+        await fake_store.publish(f"task_cancel_{task.id}", "cancel")
+
+    publisher = asyncio.create_task(publish_cancel())
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        # run() catches the ExceptionGroup([UserCancellationError]) raised by the
+        # TaskGroup and exits cleanly — no exception should propagate here.
+        await processor.run(task)
+
+    publisher.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await publisher
+
+    await fake_store.aclose()
+
+    # The task was interrupted before completing.
+    assert task.status != TaskStatus.COMPLETED
+    # State was saved at least twice: once when started, once when interrupted.
+    assert state_manager.save_task.call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_monitor_task_cancellation_calls_handle_user_cancelled_task():
+    # StateManager raises UserCancellationError directly — not inside a TaskGroup,
+    # so it never arrives wrapped in an ExceptionGroup. The except clause in
+    # TaskProcessor.monitor_task_cancellation must match UserCancellationError,
+    # not ExceptionGroup, otherwise handle_user_cancelled_task is never called.
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    state_manager.monitor_task_cancellation.side_effect = UserCancellationError("cancelled")
+
+    processor = TaskProcessor(state_manager)
+    with patch.object(processor, "handle_user_cancelled_task", new_callable=AsyncMock) as mock_handle:
+        with pytest.raises((UserCancellationError, ExceptionGroup)):
+            await processor.monitor_task_cancellation(task)
+
+    mock_handle.assert_called_once_with(task)
