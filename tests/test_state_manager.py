@@ -213,7 +213,7 @@ async def test_clean_min_and_max_queue_age(redis, state_manager):
 async def test_dispatch_scheduled_task(redis, state_manager):
     """dispatch_scheduled_task moves a due task from the scheduler into its Redis queue."""
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
-    run_at = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+    run_at = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
     state_manager.task_scheduler.add(task, run_at)
 
     due = state_manager.task_scheduler.next_due(None)

@@ -58,4 +58,4 @@ class TaskConfig(BaseModel):
                 delay = base * (2 ** attempt)
             case BackoffStrategy.EXPONENTIAL_JITTER:
                 delay = random.uniform(0, base * (2 ** attempt))
-        return dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=min(delay, self.max_retry_delay))
+        return dt.datetime.now(dt.UTC) + dt.timedelta(seconds=min(delay, self.max_retry_delay))

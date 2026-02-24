@@ -43,7 +43,7 @@ async def main(poll_interval: float, role: str, batch_size: int) -> None:
             await asyncio.gather(
                 *(state_manager.dispatch_scheduled_task(task) for task, _ in task_entries)
             )
-            now = dt.datetime.now(dt.timezone.utc)
+            now = dt.datetime.now(dt.UTC)
             for task, run_at in task_entries:
                 dispatch_latency.record(
                     (now - run_at).total_seconds(),

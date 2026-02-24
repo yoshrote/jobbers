@@ -112,7 +112,7 @@ class TaskScheduler:
         """
         if queues is not None and not queues:
             return []
-        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        now = dt.datetime.now(dt.UTC).isoformat()
         if queues is None:
             queue_filter = ""
             params: tuple[object, ...] = (now, n)
@@ -150,7 +150,7 @@ class TaskScheduler:
         """
         if queues is not None and not queues:
             return None
-        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        now = dt.datetime.now(dt.UTC).isoformat()
         if queues is None:
             queue_filter = ""
             params: tuple[object, ...] = (now,)

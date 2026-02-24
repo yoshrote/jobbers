@@ -39,7 +39,7 @@ def sample_task():
         queue="default",
         parameters={},
         status=TaskStatus.STARTED,
-        started_at=dt.datetime.now(dt.timezone.utc)
+        started_at=dt.datetime.now(dt.UTC)
     )
 
 
@@ -247,7 +247,7 @@ class TestUpdateTaskHeartbeat:
         """Test that heartbeat timestamp is updated in task details."""
         # Arrange
         await task_adapter.save_task(sample_task)
-        sample_task.heartbeat_at = dt.datetime.now(dt.timezone.utc)
+        sample_task.heartbeat_at = dt.datetime.now(dt.UTC)
 
         # Act
         await task_adapter.update_task_heartbeat(sample_task)
@@ -261,7 +261,7 @@ class TestUpdateTaskHeartbeat:
         """Test that heartbeat score is added to the sorted set."""
         # Arrange
         await task_adapter.save_task(sample_task)
-        sample_task.heartbeat_at = dt.datetime.now(dt.timezone.utc)
+        sample_task.heartbeat_at = dt.datetime.now(dt.UTC)
 
         # Act
         await task_adapter.update_task_heartbeat(sample_task)
@@ -278,7 +278,7 @@ class TestUpdateTaskHeartbeat:
         """Test that updating heartbeat overwrites the previous score."""
         # Arrange
         await task_adapter.save_task(sample_task)
-        first_time = dt.datetime.now(dt.timezone.utc)
+        first_time = dt.datetime.now(dt.UTC)
         sample_task.heartbeat_at = first_time
         await task_adapter.update_task_heartbeat(sample_task)
 
@@ -303,7 +303,7 @@ class TestGetStaleTasks:
     async def test_get_stale_tasks_returns_stale_tasks(self, task_adapter):
         """Test that stale tasks are returned."""
         # Arrange
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         stale_time = dt.timedelta(minutes=5)
 
         # Create a stale task (heartbeat 10 minutes ago)
@@ -329,7 +329,7 @@ class TestGetStaleTasks:
     async def test_get_stale_tasks_excludes_recent_tasks(self, task_adapter):
         """Test that recent tasks are not returned."""
         # Arrange
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         stale_time = dt.timedelta(minutes=5)
 
         # Create a recent task (heartbeat 1 minute ago)
@@ -354,7 +354,7 @@ class TestGetStaleTasks:
     async def test_get_stale_tasks_handles_multiple_queues(self, task_adapter):
         """Test that stale tasks from multiple queues are returned."""
         # Arrange
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         stale_time = dt.timedelta(minutes=5)
 
         # Create stale tasks in different queues
@@ -392,7 +392,7 @@ class TestGetStaleTasks:
     async def test_get_stale_tasks_returns_none_for_missing_tasks(self, task_adapter, monkeypatch):
         """Test that None results are filtered out."""
         # Arrange
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         stale_time = dt.timedelta(minutes=5)
 
         stale_task = Task(
@@ -489,7 +489,7 @@ async def test_submit_rate_limited_rejects_when_full(redis, task_adapter):
 @pytest.mark.asyncio
 async def test_submit_rate_limited_concurrent_respects_limit(redis, task_adapter):
     """Concurrent submissions must not collectively exceed the rate limit."""
-    now = dt.datetime.now(dt.timezone.utc)
+    now = dt.datetime.now(dt.UTC)
     limit = 5
     queue_config = _default_queue_config(rate_numerator=limit)
     tasks = [_make_rate_task(ULID(), now) for _ in range(10)]

@@ -7,7 +7,7 @@ from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 
-FAILED_AT = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+FAILED_AT = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 ULID1 = ULID()
 ULID2 = ULID()
 ULID3 = ULID()

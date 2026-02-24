@@ -24,7 +24,7 @@ def make_config(**kwargs) -> TaskConfig:
 
 @pytest.fixture
 def frozen_now():
-    fixed = dt.datetime(2024, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    fixed = dt.datetime(2024, 1, 1, 12, 0, 0, tzinfo=dt.UTC)
     with patch("jobbers.models.task_config.dt.datetime") as mock_dt:
         mock_dt.now.return_value = fixed
         mock_dt.side_effect = lambda *a, **kw: dt.datetime(*a, **kw)

@@ -102,7 +102,7 @@ async def test_submit_invalid_task(redis_db):
 async def test_get_task_status_found(redis_db):
     """Test retrieving the status of an existing task."""
     # Status must != "unsubmitted" or submit_task will change Task details
-    task_data = Task(id=ULID1, name="Test Task", status="submitted", submitted_at=dt.datetime.now(dt.timezone.utc), parameters={})
+    task_data = Task(id=ULID1, name="Test Task", status="submitted", submitted_at=dt.datetime.now(dt.UTC), parameters={})
     await TaskAdapter(redis_db).submit_task(task_data)
 
     # Check that it exists via API

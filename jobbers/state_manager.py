@@ -61,7 +61,7 @@ class StateManager:
 
     async def clean(self, rate_limit_age: dt.timedelta | None=None, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None, stale_time: dt.timedelta | None=None) -> None:
         """Clean up the state manager."""
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         queues = await cast("Awaitable[set[bytes]]", self.data_store.smembers(self.qca.ALL_QUEUES))
 
         if rate_limit_age:
@@ -94,7 +94,7 @@ class StateManager:
         await self.data_store.set(f"worker-queues:{role}:refresh_tag", bytes(init_tag))
         return init_tag
 
-    async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
+    async def get_next_task(self, queues: set[str], pop_timeout: int=0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
         if not queues:
             logger.info("no queues defined")
@@ -102,7 +102,7 @@ class StateManager:
 
         queues = await self.submission_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
 
-        return await self.ta.get_next_task(queues, timeout)
+        return await self.ta.get_next_task(queues, pop_timeout)
 
     # Proxy methods
 
@@ -132,7 +132,7 @@ class StateManager:
         result = await self.save_task(task)
         if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
             logger.info("Task %s sent to dead letter queue.", task.id)
-            now = dt.datetime.now(dt.timezone.utc)
+            now = dt.datetime.now(dt.UTC)
             self.dead_queue.add(task, now)
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return result

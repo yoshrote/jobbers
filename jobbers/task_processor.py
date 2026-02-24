@@ -61,7 +61,7 @@ class TaskProcessor:
                 try:
                     async with asyncio.timeout(task.task_config.timeout):
                         task.results = await self._current_promise
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     task = await self.handle_timeout_exception(task)
                 except asyncio.CancelledError as exc:
                     ex = exc

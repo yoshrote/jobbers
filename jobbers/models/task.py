@@ -103,7 +103,7 @@ class Task(BaseModel):
         return TaskAdapter(get_client())
 
     async def heartbeat(self) -> None:
-        self.heartbeat_at = dt.datetime.now(dt.timezone.utc)
+        self.heartbeat_at = dt.datetime.now(dt.UTC)
         await self._ta.update_task_heartbeat(self)
 
     def pack(self) -> bytes:
@@ -149,14 +149,14 @@ class Task(BaseModel):
         match status:
             case TaskStatus.STARTED:
                 if not self.started_at:
-                    self.started_at = dt.datetime.now(dt.timezone.utc)
+                    self.started_at = dt.datetime.now(dt.UTC)
                 else:
-                    self.retried_at = dt.datetime.now(dt.timezone.utc)
+                    self.retried_at = dt.datetime.now(dt.UTC)
             case TaskStatus.SUBMITTED:
-                self.submitted_at = dt.datetime.now(dt.timezone.utc)
+                self.submitted_at = dt.datetime.now(dt.UTC)
             case TaskStatus.COMPLETED | TaskStatus.FAILED | \
                  TaskStatus.CANCELLED | TaskStatus.STALLED | TaskStatus.DROPPED:
-                self.completed_at = dt.datetime.now(dt.timezone.utc)
+                self.completed_at = dt.datetime.now(dt.UTC)
             case TaskStatus.SCHEDULED | TaskStatus.UNSUBMITTED:
                 self.retry_attempt += 1
         self.status = status
@@ -293,7 +293,7 @@ class TaskAdapter:
         Task details are only written if the task is enqueued.
         """
         assert task.submitted_at  # noqa: S101
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
         is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
         result: int = await cast(
@@ -346,7 +346,7 @@ class TaskAdapter:
             self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id)
         )
         if heartbeat_score is not None:
-            task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.timezone.utc)
+            task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.UTC)
         return task
 
     async def update_task_heartbeat(self, task: Task) -> None:
@@ -358,7 +358,7 @@ class TaskAdapter:
 
     async def get_stale_tasks(self, queues: set[str], stale_time: dt.timedelta) -> AsyncGenerator[Task, None]:
         """Get tasks that have not had a heartbeat update in the stale time."""
-        now = dt.datetime.now(dt.timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         cutoff_time = now - stale_time
         stale_task_ids = set()
         for queue in queues:
@@ -392,7 +392,7 @@ class TaskAdapter:
             # tasks will be ordered by TASK ID, which is roughly creation time but not exactly
             task_ids = await self.data_store.zrange(
                 self.TASKS_BY_QUEUE(queue=pagination.queue),
-                pagination.start_param(), int(dt.datetime.now(dt.timezone.utc).timestamp()),
+                pagination.start_param(), int(dt.datetime.now(dt.UTC).timestamp()),
                 num=pagination.limit
             )
         if not task_ids:
@@ -410,14 +410,14 @@ class TaskAdapter:
             results.append(task)
         return results
 
-    async def get_next_task(self, queues: set[str], timeout: int=0) -> Task | None:
+    async def get_next_task(self, queues: set[str], pop_timeout: int=0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
         # Try to pop from each queue until we find a task
         # TODO: Shuffle/rotate the order of queues to avoid starving any of them
         # see https://redis.io/docs/latest/commands/blpop/#what-key-is-served-first-what-client-what-element-priority-ordering-details
         # for details of how the order of keys impact how tasks are popped
         task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
-        task_id = await self.data_store.bzpopmin(task_queues, timeout=timeout)
+        task_id = await self.data_store.bzpopmin(task_queues, timeout=pop_timeout)
         if task_id:
             task = await self.get_task(ULID.from_bytes(task_id[1]))
             if task:

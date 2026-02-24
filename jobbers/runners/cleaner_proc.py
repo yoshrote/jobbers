@@ -13,13 +13,13 @@ parser.add_argument(
 )
 parser.add_argument(
     "--min-queue-age",
-    type=lambda x: dt.datetime.fromtimestamp(int(x), tz=dt.timezone.utc),
+    type=lambda x: dt.datetime.fromtimestamp(int(x), tz=dt.UTC),
     default=None,
     help="Minimum queue age in seconds (default: 7 days)",
 )
 parser.add_argument(
     "--max-queue-age",
-    type=lambda x: dt.datetime.fromtimestamp(int(x), tz=dt.timezone.utc),
+    type=lambda x: dt.datetime.fromtimestamp(int(x), tz=dt.UTC),
     default=None,
     help="Maximum queue age in seconds (default: 30 days)",
 )

@@ -10,7 +10,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 from jobbers.runners.scheduler_proc import main
 
-PAST = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 
 
 def make_task() -> Task:
