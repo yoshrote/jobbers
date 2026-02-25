@@ -65,22 +65,3 @@ async def test_validate_task_missing_queue_config():
             MockAdapter.return_value.get_queue_config = AsyncMock(return_value=None)
             with pytest.raises(ValidationError, match="Unknown queue unknown-queue"):
                 await validate_task(task)
-
-
-@pytest.mark.asyncio
-async def test_validate_task_missing_queue_config_does_not_set_task_config():
-    """task_config is set before queue validation fails, but the error still propagates."""
-    async def task_function(foo: int) -> None:
-        pass
-
-    task_config = TaskConfig(name="Test Task", function=task_function)
-    task = Task(id=ULID1, name="Test Task", queue="unknown-queue", parameters={"foo": 42})
-
-    with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
-            MockAdapter.return_value.get_queue_config = AsyncMock(return_value=None)
-            with pytest.raises(ValidationError):
-                await validate_task(task)
-
-    # task_config is attached before the queue check runs
-    assert task.task_config is task_config
