@@ -261,6 +261,8 @@ class SubmissionRateLimiter:
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
                     queues_to_use.add(queue)
+            else:
+                queues_to_use.add(queue)
 
         return queues_to_use
 

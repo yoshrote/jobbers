@@ -5,6 +5,7 @@ from unittest.mock import patch
 import fakeredis.aioredis as fakeredis
 import pytest
 import pytest_asyncio
+import redis.asyncio as aioredis
 from ulid import ULID
 
 from jobbers.models.dead_queue import DeadQueue
@@ -34,6 +35,25 @@ def state_manager(redis, tmp_path):
         dead_queue=DeadQueue(tmp_path / "dead_queue.db"),
     )
 
+@pytest_asyncio.fixture
+async def real_redis():
+    """Real Redis fixture for commands not supported by fakeredis (e.g. bzpopmin with multiple keys)."""
+    client = aioredis.Redis(host="localhost", port=6379, db=15)
+    await client.flushdb()
+    yield client
+    await client.flushdb()
+    await client.aclose()
+
+@pytest.fixture
+def real_state_manager(real_redis, tmp_path):
+    """StateManager backed by a real Redis instance."""
+    from jobbers.models.task_scheduler import TaskScheduler
+    return StateManager(
+        real_redis,
+        task_scheduler=TaskScheduler(tmp_path / "schedule.db"),
+        dead_queue=DeadQueue(tmp_path / "dead_queue.db"),
+    )
+
 @pytest.mark.asyncio
 async def test_get_refresh_tag(redis, state_manager):
     """Test that get_refresh_tag retrieves the correct refresh tag for a role."""
@@ -48,18 +68,15 @@ async def test_get_refresh_tag(redis, state_manager):
 
 
 @pytest.mark.asyncio
-async def test_get_next_task_returns_task(redis, state_manager):
+async def test_get_next_task_returns_task(real_redis, real_state_manager):
     """Test that get_next_task retrieves the next task from the queues."""
-    # Set up the fake Redis data
     task_id = ULID()
     task_obj = Task(id=task_id, name="Test Task", queue="queue1", version=1, status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
-    await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
-    await redis.set(f"task:{task_id}", task_obj.pack())
+    await real_redis.zadd("task-queues:queue1", {task_id.bytes: 1})
+    await real_redis.set(f"task:{task_id}", task_obj.pack())
 
-    # Call the method
-    task = await state_manager.get_next_task(["queue1", "queue2"])
+    task = await real_state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
 
-    # Assert the result
     assert task is not None
     assert task.id == task_id
     assert task.name == "Test Task"
@@ -67,27 +84,21 @@ async def test_get_next_task_returns_task(redis, state_manager):
 
 
 @pytest.mark.asyncio
-async def test_get_next_task_no_task_found(redis, state_manager):
+async def test_get_next_task_no_task_found(real_state_manager):
     """Test that get_next_task returns None if no task is found."""
-    # Call the method with no tasks in the queues
-    # Use a timeout to avoid blocking forever
-    task = await state_manager.get_next_task(["queue1", "queue2"])
+    task = await real_state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
 
-    # Assert the result
     assert task is None
 
 
 @pytest.mark.asyncio
-async def test_get_next_task_missing_task_data(redis, state_manager):
+async def test_get_next_task_missing_task_data(real_redis, real_state_manager):
     """Test that get_next_task logs a warning and returns None if task data is missing."""
-    # Set up the fake Redis data
     task_id = ULID()
-    await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
+    await real_redis.zadd("task-queues:queue1", {task_id.bytes: 1})
 
-    # Call the method
-    task = await state_manager.get_next_task(["queue1", "queue2"])
+    task = await real_state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
 
-    # Assert the result
     assert task is None
 
 @pytest.fixture
