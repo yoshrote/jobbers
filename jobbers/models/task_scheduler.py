@@ -23,14 +23,14 @@ class TaskScheduler:
         )
     """
     # Partial index: only unacquired rows are ever queried by next_due.
-    _CREATE_INDEX = """
+    _CREATE_INDEX_1 = """
         CREATE INDEX IF NOT EXISTS schedule_run_at_queue
         ON schedule (run_at, queue)
         WHERE acquired = 0
     """
 
     # Support efficient aggregation and querying of scheduled tasks by queue and task type.
-    _CREATE_INDEX = """
+    _CREATE_INDEX_2 = """
         CREATE INDEX IF NOT EXISTS schedule_queue_categories
         ON schedule (queue, task_name, task_version)
     """
@@ -40,7 +40,8 @@ class TaskScheduler:
         self._conn.row_factory = sqlite3.Row
         with self._conn:
             self._conn.execute(self._CREATE_TABLE)
-            self._conn.execute(self._CREATE_INDEX)
+            self._conn.execute(self._CREATE_INDEX_1)
+            self._conn.execute(self._CREATE_INDEX_2)
 
     def add(self, task: Task, run_at: dt.datetime) -> None:
         """Insert or replace a task in the schedule."""
