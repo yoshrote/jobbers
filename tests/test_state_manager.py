@@ -71,7 +71,7 @@ async def test_get_next_task_no_task_found(redis, state_manager):
     """Test that get_next_task returns None if no task is found."""
     # Call the method with no tasks in the queues
     # Use a timeout to avoid blocking forever
-    task = await state_manager.get_next_task(["queue1", "queue2"], timeout=1)
+    task = await state_manager.get_next_task(["queue1", "queue2"])
 
     # Assert the result
     assert task is None

@@ -125,11 +125,13 @@ class QueueConfigAdapter:
             roles.append(key.decode().split(":")[1])
         return roles
 
-    async def get_queue_config(self, queue: str) -> QueueConfig:
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
         raw_data: dict[bytes, Any] = await cast(
             "Awaitable[dict[bytes, Any]]",
             self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))
         )  # Ensure the queue config exists in the store
+        if not raw_data:
+            return None
         return QueueConfig.from_redis(queue, raw_data)
 
     async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:

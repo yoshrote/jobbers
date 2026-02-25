@@ -59,6 +59,7 @@ async def test_submit_valid_task(redis_db):
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
 
+    await redis_db.hset("queue-config:default", mapping={b"max_concurrent": b"10"})
     with patch("jobbers.registry.get_task_config", return_value=test_task_config):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))

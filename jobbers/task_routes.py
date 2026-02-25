@@ -33,7 +33,7 @@ async def submit_task(task: Task) -> dict[str, Any]:
     """Handle task submission."""
     logger.info("Submitting a task")
     try:
-        validate_task(task)
+        await validate_task(task)
     except ValidationError as ex:
         raise HTTPException(status_code=400, detail=str(ex)) from ex
     try:
