@@ -142,7 +142,7 @@ async def test_get_queue_limits_single_queue_with_limit(redis, queue_config_adap
 @pytest.mark.asyncio
 async def test_get_queue_limits_single_queue_no_limit(redis, queue_config_adapter):
     """Test get_queue_limits with a queue that has no max_concurrent limit."""
-    # Set up queue config in Redis with no max_concurrent (defaults to 10)
+    # Set up queue config in Redis with no max_concurrent
     await redis.hset("queue-config:unlimited_queue", mapping={
         "rate_numerator": serialize(None),
         "rate_denominator": serialize(None),
@@ -150,7 +150,7 @@ async def test_get_queue_limits_single_queue_no_limit(redis, queue_config_adapte
     })
 
     result = await queue_config_adapter.get_queue_limits({"unlimited_queue"})
-    assert result == {"unlimited_queue": 10}  # Default value
+    assert result == {"unlimited_queue": None}  # None means no limit
 
 
 @pytest.mark.asyncio
@@ -201,9 +201,8 @@ async def test_get_queue_limits_multiple_queues(redis, queue_config_adapter):
 @pytest.mark.asyncio
 async def test_get_queue_limits_with_nonexistent_queue(queue_config_adapter):
     """Test get_queue_limits with a queue that doesn't exist in Redis."""
-    # Don't set up any queue config - this should still work with defaults
     result = await queue_config_adapter.get_queue_limits({"nonexistent_queue"})
-    assert result == {"nonexistent_queue": 10}  # Default max_concurrent
+    assert result == {"nonexistent_queue": None}  # No config means no limit
 
 
 @pytest.mark.asyncio
@@ -218,7 +217,7 @@ async def test_get_queue_limits_mixed_existing_and_nonexistent(redis, queue_conf
     })
 
     result = await queue_config_adapter.get_queue_limits({"existing_queue", "nonexistent_queue"})
-    expected = {"existing_queue": 7, "nonexistent_queue": 10}
+    expected = {"existing_queue": 7, "nonexistent_queue": None}
     assert result == expected
 
 

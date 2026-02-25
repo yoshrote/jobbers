@@ -8,7 +8,7 @@ from redis.asyncio import Redis
 from jobbers.utils.serialization import NONE, deserialize
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Iterator
+    from collections.abc import Awaitable
 
     from redis.asyncio.client import Pipeline
 
@@ -69,7 +69,7 @@ class QueueConfig(BaseModel):
     def from_redis(cls, name: str, raw_task_data: dict[bytes, bytes]) -> Self:
         return cls(
             name=name,
-            max_concurrent=int(raw_task_data.get(b"max_concurrent") or b"10"),
+            max_concurrent=int(raw_mc) if (raw_mc := raw_task_data.get(b"max_concurrent")) else None,
             rate_numerator=deserialize(raw_task_data.get(b"rate_numerator") or NONE),
             rate_denominator=deserialize(raw_task_data.get(b"rate_denominator") or NONE),
             rate_period=RatePeriod.from_bytes(raw_task_data.get(b"rate_period")),
@@ -136,14 +136,12 @@ class QueueConfigAdapter:
 
     async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
         # TODO: replace with a redis query
-        result_gen: Iterator[Awaitable[QueueConfig | None]] = (
-            self.get_queue_config(q)
-            for q in queues
+        queue_list = list(queues)
+        configs: list[QueueConfig | None] = list(
+            await asyncio.gather(*(self.get_queue_config(q) for q in queue_list))
         )
-
         return {
-            conf.name: conf.max_concurrent
-            for conf in await asyncio.gather(*result_gen)
-            if conf is not None
+            queue: conf.max_concurrent if conf is not None else None
+            for queue, conf in zip(queue_list, configs)
         }
 
