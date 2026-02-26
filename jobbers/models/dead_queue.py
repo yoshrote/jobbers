@@ -1,7 +1,10 @@
 import datetime as dt
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
 
 from jobbers.models.task import Task
 
@@ -39,7 +42,7 @@ class DeadQueue:
             self._conn.execute(self._CREATE_TABLE)
             self._conn.execute(self._CREATE_INDEX)
 
-    def add(self, task: Task, failed_at: dt.datetime) -> None:
+    async def add(self, task: Task, failed_at: dt.datetime) -> None:
         """Insert or replace the current DLQ entry for a task (latest failure wins)."""
         last_error = task.errors[-1] if task.errors else None
         with self._conn:
@@ -48,7 +51,7 @@ class DeadQueue:
                 (str(task.id), task.model_dump_json(), task.queue, task.name, task.version, failed_at.isoformat(), last_error),
             )
 
-    def get_history(self, task_id: str) -> list[dict[str, Any]]:
+    async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return the per-attempt error history for a DLQ task from its stored task blob."""
         row = self._conn.execute(
             "SELECT task FROM dead_queue WHERE task_id = ?",
@@ -59,7 +62,7 @@ class DeadQueue:
         task = Task.model_validate_json(row["task"])
         return [{"attempt": i, "error": e} for i, e in enumerate(task.errors)]
 
-    def get_by_ids(self, task_ids: list[str]) -> list[Task]:
+    async def get_by_ids(self, task_ids: list[str]) -> list[Task]:
         """Fetch DLQ entries by explicit task ID list."""
         placeholders = ",".join("?" * len(task_ids))
         rows = self._conn.execute(
@@ -68,7 +71,7 @@ class DeadQueue:
         ).fetchall()
         return [Task.model_validate_json(row["task"]) for row in rows]
 
-    def get_by_filter(
+    async def get_by_filter(
         self,
         queue: str | None = None,
         task_name: str | None = None,
@@ -95,12 +98,12 @@ class DeadQueue:
         ).fetchall()
         return [Task.model_validate_json(row["task"]) for row in rows]
 
-    def remove(self, task_id: str) -> None:
+    async def remove(self, task_id: str) -> None:
         """Remove a single entry from the dead letter queue."""
         with self._conn:
             self._conn.execute("DELETE FROM dead_queue WHERE task_id = ?", (task_id,))
 
-    def remove_many(self, task_ids: list[str]) -> None:
+    async def remove_many(self, task_ids: list[str]) -> None:
         """Remove multiple entries from the dead letter queue in a single transaction."""
         if not task_ids:
             return
@@ -108,7 +111,7 @@ class DeadQueue:
         with self._conn:
             self._conn.execute(f"DELETE FROM dead_queue WHERE task_id IN ({placeholders})", task_ids)
 
-    def clean(self, earlier_than: dt.datetime) -> None:
+    async def clean(self, earlier_than: dt.datetime) -> None:
         """Remove failed tasks older than the specified datetime."""
         with self._conn:
             self._conn.execute(

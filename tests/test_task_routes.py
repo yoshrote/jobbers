@@ -301,7 +301,7 @@ async def test_resubmit_from_dlq_by_ids():
     task = Task(id=ULID1, name="Test Task", status="submitted", parameters={})
 
     mock_sm = MagicMock()
-    mock_sm.dead_queue.get_by_ids.return_value = [task]
+    mock_sm.dead_queue.get_by_ids = AsyncMock(return_value=[task])
     mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -324,7 +324,7 @@ async def test_resubmit_from_dlq_by_filter():
     task = Task(id=ULID2, name="My Task", status="submitted", parameters={})
 
     mock_sm = MagicMock()
-    mock_sm.dead_queue.get_by_filter.return_value = [task]
+    mock_sm.dead_queue.get_by_filter = AsyncMock(return_value=[task])
     mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -365,7 +365,7 @@ async def test_resubmit_from_dlq_reset_retry_false():
     task = Task(id=ULID1, name="Test Task", status="submitted", parameters={})
 
     mock_sm = MagicMock()
-    mock_sm.dead_queue.get_by_ids.return_value = [task]
+    mock_sm.dead_queue.get_by_ids = AsyncMock(return_value=[task])
     mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):

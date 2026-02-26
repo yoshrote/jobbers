@@ -10,11 +10,11 @@ from redis.asyncio.client import Redis
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.models.dead_queue import DeadQueue
+from jobbers.models.dead_queue import RedisDeadQueue
 from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task, TaskAdapter
 from jobbers.models.task_config import DeadLetterPolicy
-from jobbers.models.task_scheduler import TaskScheduler
+from jobbers.models.task_scheduler import RedisTaskScheduler
 from jobbers.models.task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -35,14 +35,14 @@ class UserCancellationError(Exception):
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
 
-    def __init__(self, data_store: Redis, task_scheduler: TaskScheduler, dead_queue: DeadQueue) -> None:
+    def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
         self.qca = QueueConfigAdapter(data_store)
         self.ta = TaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
-        self.dead_queue = dead_queue
-        self.task_scheduler = task_scheduler
+        self.dead_queue = RedisDeadQueue(data_store)
+        self.task_scheduler = RedisTaskScheduler(data_store)
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -133,7 +133,7 @@ class StateManager:
         if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
             logger.info("Task %s sent to dead letter queue.", task.id)
             now = dt.datetime.now(dt.UTC)
-            self.dead_queue.add(task, now)
+            await self.dead_queue.add(task, now)
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return result
 
@@ -156,9 +156,9 @@ class StateManager:
             await self.ta.requeue_task(task)
             resubmitted.append(task)
 
-        # Single SQLite transaction for all removes: either all succeed or all
-        # remain, keeping DLQ consistent even if we crash here.
-        self.dead_queue.remove_many([str(t.id) for t in resubmitted])
+        # Batch remove from DLQ: either all succeed or all remain, keeping the
+        # DLQ consistent even if we crash here.
+        await self.dead_queue.remove_many([str(t.id) for t in resubmitted])
         return resubmitted
 
     async def complete_task(self, task: Task) -> Task:

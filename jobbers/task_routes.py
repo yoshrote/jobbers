@@ -145,7 +145,7 @@ async def get_dead_letter_queue(filter_query: Annotated[DLQFilter, Query()]) -> 
     the most recent error message.
     """
     sm = db.get_state_manager()
-    tasks = sm.dead_queue.get_by_filter(
+    tasks = await sm.dead_queue.get_by_filter(
         queue=filter_query.queue,
         task_name=filter_query.task_name,
         task_version=filter_query.task_version,
@@ -163,7 +163,7 @@ async def get_dlq_task_history(task_id: str) -> dict[str, Any]:
     including the retry attempt number, timestamp, and error message for each failure.
     """
     sm = db.get_state_manager()
-    history = sm.dead_queue.get_history(task_id)
+    history = await sm.dead_queue.get_history(task_id)
     return {"task_id": task_id, "history": history}
 
 
@@ -190,9 +190,9 @@ async def resubmit_from_dlq(request: DLQResubmitRequest) -> dict[str, Any]:
     sm = db.get_state_manager()
 
     if request.task_ids is not None:
-        tasks = sm.dead_queue.get_by_ids(request.task_ids)
+        tasks = await sm.dead_queue.get_by_ids(request.task_ids)
     elif request.queue or request.task_name or request.task_version is not None:
-        tasks = sm.dead_queue.get_by_filter(
+        tasks = await sm.dead_queue.get_by_filter(
             queue=request.queue,
             task_name=request.task_name,
             task_version=request.task_version,

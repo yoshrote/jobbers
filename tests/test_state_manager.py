@@ -284,7 +284,7 @@ async def test_fail_task_no_dlq_writes_redis_only(redis, state_manager):
 
     saved = await state_manager.ta.get_task(ULID1)
     assert saved.status == TaskStatus.FAILED
-    assert state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
+    assert await state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
 
 
 @pytest.mark.asyncio
@@ -297,7 +297,7 @@ async def test_fail_task_with_dlq_writes_both_stores(redis, state_manager):
 
     saved = await state_manager.ta.get_task(ULID1)
     assert saved.status == TaskStatus.FAILED
-    dlq = state_manager.dead_queue.get_by_ids([str(ULID1)])
+    dlq = await state_manager.dead_queue.get_by_ids([str(ULID1)])
     assert len(dlq) == 1
     assert dlq[0].id == ULID1
 
@@ -324,22 +324,22 @@ async def test_resubmit_dead_tasks_requeues_and_clears_dlq(redis, state_manager)
     """All tasks are enqueued in Redis and removed from the DLQ."""
     task1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
     task2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e2"])
-    state_manager.dead_queue.add(task1, FROZEN_TIME)
-    state_manager.dead_queue.add(task2, FROZEN_TIME)
+    await state_manager.dead_queue.add(task1, FROZEN_TIME)
+    await state_manager.dead_queue.add(task2, FROZEN_TIME)
 
     await state_manager.resubmit_dead_tasks([task1, task2])
 
     queue_members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in queue_members
     assert bytes(ULID2) in queue_members
-    assert state_manager.dead_queue.get_by_ids([str(ULID1), str(ULID2)]) == []
+    assert await state_manager.dead_queue.get_by_ids([str(ULID1), str(ULID2)]) == []
 
 
 @pytest.mark.asyncio
 async def test_resubmit_dead_tasks_redis_written_before_dlq_delete(redis, state_manager):
     """If the batch DLQ delete crashes, all tasks are already live in Redis (safe ordering)."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
-    state_manager.dead_queue.add(task, FROZEN_TIME)
+    await state_manager.dead_queue.add(task, FROZEN_TIME)
 
     with patch.object(state_manager.dead_queue, "remove_many", side_effect=RuntimeError("simulated crash")):
         with pytest.raises(RuntimeError):
@@ -349,26 +349,26 @@ async def test_resubmit_dead_tasks_redis_written_before_dlq_delete(redis, state_
     queue_members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in queue_members
     # Stale DLQ entry remains — acceptable; re-running resubmit is idempotent.
-    assert len(state_manager.dead_queue.get_by_ids([str(ULID1)])) == 1
+    assert len(await state_manager.dead_queue.get_by_ids([str(ULID1)])) == 1
 
 
 @pytest.mark.asyncio
 async def test_resubmit_dead_tasks_is_idempotent(redis, state_manager):
     """Re-running resubmit for a task already in Redis does not raise and clears the DLQ."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
-    state_manager.dead_queue.add(task, FROZEN_TIME)
+    await state_manager.dead_queue.add(task, FROZEN_TIME)
 
     # First run — normal path.
     await state_manager.resubmit_dead_tasks([task])
 
     # Operator re-adds to DLQ and retries (simulates the crash scenario above recovering).
     task2 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
-    state_manager.dead_queue.add(task2, FROZEN_TIME)
+await state_manager.dead_queue.add(task2, FROZEN_TIME)
     await state_manager.resubmit_dead_tasks([task2])
 
     queue_members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in queue_members
-    assert state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
+    assert await state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
 
 
 # ── schedule_retry_task / dispatch_scheduled_task ─────────────────────────────
