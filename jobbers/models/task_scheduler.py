@@ -1,9 +1,12 @@
 import datetime as dt
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
 
 from jobbers.models.task import Task
 
@@ -43,7 +46,7 @@ class TaskScheduler:
             self._conn.execute(self._CREATE_INDEX_1)
             self._conn.execute(self._CREATE_INDEX_2)
 
-    def add(self, task: Task, run_at: dt.datetime) -> None:
+    async def add(self, task: Task, run_at: dt.datetime) -> None:
         """Insert or replace a task in the schedule."""
         with self._conn:
             self._conn.execute(
@@ -51,7 +54,7 @@ class TaskScheduler:
                 (str(task.id), task.name, task.version, task.model_dump_json(), task.queue, run_at.isoformat()),
             )
 
-    def remove(self, task_id: ULID) -> None:
+    async def remove(self, task_id: ULID) -> None:
         """Remove a scheduled task by ID."""
         with self._conn:
             self._conn.execute(
@@ -59,7 +62,7 @@ class TaskScheduler:
                 (str(task_id),),
             )
 
-    def get_by_filter(
+    async def get_by_filter(
         self,
         queue: str | None = None,
         task_name: str | None = None,
@@ -96,7 +99,7 @@ class TaskScheduler:
         ).fetchall()
         return [Task.model_validate_json(row["task"]) for row in rows]
 
-    def next_due_bulk(self, n: int, queues: list[str] | None = None) -> list[tuple[Task, dt.datetime]]:
+    async def next_due_bulk(self, n: int, queues: list[str] | None = None) -> list[tuple[Task, dt.datetime]]:
         """
         Atomically acquire and return up to n due tasks paired with their scheduled run_at time.
 
@@ -138,7 +141,7 @@ class TaskScheduler:
             for row in rows
         ]
 
-    def next_due(self, queues: list[str] | None = None) -> Task | None:
+    async def next_due(self, queues: list[str] | None = None) -> Task | None:
         """
         Atomically acquire and return the earliest due task, or None.
 

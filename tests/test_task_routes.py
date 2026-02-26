@@ -212,7 +212,7 @@ async def test_get_scheduled_tasks_no_optional_filters():
     task2 = Task(id=ULID2, name="Task 2", status="submitted", parameters={})
 
     mock_sm = MagicMock()
-    mock_sm.task_scheduler.get_by_filter.return_value = [task1, task2]
+    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[task1, task2])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -235,7 +235,7 @@ async def test_get_scheduled_tasks_by_filter():
     task = Task(id=ULID1, name="My Task", status="submitted", parameters={})
 
     mock_sm = MagicMock()
-    mock_sm.task_scheduler.get_by_filter.return_value = [task]
+    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[task])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -259,7 +259,7 @@ async def test_get_scheduled_tasks_by_filter():
 async def test_get_scheduled_tasks_empty():
     """Test fetching scheduled tasks returns an empty list when none match."""
     mock_sm = MagicMock()
-    mock_sm.task_scheduler.get_by_filter.return_value = []
+    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -275,7 +275,7 @@ async def test_get_scheduled_tasks_with_start_cursor():
     task = Task(id=ULID2, name="Task 2", status="submitted", parameters={})
 
     mock_sm = MagicMock()
-    mock_sm.task_scheduler.get_by_filter.return_value = [task]
+    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[task])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

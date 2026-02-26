@@ -178,7 +178,7 @@ class StateManager:
         but before SQLite would leave the task stuck in SCHEDULED with nothing to
         dispatch it.
         """
-        self.task_scheduler.add(task, run_at)
+        await self.task_scheduler.add(task, run_at)
         logger.info("Task %s scheduled for retry at %s.", task.id, run_at)
         await self.save_task(task)
         return task
@@ -203,7 +203,7 @@ class StateManager:
         crashing would permanently lose the task.
         """
         task = await self.queue_retry_task(task)
-        self.task_scheduler.remove(task.id)
+        await self.task_scheduler.remove(task.id)
         return task
 
     async def request_task_cancellation(self, task_id: ULID) -> "Task | None":
@@ -218,7 +218,7 @@ class StateManager:
             return None
         if task.status == TaskStatus.SCHEDULED:
             # For scheduled tasks, we can just remove them from the scheduler without a pub/sub dance
-            self.task_scheduler.remove(task_id)
+            await self.task_scheduler.remove(task_id)
             task.set_status(TaskStatus.CANCELLED)
             await self.save_task(task)
             return task

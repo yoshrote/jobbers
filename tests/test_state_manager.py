@@ -225,17 +225,17 @@ async def test_dispatch_scheduled_task(redis, state_manager):
     """dispatch_scheduled_task moves a due task from the scheduler into its Redis queue."""
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
     run_at = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
-    state_manager.task_scheduler.add(task, run_at)
+    await state_manager.task_scheduler.add(task, run_at)
 
-    due = state_manager.task_scheduler.next_due(None)
+    due = await state_manager.task_scheduler.next_due(["default"])
     assert due is not None
     await state_manager.dispatch_scheduled_task(due)
 
     # Task must now be in the Redis sorted set for its queue
     queue_members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in queue_members
-    # Task must be removed from the scheduler (acquired row cleaned up)
-    assert state_manager.task_scheduler.next_due(None) is None
+    # Task must be removed from the scheduler
+    assert await state_manager.task_scheduler.next_due(["default"]) is None
 
 
 def test_task_in_registry(state_manager):
@@ -375,35 +375,37 @@ async def test_resubmit_dead_tasks_is_idempotent(redis, state_manager):
 
 @pytest.mark.asyncio
 async def test_schedule_retry_task_self_heals_via_dispatch(redis, state_manager):
-    """If the Redis write in schedule_retry_task was missed (crash), the scheduler dispatch recovers."""
+    """If save_task was missed (crash), the scheduler dispatch recovers by re-enqueueing."""
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.STARTED, retry_attempt=1)
     run_at = FROZEN_TIME
 
-    # Simulate: only the SQLite write completed (crash before save_task).
-    state_manager.task_scheduler.add(task, run_at)
+    # Simulate: task already existed in Redis (it was running) but the status update to
+    # SCHEDULED was lost (crash before save_task). The scheduler write did complete.
+    await state_manager.task_scheduler.add(task, run_at)
 
     # Scheduler picks it up and dispatches — this should update Redis.
-    due = state_manager.task_scheduler.next_due(None)
+    due = await state_manager.task_scheduler.next_due(["default"])
     assert due is not None
     await state_manager.dispatch_scheduled_task(due)
 
     queue_members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in queue_members
-    assert state_manager.task_scheduler.next_due(None) is None
+    assert await state_manager.task_scheduler.next_due(["default"]) is None
 
 
-def test_dispatch_stale_acquired_record_not_requeued(state_manager):
-    """A leftover acquired=1 row (crash between Redis write and SQLite delete) is not re-dispatched."""
+@pytest.mark.asyncio
+async def test_dispatch_acquired_record_not_requeued(redis, state_manager):
+    """A task removed from the schedule by next_due is not returned on a subsequent call."""
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
     run_at = FROZEN_TIME
 
-    state_manager.task_scheduler.add(task, run_at)
-    # Acquire the row, simulating dispatch_scheduled_task completing the Redis write
-    # but crashing before the SQLite delete.
-    state_manager.task_scheduler.next_due(None)  # sets acquired=1
+    await state_manager.task_scheduler.add(task, run_at)
+    # Acquire the task, simulating dispatch completing the Redis write
+    # but crashing before calling remove().
+    await state_manager.task_scheduler.next_due(["default"])
 
-    # next_due must not return the already-acquired row.
-    assert state_manager.task_scheduler.next_due(None) is None
+    # next_due must not return the already-acquired task.
+    assert await state_manager.task_scheduler.next_due(["default"]) is None
 
 
 # ── request_task_cancellation ─────────────────────────────────────────────────
@@ -413,7 +415,7 @@ async def test_cancel_scheduled_task(state_manager):
     """Cancelling a SCHEDULED task removes it from the scheduler and marks it CANCELLED in Redis."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
     run_at = FROZEN_TIME + dt.timedelta(hours=1)
-    state_manager.task_scheduler.add(task, run_at)
+    await state_manager.task_scheduler.add(task, run_at)
     await state_manager.save_task(task)
 
     result = await state_manager.request_task_cancellation(ULID1)
@@ -421,7 +423,7 @@ async def test_cancel_scheduled_task(state_manager):
     assert result is not None
     assert result.status == TaskStatus.CANCELLED
     # Removed from the scheduler
-    assert state_manager.task_scheduler.next_due(None) is None
+    assert await state_manager.task_scheduler.next_due(["default"]) is None
     # Persisted to Redis
     saved = await state_manager.ta.get_task(ULID1)
     assert saved.status == TaskStatus.CANCELLED

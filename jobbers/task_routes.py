@@ -215,7 +215,7 @@ async def resubmit_from_dlq(request: DLQResubmitRequest) -> dict[str, Any]:
 async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) -> dict[str, Any]:
     """Retrieve scheduled tasks filtered by queue, and optionally by task name or version."""
     sm = db.get_state_manager()
-    tasks = sm.task_scheduler.get_by_filter(
+    tasks = await sm.task_scheduler.get_by_filter(
         queue=filter_query.queue,
         task_name=filter_query.task_name,
         task_version=filter_query.task_version,
