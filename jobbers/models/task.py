@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any, Self, cast
 
 from pydantic import BaseModel, Field
-from redis.asyncio.client import Redis
+from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 from jobbers.constants import TIME_ZERO
@@ -315,26 +315,30 @@ class TaskAdapter:
         )
         return result == 1
 
-    async def requeue_task(self, task: Task) -> None:
-        """Re-enqueue an existing task for retry (bypasses the new-task existence check)."""
-        assert task.submitted_at  # noqa: S101
-        pipe = self.data_store.pipeline(transaction=True)
-        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+    def stage_save(self, pipe: Pipeline, task: Task) -> None:
+        """Queue SET task-details + type-index update onto pipe (no execute)."""
         pipe.set(self.TASK_DETAILS(task_id=task.id), task.pack())
         if task.status in TaskStatus.active_statuses():
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
+    def stage_requeue(self, pipe: Pipeline, task: Task) -> None:
+        """Queue ZADD task-queue + save-task commands onto pipe (no execute)."""
+        assert task.submitted_at  # noqa: S101
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        self.stage_save(pipe, task)
+
+    async def requeue_task(self, task: Task) -> None:
+        """Re-enqueue an existing task for retry (bypasses the new-task existence check)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_requeue(pipe, task)
         await pipe.execute()
 
     async def save_task(self, task: Task) -> None:
-        """Submit a task to the Redis data store."""
+        """Save task state to the Redis data store."""
         pipe = self.data_store.pipeline(transaction=True)
-        pipe.set(self.TASK_DETAILS(task_id=task.id), task.pack())
-        if task.status in TaskStatus.active_statuses():
-            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
-        else:
-            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        self.stage_save(pipe, task)
         await pipe.execute()
 
     async def get_task(self, task_id: ULID) -> Task | None:

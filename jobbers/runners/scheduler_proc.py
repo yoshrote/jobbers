@@ -37,7 +37,7 @@ async def main(poll_interval: float, role: str, batch_size: int) -> None:
     queues: list[str] = list(await state_manager.qca.get_queues(role))
     logger.info("Scheduler starting; poll_interval=%.1fs batch_size=%d", poll_interval, batch_size)
     while True:
-        task_entries = state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues)
+        task_entries = await state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues)
         if task_entries:
             logger.info("Dispatching %d scheduled task(s)", len(task_entries))
             await asyncio.gather(
