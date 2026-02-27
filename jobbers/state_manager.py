@@ -92,7 +92,12 @@ class StateManager:
 
         # initialize the refresh tag
         init_tag = ULID()
-        await self.data_store.set(f"worker-queues:{role}:refresh_tag", bytes(init_tag))
+        initialized = await self.data_store.setnx(f"worker-queues:{role}:refresh_tag", bytes(init_tag)) == 1
+        if not initialized:
+            # another process initialized the tag before us, so we should use that one instead of ours
+            tag = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
+            if tag:
+                return ULID(tag)
         return init_tag
 
     async def get_next_task(self, queues: set[str], pop_timeout: int=0) -> Task | None:
