@@ -7,14 +7,15 @@ from typing import cast
 
 from opentelemetry import metrics
 from redis.asyncio.client import Redis
+from redis.exceptions import WatchError
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.models.dead_queue import RedisDeadQueue
+from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task, TaskAdapter
 from jobbers.models.task_config import DeadLetterPolicy
-from jobbers.models.task_scheduler import RedisTaskScheduler
+from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -41,8 +42,8 @@ class StateManager:
         self.ta = TaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
-        self.dead_queue = RedisDeadQueue(data_store)
-        self.task_scheduler = RedisTaskScheduler(data_store)
+        self.dead_queue = DeadQueue(data_store)
+        self.task_scheduler = TaskScheduler(data_store)
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -120,46 +121,31 @@ class StateManager:
         return task
 
     async def fail_task(self, task: Task) -> Task:
-        """
-        Persist a failed task, handling any dead letter queue side effects.
-
-        Write ordering: Redis first, then SQLite DLQ.
-        If we crash after Redis but before the DLQ write, the task is correctly
-        marked FAILED in Redis (no re-execution). The DLQ entry is a best-effort
-        record; a missing entry is preferable to a task being re-executed.
-        The DLQ write is idempotent (INSERT OR REPLACE), so retries are safe.
-        """
-        result = await self.save_task(task)
+        """Persist a failed task and any DLQ side effects in a single atomic transaction."""
+        now = dt.datetime.now(dt.UTC)
+        pipe = self.data_store.pipeline(transaction=True)
+        self.ta.stage_save(pipe, task)
         if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
             logger.info("Task %s sent to dead letter queue.", task.id)
-            now = dt.datetime.now(dt.UTC)
-            await self.dead_queue.add(task, now)
+            self.dead_queue.stage_add(pipe, task, now)
+        await pipe.execute()
+        if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
-        return result
+        return task
 
     async def resubmit_dead_tasks(self, tasks: list[Task], reset_retry_count: bool = True) -> list[Task]:
-        """
-        Re-enqueue tasks from the dead letter queue into their active queues.
-
-        Write ordering: all Redis writes first, then a single SQLite batch delete.
-        requeue_task is idempotent (ZADD + HSET), so re-running after a partial
-        crash is safe. If we crash between the last Redis write and the SQLite
-        delete, tasks are live in Redis and stale DLQ entries are the only
-        side-effect (harmless — re-running resubmit is safe).
-        """
-        resubmitted = []
+        """Re-enqueue DLQ tasks and remove them from the DLQ in a single atomic transaction."""
         for task in tasks:
             if reset_retry_count:
                 task.retry_attempt = 0
             task.errors = []
             task.set_status(TaskStatus.SUBMITTED)
-            await self.ta.requeue_task(task)
-            resubmitted.append(task)
-
-        # Batch remove from DLQ: either all succeed or all remain, keeping the
-        # DLQ consistent even if we crash here.
-        await self.dead_queue.remove_many([str(t.id) for t in resubmitted])
-        return resubmitted
+        pipe = self.data_store.pipeline(transaction=True)
+        for task in tasks:
+            self.ta.stage_requeue(pipe, task)
+            self.dead_queue.stage_remove(pipe, task.id, task.queue, task.name)
+        await pipe.execute()
+        return tasks
 
     async def complete_task(self, task: Task) -> Task:
         """Persist a completed task."""
@@ -167,20 +153,12 @@ class StateManager:
         return await self.save_task(task)
 
     async def schedule_retry_task(self, task: Task, run_at: dt.datetime) -> Task:
-        """
-        Persist a delayed retry: add to the task scheduler and save.
-
-        Write ordering: SQLite scheduler first, then Redis.
-        If we crash after SQLite but before Redis, the scheduler_proc will still
-        dispatch the task via dispatch_scheduled_task → queue_retry_task, which
-        writes the SUBMITTED status to Redis. This is self-healing.
-        Swapping the order would be unsafe: a crash after Redis (status=SCHEDULED)
-        but before SQLite would leave the task stuck in SCHEDULED with nothing to
-        dispatch it.
-        """
-        await self.task_scheduler.add(task, run_at)
+        """Add a task to the scheduler and save its state in a single atomic transaction."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.task_scheduler.stage_add(pipe, task, run_at)
+        self.ta.stage_save(pipe, task)
+        await pipe.execute()
         logger.info("Task %s scheduled for retry at %s.", task.id, run_at)
-        await self.save_task(task)
         return task
 
     async def queue_retry_task(self, task: Task) -> Task:
@@ -192,19 +170,34 @@ class StateManager:
 
     async def dispatch_scheduled_task(self, task: Task) -> Task:
         """
-        Move a due scheduled task from the scheduler into its Redis queue.
+        Move a due scheduled task into its queue and clean up the scheduler atomically.
 
-        Write ordering: Redis first, then SQLite scheduler delete.
-        If we crash after Redis but before the SQLite delete, the task is already
-        enqueued and will be processed. The leftover SQLite row has acquired=1,
-        which next_due_bulk filters out (WHERE acquired = 0), so it will never
-        be re-dispatched — no duplicate execution. The orphaned row is harmless.
-        Swapping the order would be unsafe: deleting from SQLite first and then
-        crashing would permanently lose the task.
+        Uses WATCH on the task key for optimistic locking: if the task is modified
+        concurrently (e.g. cancelled between scheduler acquisition and dispatch), the
+        pipeline detects the conflict and retries. If the task is already CANCELLED at
+        read time, dispatch is silently skipped.
+
+        next_due_bulk's Lua script already removed the task from the schedule-queue sorted
+        set before this is called, so stage_remove's ZREM is a no-op; the HDEL cleans up
+        the residual schedule-task-queue hash entry.
         """
-        task = await self.queue_retry_task(task)
-        await self.task_scheduler.remove(task.id)
-        return task
+        task_key = self.ta.TASK_DETAILS(task_id=task.id)
+        while True:
+            pipe = self.data_store.pipeline()
+            await pipe.watch(task_key)
+            task_data: bytes | None = await pipe.get(task_key)
+            if task_data is None or Task.unpack(task.id, task_data).status == TaskStatus.CANCELLED:
+                await pipe.unwatch()  # type: ignore[no-untyped-call]
+                return task
+            task.set_status(TaskStatus.SUBMITTED)
+            pipe.multi()  # type: ignore[no-untyped-call]
+            self.ta.stage_requeue(pipe, task)
+            self.task_scheduler.stage_remove(pipe, task.id, task.queue)
+            try:
+                await pipe.execute()
+                return task
+            except WatchError:
+                continue
 
     async def request_task_cancellation(self, task_id: ULID) -> "Task | None":
         """
