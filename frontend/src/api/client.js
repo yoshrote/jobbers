@@ -25,8 +25,10 @@ async function request(method, path, body, params) {
   return data
 }
 
-const get  = (path, params) => request('GET',  path, null, params)
-const post = (path, body)   => request('POST', path, body)
+const get  = (path, params) => request('GET',    path, null, params)
+const post = (path, body)   => request('POST',   path, body)
+const put  = (path, body)   => request('PUT',    path, body)
+const del  = (path)         => request('DELETE', path)
 
 // ── Index ──────────────────────────────────────────────────────────────────
 
@@ -37,20 +39,43 @@ export const getIndex = () => get('/')
 
 /**
  * GET /task-list
- * @param {{ queue: string, limit?: number, start?: string, order_by?: string, task_name?: string, task_version?: number }} params
+ * @param {{
+ *   queue: string,
+ *   limit?: number,
+ *   start?: string,
+ *   order_by?: 'submitted_at' | 'task_id',
+ *   task_name?: string,
+ *   task_version?: number
+ * }} params
  */
 export const getTaskList = (params) => get('/task-list', params)
 
-/** GET /task-status/:taskId  →  task summary object */
+/** GET /task-status/{task_id}  →  task summary object */
 export const getTaskStatus = (taskId) => get(`/task-status/${taskId}`)
 
 /**
  * POST /submit-task
- * @param {{ id: string, name: string, queue?: string, version?: number, parameters?: object }} task
+ * @param {{
+ *   id: string,
+ *   name: string,
+ *   queue?: string,
+ *   version?: number,
+ *   parameters?: object,
+ *   results?: object,
+ *   errors?: string[],
+ *   retry_attempt?: number,
+ *   status?: string,
+ *   submitted_at?: string,
+ *   retried_at?: string,
+ *   started_at?: string,
+ *   heartbeat_at?: string,
+ *   completed_at?: string,
+ *   task_config?: object
+ * }} task
  */
 export const submitTask = (task) => post('/submit-task', task)
 
-/** POST /task/:taskId/cancel  →  { message, task } */
+/** POST /task/{task_id}/cancel  →  { message, task } */
 export const cancelTask = (taskId) => post(`/task/${taskId}/cancel`)
 
 /**
@@ -63,7 +88,14 @@ export const cancelTasks = (taskIds) => post('/tasks/cancel', { task_ids: taskId
 
 /**
  * GET /scheduled-tasks
- * @param {{ queue: string, limit?: number, start?: string, task_name?: string, task_version?: number }} params
+ * @param {{
+ *   queue: string,
+ *   limit?: number,
+ *   start?: string,
+ *   order_by?: 'submitted_at' | 'task_id',
+ *   task_name?: string,
+ *   task_version?: number
+ * }} params
  */
 export const getScheduledTasks = (params) => get('/scheduled-tasks', params)
 
@@ -75,30 +107,67 @@ export const getScheduledTasks = (params) => get('/scheduled-tasks', params)
  */
 export const getDLQ = (params) => get('/dead-letter-queue', params)
 
-/** GET /dead-letter-queue/:taskId/history  →  { task_id, history: [] } */
+/** GET /dead-letter-queue/{task_id}/history  →  { task_id, history: [] } */
 export const getDLQHistory = (taskId) => get(`/dead-letter-queue/${taskId}/history`)
 
 /**
  * POST /dead-letter-queue/resubmit
- * @param {{ task_ids?: string[], queue?: string, task_name?: string, task_version?: number, reset_retry_count?: boolean, limit?: number }} body
+ * @param {{
+ *   task_ids?: string[],
+ *   queue?: string,
+ *   task_name?: string,
+ *   task_version?: number,
+ *   reset_retry_count?: boolean,
+ *   limit?: number
+ * }} body
  */
 export const resubmitFromDLQ = (body) => post('/dead-letter-queue/resubmit', body)
 
 // ── Queues ─────────────────────────────────────────────────────────────────
 
-/** GET /queues  →  { queues: object } */
+/** GET /queues  →  { queues: string[] } */
 export const getAllQueues = () => get('/queues')
 
-/** GET /queues/:role  →  { queues: string[] } */
-export const getQueuesForRole = (role) => get(`/queues/${role}`)
+/**
+ * POST /queues  →  201 { message, queue }
+ * @param {{ name: string, max_concurrent?: number|null, rate_numerator?: number|null, rate_denominator?: number|null, rate_period?: 'second'|'minute'|'hour'|'day'|null }} config
+ */
+export const createQueue = (config) => post('/queues', config)
+
+/** GET /queues/{queue_name}/config  →  { queue: QueueConfig } */
+export const getQueueConfig = (name) => get(`/queues/${name}/config`)
 
 /**
- * POST /queues/:role
- * @param {string[]} queues
+ * PUT /queues/{queue_name}  →  { message, queue }
+ * @param {string} name
+ * @param {{ name: string, max_concurrent?: number|null, rate_numerator?: number|null, rate_denominator?: number|null, rate_period?: 'second'|'minute'|'hour'|'day'|null }} config
  */
-export const setQueuesForRole = (role, queues) => post(`/queues/${role}`, queues)
+export const updateQueue = (name, config) => put(`/queues/${name}`, config)
+
+/** DELETE /queues/{queue_name}  →  { message } */
+export const deleteQueue = (name) => del(`/queues/${name}`)
 
 // ── Roles ──────────────────────────────────────────────────────────────────
 
 /** GET /roles  →  { roles: string[] } */
 export const getRoles = () => get('/roles')
+
+/** GET /roles/{role_name}  →  { role: string, queues: string[] } */
+export const getRole = (name) => get(`/roles/${name}`)
+
+/**
+ * POST /roles  →  201 { message, role, queues }
+ * @param {string} name
+ * @param {string[]} queues
+ */
+export const createRole = (name, queues) => post('/roles', { name, queues })
+
+/**
+ * PUT /roles/{role_name}  →  { message, role, queues }
+ * @param {string} name
+ * @param {string[]} queues
+ */
+export const updateRole = (name, queues) => put(`/roles/${name}`, queues)
+
+/** DELETE /roles/{role_name}  →  { message } */
+export const deleteRole = (name) => del(`/roles/${name}`)

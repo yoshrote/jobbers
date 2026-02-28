@@ -2,11 +2,21 @@ import datetime as dt
 import random
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PlainSerializer, WithJsonSchema
 
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+
+SerializableCallable = Annotated[
+    Callable[..., Awaitable[Any]],
+    WithJsonSchema({"type": "string", "readOnly": True}),
+    PlainSerializer(
+        lambda f: f"{f.__module__}.{f.__qualname__}",
+        return_type=str,
+        when_used="json",
+    ),
+]
 
 
 class BackoffStrategy(StrEnum):
@@ -41,7 +51,7 @@ class TaskConfig(BaseModel):
     max_heartbeat_interval: dt.timedelta | None = Field(default=None)  # Interval for sending heartbeats in seconds, if applicable
 
     # The actual function to execute for this task, used internally by the worker
-    function: Callable[..., Awaitable[Any]] = Field(exclude=True)
+    function: SerializableCallable
 
     # The tuple of expected exceptions that can be handled by the task processor
     expected_exceptions: tuple[type[Exception]] | None = Field(default=None)
