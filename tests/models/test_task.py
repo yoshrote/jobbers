@@ -416,6 +416,114 @@ class TestGetStaleTasks:
         assert len(stale_tasks) == 0
 
 
+class TestCleanTerminalTasks:
+    """Tests for TaskAdapter.clean_terminal_tasks."""
+
+    @pytest.mark.asyncio
+    async def test_deletes_old_completed_task_blob(self, task_adapter, redis):
+        """A completed task blob older than max_age is deleted."""
+        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        await redis.set(f"task:{ULID1}", task.pack())
+
+        await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
+
+        assert await redis.get(f"task:{ULID1}") is None
+
+    @pytest.mark.asyncio
+    async def test_removes_heartbeat_entry(self, task_adapter, redis):
+        """The heartbeat sorted-set entry is removed along with the task blob."""
+        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        await redis.set(f"task:{ULID1}", task.pack())
+        await redis.zadd(task_adapter.HEARTBEAT_SCORES(queue="default"),
+                         {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=8)).timestamp()})
+
+        await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
+
+        score = await redis.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes)
+        assert score is None
+
+    @pytest.mark.asyncio
+    async def test_removes_type_index_entry(self, task_adapter, redis):
+        """Orphaned task-type-idx entries are removed alongside the task blob."""
+        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        await redis.set(f"task:{ULID1}", task.pack())
+        await redis.sadd(task_adapter.TASK_BY_TYPE_IDX(name="test_task"), ULID1.bytes)
+
+        await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
+
+        members = await redis.smembers(task_adapter.TASK_BY_TYPE_IDX(name="test_task"))
+        assert ULID1.bytes not in members
+
+    @pytest.mark.asyncio
+    async def test_skips_active_task(self, task_adapter, redis):
+        """Tasks in active statuses are never deleted regardless of age."""
+        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.STARTED,
+                    started_at=FROZEN_TIME - dt.timedelta(days=100))
+        await redis.set(f"task:{ULID1}", task.pack())
+
+        await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(seconds=0))
+
+        assert await redis.get(f"task:{ULID1}") is not None
+
+    @pytest.mark.asyncio
+    async def test_skips_task_within_age(self, task_adapter, redis):
+        """A completed task whose completed_at is within max_age is not deleted."""
+        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+                    completed_at=FROZEN_TIME - dt.timedelta(hours=1))
+        await redis.set(f"task:{ULID1}", task.pack())
+
+        await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
+
+        assert await redis.get(f"task:{ULID1}") is not None
+
+    @pytest.mark.asyncio
+    async def test_skips_task_without_completed_at(self, task_adapter, redis):
+        """A terminal task with no completed_at is not deleted."""
+        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.FAILED,
+                    completed_at=None)
+        await redis.set(f"task:{ULID1}", task.pack())
+
+        await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(seconds=0))
+
+        assert await redis.get(f"task:{ULID1}") is not None
+
+    @pytest.mark.parametrize("status", [
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.STALLED,
+        TaskStatus.DROPPED,
+    ])
+    @pytest.mark.asyncio
+    async def test_cleans_all_terminal_statuses(self, task_adapter, redis, status):
+        """All five terminal statuses are eligible for cleanup when old enough."""
+        task = Task(id=ULID1, name="test_task", queue="default", status=status,
+                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        await redis.set(f"task:{ULID1}", task.pack())
+
+        await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
+
+        assert await redis.get(f"task:{ULID1}") is None
+
+    @pytest.mark.asyncio
+    async def test_leaves_other_tasks_untouched(self, task_adapter, redis):
+        """Only old terminal tasks are deleted; active and recent tasks remain."""
+        old_task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+                        completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        recent_task = Task(id=ULID2, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+                           completed_at=FROZEN_TIME - dt.timedelta(hours=1))
+        await redis.set(f"task:{ULID1}", old_task.pack())
+        await redis.set(f"task:{ULID2}", recent_task.pack())
+
+        await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
+
+        assert await redis.get(f"task:{ULID1}") is None
+        assert await redis.get(f"task:{ULID2}") is not None
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_rate_task(task_id: ULID, submitted_at: dt.datetime) -> Task:

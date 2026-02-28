@@ -23,6 +23,24 @@ parser.add_argument(
     default=None,
     help="Maximum queue age in seconds (default: 30 days)",
 )
+parser.add_argument(
+    "--stale-time",
+    type=lambda x: dt.timedelta(seconds=int(x)),
+    default=None,
+    help="Mark tasks as stalled if their heartbeat is older than this many seconds",
+)
+parser.add_argument(
+    "--dlq-age",
+    type=lambda x: dt.timedelta(seconds=int(x)),
+    default=None,
+    help="Remove dead-letter queue entries older than this many seconds",
+)
+parser.add_argument(
+    "--completed-task-age",
+    type=lambda x: dt.timedelta(seconds=int(x)),
+    default=None,
+    help="Delete task blobs and heartbeat entries for terminal tasks older than this many seconds",
+)
 
 
 def run() -> None:
@@ -41,5 +59,12 @@ def run() -> None:
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(
-        state_manager.clean(args.rate_limit_age, args.min_queue_age, args.max_queue_age)
+        state_manager.clean(
+            args.rate_limit_age,
+            args.min_queue_age,
+            args.max_queue_age,
+            stale_time=args.stale_time,
+            dlq_age=args.dlq_age,
+            completed_task_age=args.completed_task_age,
+        )
     )

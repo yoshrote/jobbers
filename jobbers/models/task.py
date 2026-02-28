@@ -431,6 +431,46 @@ class TaskAdapter:
             logger.info("task query timed out")
         return None
 
+    async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
+        """
+        Delete task blobs, heartbeat entries, and type-index members for old terminal tasks.
+
+        Scans all ``task:*`` keys. For each task in a terminal status whose
+        ``completed_at`` is older than ``max_age``, atomically removes:
+          - ``task:{task_id}``
+          - its entry in ``task-heartbeats:{queue}``
+          - its entry in ``task-type-idx:{name}`` (safety net for stale orphans)
+        """
+        terminal_statuses = {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.STALLED,
+            TaskStatus.DROPPED,
+        }
+        cutoff = now - max_age
+        async for raw_key in self.data_store.scan_iter("task:*"):
+            key = raw_key if isinstance(raw_key, bytes) else raw_key.encode()
+            task_data: bytes | None = await self.data_store.get(key)
+            if task_data is None:
+                continue
+            key_str = key.decode()
+            task_id_str = key_str.removeprefix("task:")
+            try:
+                task_id = ULID.from_str(task_id_str)
+            except ValueError:
+                continue
+            task = Task.unpack(task_id, task_data)
+            if task.status not in terminal_statuses:
+                continue
+            if task.completed_at is None or task.completed_at >= cutoff:
+                continue
+            pipe = self.data_store.pipeline(transaction=True)
+            pipe.delete(key)
+            pipe.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id))
+            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task_id))
+            await pipe.execute()
+
     async def clean(self, queues: set[bytes], now: dt.datetime, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None) -> None:
         """Clean up the state manager."""
         if max_queue_age or min_queue_age:

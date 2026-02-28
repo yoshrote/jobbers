@@ -8,6 +8,7 @@ import pytest_asyncio
 import redis.asyncio as aioredis
 from ulid import ULID
 
+from jobbers import registry
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_status import TaskStatus
@@ -208,6 +209,95 @@ async def test_clean_min_and_max_queue_age(redis, state_manager):
     # Verify only tasks within the age range remain
     queue1_tasks = await redis.zrange("task-queues:queue1", 0, -1, withscores=True)
     assert queue1_tasks == []
+
+@pytest.mark.asyncio
+async def test_clean_completed_task_age_removes_old_terminal_tasks(redis, state_manager):
+    """completed_task_age deletes terminal task blobs and their index entries when old enough."""
+    old_task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED,
+                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+    active_task = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.STARTED,
+                       started_at=FROZEN_TIME - dt.timedelta(hours=1))
+    await redis.set(f"task:{ULID1}", old_task.pack())
+    await redis.set(f"task:{ULID2}", active_task.pack())
+    await redis.sadd("all-queues", "default")
+
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        await state_manager.clean(completed_task_age=dt.timedelta(days=7))
+
+    assert await redis.get(f"task:{ULID1}") is None
+    assert await redis.get(f"task:{ULID2}") is not None
+
+@pytest.mark.asyncio
+async def test_clean_dlq_age_removes_old_entries(redis, state_manager):
+    """dlq_age removes DLQ index entries older than the cutoff."""
+    await redis.sadd("all-queues", "default")
+    old_task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
+    recent_task = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.FAILED)
+    await state_manager.dead_queue.add(old_task, FROZEN_TIME - dt.timedelta(days=8))
+    await state_manager.dead_queue.add(recent_task, FROZEN_TIME - dt.timedelta(days=6))
+
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        await state_manager.clean(dlq_age=dt.timedelta(days=7))
+
+    assert await redis.zscore("dlq", ULID1.bytes) is None
+    assert ULID1.bytes not in await redis.smembers("dlq-queue:default")
+    assert await redis.zscore("dlq", ULID2.bytes) is not None
+
+@pytest.mark.asyncio
+async def test_clean_dlq_age_keeps_recent_entries(redis, state_manager):
+    """dlq_age does not remove DLQ entries within the cutoff window."""
+    await redis.sadd("all-queues", "default")
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
+    await state_manager.dead_queue.add(task, FROZEN_TIME - dt.timedelta(days=6))
+
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        await state_manager.clean(dlq_age=dt.timedelta(days=7))
+
+    assert await redis.zscore("dlq", ULID1.bytes) is not None
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_skips_terminal_tasks(redis, state_manager):
+    """A COMPLETED task with a stale heartbeat entry is NOT re-marked STALLED."""
+    # Use real timestamps so datetime mocking doesn't interfere with serialization.
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    completed = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED,
+                     completed_at=two_hours_ago + dt.timedelta(minutes=30),
+                     heartbeat_at=two_hours_ago)
+    await redis.set(f"task:{ULID1}", completed.pack())
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await redis.sadd("all-queues", "default")
+
+    stale_config = TaskConfig(name="my_task", function=dummy_fn,
+                              max_heartbeat_interval=dt.timedelta(minutes=5))
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await state_manager.ta.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager):
+    """When a STARTED task is marked STALLED, its heartbeat sorted-set entry is removed."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED,
+                   started_at=two_hours_ago, heartbeat_at=two_hours_ago)
+    await redis.set(f"task:{ULID1}", started.pack())
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await redis.sadd("all-queues", "default")
+
+    stale_config = TaskConfig(name="my_task", function=dummy_fn,
+                              max_heartbeat_interval=dt.timedelta(minutes=5))
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await state_manager.ta.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert await redis.zscore("task-heartbeats:default", ULID1.bytes) is None
 
 @pytest.mark.asyncio
 async def test_dispatch_scheduled_task(redis, state_manager):

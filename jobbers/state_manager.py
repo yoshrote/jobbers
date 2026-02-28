@@ -60,7 +60,15 @@ class StateManager:
             # Need to consider interactions with callbacks of the task
             self.current_tasks_by_queue[task.queue].remove(task.id)
 
-    async def clean(self, rate_limit_age: dt.timedelta | None=None, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None, stale_time: dt.timedelta | None=None) -> None:
+    async def clean(
+        self,
+        rate_limit_age: dt.timedelta | None = None,
+        min_queue_age: dt.datetime | None = None,
+        max_queue_age: dt.datetime | None = None,
+        stale_time: dt.timedelta | None = None,
+        dlq_age: dt.timedelta | None = None,
+        completed_task_age: dt.timedelta | None = None,
+    ) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.UTC)
         queues = await cast("Awaitable[set[bytes]]", self.data_store.smembers(self.qca.ALL_QUEUES))
@@ -74,6 +82,8 @@ class StateManager:
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
             async for task in self.ta.get_stale_tasks({q.decode() for q in queues}, stale_time):
+                if task.status not in {TaskStatus.STARTED, TaskStatus.HEARTBEAT}:
+                    continue
                 stale_tasks_by_type[(task.name, task.version)].append(task)
 
             for (task_type, task_version), tasks in stale_tasks_by_type.items():
@@ -82,7 +92,16 @@ class StateManager:
                     for task in tasks:
                         if task.heartbeat_at and (now - task.heartbeat_at) > task_config.max_heartbeat_interval:
                             task.set_status(TaskStatus.STALLED)
-                            await self.save_task(task)
+                            pipe = self.data_store.pipeline(transaction=True)
+                            self.ta.stage_save(pipe, task)
+                            pipe.zrem(self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
+                            await pipe.execute()
+
+        if dlq_age:
+            await self.dead_queue.clean(now - dlq_age)
+
+        if completed_task_age:
+            await self.ta.clean_terminal_tasks(now, completed_task_age)
 
     # TODO: refactor the refresh tag to be an implementation detail of QueueConfigAdapter
     async def get_refresh_tag(self, role: str) -> ULID:
