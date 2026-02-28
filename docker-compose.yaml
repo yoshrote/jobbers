@@ -65,5 +65,12 @@ services:
     depends_on:
       - redis
       - collector
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      manager:
+        condition: service_healthy
 volumes:
   redis_data:
