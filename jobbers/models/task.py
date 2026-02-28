@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator, Awaitable
 from enum import StrEnum
 from typing import Any, Self, cast
 
+from opentelemetry import metrics
 from pydantic import BaseModel, Field
 from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
@@ -22,6 +23,8 @@ from .task_config import TaskConfig
 from .task_status import TaskStatus
 
 logger = logging.getLogger(__name__)
+meter = metrics.get_meter(__name__)
+tasks_missing_data = meter.create_counter("tasks_missing_data", unit="1")
 
 class Task(BaseModel):
     """A task to be executed."""
@@ -199,6 +202,7 @@ class TaskAdapter:
     HEARTBEAT_SCORES = "task-heartbeats:{queue}".format
     TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
+    DLQ_MISSING_DATA = "dlq-missing-data"
 
     # Atomically enqueue a new task (no rate limiting).
     # Skips the ZADD if the task details key already exists (idempotent re-submit guard).
@@ -421,14 +425,20 @@ class TaskAdapter:
         # see https://redis.io/docs/latest/commands/blpop/#what-key-is-served-first-what-client-what-element-priority-ordering-details
         # for details of how the order of keys impact how tasks are popped
         task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
-        task_id = await self.data_store.bzpopmin(task_queues, timeout=pop_timeout)
-        if task_id:
-            task = await self.get_task(ULID.from_bytes(task_id[1]))
+        pop_result = await self.data_store.bzpopmin(task_queues, timeout=pop_timeout)
+        while pop_result:
+            task = await self.get_task(ULID.from_bytes(pop_result[1]))
             if task:
                 return task
-            logger.warning("Task with ID %s not found.", task_id)
-        else:
-            logger.info("task query timed out")
+            # Task ID was popped from the queue but its data is missing.
+            # Record a metric, move the bare ID to the missing-data DLQ for
+            # investigation, and keep waiting for a valid task.
+            logger.error("Task %s popped from queue but data not found; adding to %s", pop_result[1], self.DLQ_MISSING_DATA)
+            tasks_missing_data.add(1)
+            now = dt.datetime.now(dt.UTC)
+            await self.data_store.zadd(self.DLQ_MISSING_DATA, {pop_result[1]: now.timestamp()})
+            pop_result = await self.data_store.bzpopmin(task_queues, timeout=pop_timeout)
+        logger.info("task query timed out")
         return None
 
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
