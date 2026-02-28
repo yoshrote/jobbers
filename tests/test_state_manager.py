@@ -83,13 +83,35 @@ async def test_get_next_task_no_task_found(real_state_manager):
 
 @pytest.mark.asyncio
 async def test_get_next_task_missing_task_data(real_redis, real_state_manager):
-    """Test that get_next_task logs a warning and returns None if task data is missing."""
+    """Test that a task with missing data is moved to dlq-missing-data and None is returned."""
     task_id = ULID()
     await real_redis.zadd("task-queues:queue1", {task_id.bytes: 1})
 
     task = await real_state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
 
     assert task is None
+    dlq_members = await real_redis.zrange("dlq-missing-data", 0, -1)
+    assert task_id.bytes in dlq_members
+
+
+@pytest.mark.asyncio
+async def test_get_next_task_skips_missing_data_and_returns_valid(real_redis, real_state_manager):
+    """When the first queued task has missing data it is skipped and the next valid task is returned."""
+    missing_id = ULID()
+    valid_id = ULID()
+    valid_task = Task(id=valid_id, name="Test Task", queue="queue1", version=1,
+                      status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
+
+    # missing_id has a lower score so it is popped first
+    await real_redis.zadd("task-queues:queue1", {missing_id.bytes: 1, valid_id.bytes: 2})
+    await real_redis.set(f"task:{valid_id}", valid_task.pack())
+
+    task = await real_state_manager.get_next_task(["queue1"], pop_timeout=1)
+
+    assert task is not None
+    assert task.id == valid_id
+    dlq_members = await real_redis.zrange("dlq-missing-data", 0, -1)
+    assert missing_id.bytes in dlq_members
 
 @pytest.fixture
 def rate_limiter(state_manager):
