@@ -1,5 +1,8 @@
 # Jobbers
 
+> 💡 **VS Code Dev Containers**
+> The workspace now configures the devcontainer to include `docker-compose.override.yml` alongside `docker-compose.yml`. This ensures VS Code uses the same override settings when spinning up the development containers.
+>
 A task execution framework similar to Celery, but with a focus on providing
 support to track and handle the recovery of long running tasks that stall or
 fail.
