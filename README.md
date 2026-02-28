@@ -231,6 +231,73 @@ async def my_task(**kwargs):
     ...
 ```
 
+## Queue and Role Management API
+
+### Queue endpoints
+
+Queues hold task configuration (concurrency limits and rate limits) independently of the roles that reference them.
+
+| method | path | description |
+| ------ | ---- | ----------- |
+| `GET` | `/queues` | List all queue names across all roles |
+| `POST` | `/queues` | Create a new queue with its config (201, 409 if already exists) |
+| `GET` | `/queues/{queue_name}/config` | Get the config for a specific queue (404 if not found) |
+| `PUT` | `/queues/{queue_name}` | Create or update a queue's config (upsert) |
+| `DELETE` | `/queues/{queue_name}` | Delete a queue and remove it from all roles (404 if not found) |
+
+#### `POST /queues` and `PUT /queues/{queue_name}` request body
+
+| field | type | default | description |
+| ----- | ---- | ------- | ----------- |
+| `name` | `str` | required | Queue name (ignored for PUT — path name is used) |
+| `max_concurrent` | `int \| null` | `10` | Max concurrent tasks from this queue per worker |
+| `rate_numerator` | `int \| null` | `null` | Number of tasks allowed per rate window |
+| `rate_denominator` | `int \| null` | `null` | Size of the rate window |
+| `rate_period` | `"second" \| "minute" \| "hour" \| "day" \| null` | `null` | Unit for the rate window |
+
+Rate limiting example: `rate_numerator=5, rate_denominator=2, rate_period="minute"` → 5 tasks every 2 minutes.
+
+```json
+{
+  "name": "imports",
+  "max_concurrent": 5,
+  "rate_numerator": 100,
+  "rate_denominator": 1,
+  "rate_period": "hour"
+}
+```
+
+### Role endpoints
+
+Roles group queues together for workers. A worker is assigned a role and will consume tasks from all queues in that role.
+
+| method | path | description |
+| ------ | ---- | ----------- |
+| `GET` | `/roles` | List all role names |
+| `POST` | `/roles` | Create a new role with an initial queue list (201, 409 if already exists) |
+| `GET` | `/roles/{role_name}` | Get the queues assigned to a specific role (404 if not found) |
+| `PUT` | `/roles/{role_name}` | Replace the queue list for a role (404 if not found) |
+| `DELETE` | `/roles/{role_name}` | Delete a role (queue configs are preserved) (404 if not found) |
+
+#### `POST /roles` request body
+
+| field | type | description |
+| ----- | ---- | ----------- |
+| `name` | `str` | Role name |
+| `queues` | `list[str]` | Initial set of queues assigned to this role |
+
+```json
+{ "name": "import-workers", "queues": ["imports", "default"] }
+```
+
+#### `PUT /roles/{role_name}` request body
+
+A plain JSON array of queue names that replaces the current list:
+
+```json
+["imports", "exports", "default"]
+```
+
 ### Dead Letter Queue API
 
 | method | path | description |
