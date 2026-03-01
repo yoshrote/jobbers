@@ -4,7 +4,7 @@ import { getScheduledTasks } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
 
 export default function ScheduledTasks() {
-  const [filter, setFilter] = useState({ queue: '', task_name: '', task_version: '', limit: '20' })
+  const [filter, setFilter] = useState({ queue: '', task_name: '', task_version: '', start: '', limit: '20' })
   const [tasks,   setTasks]   = useState([])
   const [loading, setLoading] = useState(false)
   const [error,   setError]   = useState(null)
@@ -20,6 +20,7 @@ export default function ScheduledTasks() {
     setError(null)
     const params = {
       queue:        filter.queue,
+      start:        filter.start || undefined,
       task_name:    filter.task_name   || undefined,
       task_version: filter.task_version ? Number(filter.task_version) : undefined,
       limit:        Number(filter.limit),
@@ -47,6 +48,10 @@ export default function ScheduledTasks() {
           <div className="form-row">
             <label>Version</label>
             <input type="number" value={filter.task_version} onChange={setF('task_version')} style={{ width: 70 }} />
+          </div>
+          <div className="form-row">
+            <label>Start after</label>
+            <input value={filter.start} onChange={setF('start')} placeholder="ULID (optional)" />
           </div>
           <div className="form-row">
             <label>Limit</label>

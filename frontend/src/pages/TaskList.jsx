@@ -11,6 +11,7 @@ export default function TaskList() {
   const [queue,       setQueue]       = useState(searchParams.get('queue')       ?? '')
   const [taskName,    setTaskName]    = useState(searchParams.get('task_name')   ?? '')
   const [taskVersion, setTaskVersion] = useState(searchParams.get('task_version') ?? '')
+  const [startAfter,  setStartAfter]  = useState(searchParams.get('start')       ?? '')
   const [limit,       setLimit]       = useState(searchParams.get('limit')       ?? '20')
   const [orderBy,     setOrderBy]     = useState(searchParams.get('order_by')    ?? 'submitted_at')
 
@@ -23,7 +24,14 @@ export default function TaskList() {
     if (!queue) return
     setLoading(true)
     setError(null)
-    getTaskList({ queue, limit, order_by: orderBy, task_name: taskName || undefined, task_version: taskVersion || undefined })
+    getTaskList({
+      queue,
+      start: startAfter || undefined,
+      limit,
+      order_by: orderBy,
+      task_name: taskName || undefined,
+      task_version: taskVersion || undefined,
+    })
       .then((d) => setTasks(d.tasks ?? []))
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
@@ -31,8 +39,8 @@ export default function TaskList() {
 
   useEffect(() => {
     load()
-    setSearchParams({ queue, task_name: taskName, limit, order_by: orderBy }, { replace: true })
-  }, [queue, taskName, taskVersion, limit, orderBy]) // eslint-disable-line react-hooks/exhaustive-deps
+    setSearchParams({ queue, task_name: taskName, start: startAfter, limit, order_by: orderBy }, { replace: true })
+  }, [queue, taskName, taskVersion, startAfter, limit, orderBy]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function toggleSelect(id) {
     setSelected((prev) => {
@@ -78,6 +86,14 @@ export default function TaskList() {
           <div className="form-row">
             <label>Version</label>
             <input type="number" value={taskVersion} onChange={(e) => setTaskVersion(e.target.value)} style={{ width: 70 }} />
+          </div>
+          <div className="form-row">
+            <label>Start after</label>
+            <input
+              value={startAfter}
+              onChange={(e) => setStartAfter(e.target.value)}
+              placeholder="ULID (optional)"
+            />
           </div>
           <div className="form-row">
             <label>Order by</label>
