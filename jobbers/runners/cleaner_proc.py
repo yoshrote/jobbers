@@ -41,6 +41,12 @@ parser.add_argument(
     default=None,
     help="Delete task blobs and heartbeat entries for terminal tasks older than this many seconds",
 )
+parser.add_argument(
+    "--rebuild-status-index",
+    action="store_true",
+    default=False,
+    help="Backfill task-status-idx sorted sets from existing task blobs",
+)
 
 
 def run() -> None:
@@ -58,6 +64,8 @@ def run() -> None:
     state_manager = build_sm()
 
     loop = asyncio.get_event_loop()
+    if args.rebuild_status_index:
+        loop.run_until_complete(state_manager.ta.rebuild_status_indexes())
     loop.run_until_complete(
         state_manager.clean(
             args.rate_limit_age,

@@ -130,7 +130,7 @@ async def test_get_task_status_not_found():
 
 @pytest.mark.asyncio
 async def test_get_task_list():
-    """Test retrieving the list of all tasks."""
+    """Test retrieving the list of all tasks with an explicit queue."""
     mock_task_adapter = AsyncMock()
     mock_task_adapter.get_all_tasks.return_value = [
         {"id": str(ULID1), "name": "Task 1", "status": "started"},
@@ -149,6 +149,56 @@ async def test_get_task_list():
             ]
         }
         mock_task_adapter.get_all_tasks.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_get_task_list_no_queue(redis_db):
+    """GET /task-list without a queue parameter returns tasks from all queues."""
+    from jobbers.models.task import TaskAdapter as TA
+
+    t1 = Task(id=ULID1, name="t1", queue="q1", status="submitted",
+              submitted_at=dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc))
+    t2 = Task(id=ULID2, name="t2", queue="q2", status="submitted",
+              submitted_at=dt.datetime(2021, 1, 2, tzinfo=dt.timezone.utc))
+    await redis_db.set(f"task:{ULID1}", t1.pack())
+    await redis_db.set(f"task:{ULID2}", t2.pack())
+    await redis_db.zadd("task-queues:q1", {ULID1.bytes: t1.submitted_at.timestamp()})
+    await redis_db.zadd("task-queues:q2", {ULID2.bytes: t2.submitted_at.timestamp()})
+    await redis_db.sadd("all-queues", "q1", "q2")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/task-list")
+
+    assert response.status_code == 200
+    ids = {t["id"] for t in response.json()["tasks"]}
+    assert ids == {str(ULID1), str(ULID2)}
+
+
+@pytest.mark.asyncio
+async def test_get_task_list_status_filter(redis_db):
+    """GET /task-list with status filter returns only matching tasks."""
+    t1 = Task(id=ULID1, name="t1", queue="default", status="submitted",
+              submitted_at=dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc))
+    t2 = Task(id=ULID2, name="t2", queue="default", status="failed",
+              submitted_at=dt.datetime(2021, 1, 2, tzinfo=dt.timezone.utc))
+    await redis_db.set(f"task:{ULID1}", t1.pack())
+    await redis_db.set(f"task:{ULID2}", t2.pack())
+    await redis_db.zadd("task-queues:default", {
+        ULID1.bytes: t1.submitted_at.timestamp(),
+        ULID2.bytes: t2.submitted_at.timestamp(),
+    })
+    # Status index must be populated for the status-filter path
+    await redis_db.zadd("task-status-idx:submitted", {ULID1.bytes: t1.submitted_at.timestamp()})
+    await redis_db.zadd("task-status-idx:failed", {ULID2.bytes: t2.submitted_at.timestamp()})
+    await redis_db.sadd("all-queues", "default")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/task-list", params={"status": "failed"})
+
+    assert response.status_code == 200
+    tasks = response.json()["tasks"]
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == str(ULID2)
 
 @pytest.mark.asyncio
 async def test_get_queues():

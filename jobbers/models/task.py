@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any, Self, cast
 
 from opentelemetry import metrics
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
@@ -47,6 +47,7 @@ class Task(BaseModel):
     completed_at: dt.datetime | None = None
 
     task_config: TaskConfig | None = Field(default=None, exclude=True)
+    _last_status: TaskStatus | None = PrivateAttr(default=None)
 
     def valid_task_params(self) -> bool:
         if not self.task_config:
@@ -149,6 +150,7 @@ class Task(BaseModel):
         )
 
     def set_status(self, status: TaskStatus) -> None:
+        self._last_status = self.status
         match status:
             case TaskStatus.STARTED:
                 if not self.started_at:
@@ -174,13 +176,16 @@ class PaginationOrder(StrEnum):
 class TaskPagination(BaseModel):
     "Pagination details."
 
-    queue: str = Field()
+    queue: str | None = Field(default=None)
+    queues: list[str] | None = Field(default=None)
     limit: int = Field(default=10, gt=0, le=100)
     start: ULID | None = Field(default=None)
     order_by: PaginationOrder = Field(default=PaginationOrder.SUBMITTED_AT)
     task_name: str | None = Field(default=None)
     task_version: int | None = Field(default=None)
-    # status: TaskStatus | None = Field(default=None)
+    status: list[TaskStatus] | None = Field(default=None)
+    submitted_after: dt.datetime | None = Field(default=None)
+    submitted_before: dt.datetime | None = Field(default=None)
 
     def start_param(self) -> int:
         if not self.start:
@@ -201,6 +206,7 @@ class TaskAdapter:
     TASK_DETAILS = "task:{task_id}".format
     HEARTBEAT_SCORES = "task-heartbeats:{queue}".format
     TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
+    TASK_STATUS_IDX = "task-status-idx:{status}".format
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     DLQ_MISSING_DATA = "dlq-missing-data"
 
@@ -209,10 +215,12 @@ class TaskAdapter:
     # KEYS[1] = task-queues:{queue}
     # KEYS[2] = task:{task_id}
     # KEYS[3] = task-type-idx:{name}
+    # KEYS[4] = task-status-idx:{status}
     # ARGV[1] = submitted_at timestamp (score for the queue sorted set)
     # ARGV[2] = task_id bytes (member for sorted sets)
     # ARGV[3] = '1' to SADD the type index, '0' to SREM
     # ARGV[4] = packed task blob (msgpack)
+    # ARGV[5] = submitted_at timestamp (score for the status index)
     SUBMIT_SCRIPT = """
         local exists = redis.call('EXISTS', KEYS[2])
         if exists == 0 then
@@ -224,6 +232,7 @@ class TaskAdapter:
         else
             redis.call('SREM', KEYS[3], ARGV[2])
         end
+        redis.call('ZADD', KEYS[4], ARGV[5], ARGV[2])
         return 1
     """
 
@@ -234,12 +243,14 @@ class TaskAdapter:
     # KEYS[2] = task-queues:{queue}
     # KEYS[3] = task:{task_id}
     # KEYS[4] = task-type-idx:{name}
+    # KEYS[5] = task-status-idx:{status}
     # ARGV[1] = earliest_time (entries with score <= this are outside the window)
     # ARGV[2] = rate_numerator (max tasks allowed in the window)
     # ARGV[3] = submitted_at timestamp (score for rate-limiter and task-queues sorted sets)
     # ARGV[4] = task_id bytes (member for sorted sets)
     # ARGV[5] = '1' to SADD the type index, '0' to SREM
     # ARGV[6] = packed task blob (msgpack)
+    # ARGV[7] = submitted_at timestamp (score for the status index)
     # Returns: 1 if enqueued, 0 if rate-limited
     SUBMIT_RATE_LIMITED_SCRIPT = """
         local enqueued = 0
@@ -263,6 +274,9 @@ class TaskAdapter:
         else
             redis.call('SREM', KEYS[4], ARGV[4])
         end
+        if enqueued == 1 then
+            redis.call('ZADD', KEYS[5], ARGV[7], ARGV[4])
+        end
         return enqueued
     """
 
@@ -277,14 +291,16 @@ class TaskAdapter:
             "Awaitable[int]",
             self.data_store.eval(
                 self.SUBMIT_SCRIPT,
-                3,
-                self.TASKS_BY_QUEUE(queue=task.queue),    # KEYS[1]
-                self.TASK_DETAILS(task_id=task.id),       # KEYS[2]
-                self.TASK_BY_TYPE_IDX(name=task.name),    # KEYS[3]
-                task.submitted_at.timestamp(),            # ARGV[1]
-                bytes(task.id),                           # ARGV[2]
-                is_active,                                # ARGV[3]
-                task.pack(),                              # ARGV[4]
+                4,
+                self.TASKS_BY_QUEUE(queue=task.queue),          # KEYS[1]
+                self.TASK_DETAILS(task_id=task.id),             # KEYS[2]
+                self.TASK_BY_TYPE_IDX(name=task.name),          # KEYS[3]
+                self.TASK_STATUS_IDX(status=task.status),       # KEYS[4]
+                task.submitted_at.timestamp(),                  # ARGV[1]
+                bytes(task.id),                                 # ARGV[2]
+                is_active,                                      # ARGV[3]
+                task.pack(),                                    # ARGV[4]
+                task.submitted_at.timestamp(),                  # ARGV[5]
             )
         )
         return result == 1
@@ -304,28 +320,34 @@ class TaskAdapter:
             "Awaitable[int]",
             self.data_store.eval(
                 self.SUBMIT_RATE_LIMITED_SCRIPT,
-                4,
-                self.QUEUE_RATE_LIMITER(queue=task.queue),  # KEYS[1]
-                self.TASKS_BY_QUEUE(queue=task.queue),      # KEYS[2]
-                self.TASK_DETAILS(task_id=task.id),         # KEYS[3]
-                self.TASK_BY_TYPE_IDX(name=task.name),      # KEYS[4]
-                earliest_time.timestamp(),                  # ARGV[1]
-                queue_config.rate_numerator or 0,           # ARGV[2]
-                task.submitted_at.timestamp(),              # ARGV[3]
-                bytes(task.id),                             # ARGV[4]
-                is_active,                                  # ARGV[5]
-                task.pack(),                                # ARGV[6]
+                5,
+                self.QUEUE_RATE_LIMITER(queue=task.queue),      # KEYS[1]
+                self.TASKS_BY_QUEUE(queue=task.queue),          # KEYS[2]
+                self.TASK_DETAILS(task_id=task.id),             # KEYS[3]
+                self.TASK_BY_TYPE_IDX(name=task.name),          # KEYS[4]
+                self.TASK_STATUS_IDX(status=task.status),       # KEYS[5]
+                earliest_time.timestamp(),                      # ARGV[1]
+                queue_config.rate_numerator or 0,               # ARGV[2]
+                task.submitted_at.timestamp(),                  # ARGV[3]
+                bytes(task.id),                                 # ARGV[4]
+                is_active,                                      # ARGV[5]
+                task.pack(),                                    # ARGV[6]
+                task.submitted_at.timestamp(),                  # ARGV[7]
             )
         )
         return result == 1
 
     def stage_save(self, pipe: Pipeline, task: Task) -> None:
-        """Queue SET task-details + type-index update onto pipe (no execute)."""
+        """Queue SET task-details + type-index + status-index updates onto pipe (no execute)."""
         pipe.set(self.TASK_DETAILS(task_id=task.id), task.pack())
         if task.status in TaskStatus.active_statuses():
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        if task._last_status is not None:
+            pipe.zrem(self.TASK_STATUS_IDX(status=task._last_status), bytes(task.id))
+        score = task.submitted_at.timestamp() if task.submitted_at else 0.0
+        pipe.zadd(self.TASK_STATUS_IDX(status=task.status), {bytes(task.id): score})
 
     def stage_requeue(self, pipe: Pipeline, task: Task) -> None:
         """Queue ZADD task-queue + save-task commands onto pipe (no execute)."""
@@ -388,29 +410,128 @@ class TaskAdapter:
         return does_exists == 1
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
-        if pagination.order_by == "submitted_at":
-            # tasks will be ordered by SUBMISSION time
-            task_ids = await self.data_store.zrangebyscore(
-                self.TASKS_BY_QUEUE(queue=pagination.queue),
-                pagination.start_param(), '+inf',
-                start=pagination.start_param(),
-                num=pagination.limit
-            )
+        # Map date bounds to score bounds used by both queue and status sorted sets
+        min_score: float = float(pagination.start_param())
+        max_score: float | str = "+inf"
+        if pagination.submitted_after:
+            min_score = max(min_score, pagination.submitted_after.timestamp())
+        if pagination.submitted_before:
+            max_score = pagination.submitted_before.timestamp()
+
+        task_id_bytes: list[bytes]
+        if pagination.status:
+            task_id_bytes = await self._query_via_status_index(pagination, min_score, max_score)
         else:
-            # tasks will be ordered by TASK ID, which is roughly creation time but not exactly
-            task_ids = await self.data_store.zrange(
-                self.TASKS_BY_QUEUE(queue=pagination.queue),
-                pagination.start_param(), int(dt.datetime.now(dt.UTC).timestamp()),
-                num=pagination.limit
-            )
-        if not task_ids:
+            task_id_bytes = await self._query_via_queue_sets(pagination, min_score, max_score)
+
+        if not task_id_bytes:
             return []
-        results: list[Task] = []
+
+        # Fetch task details concurrently
         # TODO: do some batching in case there are tons of tasks
+        results: list[Task] = []
         async with TaskGroup() as group:
-            for task_id in task_ids:
-                group.create_task(self._add_task_to_results(ULID(task_id), results))
-        return results
+            for raw_id in task_id_bytes:
+                group.create_task(self._add_task_to_results(ULID(raw_id), results))
+
+        # Sort and paginate
+        if pagination.order_by == PaginationOrder.SUBMITTED_AT:
+            results.sort(key=lambda t: t.submitted_at or dt.datetime.min.replace(tzinfo=dt.UTC))
+        else:
+            results.sort(key=lambda t: t.id)
+
+        return results[:pagination.limit]
+
+    async def _resolve_queues(self, pagination: TaskPagination) -> list[str] | None:
+        """Return the effective queue list, or None to mean 'all queues'."""
+        if pagination.queues:
+            return pagination.queues
+        if pagination.queue:
+            return [pagination.queue]
+        return None
+
+    async def _query_via_status_index(
+        self,
+        pagination: TaskPagination,
+        min_score: float,
+        max_score: float | str,
+    ) -> list[bytes]:
+        """
+        Use task-status-idx:{status} as the primary lookup set.
+
+        - All queues + status: ZRANGEBYSCORE on each status index, union IDs in Python.
+        - Single queue + status: ZINTERSTORE(queue_set, status_idx) → temp key.
+        - Multiple queues + status: ZUNIONSTORE(queue_sets) → ZINTERSTORE(status_idx) → temp key.
+        """
+        from uuid import uuid4
+
+        assert pagination.status  # noqa: S101
+
+        queue_list = await self._resolve_queues(pagination)
+
+        if queue_list is None:
+            # All queues: query each status index directly, no intersection needed
+            id_set: set[bytes] = set()
+            for status in pagination.status:
+                ids: list[bytes] = await self.data_store.zrangebyscore(
+                    self.TASK_STATUS_IDX(status=status), min_score, max_score
+                )
+                id_set.update(ids)
+            return list(id_set)
+
+        # Specific queues: intersect with each status index via a temp key
+        queue_keys = [self.TASKS_BY_QUEUE(queue=q) for q in queue_list]
+        id_set = set()
+
+        for status in pagination.status:
+            status_key = self.TASK_STATUS_IDX(status=status)
+            temp_key = f"_tmp:task-query:{uuid4().hex}"
+            pipe = self.data_store.pipeline()
+            if len(queue_keys) == 1:
+                pipe.zinterstore(temp_key, {queue_keys[0]: 1, status_key: 0})
+            else:
+                temp_union = f"{temp_key}:union"
+                pipe.zunionstore(temp_union, queue_keys)
+                pipe.zinterstore(temp_key, {temp_union: 1, status_key: 0})
+                pipe.expire(temp_union, 30)
+            pipe.expire(temp_key, 30)
+            await pipe.execute()
+
+            ids = await self.data_store.zrangebyscore(temp_key, min_score, max_score)
+            id_set.update(ids)
+            await self.data_store.delete(temp_key)
+
+        return list(id_set)
+
+    async def _query_via_queue_sets(
+        self,
+        pagination: TaskPagination,
+        min_score: float,
+        max_score: float | str,
+    ) -> list[bytes]:
+        """Use task-queues:{queue} sorted sets directly (no status filter)."""
+        queue_list = await self._resolve_queues(pagination)
+
+        if queue_list is None:
+            queue_bytes: set[bytes] = await cast(
+                "Awaitable[set[bytes]]",
+                self.data_store.smembers("all-queues"),
+            )
+            queue_list = [q.decode() for q in queue_bytes]
+
+        if not queue_list:
+            return []
+
+        all_ids: list[bytes] = []
+        for queue in queue_list:
+            if pagination.order_by == PaginationOrder.SUBMITTED_AT:
+                ids: list[bytes] = await self.data_store.zrangebyscore(
+                    self.TASKS_BY_QUEUE(queue=queue), min_score, max_score
+                )
+            else:
+                ids = await self.data_store.zrange(self.TASKS_BY_QUEUE(queue=queue), 0, -1)
+            all_ids.extend(ids)
+        return all_ids
 
     async def _add_task_to_results(self, task_id: ULID, results: list[Task]) -> list[Task]:
         task = await self.get_task(task_id)
@@ -443,13 +564,14 @@ class TaskAdapter:
 
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """
-        Delete task blobs, heartbeat entries, and type-index members for old terminal tasks.
+        Delete task blobs, heartbeat entries, type-index, and status-index members for old terminal tasks.
 
         Scans all ``task:*`` keys. For each task in a terminal status whose
         ``completed_at`` is older than ``max_age``, atomically removes:
           - ``task:{task_id}``
           - its entry in ``task-heartbeats:{queue}``
           - its entry in ``task-type-idx:{name}`` (safety net for stale orphans)
+          - its entry in ``task-status-idx:{status}``
         """
         terminal_statuses = {
             TaskStatus.COMPLETED,
@@ -479,7 +601,34 @@ class TaskAdapter:
             pipe.delete(key)
             pipe.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id))
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task_id))
+            pipe.zrem(self.TASK_STATUS_IDX(status=task.status), bytes(task_id))
             await pipe.execute()
+
+    async def rebuild_status_indexes(self) -> None:
+        """
+        Backfill task-status-idx:{status} from all existing task:* blobs.
+
+        Scans every ``task:*`` key and (re)inserts the task into the correct
+        ``task-status-idx:{status}`` sorted set using ``submitted_at`` as the
+        score (0 when not set).  Existing entries are overwritten in-place by
+        ZADD, so the operation is idempotent and safe to run on a live instance.
+        """
+        async for raw_key in self.data_store.scan_iter("task:*"):
+            key = raw_key if isinstance(raw_key, bytes) else raw_key.encode()
+            task_data: bytes | None = await self.data_store.get(key)
+            if task_data is None:
+                continue
+            key_str = key.decode()
+            task_id_str = key_str.removeprefix("task:")
+            try:
+                task_id = ULID.from_str(task_id_str)
+            except ValueError:
+                continue
+            task = Task.unpack(task_id, task_data)
+            score = task.submitted_at.timestamp() if task.submitted_at else 0.0
+            await self.data_store.zadd(
+                self.TASK_STATUS_IDX(status=task.status), {bytes(task_id): score}
+            )
 
     async def clean(self, queues: set[bytes], now: dt.datetime, min_queue_age: dt.datetime | None=None, max_queue_age: dt.datetime | None=None) -> None:
         """Clean up the state manager."""

@@ -9,7 +9,7 @@ import redis.asyncio as aioredis
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.models.task import Task
+from jobbers.models.task import Task, TaskAdapter, TaskPagination
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import StateManager
@@ -378,6 +378,274 @@ def test_task_in_registry(state_manager):
 
     # Now, the task should be removed from the registry
     assert task.id not in state_manager.current_tasks_by_queue[task.queue]
+
+# ── get_all_tasks ──────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_single_queue(redis):
+    """get_all_tasks returns only tasks from the specified queue."""
+    t1 = Task(id=ULID1, name="my_task", queue="queue1", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    t2 = Task(id=ULID2, name="my_task", queue="queue2", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+    await redis.zadd("task-queues:queue1", {ULID1.bytes: FROZEN_TIME.timestamp()})
+    await redis.zadd("task-queues:queue2", {ULID2.bytes: FROZEN_TIME.timestamp()})
+    await redis.sadd("all-queues", "queue1", "queue2")
+
+    ta = TaskAdapter(redis)
+    results = await ta.get_all_tasks(TaskPagination(queue="queue1"))
+
+    assert len(results) == 1
+    assert results[0].id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_multiple_queues(redis):
+    """get_all_tasks with queues list returns tasks from each listed queue."""
+    t1 = Task(id=ULID1, name="my_task", queue="queue1", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    t2 = Task(id=ULID2, name="my_task", queue="queue2", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+    await redis.zadd("task-queues:queue1", {ULID1.bytes: FROZEN_TIME.timestamp()})
+    await redis.zadd("task-queues:queue2", {ULID2.bytes: FROZEN_TIME.timestamp()})
+    await redis.sadd("all-queues", "queue1", "queue2")
+
+    ta = TaskAdapter(redis)
+    results = await ta.get_all_tasks(TaskPagination(queues=["queue1", "queue2"]))
+
+    ids = {r.id for r in results}
+    assert ids == {ULID1, ULID2}
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_all_queues(redis):
+    """get_all_tasks with no queue/queues returns tasks from all known queues."""
+    t1 = Task(id=ULID1, name="my_task", queue="queue1", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    t2 = Task(id=ULID2, name="my_task", queue="queue2", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+    await redis.zadd("task-queues:queue1", {ULID1.bytes: FROZEN_TIME.timestamp()})
+    await redis.zadd("task-queues:queue2", {ULID2.bytes: FROZEN_TIME.timestamp()})
+    await redis.sadd("all-queues", "queue1", "queue2")
+
+    ta = TaskAdapter(redis)
+    results = await ta.get_all_tasks(TaskPagination())
+
+    ids = {r.id for r in results}
+    assert ids == {ULID1, ULID2}
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_no_queues_registered(redis):
+    """get_all_tasks returns empty list when all-queues set is empty."""
+    ta = TaskAdapter(redis)
+    results = await ta.get_all_tasks(TaskPagination())
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_status_filter(redis):
+    """get_all_tasks with status filter returns only tasks matching that status."""
+    t1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    t2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.FAILED,
+              submitted_at=FROZEN_TIME)
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+    await redis.zadd("task-queues:default", {
+        ULID1.bytes: FROZEN_TIME.timestamp(),
+        ULID2.bytes: FROZEN_TIME.timestamp(),
+    })
+    # Status index must be populated for the status-filter path
+    await redis.zadd("task-status-idx:submitted", {ULID1.bytes: FROZEN_TIME.timestamp()})
+    await redis.zadd("task-status-idx:failed", {ULID2.bytes: FROZEN_TIME.timestamp()})
+    await redis.sadd("all-queues", "default")
+
+    ta = TaskAdapter(redis)
+    results = await ta.get_all_tasks(TaskPagination(status=[TaskStatus.FAILED]))
+
+    assert len(results) == 1
+    assert results[0].id == ULID2
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_submitted_after_filter(redis):
+    """get_all_tasks with submitted_after excludes tasks submitted before the cutoff."""
+    early = FROZEN_TIME - dt.timedelta(hours=2)
+    late = FROZEN_TIME
+
+    t1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+              submitted_at=early)
+    t2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+              submitted_at=late)
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+    await redis.zadd("task-queues:default", {
+        ULID1.bytes: early.timestamp(),
+        ULID2.bytes: late.timestamp(),
+    })
+    await redis.sadd("all-queues", "default")
+
+    ta = TaskAdapter(redis)
+    cutoff = FROZEN_TIME - dt.timedelta(hours=1)
+    results = await ta.get_all_tasks(TaskPagination(submitted_after=cutoff))
+
+    assert len(results) == 1
+    assert results[0].id == ULID2
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_submitted_before_filter(redis):
+    """get_all_tasks with submitted_before excludes tasks submitted after the cutoff."""
+    early = FROZEN_TIME - dt.timedelta(hours=2)
+    late = FROZEN_TIME
+
+    t1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+              submitted_at=early)
+    t2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+              submitted_at=late)
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+    await redis.zadd("task-queues:default", {
+        ULID1.bytes: early.timestamp(),
+        ULID2.bytes: late.timestamp(),
+    })
+    await redis.sadd("all-queues", "default")
+
+    ta = TaskAdapter(redis)
+    cutoff = FROZEN_TIME - dt.timedelta(hours=1)
+    results = await ta.get_all_tasks(TaskPagination(submitted_before=cutoff))
+
+    assert len(results) == 1
+    assert results[0].id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_limit(redis):
+    """get_all_tasks respects the limit even when more tasks are available."""
+    t1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME - dt.timedelta(seconds=2))
+    t2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+    await redis.zadd("task-queues:default", {
+        ULID1.bytes: (FROZEN_TIME - dt.timedelta(seconds=2)).timestamp(),
+        ULID2.bytes: FROZEN_TIME.timestamp(),
+    })
+    await redis.sadd("all-queues", "default")
+
+    ta = TaskAdapter(redis)
+    results = await ta.get_all_tasks(TaskPagination(limit=1))
+
+    assert len(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_status_and_queue_filter(redis):
+    """get_all_tasks with both queue and status uses the ZINTERSTORE path."""
+    t1 = Task(id=ULID1, name="my_task", queue="queue1", status=TaskStatus.FAILED,
+              submitted_at=FROZEN_TIME)
+    t2 = Task(id=ULID2, name="my_task", queue="queue2", status=TaskStatus.FAILED,
+              submitted_at=FROZEN_TIME)
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+    await redis.zadd("task-queues:queue1", {ULID1.bytes: FROZEN_TIME.timestamp()})
+    await redis.zadd("task-queues:queue2", {ULID2.bytes: FROZEN_TIME.timestamp()})
+    await redis.zadd("task-status-idx:failed", {
+        ULID1.bytes: FROZEN_TIME.timestamp(),
+        ULID2.bytes: FROZEN_TIME.timestamp(),
+    })
+    await redis.sadd("all-queues", "queue1", "queue2")
+
+    ta = TaskAdapter(redis)
+    # Filter to queue1 + FAILED — should only return ULID1
+    results = await ta.get_all_tasks(TaskPagination(queue="queue1", status=[TaskStatus.FAILED]))
+
+    assert len(results) == 1
+    assert results[0].id == ULID1
+
+
+# ── Status index maintenance ───────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_stage_save_populates_status_index(redis):
+    """stage_save adds the task to the correct task-status-idx sorted set."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+                submitted_at=FROZEN_TIME)
+    ta = TaskAdapter(redis)
+    pipe = redis.pipeline()
+    ta.stage_save(pipe, task)
+    await pipe.execute()
+
+    score = await redis.zscore("task-status-idx:submitted", ULID1.bytes)
+    assert score == FROZEN_TIME.timestamp()
+
+
+@pytest.mark.asyncio
+async def test_stage_save_moves_status_index_on_status_change(redis):
+    """stage_save removes the old status index entry and adds a new one when status changes."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+                submitted_at=FROZEN_TIME)
+    ta = TaskAdapter(redis)
+
+    # Initial save — task is SUBMITTED
+    pipe = redis.pipeline()
+    ta.stage_save(pipe, task)
+    await pipe.execute()
+    assert await redis.zscore("task-status-idx:submitted", ULID1.bytes) is not None
+
+    # Transition to STARTED
+    task.set_status(TaskStatus.STARTED)
+    pipe = redis.pipeline()
+    ta.stage_save(pipe, task)
+    await pipe.execute()
+
+    assert await redis.zscore("task-status-idx:submitted", ULID1.bytes) is None
+    assert await redis.zscore("task-status-idx:started", ULID1.bytes) is not None
+
+
+@pytest.mark.asyncio
+async def test_clean_terminal_tasks_removes_status_index(redis, state_manager):
+    """clean_terminal_tasks removes the task from task-status-idx:{status}."""
+    old_task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED,
+                    submitted_at=FROZEN_TIME - dt.timedelta(days=9),
+                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+    await redis.set(f"task:{ULID1}", old_task.pack())
+    await redis.zadd("task-status-idx:completed", {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=9)).timestamp()})
+    await redis.sadd("all-queues", "default")
+
+    with patch("datetime.datetime") as mock_datetime:
+        mock_datetime.now.return_value = FROZEN_TIME
+        await state_manager.clean(completed_task_age=dt.timedelta(days=7))
+
+    assert await redis.zscore("task-status-idx:completed", ULID1.bytes) is None
+
+
+@pytest.mark.asyncio
+async def test_rebuild_status_indexes(redis):
+    """rebuild_status_indexes backfills task-status-idx from task blobs."""
+    t1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
+              submitted_at=FROZEN_TIME)
+    t2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.FAILED,
+              submitted_at=FROZEN_TIME - dt.timedelta(hours=1))
+    await redis.set(f"task:{ULID1}", t1.pack())
+    await redis.set(f"task:{ULID2}", t2.pack())
+
+    ta = TaskAdapter(redis)
+    await ta.rebuild_status_indexes()
+
+    assert await redis.zscore("task-status-idx:submitted", ULID1.bytes) == FROZEN_TIME.timestamp()
+    assert await redis.zscore("task-status-idx:failed", ULID2.bytes) == (FROZEN_TIME - dt.timedelta(hours=1)).timestamp()
+    # Cross-check: wrong index is not populated
+    assert await redis.zscore("task-status-idx:failed", ULID1.bytes) is None
+
 
 if __name__ == "__main__":
     pytest.main(["-v", "test_state_manager.py"])
