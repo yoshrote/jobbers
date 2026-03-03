@@ -111,7 +111,7 @@ class StateManager:
                             pipe.zrem(self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
                             await pipe.execute()
 
-        asyncio.gather(*clean_ops)
+        await asyncio.gather(*clean_ops)
 
 
     async def get_next_task(self, queues: set[str], pop_timeout: int=0) -> Task | None:

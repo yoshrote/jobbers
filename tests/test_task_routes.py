@@ -12,7 +12,7 @@ from ulid import ULID
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, create_schema
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
-from jobbers.state_manager import TaskAdapter
+from jobbers.state_manager import StateManager, TaskAdapter
 from jobbers.task_routes import app
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -41,6 +41,13 @@ async def patch_sqlite():
         await QueueConfigAdapter(conn).save_queue_config(QueueConfig(name="default"))
         with patch("jobbers.validation.db.get_sqlite_conn", return_value=conn):
             yield conn
+
+@pytest_asyncio.fixture(autouse=True)
+async def patch_state_manager(redis_db, patch_sqlite):
+    """Provide a real StateManager backed by the test redis and sqlite connections."""
+    sm = StateManager(redis_db, patch_sqlite)
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=sm):
+        yield sm
 
 @pytest.mark.asyncio
 async def test_main_page(redis_db):
