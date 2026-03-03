@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
 import logging
 import os
+import sys
 from typing import TYPE_CHECKING
 
 from jobbers import db
@@ -61,10 +64,18 @@ async def main() -> None:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
 
-def run() -> None:
-    import importlib
-    import sys
+def _load_task_module(arg: str) -> None:
+    if os.path.isabs(arg) or arg.endswith(".py"):
+        spec = importlib.util.spec_from_file_location("_user_tasks", arg)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load task module from path: {arg}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["_user_tasks"] = module
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    else:
+        importlib.import_module(arg)
 
+def run() -> None:
     from jobbers.utils.otel import enable_otel
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
@@ -73,7 +84,6 @@ def run() -> None:
     # logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
     # register tasks
-    task_module = sys.argv[1]
-    importlib.import_module(task_module)
+    _load_task_module(sys.argv[1])
 
     asyncio.run(main(), debug=True)
