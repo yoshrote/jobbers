@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest:*)",
+      "Bash(mypy:*)",
+      "Bash(ruff check:*)",
+      "Bash(docker-compose ps:*)",
+      "Bash(docker run:*)",
+      "Bash(gh issue create:*)",
+      "Bash(grep:*)",
+      "Bash(gh api:*)",
+      "Bash(git checkout:*)",
+      "Bash(pip install:*)"
+    ]
+  }
+}

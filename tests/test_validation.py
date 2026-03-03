@@ -1,15 +1,38 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
+import fakeredis
 import pytest
+import pytest_asyncio
 from ulid import ULID
 
-from jobbers.models.queue_config import QueueConfig
+from jobbers.models.queue_config import QueueConfig, create_schema
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
+from jobbers.state_manager import StateManager
 from jobbers.validation import ValidationError, validate_task
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 
+@pytest_asyncio.fixture(autouse=True)
+async def redis():
+    """Fixture to reset the tasks in the mocked Redis before each test."""
+    fake_store = fakeredis.aioredis.FakeRedis()
+    yield fake_store
+    await fake_store.aclose()
+
+@pytest_asyncio.fixture
+async def sqlite_conn():
+    """In-memory SQLite connection with schema applied."""
+    async with aiosqlite.connect(":memory:") as conn:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await create_schema(conn)
+        yield conn
+
+@pytest_asyncio.fixture
+async def state_manager(redis, sqlite_conn):
+    """Fixture to provide a StateManager instance with a fake Redis and in-memory SQLite."""
+    return StateManager(redis, sqlite_conn)
 
 @pytest.mark.asyncio
 async def test_validate_task_unregistered():
@@ -44,9 +67,10 @@ async def test_validate_task_valid_sets_task_config():
     task = Task(id=ULID1, name="Test Task", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
-            MockAdapter.return_value.get_queue_config = AsyncMock(return_value=queue_config)
-            await validate_task(task)
+        with patch("jobbers.validation.db.get_sqlite_conn", return_value=MagicMock()):
+            with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
+                MockAdapter.return_value.get_queue_config = AsyncMock(return_value=queue_config)
+                await validate_task(task)
 
     assert task.task_config is task_config
 
@@ -61,7 +85,8 @@ async def test_validate_task_missing_queue_config():
     task = Task(id=ULID1, name="Test Task", queue="unknown-queue", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
-            MockAdapter.return_value.get_queue_config = AsyncMock(return_value=None)
-            with pytest.raises(ValidationError, match="Unknown queue unknown-queue"):
-                await validate_task(task)
+        with patch("jobbers.validation.db.get_sqlite_conn", return_value=MagicMock()):
+            with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
+                MockAdapter.return_value.get_queue_config = AsyncMock(return_value=None)
+                with pytest.raises(ValidationError, match="Unknown queue unknown-queue"):
+                    await validate_task(task)

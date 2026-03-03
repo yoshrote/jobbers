@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
 
-from jobbers.db import get_state_manager
+from jobbers import db
 
 if TYPE_CHECKING:
     from jobbers.state_manager import StateManager
@@ -33,7 +33,7 @@ dispatch_latency = meter.create_histogram(
 
 
 async def main(poll_interval: float, role: str, batch_size: int) -> None:
-    state_manager: StateManager = get_state_manager()
+    state_manager: StateManager = await db.init_state_manager()
     queues: list[str] = list(await state_manager.qca.get_queues(role))
     logger.info("Scheduler starting; poll_interval=%.1fs batch_size=%d", poll_interval, batch_size)
     while True:

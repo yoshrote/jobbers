@@ -1,16 +1,13 @@
-import asyncio
+from __future__ import annotations
+
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic import BaseModel
-from redis.asyncio import Redis
-
-from jobbers.utils.serialization import NONE, deserialize
+from ulid import ULID
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
-    from redis.asyncio.client import Pipeline
+    import aiosqlite
 
 
 class RatePeriod(StrEnum):
@@ -21,35 +18,17 @@ class RatePeriod(StrEnum):
     HOUR = "hour"
     DAY = "day"
 
-    @classmethod
-    def from_bytes(cls, value: bytes | None) -> Self | None:
-        if value is None:
-            return None
-        period_str = value.decode()
-        try:
-            return cls(period_str)
-        except ValueError:
-            # TODO: Swallowing bad data may not be the best approach
-            return None
-
-    def to_bytes(self) -> bytes:
-        return self.value.encode()
 
 class QueueConfig(BaseModel):
     """Configuration for a task queue."""
 
     name: str  # Name of the queue
     max_concurrent: int | None = 10  # Maximum number of concurrent tasks that can be processed from this queue
-    # max_tasks_per_worker: int | None = None  # Maximum number of tasks a worker can process before shutting down
-    # task_timeout: int | None = None  # Timeout for tasks in this queue in seconds, if applicable
-    # retry_delay: dt.timedelta = dt.timedelta(seconds=5)  # Delay before retrying failed tasks in this queue
-    # backoff_strategy: str = "exponential"  # Backoff strategy for retries (e.g., "exponential", "linear")
-    # retry_delay: dt.timedelta = dt.timedelta(seconds=5)  # Delay before retrying the task
     # Rate limiting is {task_number} tasks every {rate_number} {rate_period}
-    #  e.g. 5 tasks every 2 minutea
+    #  e.g. 5 tasks every 2 minutes
     rate_numerator: int | None = None  # Number of tasks to process from this queue
     rate_denominator: int | None = None  # Number of tasks to rate limit
-    rate_period: RatePeriod | None = None  # Period for rate limiting in seconds
+    rate_period: RatePeriod | None = None  # Period for rate limiting
 
     def period_in_seconds(self) -> int | None:
         """Convert the rate period to seconds."""
@@ -66,82 +45,167 @@ class QueueConfig(BaseModel):
                 return 86400 * self.rate_denominator
 
     @classmethod
-    def from_redis(cls, name: str, raw_task_data: dict[bytes, bytes]) -> Self:
+    def from_row(cls, row: Any) -> Self:
+        """Construct from a sqlite3 row (name, max_concurrent, rate_numerator, rate_denominator, rate_period)."""
+        name, max_concurrent, rate_numerator, rate_denominator, rate_period = row
         return cls(
             name=name,
-            max_concurrent=int(raw_mc) if (raw_mc := raw_task_data.get(b"max_concurrent")) else None,
-            rate_numerator=deserialize(raw_task_data.get(b"rate_numerator") or NONE),
-            rate_denominator=deserialize(raw_task_data.get(b"rate_denominator") or NONE),
-            rate_period=RatePeriod.from_bytes(raw_task_data.get(b"rate_period")),
-            # max_tasks_per_worker=int(raw_task_data.get(b"max_tasks_per_worker", b"0")),
-            # task_timeout=int(raw_task_data.get(b"task_timeout", b"0")),
-            # retry_delay=dt.timedelta(seconds=int(raw_task_data.get(b"retry_delay", b"5"))),
-            # backoff_strategy=raw_task_data.get(b"backoff_strategy", b"exponential").decode(),
+            max_concurrent=max_concurrent,
+            rate_numerator=rate_numerator,
+            rate_denominator=rate_denominator,
+            rate_period=RatePeriod(rate_period) if rate_period else None,
         )
+
+
+async def create_schema(conn: aiosqlite.Connection) -> None:
+    """Create tables and indexes for queue/role configuration."""
+    await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS roles (
+            name        TEXT PRIMARY KEY,
+            refresh_tag TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS queues (
+            name             TEXT PRIMARY KEY,
+            max_concurrent   INTEGER,
+            rate_numerator   INTEGER,
+            rate_denominator INTEGER,
+            rate_period      TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS role_queues (
+            role  TEXT NOT NULL REFERENCES roles(name)  ON DELETE CASCADE,
+            queue TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
+            PRIMARY KEY (role, queue)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_roles_refresh_tag ON roles (refresh_tag);
+        CREATE INDEX IF NOT EXISTS idx_role_queues_role_queue ON role_queues (role, queue);
+    """)
+    await conn.commit()
+
 
 class QueueConfigAdapter:
     """
-    Manages queue configuration in a Redis data store.
+    Manages queue configuration in a SQLite data store.
 
-    - `worker-queues:<role>`: Set of queues for a given role, used to manage which queues are available for task submission.
-    - `queue-config:<queue>`: Hash of queue configuration data which is shared for by all roles using this queue
-    - `all_queues`: a list of all queues used across all roles.
+    - `roles`: table of named roles, each with a refresh_tag for change detection.
+    - `queues`: table of queue configurations (concurrency and rate limiting).
+    - `role_queues`: many-to-many mapping of roles to queues.
     """
 
-    QUEUES_BY_ROLE = "worker-queues:{role}".format
-    QUEUE_CONFIG = "queue-config:{queue}".format
-    ALL_QUEUES = "all-queues"
-
-    def __init__(self, data_store: Redis) -> None:
-        self.data_store: Redis = data_store
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        self.conn = conn
 
     async def get_queues(self, role: str) -> set[str]:
-        return {role.decode() for role in await cast("Awaitable[set[bytes]]", self.data_store.smembers(self.QUEUES_BY_ROLE(role=role)))}
+        async with self.conn.execute(
+            "SELECT queue FROM role_queues WHERE role = ?", (role,)
+        ) as cursor:
+            return {row[0] for row in await cursor.fetchall()}
 
     async def set_queues(self, role: str, queues: set[str]) -> None:
-        pipe: Pipeline = self.data_store.pipeline(transaction=True)
-        pipe.delete(self.QUEUES_BY_ROLE(role=role))
-        pipe.sadd(self.ALL_QUEUES, *queues)
-        pipe.sadd(self.QUEUES_BY_ROLE(role=role), *queues)
-        await pipe.execute()
+        new_tag = str(ULID())
+        async with self.conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO roles (name, refresh_tag) VALUES (?, ?)"
+                " ON CONFLICT(name) DO UPDATE SET refresh_tag = excluded.refresh_tag",
+                (role, new_tag),
+            )
+            await cur.execute("DELETE FROM role_queues WHERE role = ?", (role,))
+            if queues:
+                await cur.executemany(
+                    "INSERT OR IGNORE INTO role_queues (role, queue) VALUES (?, ?)",
+                    [(role, q) for q in queues],
+                )
+        await self.conn.commit()
 
     async def get_all_queues(self) -> list[str]:
-        # find the union of the queues for all roles
-        # this query approach is not ideal for large numbers of roles or queues
-        roles = await self.get_all_roles()
-        if not roles:
-            return []
-
-        return [
-            queue.decode()
-            for queue in await cast("Awaitable[list[bytes]]", self.data_store.sunion(
-                [self.QUEUES_BY_ROLE(role=role) for role in roles]
-            ))
-        ]
+        async with self.conn.execute("SELECT name FROM queues ORDER BY name") as cursor:
+            return [row[0] for row in await cursor.fetchall()]
 
     async def get_all_roles(self) -> list[str]:
-        roles = []
-        async for key in self.data_store.scan_iter(match=self.QUEUES_BY_ROLE(role="*").encode()):
-            roles.append(key.decode().split(":")[1])
-        return roles
+        async with self.conn.execute("SELECT name FROM roles ORDER BY name") as cursor:
+            return [row[0] for row in await cursor.fetchall()]
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
-        raw_data: dict[bytes, Any] = await cast(
-            "Awaitable[dict[bytes, Any]]",
-            self.data_store.hgetall(self.QUEUE_CONFIG(queue=queue))
-        )  # Ensure the queue config exists in the store
-        if not raw_data:
+        async with self.conn.execute(
+            "SELECT name, max_concurrent, rate_numerator, rate_denominator, rate_period"
+            " FROM queues WHERE name = ?",
+            (queue,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
             return None
-        return QueueConfig.from_redis(queue, raw_data)
+        return QueueConfig.from_row(row)
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        await self.conn.execute(
+            "INSERT INTO queues (name, max_concurrent, rate_numerator, rate_denominator, rate_period)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(name) DO UPDATE SET"
+            "   max_concurrent   = excluded.max_concurrent,"
+            "   rate_numerator   = excluded.rate_numerator,"
+            "   rate_denominator = excluded.rate_denominator,"
+            "   rate_period      = excluded.rate_period",
+            (
+                queue_config.name,
+                queue_config.max_concurrent,
+                queue_config.rate_numerator,
+                queue_config.rate_denominator,
+                queue_config.rate_period,
+            ),
+        )
+        await self.conn.commit()
+
+    async def delete_queue(self, queue_name: str) -> None:
+        """Delete a queue and cascade to role_queues; bump refresh_tag for affected roles."""
+        new_tag = str(ULID())
+        async with self.conn.cursor() as cur:
+            # Collect roles that reference this queue before deleting
+            await cur.execute("SELECT DISTINCT role FROM role_queues WHERE queue = ?", (queue_name,))
+            affected_roles = [row[0] for row in await cur.fetchall()]
+            await cur.execute("DELETE FROM queues WHERE name = ?", (queue_name,))
+            if affected_roles:
+                await cur.executemany(
+                    "UPDATE roles SET refresh_tag = ? WHERE name = ?",
+                    [(new_tag, r) for r in affected_roles],
+                )
+        await self.conn.commit()
+
+    async def delete_role(self, role: str) -> None:
+        """Delete a role (cascades to role_queues). Queue configs are preserved."""
+        await self.conn.execute("DELETE FROM roles WHERE name = ?", (role,))
+        await self.conn.commit()
 
     async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
-        # TODO: replace with a redis query
-        queue_list = list(queues)
-        configs: list[QueueConfig | None] = list(
-            await asyncio.gather(*(self.get_queue_config(q) for q in queue_list))
-        )
-        return {
-            queue: conf.max_concurrent if conf is not None else None
-            for queue, conf in zip(queue_list, configs)
-        }
+        if not queues:
+            return {}
+        placeholders = ",".join("?" * len(queues))
+        async with self.conn.execute(
+            f"SELECT name, max_concurrent FROM queues WHERE name IN ({placeholders})",
+            list(queues),
+        ) as cursor:
+            found = {row[0]: row[1] for row in await cursor.fetchall()}
+        return {q: found.get(q) for q in queues}
 
+    async def get_refresh_tag(self, role: str) -> ULID:
+        """Return the current refresh tag for a role, creating one if needed."""
+        async with self.conn.execute(
+            "SELECT refresh_tag FROM roles WHERE name = ?", (role,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            return cast("ULID", ULID.from_str(row[0]))
+
+        init_tag = ULID()
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO roles (name, refresh_tag) VALUES (?, ?)",
+            (role, str(init_tag)),
+        )
+        await self.conn.commit()
+        # Re-read in case another process won the race
+        async with self.conn.execute(
+            "SELECT refresh_tag FROM roles WHERE name = ?", (role,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return ULID.from_str(row[0]) if row else init_tag

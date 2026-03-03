@@ -36,7 +36,7 @@ async def test_scheduler_dispatches_due_task():
         sleep_calls.append(interval)
         raise asyncio.CancelledError  # stop the loop after first idle
 
-    with patch("jobbers.runners.scheduler_proc.get_state_manager", return_value=state_manager), \
+    with patch("jobbers.runners.scheduler_proc.db.init_state_manager", return_value=state_manager), \
          patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep):
         try:
             await main(poll_interval=1.0, role="default", batch_size=1)
@@ -59,7 +59,7 @@ async def test_scheduler_sleeps_when_no_task():
         sleep_calls.append(interval)
         raise asyncio.CancelledError  # stop after first sleep
 
-    with patch("jobbers.runners.scheduler_proc.get_state_manager", return_value=state_manager), \
+    with patch("jobbers.runners.scheduler_proc.db.init_state_manager", return_value=state_manager), \
          patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep):
         try:
             await main(poll_interval=7.5, role="default", batch_size=1)
@@ -81,7 +81,7 @@ async def test_scheduler_runs_multiple_iterations():
     async def fake_sleep(interval: float) -> None:
         raise asyncio.CancelledError  # stop on first idle
 
-    with patch("jobbers.runners.scheduler_proc.get_state_manager", return_value=state_manager), \
+    with patch("jobbers.runners.scheduler_proc.db.init_state_manager", return_value=state_manager), \
          patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep):
         try:
             await main(poll_interval=1.0, role="default", batch_size=1)
@@ -106,7 +106,7 @@ async def test_scheduler_uses_env_var_poll_interval(monkeypatch):
 
     import os
 
-    with patch("jobbers.runners.scheduler_proc.get_state_manager", return_value=state_manager), \
+    with patch("jobbers.runners.scheduler_proc.db.init_state_manager", return_value=state_manager), \
          patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep):
         try:
             poll_interval = float(os.environ.get("SCHEDULER_POLL_INTERVAL", "5.0"))
