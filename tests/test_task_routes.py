@@ -2,12 +2,14 @@ import datetime as dt
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 import fakeredis
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from ulid import ULID
 
+from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, create_schema
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.state_manager import TaskAdapter
@@ -29,6 +31,16 @@ async def redis_db():
 def patch_redis(redis_db):
      with patch("jobbers.task_routes.db.get_client", return_value=redis_db):
          yield
+
+@pytest_asyncio.fixture(autouse=True)
+async def patch_sqlite():
+    """Provide an in-memory SQLite DB with a 'default' queue for validation."""
+    async with aiosqlite.connect(":memory:") as conn:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await create_schema(conn)
+        await QueueConfigAdapter(conn).save_queue_config(QueueConfig(name="default"))
+        with patch("jobbers.validation.db.get_sqlite_conn", return_value=conn):
+            yield conn
 
 @pytest.mark.asyncio
 async def test_main_page(redis_db):
@@ -59,7 +71,6 @@ async def test_submit_valid_task(redis_db):
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
 
-    await redis_db.hset("queue-config:default", mapping={b"max_concurrent": b"10"})
     with patch("jobbers.registry.get_task_config", return_value=test_task_config):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))

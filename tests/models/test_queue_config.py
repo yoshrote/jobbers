@@ -1,30 +1,31 @@
-import fakeredis.aioredis as fakeredis
+import aiosqlite
 import pytest
 import pytest_asyncio
 
-from jobbers.models.queue_config import QueueConfig, RatePeriod
-from jobbers.state_manager import QueueConfigAdapter
-from jobbers.utils.serialization import serialize
+from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, RatePeriod, create_schema
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def redis():
-    """Fixture to reset the tasks in the mocked Redis before each test."""
-    fake_store = fakeredis.FakeRedis()
-    yield fake_store
-    await fake_store.close()
+@pytest_asyncio.fixture
+async def conn():
+    """In-memory SQLite connection with the queue/role schema applied."""
+    async with aiosqlite.connect(":memory:") as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await create_schema(db)
+        yield db
+
 
 @pytest.fixture
-def queue_config_adapter(redis):
-    """Fixture to provide a QueueConfigAdapter instance with a fake Redis data store."""
-    return QueueConfigAdapter(redis)
+def queue_config_adapter(conn):
+    return QueueConfigAdapter(conn)
 
+
+# ---------------------------------------------------------------------------
+# RatePeriod
+# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(("rate_period", "rate_denominator", "expected_seconds"), [
-    # bad configurations
     (None, 1, None),
     (RatePeriod.SECOND, None, None),
-    # real configurations
     (RatePeriod.SECOND, 1, 1),
     (RatePeriod.MINUTE, 1, 60),
     (RatePeriod.HOUR, 1, 3600),
@@ -38,222 +39,157 @@ def test_period_in_seconds(rate_period, rate_denominator, expected_seconds):
     )
     assert config.period_in_seconds() == expected_seconds
 
-@pytest.mark.parametrize(("input_value", "expected_result"), [
-    (None, None),  # Test with None input
-    (b"second", RatePeriod.SECOND),  # Valid input for SECOND
-    (b"minute", RatePeriod.MINUTE),  # Valid input for MINUTE
-    (b"hour", RatePeriod.HOUR),  # Valid input for HOUR
-    (b"day", RatePeriod.DAY),  # Valid input for DAY
-    (b"invalid", None),  # Invalid input
-])
-def test_from_bytes(input_value, expected_result):
-    assert RatePeriod.from_bytes(input_value) == expected_result
 
-@pytest.mark.parametrize(("rate_period", "expected_bytes"), [
-    (RatePeriod.SECOND, b"second"),
-    (RatePeriod.MINUTE, b"minute"),
-    (RatePeriod.HOUR, b"hour"),
-    (RatePeriod.DAY, b"day"),
-])
-def test_to_bytes(rate_period, expected_bytes):
-    assert rate_period.to_bytes() == expected_bytes
-
+# ---------------------------------------------------------------------------
+# get_queues / set_queues
+# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_get_queues(redis, queue_config_adapter):
-    """Test retrieving queues for a specific role."""
-    # Add queues for a role
-    await redis.sadd("worker-queues:role1", "queue1", "queue2")
-    # Retrieve queues
+async def test_get_queues(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
+    await queue_config_adapter.set_queues("role1", {"queue1", "queue2"})
     queues = await queue_config_adapter.get_queues("role1")
-    assert set(queues) == {"queue1", "queue2"}
+    assert queues == {"queue1", "queue2"}
+
 
 @pytest.mark.asyncio
-async def test_get_queues_empty(redis, queue_config_adapter):
-    """Test retrieving queues for a role with no queues."""
+async def test_get_queues_empty(queue_config_adapter):
     queues = await queue_config_adapter.get_queues("role1")
     assert queues == set()
 
-@pytest.mark.asyncio
-async def test_set_queues(redis, queue_config_adapter):
-    """Test setting queues for a specific role."""
-    # Set queues for a role
-    await queue_config_adapter.set_queues("role1", {"queue1", "queue2"})
-    # Verify the queues were set
-    queues = await redis.smembers("worker-queues:role1")
-    assert set(queues) == {b"queue1", b"queue2"}
-    all_queues = await redis.smembers("all-queues")
-    assert set(all_queues) == {b"queue1", b"queue2"}
 
 @pytest.mark.asyncio
-async def test_get_all_queues(redis, queue_config_adapter):
-    """Test retrieving all queues across roles."""
-    # Add queues for multiple roles
-    await redis.sadd("worker-queues:role1", "queue1", "queue2")
-    await redis.sadd("worker-queues:role2", "queue3")
-    # Retrieve all queues
+async def test_set_queues(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
+    await queue_config_adapter.set_queues("role1", {"queue1", "queue2"})
+    queues = await queue_config_adapter.get_queues("role1")
+    assert queues == {"queue1", "queue2"}
+
+
+@pytest.mark.asyncio
+async def test_set_queues_replaces_existing(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue3"))
+    await queue_config_adapter.set_queues("role1", {"queue1", "queue2"})
+    await queue_config_adapter.set_queues("role1", {"queue3"})
+    queues = await queue_config_adapter.get_queues("role1")
+    assert queues == {"queue3"}
+
+
+# ---------------------------------------------------------------------------
+# get_all_queues
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_all_queues(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue3"))
     queues = await queue_config_adapter.get_all_queues()
     assert set(queues) == {"queue1", "queue2", "queue3"}
 
+
 @pytest.mark.asyncio
-async def test_get_all_queues_empty(redis, queue_config_adapter):
-    """Test retrieving all queues when no queues exist."""
+async def test_get_all_queues_empty(queue_config_adapter):
     queues = await queue_config_adapter.get_all_queues()
     assert queues == []
 
+
+# ---------------------------------------------------------------------------
+# get_all_roles
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
-async def test_get_all_roles(redis, queue_config_adapter):
-    """Test retrieving all roles."""
-    # Add roles with queues
-    await redis.sadd("worker-queues:role1", "queue1")
-    await redis.sadd("worker-queues:role2", "queue2")
-    # Retrieve all roles
+async def test_get_all_roles(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
+    await queue_config_adapter.set_queues("role1", {"queue1"})
+    await queue_config_adapter.set_queues("role2", {"queue2"})
     roles = await queue_config_adapter.get_all_roles()
     assert set(roles) == {"role1", "role2"}
 
+
 @pytest.mark.asyncio
 async def test_get_all_roles_empty(queue_config_adapter):
-    """Test retrieving all roles when no roles exist."""
     roles = await queue_config_adapter.get_all_roles()
     assert roles == []
 
+
+# ---------------------------------------------------------------------------
+# get_queue_limits
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
 async def test_get_queue_limits_empty_set(queue_config_adapter):
-    """Test get_queue_limits with an empty set of queues."""
     result = await queue_config_adapter.get_queue_limits(set())
     assert result == {}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_single_queue_with_limit(redis, queue_config_adapter):
-    """Test get_queue_limits with a single queue that has max_concurrent set."""
-    # Set up queue config in Redis
-    await redis.hset("queue-config:test_queue", mapping={
-        "max_concurrent": "5",
-        "rate_numerator": serialize(None),
-        "rate_denominator": serialize(None),
-        "rate_period": ""
-    })
-
+async def test_get_queue_limits_single_queue_with_limit(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="test_queue", max_concurrent=5))
     result = await queue_config_adapter.get_queue_limits({"test_queue"})
     assert result == {"test_queue": 5}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_single_queue_no_limit(redis, queue_config_adapter):
-    """Test get_queue_limits with a queue that has no max_concurrent limit."""
-    # Set up queue config in Redis with no max_concurrent
-    await redis.hset("queue-config:unlimited_queue", mapping={
-        "rate_numerator": serialize(None),
-        "rate_denominator": serialize(None),
-        "rate_period": ""
-    })
-
+async def test_get_queue_limits_single_queue_no_limit(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="unlimited_queue", max_concurrent=None))
     result = await queue_config_adapter.get_queue_limits({"unlimited_queue"})
-    assert result == {"unlimited_queue": None}  # None means no limit
+    assert result == {"unlimited_queue": None}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_single_queue_zero_limit(redis, queue_config_adapter):
-    """Test get_queue_limits with a queue that has max_concurrent set to 0."""
-    # Set up queue config in Redis
-    await redis.hset("queue-config:zero_limit_queue", mapping={
-        "max_concurrent": "0",
-        "rate_numerator": serialize(None),
-        "rate_denominator": serialize(None),
-        "rate_period": ""
-    })
-
+async def test_get_queue_limits_single_queue_zero_limit(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="zero_limit_queue", max_concurrent=0))
     result = await queue_config_adapter.get_queue_limits({"zero_limit_queue"})
     assert result == {"zero_limit_queue": 0}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_multiple_queues(redis, queue_config_adapter):
-    """Test get_queue_limits with multiple queues having different limits."""
-    # Set up multiple queue configs in Redis
-    await redis.hset("queue-config:queue1", mapping={
-        "max_concurrent": "3",
-        "rate_numerator": serialize(None),
-        "rate_denominator": serialize(None),
-        "rate_period": ""
-    })
-
-    await redis.hset("queue-config:queue2", mapping={
-        "max_concurrent": "10",
-        "rate_numerator": serialize(None),
-        "rate_denominator": serialize(None),
-        "rate_period": ""
-    })
-
-    await redis.hset("queue-config:queue3", mapping={
-        "max_concurrent": "1",
-        "rate_numerator": serialize(None),
-        "rate_denominator": serialize(None),
-        "rate_period": ""
-    })
-
+async def test_get_queue_limits_multiple_queues(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue1", max_concurrent=3))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue2", max_concurrent=10))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="queue3", max_concurrent=1))
     result = await queue_config_adapter.get_queue_limits({"queue1", "queue2", "queue3"})
-    expected = {"queue1": 3, "queue2": 10, "queue3": 1}
-    assert result == expected
+    assert result == {"queue1": 3, "queue2": 10, "queue3": 1}
 
 
 @pytest.mark.asyncio
 async def test_get_queue_limits_with_nonexistent_queue(queue_config_adapter):
-    """Test get_queue_limits with a queue that doesn't exist in Redis."""
     result = await queue_config_adapter.get_queue_limits({"nonexistent_queue"})
-    assert result == {"nonexistent_queue": None}  # No config means no limit
+    assert result == {"nonexistent_queue": None}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_mixed_existing_and_nonexistent(redis, queue_config_adapter):
-    """Test get_queue_limits with a mix of existing and non-existing queues."""
-    # Set up one queue config
-    await redis.hset("queue-config:existing_queue", mapping={
-        "max_concurrent": "7",
-        "rate_numerator": serialize(None),
-        "rate_denominator": serialize(None),
-        "rate_period": ""
-    })
-
+async def test_get_queue_limits_mixed_existing_and_nonexistent(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="existing_queue", max_concurrent=7))
     result = await queue_config_adapter.get_queue_limits({"existing_queue", "nonexistent_queue"})
-    expected = {"existing_queue": 7, "nonexistent_queue": None}
-    assert result == expected
+    assert result == {"existing_queue": 7, "nonexistent_queue": None}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_with_rate_limiting_config(redis, queue_config_adapter):
-    """Test get_queue_limits with queues that have rate limiting configured (should still return max_concurrent)."""
-    # Set up queue config with rate limiting
-    await redis.hset("queue-config:rate_limited_queue", mapping={
-        "max_concurrent": "15",
-        "rate_numerator": serialize(5),
-        "rate_denominator": serialize(2),
-        "rate_period": "minute"
-    })
-
+async def test_get_queue_limits_with_rate_limiting_config(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(
+        name="rate_limited_queue",
+        max_concurrent=15,
+        rate_numerator=5,
+        rate_denominator=2,
+        rate_period=RatePeriod.MINUTE,
+    ))
     result = await queue_config_adapter.get_queue_limits({"rate_limited_queue"})
     assert result == {"rate_limited_queue": 15}
 
 
 @pytest.mark.asyncio
-async def test_get_queue_limits_large_number_of_queues(redis, queue_config_adapter):
-    """Test get_queue_limits with a large number of queues to ensure it handles concurrency well."""
+async def test_get_queue_limits_large_number_of_queues(queue_config_adapter):
     queue_names = [f"queue_{i}" for i in range(20)]
-
-    # Set up configs for all queues
-    for i, queue_name in enumerate(queue_names):
-        await redis.hset(f"queue-config:{queue_name}", mapping={
-            "max_concurrent": str(i + 1),  # Different limit for each queue
-            "rate_numerator": serialize(None),
-            "rate_denominator": serialize(None),
-            "rate_period": ""
-        })
-
+    for i, name in enumerate(queue_names):
+        await queue_config_adapter.save_queue_config(QueueConfig(name=name, max_concurrent=i + 1))
     result = await queue_config_adapter.get_queue_limits(set(queue_names))
-
-    # Verify all queues are present with correct limits
     assert len(result) == 20
-    for i, queue_name in enumerate(queue_names):
-        expected_limit = i + 1
-        assert result[queue_name] == expected_limit
+    for i, name in enumerate(queue_names):
+        assert result[name] == i + 1
