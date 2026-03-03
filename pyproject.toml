@@ -42,6 +42,7 @@ dependencies = [
     "redis",
     "python_on_whales",
     "msgpack",
+    "aiosqlite",
     "python-ulid[pydantic]",
     "asyncio-taskpool",
     "msgpack-types",
@@ -49,7 +50,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "fakeredis",
+    "fakeredis[lua]",
     "httpx",
     "pytest",
     "pytest-asyncio",
