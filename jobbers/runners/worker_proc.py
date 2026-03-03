@@ -5,7 +5,7 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
-from jobbers.db import get_state_manager
+from jobbers import db
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
 
@@ -27,7 +27,7 @@ async def main() -> None:
     num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
     role = os.environ.get("WORKER_ROLE", "default")
     worker_ttl = int(os.environ.get("WORKER_TTL", 50)) # if 0, will run indefinitely
-    state_manager = get_state_manager()
+    state_manager = await db.init_state_manager()
     task_generator = TaskGenerator(state_manager, state_manager.qca, role, max_tasks=worker_ttl)
     await task_generator.queues() # warm up the refresh tag once
 

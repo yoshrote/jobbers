@@ -8,7 +8,6 @@ from fastapi.staticfiles import StaticFiles
 
 ENABLE_OTEL = True
 def run() -> None:
-    from jobbers import db
     from jobbers.task_routes import app
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
@@ -22,10 +21,6 @@ def run() -> None:
 
     logging.basicConfig(level=logging.INFO, handlers=handlers)
     logging.getLogger("jobbers").setLevel(logging.DEBUG)
-
-
-    # Initialize the database client
-    db.get_client()
 
     # register tasks so we can validate submitted task signatures
     task_module = sys.argv[1]

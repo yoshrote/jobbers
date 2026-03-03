@@ -1,14 +1,14 @@
+from __future__ import annotations
+
+import asyncio
 import datetime as dt
 import logging
 from collections import defaultdict
-from collections.abc import Awaitable, Iterator
 from contextlib import contextmanager
-from typing import cast
+from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
-from redis.asyncio.client import Redis
 from redis.exceptions import WatchError
-from ulid import ULID
 
 from jobbers import registry
 from jobbers.models.dead_queue import DeadQueue
@@ -17,6 +17,13 @@ from jobbers.models.task import Task, TaskAdapter
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    import aiosqlite
+    from redis.asyncio.client import Redis
+    from ulid import ULID
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -36,11 +43,11 @@ class UserCancellationError(Exception):
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
 
-    def __init__(self, data_store: Redis) -> None:
+    def __init__(self, data_store: Redis, sqlite_conn: aiosqlite.Connection) -> None:
         self.data_store: Redis = data_store
-        self.qca = QueueConfigAdapter(data_store)
+        self.qca = QueueConfigAdapter(sqlite_conn)
         self.ta = TaskAdapter(data_store)
-        self.submission_limiter = SubmissionRateLimiter(self.qca)
+        self.submission_limiter = SubmissionRateLimiter(data_store, self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self.dead_queue = DeadQueue(data_store)
         self.task_scheduler = TaskScheduler(data_store)
@@ -71,13 +78,20 @@ class StateManager:
     ) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.UTC)
-        queues = await cast("Awaitable[set[bytes]]", self.data_store.smembers(self.qca.ALL_QUEUES))
+        queues = {q.encode() for q in await self.qca.get_all_queues()}
 
+        clean_ops = []
         if rate_limit_age:
-            await self.submission_limiter.clean(queues, now, rate_limit_age)
+            clean_ops.append(self.submission_limiter.clean(queues, now, rate_limit_age))
 
         if max_queue_age or min_queue_age:
-            await self.ta.clean(queues, now, min_queue_age, max_queue_age)
+            clean_ops.append(self.ta.clean(queues, now, min_queue_age, max_queue_age))
+
+        if dlq_age:
+            clean_ops.append(self.dead_queue.clean(now - dlq_age))
+
+        if completed_task_age:
+            clean_ops.append(self.ta.clean_terminal_tasks(now, completed_task_age))
 
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
@@ -97,27 +111,8 @@ class StateManager:
                             pipe.zrem(self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
                             await pipe.execute()
 
-        if dlq_age:
-            await self.dead_queue.clean(now - dlq_age)
+        asyncio.gather(*clean_ops)
 
-        if completed_task_age:
-            await self.ta.clean_terminal_tasks(now, completed_task_age)
-
-    # TODO: refactor the refresh tag to be an implementation detail of QueueConfigAdapter
-    async def get_refresh_tag(self, role: str) -> ULID:
-        tag: bytes|None = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
-        if tag:
-            return ULID(tag)
-
-        # initialize the refresh tag
-        init_tag = ULID()
-        initialized = await self.data_store.setnx(f"worker-queues:{role}:refresh_tag", bytes(init_tag)) == 1
-        if not initialized:
-            # another process initialized the tag before us, so we should use that one instead of ours
-            tag = await self.data_store.get(f"worker-queues:{role}:refresh_tag")
-            if tag:
-                return ULID(tag)
-        return init_tag
 
     async def get_next_task(self, queues: set[str], pop_timeout: int=0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
@@ -130,6 +125,8 @@ class StateManager:
         return await self.ta.get_next_task(queues, pop_timeout)
 
     # Proxy methods
+    async def get_refresh_tag(self, role: str) -> ULID:
+        return await self.qca.get_refresh_tag(role)
 
     async def submit_task(self, task: Task) -> None:
         queue_config = await self.qca.get_queue_config(queue=task.queue)
@@ -223,7 +220,7 @@ class StateManager:
             except WatchError:
                 continue
 
-    async def request_task_cancellation(self, task_id: ULID) -> "Task | None":
+    async def request_task_cancellation(self, task_id: ULID) -> Task | None:
         """
         Publish a cancellation request for a task.
 
@@ -265,8 +262,8 @@ class SubmissionRateLimiter:
 
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
 
-    def __init__(self, queue_config_adapter: QueueConfigAdapter):
-        self.data_store = queue_config_adapter.data_store
+    def __init__(self, data_store: Redis, queue_config_adapter: QueueConfigAdapter):
+        self.data_store = data_store
         self.qca = queue_config_adapter
 
     async def concurrency_limits(self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]) -> set[str]:
@@ -290,7 +287,3 @@ class SubmissionRateLimiter:
         for queue in queues:
             pipe.zremrangebyscore(self.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp())
         await pipe.execute()
-
-def build_sm() -> StateManager:
-    from jobbers import db
-    return db.get_state_manager()

@@ -20,6 +20,6 @@ async def validate_task(task: Task) -> None:
     if not task.valid_task_params():
         raise ValidationError(f"Invalid parameters for {task.name} v{task.version}")
 
-    queue_config = await QueueConfigAdapter(db.get_client()).get_queue_config(task.queue)
+    queue_config = await QueueConfigAdapter(db.get_sqlite_conn()).get_queue_config(task.queue)
     if queue_config is None:
         raise ValidationError(f"Unknown queue {task.queue}")
