@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 import redis.asyncio as redis
 
-# from jobbers.models.queue_config import create_schema
+from jobbers.models.queue_config import create_schema
 
 if TYPE_CHECKING:
     from jobbers.state_manager import StateManager
@@ -59,7 +59,7 @@ async def init_state_manager() -> StateManager:
     db_path = os.environ.get("SQLITE_PATH", "jobbers.db")
     _sqlite_conn = await aiosqlite.connect(db_path)
     await _sqlite_conn.execute("PRAGMA foreign_keys = ON")
-    # await create_schema(_sqlite_conn)
+    await create_schema(_sqlite_conn)
     _state_manager = StateManager(get_client(), _sqlite_conn)
     return _state_manager
 
