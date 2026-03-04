@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import Any, Self, cast
 
+import aiosqlite
 from pydantic import BaseModel
 from ulid import ULID
-
-if TYPE_CHECKING:
-    import aiosqlite
 
 
 class RatePeriod(StrEnum):
@@ -118,7 +116,7 @@ class QueueConfigAdapter:
                         "INSERT INTO role_queues (role, queue) VALUES (?, ?)",
                         [(role, q) for q in queues],
                     )
-            except Exception:
+            except aiosqlite.IntegrityError:
                 await self.conn.rollback()
                 raise
             else:
