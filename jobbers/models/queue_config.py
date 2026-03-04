@@ -101,7 +101,7 @@ class QueueConfigAdapter:
         ) as cursor:
             return {row[0] for row in await cursor.fetchall()}
 
-    async def set_queues(self, role: str, queues: set[str]) -> None:
+    async def save_role(self, role: str, queues: set[str]) -> None:
         new_tag = str(ULID())
         async with self.conn.cursor() as cur:
             try:

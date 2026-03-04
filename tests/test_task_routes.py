@@ -202,10 +202,10 @@ async def test_set_queues_rolls_back_on_invalid_queue(patch_sqlite):
 
     qca = QueueConfigAdapter(patch_sqlite)
     await qca.save_queue_config(QueueConfig(name="extra_queue"))
-    await qca.set_queues("myrole", {"default", "extra_queue"})
+    await qca.save_role("myrole", {"default", "extra_queue"})
 
     with pytest.raises(aiosqlite.IntegrityError):
-        await qca.set_queues("myrole", {"default", "nonexistent_queue"})
+        await qca.save_role("myrole", {"default", "nonexistent_queue"})
 
     assert await qca.get_queues("myrole") == {"default", "extra_queue"}
 

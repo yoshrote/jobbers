@@ -129,7 +129,7 @@ async def get_queues(role: str) -> dict[str, Any]:
 async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
     """Set the list of all queues for a given role."""
     logger.info("Setting all queues for role %s", role)
-    await QueueConfigAdapter(db.get_sqlite_conn()).set_queues(role, set(queues))
+    await QueueConfigAdapter(db.get_sqlite_conn()).save_role(role, set(queues))
     return {"message": "Queues set successfully"}
 
 @app.get("/queues")
@@ -295,7 +295,7 @@ async def create_role(role: RoleRequest) -> dict[str, Any]:
     existing = await qca.get_queues(role.name)
     if existing:
         raise HTTPException(status_code=409, detail=f"Role '{role.name}' already exists.")
-    await qca.set_queues(role.name, set(role.queues))
+    await qca.save_role(role.name, set(role.queues))
     return {"message": "Role created successfully", "role": role.name, "queues": sorted(role.queues)}
 
 @app.get("/roles/{role_name}")
@@ -315,7 +315,7 @@ async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
     all_roles = await qca.get_all_roles()
     if role_name not in all_roles:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
-    await qca.set_queues(role_name, set(queues))
+    await qca.save_role(role_name, set(queues))
     return {"message": "Role updated successfully", "role": role_name, "queues": sorted(queues)}
 
 @app.delete("/roles/{role_name}", status_code=200)
