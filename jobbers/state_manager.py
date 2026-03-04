@@ -100,6 +100,7 @@ class StateManager:
                     continue
                 stale_tasks_by_type[(task.name, task.version)].append(task)
 
+            stale_pipes = []
             for (task_type, task_version), tasks in stale_tasks_by_type.items():
                 task_config = registry.get_task_config(task_type, task_version)
                 if task_config and task_config.max_heartbeat_interval:
@@ -109,7 +110,9 @@ class StateManager:
                             pipe = self.data_store.pipeline(transaction=True)
                             self.ta.stage_save(pipe, task)
                             pipe.zrem(self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
-                            await pipe.execute()
+                            stale_pipes.append(pipe.execute())
+            if stale_pipes:
+                await asyncio.gather(*stale_pipes)
 
         await asyncio.gather(*clean_ops)
 
@@ -269,9 +272,9 @@ class SubmissionRateLimiter:
     async def concurrency_limits(self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]) -> set[str]:
         """Limit the number of concurrent tasks in each queue."""
         queues_to_use = set()
-        # TODO: Consider ways to check each queue in a single transaction or in parallel
-        for queue in task_queues:
-            config = await self.qca.get_queue_config(queue=queue)
+        queues = list(task_queues)
+        configs = await asyncio.gather(*(self.qca.get_queue_config(queue=q) for q in queues))
+        for queue, config in zip(queues, configs):
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
                     queues_to_use.add(queue)
