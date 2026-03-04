@@ -2,7 +2,7 @@
 FROM node:alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install --frozen-lockfile
+RUN npm install
 COPY . .
 # Point the API client at the nginx proxy path (no Vite dev-server proxy in prod)
 ENV VITE_API_BASE=/api
