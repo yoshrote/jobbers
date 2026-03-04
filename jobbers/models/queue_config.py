@@ -106,18 +106,23 @@ class QueueConfigAdapter:
     async def set_queues(self, role: str, queues: set[str]) -> None:
         new_tag = str(ULID())
         async with self.conn.cursor() as cur:
-            await cur.execute(
-                "INSERT INTO roles (name, refresh_tag) VALUES (?, ?)"
-                " ON CONFLICT(name) DO UPDATE SET refresh_tag = excluded.refresh_tag",
-                (role, new_tag),
-            )
-            await cur.execute("DELETE FROM role_queues WHERE role = ?", (role,))
-            if queues:
-                await cur.executemany(
-                    "INSERT OR IGNORE INTO role_queues (role, queue) VALUES (?, ?)",
-                    [(role, q) for q in queues],
+            try:
+                await cur.execute(
+                    "INSERT INTO roles (name, refresh_tag) VALUES (?, ?)"
+                    " ON CONFLICT(name) DO UPDATE SET refresh_tag = excluded.refresh_tag",
+                    (role, new_tag),
                 )
-        await self.conn.commit()
+                await cur.execute("DELETE FROM role_queues WHERE role = ?", (role,))
+                if queues:
+                    await cur.executemany(
+                        "INSERT INTO role_queues (role, queue) VALUES (?, ?)",
+                        [(role, q) for q in queues],
+                    )
+            except Exception:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
 
     async def get_all_queues(self) -> list[str]:
         async with self.conn.execute("SELECT name FROM queues ORDER BY name") as cursor:
