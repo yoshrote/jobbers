@@ -1,4 +1,5 @@
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom'
+import ActiveTasks from './pages/ActiveTasks'
 import Dashboard from './pages/Dashboard'
 import DeadLetterQueue from './pages/DeadLetterQueue'
 import Queues from './pages/Queues'
@@ -9,7 +10,8 @@ import TaskList from './pages/TaskList'
 
 const NAV_LINKS = [
   { to: '/', label: 'Dashboard' },
-  { to: '/tasks', label: 'Tasks' },
+  { to: '/active', label: 'Active Tasks' },
+  { to: '/tasks', label: 'Queued Tasks' },
   { to: '/scheduled', label: 'Scheduled' },
   { to: '/dlq', label: 'Dead Letter Queue' },
   { to: '/queues', label: 'Queues' },
@@ -39,6 +41,7 @@ export default function App() {
       <main className="main-content">
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/active" element={<ActiveTasks />} />
           <Route path="/tasks" element={<TaskList />} />
           <Route path="/tasks/:taskId" element={<TaskDetail />} />
           <Route path="/scheduled" element={<ScheduledTasks />} />

@@ -84,6 +84,12 @@ export const cancelTask = (taskId) => post(`/task/${taskId}/cancel`)
  */
 export const cancelTasks = (taskIds) => post('/tasks/cancel', { task_ids: taskIds })
 
+/**
+ * GET /active-tasks
+ * @param {{ queue?: string }} [params]
+ */
+export const getActiveTasks = (params) => get('/active-tasks', params)
+
 // ── Scheduled tasks ────────────────────────────────────────────────────────
 
 /**

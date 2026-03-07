@@ -1,46 +1,27 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { cancelTasks, getTaskList } from '../api/client'
+import { Link, useNavigate } from 'react-router-dom'
+import { cancelTasks, getActiveTasks } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
 
-export default function TaskList() {
-  const [searchParams, setSearchParams] = useSearchParams()
+export default function ActiveTasks() {
   const navigate = useNavigate()
 
-  // Filter state – initialise from URL query params
-  const [queue,       setQueue]       = useState(searchParams.get('queue')       ?? '')
-  const [taskName,    setTaskName]    = useState(searchParams.get('task_name')   ?? '')
-  const [taskVersion, setTaskVersion] = useState(searchParams.get('task_version') ?? '')
-  const [startAfter,  setStartAfter]  = useState(searchParams.get('start')       ?? '')
-  const [limit,       setLimit]       = useState(searchParams.get('limit')       ?? '20')
-  const [orderBy,     setOrderBy]     = useState(searchParams.get('order_by')    ?? 'submitted_at')
-
-  const [tasks,     setTasks]     = useState([])
-  const [selected,  setSelected]  = useState(new Set())
-  const [loading,   setLoading]   = useState(false)
-  const [error,     setError]     = useState(null)
+  const [queue,    setQueue]    = useState('')
+  const [tasks,    setTasks]    = useState([])
+  const [selected, setSelected] = useState(new Set())
+  const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState(null)
 
   function load() {
-    if (!queue) return
     setLoading(true)
     setError(null)
-    getTaskList({
-      queue,
-      start: startAfter || undefined,
-      limit,
-      order_by: orderBy,
-      task_name: taskName || undefined,
-      task_version: taskVersion || undefined,
-    })
+    getActiveTasks(queue ? { queue } : undefined)
       .then((d) => setTasks(d.tasks ?? []))
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
   }
 
-  useEffect(() => {
-    load()
-    setSearchParams({ queue, task_name: taskName, start: startAfter, limit, order_by: orderBy }, { replace: true })
-  }, [queue, taskName, taskVersion, startAfter, limit, orderBy]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   function toggleSelect(id) {
     setSelected((prev) => {
@@ -70,45 +51,16 @@ export default function TaskList() {
 
   return (
     <div>
-      <h1>Queued Tasks</h1>
+      <h1>Active Tasks</h1>
 
       {/* Filter bar */}
       <div className="card">
         <div className="filter-bar">
           <div className="form-row">
-            <label>Queue *</label>
-            <input value={queue} onChange={(e) => setQueue(e.target.value)} placeholder="default" />
+            <label>Queue</label>
+            <input value={queue} onChange={(e) => setQueue(e.target.value)} placeholder="all queues" />
           </div>
-          <div className="form-row">
-            <label>Task name</label>
-            <input value={taskName} onChange={(e) => setTaskName(e.target.value)} placeholder="any" />
-          </div>
-          <div className="form-row">
-            <label>Version</label>
-            <input type="number" value={taskVersion} onChange={(e) => setTaskVersion(e.target.value)} style={{ width: 70 }} />
-          </div>
-          <div className="form-row">
-            <label>Start after</label>
-            <input
-              value={startAfter}
-              onChange={(e) => setStartAfter(e.target.value)}
-              placeholder="ULID (optional)"
-            />
-          </div>
-          <div className="form-row">
-            <label>Order by</label>
-            <select value={orderBy} onChange={(e) => setOrderBy(e.target.value)}>
-              <option value="submitted_at">Submitted at</option>
-              <option value="task_id">Task ID</option>
-            </select>
-          </div>
-          <div className="form-row">
-            <label>Limit</label>
-            <select value={limit} onChange={(e) => setLimit(e.target.value)} style={{ width: 80 }}>
-              {[10, 20, 50, 100].map((n) => <option key={n}>{n}</option>)}
-            </select>
-          </div>
-          <button className="btn btn-primary" onClick={load}>Search</button>
+          <button className="btn btn-primary" onClick={load}>Refresh</button>
         </div>
       </div>
 
@@ -134,6 +86,7 @@ export default function TaskList() {
                 </th>
                 <th>ID</th>
                 <th>Name</th>
+                <th>Queue</th>
                 <th>Status</th>
                 <th>Retry</th>
                 <th>Submitted at</th>
@@ -142,7 +95,7 @@ export default function TaskList() {
             </thead>
             <tbody>
               {tasks.length === 0 && (
-                <tr><td colSpan={7} className="empty-msg" style={{ padding: '1rem' }}>No tasks found.</td></tr>
+                <tr><td colSpan={8} className="empty-msg" style={{ padding: '1rem' }}>No active tasks.</td></tr>
               )}
               {tasks.map((t) => (
                 <tr key={t.id}>
@@ -153,6 +106,7 @@ export default function TaskList() {
                     <Link to={`/tasks/${t.id}`} className="task-id-link">{t.id}</Link>
                   </td>
                   <td>{t.name}</td>
+                  <td>{t.queue ?? '—'}</td>
                   <td><StatusBadge status={t.status} /></td>
                   <td>{t.retry_attempt}</td>
                   <td>{t.submitted_at ? new Date(t.submitted_at).toLocaleString() : '—'}</td>
