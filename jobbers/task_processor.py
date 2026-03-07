@@ -53,6 +53,7 @@ class TaskProcessor:
             await self.state_manager.save_task(task)
 
             with self.state_manager.task_in_registry(task):
+                await task.heartbeat()
                 self._current_promise = task.task_config.function(**task.parameters)
                 if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                     self._current_promise = asyncio.shield(self._current_promise)
@@ -73,6 +74,8 @@ class TaskProcessor:
                         await self.handle_unexpected_exception(task, exc)
                 else:
                     await self.handle_success(task)
+
+            await self.state_manager.remove_task_heartbeat(task)
 
         # Metrics recording
         tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})

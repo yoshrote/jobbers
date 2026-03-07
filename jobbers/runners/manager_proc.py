@@ -16,7 +16,7 @@ def _load_task_module(arg: str) -> None:
             raise ImportError(f"Cannot load task module from path: {arg}")
         module = importlib.util.module_from_spec(spec)
         sys.modules["_user_tasks"] = module
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        spec.loader.exec_module(module)
     else:
         importlib.import_module(arg)
 

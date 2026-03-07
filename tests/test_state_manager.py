@@ -10,7 +10,7 @@ import redis.asyncio as aioredis
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, create_schema
+from jobbers.models.queue_config import QueueConfig, create_schema
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_status import TaskStatus

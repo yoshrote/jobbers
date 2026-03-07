@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -94,19 +95,19 @@ async def cancel_tasks(request: BulkCancelRequest) -> dict[str, Any]:
     """Cancel multiple tasks by publishing to each task's cancellation channel."""
     logger.info("Requesting cancellation for %d tasks", len(request.task_ids))
     sm = db.get_state_manager()
-    results = []
-    for task_id_str in request.task_ids:
+
+    async def _cancel_one(task_id_str: str) -> dict[str, Any]:
         try:
             task_uid: ULID = ULID.from_str(task_id_str)
             task = await sm.request_task_cancellation(task_uid)
         except TaskException as ex:
-            results.append({"task_id": task_id_str, "status": "error", "detail": str(ex)})
-            continue
+            return {"task_id": task_id_str, "status": "error", "detail": str(ex)}
         if task is None:
-            results.append({"task_id": task_id_str, "status": "not_found"})
-        else:
-            cancellations_requested.add(1, {"queue": task.queue, "task": task.name})
-            results.append({"task_id": task_id_str, "status": "cancellation_requested"})
+            return {"task_id": task_id_str, "status": "not_found"}
+        cancellations_requested.add(1, {"queue": task.queue, "task": task.name})
+        return {"task_id": task_id_str, "status": "cancellation_requested"}
+
+    results = list(await asyncio.gather(*(_cancel_one(tid) for tid in request.task_ids)))
     return {"results": results}
 
 
@@ -128,7 +129,7 @@ async def get_queues(role: str) -> dict[str, Any]:
 async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
     """Set the list of all queues for a given role."""
     logger.info("Setting all queues for role %s", role)
-    await QueueConfigAdapter(db.get_sqlite_conn()).set_queues(role, set(queues))
+    await QueueConfigAdapter(db.get_sqlite_conn()).save_role(role, set(queues))
     return {"message": "Queues set successfully"}
 
 @app.get("/queues")
@@ -258,6 +259,18 @@ async def resubmit_from_dlq(request: DLQResubmitRequest) -> dict[str, Any]:
     }
 
 
+@app.get("/active-tasks")
+async def get_active_tasks(queue: str | None = None) -> dict[str, Any]:
+    """Retrieve tasks currently being executed (those with an active heartbeat record)."""
+    sm = db.get_state_manager()
+    if queue:
+        queues: set[str] = {queue}
+    else:
+        queues = set(await QueueConfigAdapter(db.get_sqlite_conn()).get_all_queues())
+    tasks = await sm.get_active_tasks(queues)
+    return {"tasks": [t.summarized() for t in tasks]}
+
+
 @app.get("/scheduled-tasks")
 async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) -> dict[str, Any]:
     """Retrieve scheduled tasks filtered by queue, and optionally by task name or version."""
@@ -294,7 +307,7 @@ async def create_role(role: RoleRequest) -> dict[str, Any]:
     existing = await qca.get_queues(role.name)
     if existing:
         raise HTTPException(status_code=409, detail=f"Role '{role.name}' already exists.")
-    await qca.set_queues(role.name, set(role.queues))
+    await qca.save_role(role.name, set(role.queues))
     return {"message": "Role created successfully", "role": role.name, "queues": sorted(role.queues)}
 
 @app.get("/roles/{role_name}")
@@ -314,7 +327,7 @@ async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
     all_roles = await qca.get_all_roles()
     if role_name not in all_roles:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
-    await qca.set_queues(role_name, set(queues))
+    await qca.save_role(role_name, set(queues))
     return {"message": "Role updated successfully", "role": role_name, "queues": sorted(queues)}
 
 @app.delete("/roles/{role_name}", status_code=200)

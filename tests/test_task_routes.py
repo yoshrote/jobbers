@@ -196,6 +196,21 @@ async def test_set_queues():
         mock_queue_adapter.set_queues.assert_called_once_with("role1", {"queue1", "queue2"})
 
 @pytest.mark.asyncio
+async def test_set_queues_rolls_back_on_invalid_queue(patch_sqlite):
+    """Adding a nonexistent queue to a role rolls back: original queues are preserved."""
+    import aiosqlite
+
+    qca = QueueConfigAdapter(patch_sqlite)
+    await qca.save_queue_config(QueueConfig(name="extra_queue"))
+    await qca.save_role("myrole", {"default", "extra_queue"})
+
+    with pytest.raises(aiosqlite.IntegrityError):
+        await qca.save_role("myrole", {"default", "nonexistent_queue"})
+
+    assert await qca.get_queues("myrole") == {"default", "extra_queue"}
+
+
+@pytest.mark.asyncio
 async def test_get_all_queues():
     """Test retrieving the list of all queues."""
     mock_queue_adapter = AsyncMock()

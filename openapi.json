@@ -1,0 +1,1652 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "FastAPI",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Read Root",
+        "description": "Serve the index page.",
+        "operationId": "read_root__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Read Root  Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/submit-task": {
+      "post": {
+        "summary": "Submit Task",
+        "description": "Handle task submission.",
+        "operationId": "submit_task_submit_task_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Task"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Submit Task Submit Task Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/task-status/{task_id}": {
+      "get": {
+        "summary": "Get Task Status",
+        "description": "Retrieve the status of a specific task.",
+        "operationId": "get_task_status_task_status__task_id__get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Task Status Task Status  Task Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/task/{task_id}/cancel": {
+      "post": {
+        "summary": "Cancel Task",
+        "description": "Cancel a running task by publishing to its cancellation channel.",
+        "operationId": "cancel_task_task__task_id__cancel_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Cancel Task Task  Task Id  Cancel Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tasks/cancel": {
+      "post": {
+        "summary": "Cancel Tasks",
+        "description": "Cancel multiple tasks by publishing to each task's cancellation channel.",
+        "operationId": "cancel_tasks_tasks_cancel_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkCancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Cancel Tasks Tasks Cancel Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/task-list": {
+      "get": {
+        "summary": "Get Task List",
+        "description": "Retrieve the list of all tasks.",
+        "operationId": "get_task_list_task_list_get",
+        "parameters": [
+          {
+            "name": "queue",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Queue"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "default": 10,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 26,
+                  "maxLength": 26,
+                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                },
+                {
+                  "type": "string",
+                  "format": "binary",
+                  "minLength": 16,
+                  "maxLength": 16
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start"
+            }
+          },
+          {
+            "name": "order_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PaginationOrder",
+              "default": "submitted_at"
+            }
+          },
+          {
+            "name": "task_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Name"
+            }
+          },
+          {
+            "name": "task_version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Task List Task List Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/queues/{role}": {
+      "get": {
+        "summary": "Get Queues",
+        "description": "Retrieve the list of all queues for a given role.",
+        "operationId": "get_queues_queues__role__get",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Role"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Queues Queues  Role  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Set Queues",
+        "description": "Set the list of all queues for a given role.",
+        "operationId": "set_queues_queues__role__post",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Role"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Queues"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Set Queues Queues  Role  Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/queues": {
+      "get": {
+        "summary": "Get All Queues",
+        "description": "Retrieve the list of all queues.",
+        "operationId": "get_all_queues_queues_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get All Queues Queues Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Queue",
+        "description": "Create a new queue with its configuration. Returns 409 if the queue already exists.",
+        "operationId": "create_queue_queues_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueueConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Create Queue Queues Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/queues/{queue_name}/config": {
+      "get": {
+        "summary": "Get Queue Config",
+        "description": "Retrieve the configuration for a specific queue.",
+        "operationId": "get_queue_config_queues__queue_name__config_get",
+        "parameters": [
+          {
+            "name": "queue_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Queue Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Queue Config Queues  Queue Name  Config Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/queues/{queue_name}": {
+      "put": {
+        "summary": "Update Queue",
+        "description": "Create or update the configuration for a queue. The name in the body is ignored; the path name is used.",
+        "operationId": "update_queue_queues__queue_name__put",
+        "parameters": [
+          {
+            "name": "queue_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Queue Name"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueueConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Update Queue Queues  Queue Name  Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Queue",
+        "description": "Delete a queue and remove it from all roles. Returns 404 if the queue does not exist.",
+        "operationId": "delete_queue_queues__queue_name__delete",
+        "parameters": [
+          {
+            "name": "queue_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Queue Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Queue Queues  Queue Name  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dead-letter-queue": {
+      "get": {
+        "summary": "Get Dead Letter Queue",
+        "description": "Search the dead letter queue.\n\nReturns tasks that have exhausted retries or been permanently failed, optionally\nfiltered by queue, task name, or version. Results include the task summary and\nthe most recent error message.",
+        "operationId": "get_dead_letter_queue_dead_letter_queue_get",
+        "parameters": [
+          {
+            "name": "queue",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by queue name.",
+              "title": "Queue"
+            },
+            "description": "Filter by queue name."
+          },
+          {
+            "name": "task_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by task name.",
+              "title": "Task Name"
+            },
+            "description": "Filter by task name."
+          },
+          {
+            "name": "task_version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by task version.",
+              "title": "Task Version"
+            },
+            "description": "Filter by task version."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "exclusiveMinimum": 0,
+              "description": "Maximum number of entries to return.",
+              "default": 100,
+              "title": "Limit"
+            },
+            "description": "Maximum number of entries to return."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Dead Letter Queue Dead Letter Queue Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dead-letter-queue/{task_id}/history": {
+      "get": {
+        "summary": "Get Dlq Task History",
+        "description": "Retrieve the full failure history for a dead-lettered task.\n\nReturns every recorded failure event for the task in chronological order,\nincluding the retry attempt number, timestamp, and error message for each failure.",
+        "operationId": "get_dlq_task_history_dead_letter_queue__task_id__history_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Dlq Task History Dead Letter Queue  Task Id  History Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dead-letter-queue/resubmit": {
+      "post": {
+        "summary": "Resubmit From Dlq",
+        "description": "Bulk resubmit tasks from the dead letter queue back into their active queues.",
+        "operationId": "resubmit_from_dlq_dead_letter_queue_resubmit_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DLQResubmitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Resubmit From Dlq Dead Letter Queue Resubmit Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scheduled-tasks": {
+      "get": {
+        "summary": "Get Scheduled Tasks",
+        "description": "Retrieve scheduled tasks filtered by queue, and optionally by task name or version.",
+        "operationId": "get_scheduled_tasks_scheduled_tasks_get",
+        "parameters": [
+          {
+            "name": "queue",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Queue"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "default": 10,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 26,
+                  "maxLength": 26,
+                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                },
+                {
+                  "type": "string",
+                  "format": "binary",
+                  "minLength": 16,
+                  "maxLength": 16
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start"
+            }
+          },
+          {
+            "name": "order_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PaginationOrder",
+              "default": "submitted_at"
+            }
+          },
+          {
+            "name": "task_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Name"
+            }
+          },
+          {
+            "name": "task_version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Scheduled Tasks Scheduled Tasks Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles": {
+      "get": {
+        "summary": "Get All Roles",
+        "description": "Retrieve the list of all roles.",
+        "operationId": "get_all_roles_roles_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get All Roles Roles Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Role",
+        "description": "Create a new role with an initial set of queues. Returns 409 if the role already exists.",
+        "operationId": "create_role_roles_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Create Role Roles Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role_name}": {
+      "get": {
+        "summary": "Get Role",
+        "description": "Retrieve the queues assigned to a specific role.",
+        "operationId": "get_role_roles__role_name__get",
+        "parameters": [
+          {
+            "name": "role_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Role Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Role Roles  Role Name  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update Role",
+        "description": "Replace the queue list for a role. Returns 404 if the role does not exist.",
+        "operationId": "update_role_roles__role_name__put",
+        "parameters": [
+          {
+            "name": "role_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Role Name"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Queues"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Update Role Roles  Role Name  Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Role",
+        "description": "Delete a role. Queue configs are preserved. Returns 404 if the role does not exist.",
+        "operationId": "delete_role_roles__role_name__delete",
+        "parameters": [
+          {
+            "name": "role_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Role Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Role Roles  Role Name  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BackoffStrategy": {
+        "type": "string",
+        "enum": [
+          "constant",
+          "linear",
+          "exponential",
+          "exponential_jitter"
+        ],
+        "title": "BackoffStrategy",
+        "description": "Backoff strategy to use when retrying a task."
+      },
+      "BulkCancelRequest": {
+        "properties": {
+          "task_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Task Ids",
+            "description": "List of task IDs to cancel."
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_ids"
+        ],
+        "title": "BulkCancelRequest",
+        "description": "Request body for bulk task cancellation."
+      },
+      "DLQResubmitRequest": {
+        "properties": {
+          "task_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Ids",
+            "description": "Explicit list of task IDs to resubmit."
+          },
+          "queue": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Queue",
+            "description": "Resubmit only tasks from this queue."
+          },
+          "task_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Name",
+            "description": "Resubmit only tasks with this name."
+          },
+          "task_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Version",
+            "description": "Resubmit only tasks with this version."
+          },
+          "reset_retry_count": {
+            "type": "boolean",
+            "title": "Reset Retry Count",
+            "description": "Reset retry_attempt to 0 before resubmitting.",
+            "default": true
+          },
+          "limit": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Limit",
+            "description": "Maximum number of tasks to resubmit (filter mode only).",
+            "default": 100
+          }
+        },
+        "type": "object",
+        "title": "DLQResubmitRequest",
+        "description": "Filter criteria for bulk resubmission from the dead letter queue.\n\nProvide either `task_ids` for an explicit list, or one or more of `queue`,\n`task_name`, and `task_version` to select by filter. At least one field\nmust be set to prevent accidentally resubmitting the entire queue."
+      },
+      "DeadLetterPolicy": {
+        "type": "string",
+        "enum": [
+          "none",
+          "save"
+        ],
+        "title": "DeadLetterPolicy",
+        "description": "Dead letter policy to use when a task fails."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "PaginationOrder": {
+        "type": "string",
+        "enum": [
+          "submitted_at",
+          "task_id"
+        ],
+        "title": "PaginationOrder",
+        "description": "Supported fields to order task list by."
+      },
+      "QueueConfig": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "max_concurrent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Concurrent",
+            "default": 10
+          },
+          "rate_numerator": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rate Numerator"
+          },
+          "rate_denominator": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rate Denominator"
+          },
+          "rate_period": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RatePeriod"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "QueueConfig",
+        "description": "Configuration for a task queue."
+      },
+      "RatePeriod": {
+        "type": "string",
+        "enum": [
+          "second",
+          "minute",
+          "hour",
+          "day"
+        ],
+        "title": "RatePeriod",
+        "description": "Enumeration of rate limiting periods."
+      },
+      "RoleRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "Role name."
+          },
+          "queues": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Queues",
+            "description": "Queues assigned to this role."
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "queues"
+        ],
+        "title": "RoleRequest",
+        "description": "Request body for creating a role."
+      },
+      "Task": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 26,
+                "minLength": 26,
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+              },
+              {
+                "type": "string",
+                "maxLength": 16,
+                "minLength": 16,
+                "format": "binary"
+              }
+            ],
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "queue": {
+            "type": "string",
+            "title": "Queue",
+            "default": "default"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 0
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Parameters",
+            "default": {}
+          },
+          "results": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Results",
+            "default": {}
+          },
+          "errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Errors",
+            "default": []
+          },
+          "retry_attempt": {
+            "type": "integer",
+            "title": "Retry Attempt",
+            "default": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus",
+            "default": "unsubmitted"
+          },
+          "submitted_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Submitted At"
+          },
+          "retried_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retried At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "heartbeat_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heartbeat At"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "task_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "Task",
+        "description": "A task to be executed."
+      },
+      "TaskConfig": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 0
+          },
+          "max_concurrent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Concurrent",
+            "default": 1
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout"
+          },
+          "max_retries": {
+            "type": "integer",
+            "title": "Max Retries",
+            "default": 3
+          },
+          "retry_delay": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Delay"
+          },
+          "backoff_strategy": {
+            "$ref": "#/components/schemas/BackoffStrategy",
+            "default": "exponential"
+          },
+          "max_retry_delay": {
+            "type": "integer",
+            "title": "Max Retry Delay",
+            "default": 3600
+          },
+          "on_shutdown": {
+            "$ref": "#/components/schemas/TaskShutdownPolicy",
+            "default": "stop"
+          },
+          "dead_letter_policy": {
+            "$ref": "#/components/schemas/DeadLetterPolicy",
+            "default": "none"
+          },
+          "max_heartbeat_interval": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "duration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Heartbeat Interval"
+          },
+          "function": {
+            "type": "string",
+            "title": "Function",
+            "readOnly": true
+          },
+          "expected_exceptions": {
+            "anyOf": [
+              {
+                "prefixItems": [
+                  {}
+                ],
+                "type": "array",
+                "maxItems": 1,
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Exceptions"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "function"
+        ],
+        "title": "TaskConfig",
+        "description": "Configuration for a task."
+      },
+      "TaskShutdownPolicy": {
+        "type": "string",
+        "enum": [
+          "continue",
+          "stop",
+          "resubmit"
+        ],
+        "title": "TaskShutdownPolicy",
+        "description": "Possible ways to handle tasks when the worker is being shut down."
+      },
+      "TaskStatus": {
+        "type": "string",
+        "enum": [
+          "unsubmitted",
+          "submitted",
+          "started",
+          "heartbeat",
+          "completed",
+          "cancelled",
+          "stalled",
+          "failed",
+          "dropped",
+          "scheduled"
+        ],
+        "title": "TaskStatus",
+        "description": "Enumeration of task statuses."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

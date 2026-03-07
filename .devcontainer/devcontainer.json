@@ -6,7 +6,12 @@
 	// Update the 'dockerComposeFile' list if you have more compose files or use different names.
 	// The .devcontainer/docker-compose.yml file contains any overrides you need/want to make.
 	"dockerComposeFile": [
+		// Primary compose file defined at the repo root
 		"../docker-compose.yaml",
+		// Local overrides for development are picked up by docker-compose when present
+		// and should also be included here so VS Code uses the same set of services.
+		"../docker-compose.override.yml",
+		// Any additional container-specific overrides under .devcontainer
 		"docker-compose.yml"
 	],
 
