@@ -259,6 +259,18 @@ async def resubmit_from_dlq(request: DLQResubmitRequest) -> dict[str, Any]:
     }
 
 
+@app.get("/active-tasks")
+async def get_active_tasks(queue: str | None = None) -> dict[str, Any]:
+    """Retrieve tasks currently being executed (those with an active heartbeat record)."""
+    sm = db.get_state_manager()
+    if queue:
+        queues: set[str] = {queue}
+    else:
+        queues = set(await QueueConfigAdapter(db.get_sqlite_conn()).get_all_queues())
+    tasks = await sm.get_active_tasks(queues)
+    return {"tasks": [t.summarized() for t in tasks]}
+
+
 @app.get("/scheduled-tasks")
 async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) -> dict[str, Any]:
     """Retrieve scheduled tasks filtered by queue, and optionally by task name or version."""

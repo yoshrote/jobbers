@@ -171,6 +171,14 @@ class StateManager:
         await pipe.execute()
         return tasks
 
+    async def remove_task_heartbeat(self, task: Task) -> None:
+        """Remove a task from the heartbeat sorted set."""
+        await self.ta.remove_task_heartbeat(task)
+
+    async def get_active_tasks(self, queues: set[str]) -> list[Task]:
+        """Return all tasks currently present in any heartbeat sorted set."""
+        return await self.ta.get_active_tasks(queues)
+
     async def complete_task(self, task: Task) -> Task:
         """Persist a completed task."""
         #TODO set a ttl for the data in redis after completion
