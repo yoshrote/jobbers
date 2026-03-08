@@ -238,6 +238,20 @@ class DLQResubmitRequest(BaseModel):
     limit: int = Field(default=100, gt=0, le=1000, description="Maximum number of tasks to resubmit (filter mode only).")
 
 
+class DLQRemoveRequest(BaseModel):
+    """Request body for bulk removal from the dead letter queue."""
+
+    task_ids: list[str] = Field(description="List of task IDs to remove.")
+
+
+@app.delete("/dead-letter-queue")
+async def remove_from_dlq(request: DLQRemoveRequest) -> dict[str, Any]:
+    """Bulk remove tasks from the dead letter queue by task ID."""
+    sm = db.get_state_manager()
+    await sm.dead_queue.remove_many(request.task_ids)
+    return {"removed": len(request.task_ids), "task_ids": request.task_ids}
+
+
 @app.post("/dead-letter-queue/resubmit")
 async def resubmit_from_dlq(request: DLQResubmitRequest) -> dict[str, Any]:
     """Bulk resubmit tasks from the dead letter queue back into their active queues."""
