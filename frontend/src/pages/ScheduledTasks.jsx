@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { getScheduledTasks } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
+import TaskNameSelect from '../components/TaskNameSelect'
 
 export default function ScheduledTasks() {
-  const [filter, setFilter] = useState({ queue: '', task_name: '', task_version: '', start: '', limit: '20' })
+  const [filter, setFilter] = useState({ queue: '', task_name: '', start: '', limit: '20' })
   const [tasks,   setTasks]   = useState([])
   const [loading, setLoading] = useState(false)
   const [error,   setError]   = useState(null)
@@ -22,7 +23,6 @@ export default function ScheduledTasks() {
       queue:        filter.queue,
       start:        filter.start || undefined,
       task_name:    filter.task_name   || undefined,
-      task_version: filter.task_version ? Number(filter.task_version) : undefined,
       limit:        Number(filter.limit),
     }
     getScheduledTasks(params)
@@ -43,11 +43,7 @@ export default function ScheduledTasks() {
           </div>
           <div className="form-row">
             <label>Task name</label>
-            <input value={filter.task_name} onChange={setF('task_name')} placeholder="any" />
-          </div>
-          <div className="form-row">
-            <label>Version</label>
-            <input type="number" value={filter.task_version} onChange={setF('task_version')} style={{ width: 70 }} />
+            <TaskNameSelect value={filter.task_name} onChange={(v) => setFilter((f) => ({ ...f, task_name: v }))} />
           </div>
           <div className="form-row">
             <label>Start after</label>

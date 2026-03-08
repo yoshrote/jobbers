@@ -30,10 +30,10 @@ const post = (path, body)   => request('POST',   path, body)
 const put  = (path, body)   => request('PUT',    path, body)
 const del  = (path)         => request('DELETE', path)
 
-// ── Index ──────────────────────────────────────────────────────────────────
+// ── Registered tasks ───────────────────────────────────────────────────────
 
-/** GET /  →  { message, tasks: string[] } */
-export const getIndex = () => get('/')
+/** GET /  →  { message, tasks: [string, number][] } */
+export const getRegisteredTasks = () => get('/')
 
 // ── Tasks ──────────────────────────────────────────────────────────────────
 

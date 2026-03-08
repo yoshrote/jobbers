@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getAllQueues, getIndex, getRoles } from '../api/client'
+import { getAllQueues, getRegisteredTasks, getRoles } from '../api/client'
 
 export default function Dashboard() {
   const [index, setIndex]   = useState(null)
@@ -9,7 +9,7 @@ export default function Dashboard() {
   const [error, setError]   = useState(null)
 
   useEffect(() => {
-    Promise.all([getIndex(), getAllQueues(), getRoles()])
+    Promise.all([getRegisteredTasks(), getAllQueues(), getRoles()])
       .then(([idx, q, r]) => {
         setIndex(idx)
         setQueues(q.queues)

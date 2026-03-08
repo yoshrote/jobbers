@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { cancelTasks, getTaskList } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
+import TaskNameSelect from '../components/TaskNameSelect'
 
 export default function TaskList() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -10,7 +11,7 @@ export default function TaskList() {
   // Filter state – initialise from URL query params
   const [queue,       setQueue]       = useState(searchParams.get('queue')       ?? '')
   const [taskName,    setTaskName]    = useState(searchParams.get('task_name')   ?? '')
-  const [taskVersion, setTaskVersion] = useState(searchParams.get('task_version') ?? '')
+  const [taskVersion] = useState(searchParams.get('task_version') ?? '')
   const [startAfter,  setStartAfter]  = useState(searchParams.get('start')       ?? '')
   const [limit,       setLimit]       = useState(searchParams.get('limit')       ?? '20')
   const [orderBy,     setOrderBy]     = useState(searchParams.get('order_by')    ?? 'submitted_at')
@@ -81,11 +82,7 @@ export default function TaskList() {
           </div>
           <div className="form-row">
             <label>Task name</label>
-            <input value={taskName} onChange={(e) => setTaskName(e.target.value)} placeholder="any" />
-          </div>
-          <div className="form-row">
-            <label>Version</label>
-            <input type="number" value={taskVersion} onChange={(e) => setTaskVersion(e.target.value)} style={{ width: 70 }} />
+            <TaskNameSelect value={taskName} onChange={setTaskName} />
           </div>
           <div className="form-row">
             <label>Start after</label>

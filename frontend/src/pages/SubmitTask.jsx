@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getIndex, submitTask } from '../api/client'
+import { getRegisteredTasks, submitTask } from '../api/client'
 import { ulid } from "ulid";
 
 // Generate a ULID-like placeholder for the id field.
@@ -22,7 +22,7 @@ export default function SubmitTask() {
   const [error,  setError]  = useState(null)
 
   useEffect(() => {
-    getIndex().then((d) => setTaskTypes(d.tasks ?? [])).catch(() => {})
+    getRegisteredTasks().then((d) => setTaskTypes(d.tasks ?? [])).catch(() => {})
   }, [])
 
   function set(field) {
