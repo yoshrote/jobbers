@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react'
 import { getIndex, submitTask } from '../api/client'
+import { ulid } from "ulid";
 
 // Generate a ULID-like placeholder for the id field.
 // In production you'd use a real ULID library; this is just a UI hint.
 function tempId() {
-  return Array.from({ length: 26 }, () => '0123456789ABCDEFGHJKMNPQRSTVWXYZ'[Math.floor(Math.random() * 32)]).join('')
+  return ulid()
 }
 
 export default function SubmitTask() {
   const [taskTypes, setTaskTypes] = useState([])
+  const [selectedTask, setSelectedTask] = useState('')
   const [form, setForm] = useState({
     id: tempId(),
     name: '',
@@ -68,9 +70,22 @@ export default function SubmitTask() {
           <div className="form-row">
             <label>Task name</label>
             {taskTypes.length > 0 ? (
-              <select value={form.name} onChange={set('name')} required>
+              <select
+                value={selectedTask}
+                onChange={(e) => {
+                  const val = e.target.value
+                  setSelectedTask(val)
+                  const [name, version] = val.split('\0')
+                  setForm((f) => ({ ...f, name, version: Number(version) }))
+                }}
+                required
+              >
                 <option value="">— select —</option>
-                {taskTypes.map((t) => <option key={t} value={t}>{t}</option>)}
+                {taskTypes.map(([name, version]) => (
+                  <option key={`${name}\0${version}`} value={`${name}\0${version}`}>
+                    {name} (v{version})
+                  </option>
+                ))}
               </select>
             ) : (
               <input value={form.name} onChange={set('name')} required placeholder="my_task" />
@@ -82,10 +97,7 @@ export default function SubmitTask() {
             <input value={form.queue} onChange={set('queue')} required placeholder="default" />
           </div>
 
-          <div className="form-row">
-            <label>Version</label>
-            <input type="number" value={form.version} onChange={set('version')} min={0} style={{ width: 80 }} />
-          </div>
+          <input type="hidden" value={form.version} />
 
           <div className="form-row">
             <label>Parameters (JSON)</label>

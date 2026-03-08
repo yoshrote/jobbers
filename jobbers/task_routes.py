@@ -31,14 +31,20 @@ meter = metrics.get_meter(__name__)
 hit_counter = meter.create_up_down_counter("hit_counter")
 cancellations_requested = meter.create_counter("cancellations_requested", unit="1")
 
+class RootResponse(BaseModel):
+    """Response model for the root endpoint."""
+
+    message: str = Field(description="Welcome message.")
+    tasks: list[tuple[str, int]] = Field(description="List of registered tasks with their versions.")
+
 @app.get("/")
-async def read_root() -> dict[str, Any]:
+async def read_root() -> RootResponse:
     """Serve the index page."""
     logger.info("Serving the index page")
-    return {
-        "message": "Welcome to Task Manager!",
-        "tasks": list(registry.get_tasks())
-    }
+    return RootResponse(
+        message="Welcome to Task Manager!",
+        tasks=list(registry.get_tasks())
+    )
 
 @app.post("/submit-task")
 async def submit_task(task: Task) -> dict[str, Any]:

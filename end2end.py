@@ -26,7 +26,7 @@ async def fast_task() -> dict[Any, Any]:
     expected_exceptions=None
 )
 async def medium_task() -> dict[Any, Any]:
-    await sleep(1)
+    await sleep(30)
     return {}
 
 @register_task(
@@ -39,5 +39,18 @@ async def medium_task() -> dict[Any, Any]:
     expected_exceptions=None
 )
 async def slow_task() -> dict[Any, Any]:
-    await sleep(10)
+    await sleep(60)
     return {}
+
+@register_task(
+    name="fail_task",
+    version=1,
+    max_concurrent=None,
+    timeout=None,
+    max_retries=3,
+    retry_delay=10,
+    expected_exceptions=None
+)
+async def fail_task() -> dict[Any, Any]:
+    await sleep(30)
+    raise Exception("Task failed")
