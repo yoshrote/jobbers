@@ -357,6 +357,13 @@ class TaskAdapter:
             task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.UTC)
         return task
 
+    async def remove_from_queue(self, task: Task) -> None:
+        """Remove a task from its queue."""
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
+        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        await pipe.execute()
+
     async def update_task_heartbeat(self, task: Task) -> None:
         """Update the heartbeat for a task."""
         assert task.heartbeat_at  # noqa: S101
