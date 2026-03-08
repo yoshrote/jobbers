@@ -1,6 +1,7 @@
 from asyncio import sleep
 from typing import Any
 
+from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.registry import register_task
 
 
@@ -49,7 +50,8 @@ async def slow_task() -> dict[Any, Any]:
     timeout=None,
     max_retries=3,
     retry_delay=10,
-    expected_exceptions=None
+    expected_exceptions=None,
+    dead_letter_policy=DeadLetterPolicy.SAVE
 )
 async def fail_task() -> dict[Any, Any]:
     await sleep(30)

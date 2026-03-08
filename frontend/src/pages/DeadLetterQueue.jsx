@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { getDLQ, getDLQHistory, resubmitFromDLQ } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
+import TaskNameSelect from '../components/TaskNameSelect'
 
 export default function DeadLetterQueue() {
-  const [filter, setFilter] = useState({ queue: '', task_name: '', task_version: '', limit: '100' })
+  const [filter, setFilter] = useState({ queue: '', task_name: '', limit: '100' })
   const [tasks,    setTasks]    = useState([])
   const [selected, setSelected] = useState(new Set())
   const [history,  setHistory]  = useState(null)  // { task_id, history }
@@ -22,7 +23,6 @@ export default function DeadLetterQueue() {
     const params = {
       queue:        filter.queue       || undefined,
       task_name:    filter.task_name   || undefined,
-      task_version: filter.task_version ? Number(filter.task_version) : undefined,
       limit:        Number(filter.limit),
     }
     getDLQ(params)
@@ -51,7 +51,6 @@ export default function DeadLetterQueue() {
       : {
           queue:        filter.queue       || undefined,
           task_name:    filter.task_name   || undefined,
-          task_version: filter.task_version ? Number(filter.task_version) : undefined,
           limit:        Number(filter.limit),
         }
     try {
@@ -84,11 +83,7 @@ export default function DeadLetterQueue() {
           </div>
           <div className="form-row">
             <label>Task name</label>
-            <input value={filter.task_name} onChange={setF('task_name')} placeholder="any" />
-          </div>
-          <div className="form-row">
-            <label>Version</label>
-            <input type="number" value={filter.task_version} onChange={setF('task_version')} style={{ width: 70 }} />
+            <TaskNameSelect value={filter.task_name} onChange={(v) => setFilter((f) => ({ ...f, task_name: v }))} />
           </div>
           <div className="form-row">
             <label>Limit</label>
