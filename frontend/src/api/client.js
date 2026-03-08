@@ -129,6 +129,12 @@ export const getDLQHistory = (taskId) => get(`/dead-letter-queue/${taskId}/histo
  */
 export const resubmitFromDLQ = (body) => post('/dead-letter-queue/resubmit', body)
 
+/**
+ * DELETE /dead-letter-queue
+ * @param {string[]} taskIds
+ */
+export const removeManyFromDLQ = (taskIds) => request('DELETE', '/dead-letter-queue', { task_ids: taskIds })
+
 // ── Queues ─────────────────────────────────────────────────────────────────
 
 /** GET /queues  →  { queues: string[] } */

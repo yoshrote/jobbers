@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getDLQ, getDLQHistory, resubmitFromDLQ } from '../api/client'
+import { getDLQ, getDLQHistory, removeManyFromDLQ, resubmitFromDLQ } from '../api/client'
 import StatusBadge from '../components/StatusBadge'
 import TaskNameSelect from '../components/TaskNameSelect'
 
@@ -62,6 +62,16 @@ export default function DeadLetterQueue() {
     }
   }
 
+  async function handleDelete() {
+    try {
+      const res = await removeManyFromDLQ([...selected])
+      setMsg(`Deleted ${res.removed} task(s).`)
+      load()
+    } catch (e) {
+      setError(e.message)
+    }
+  }
+
   async function showHistory(taskId) {
     try {
       const res = await getDLQHistory(taskId)
@@ -108,6 +118,7 @@ export default function DeadLetterQueue() {
           <button className="btn btn-primary btn-sm" onClick={() => handleResubmit(true)}>
             Resubmit selected
           </button>
+              <button className="btn btn-danger btn-sm" onClick={() => handleDelete()}>Delete selected</button>
           <button className="btn btn-secondary btn-sm" onClick={() => setSelected(new Set())}>Clear</button>
         </div>
       )}
