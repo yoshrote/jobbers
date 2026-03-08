@@ -80,8 +80,8 @@ def run() -> None:
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-worker")
-    logging.basicConfig(level=logging.DEBUG, handlers=handlers)
-    # logging.getLogger("jobbers").setLevel(logging.DEBUG)
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
+    logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
     # register tasks
     _load_task_module(sys.argv[1])
