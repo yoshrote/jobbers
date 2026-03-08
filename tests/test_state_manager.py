@@ -530,3 +530,45 @@ async def test_cancel_scheduled_task(redis, state_manager):
     # Persisted to Redis
     saved = await state_manager.ta.get_task(ULID1)
     assert saved.status == TaskStatus.CANCELLED
+
+
+# ── TaskAdapter.remove_from_queue ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_remove_from_queue_removes_task(redis, state_manager):
+    """remove_from_queue removes the task from the queue sorted set and the type index."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
+    await redis.zadd("task-queues:default", {ULID1.bytes: FROZEN_TIME.timestamp()})
+    await redis.sadd("task-type-idx:my_task", ULID1.bytes)
+
+    await state_manager.ta.remove_from_queue(task)
+
+    assert await redis.zscore("task-queues:default", ULID1.bytes) is None
+    assert not await redis.sismember("task-type-idx:my_task", ULID1.bytes)
+
+
+@pytest.mark.asyncio
+async def test_remove_from_queue_does_not_affect_other_tasks(redis, state_manager):
+    """remove_from_queue only removes the specified task; other tasks in the same queue and index are untouched."""
+    task1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
+    task2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
+    await redis.zadd("task-queues:default", {ULID1.bytes: FROZEN_TIME.timestamp(), ULID2.bytes: FROZEN_TIME.timestamp()})
+    await redis.sadd("task-type-idx:my_task", ULID1.bytes, ULID2.bytes)
+
+    await state_manager.ta.remove_from_queue(task1)
+
+    assert await redis.zscore("task-queues:default", ULID1.bytes) is None
+    assert not await redis.sismember("task-type-idx:my_task", ULID1.bytes)
+    assert await redis.zscore("task-queues:default", ULID2.bytes) is not None
+    assert await redis.sismember("task-type-idx:my_task", ULID2.bytes)
+
+
+@pytest.mark.asyncio
+async def test_remove_from_queue_is_idempotent(redis, state_manager):
+    """remove_from_queue on a task not in either structure is a no-op."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
+
+    await state_manager.ta.remove_from_queue(task)
+
+    assert await redis.zscore("task-queues:default", ULID1.bytes) is None
+    assert not await redis.sismember("task-type-idx:my_task", ULID1.bytes)
