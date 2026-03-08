@@ -41,14 +41,14 @@ def test_period_in_seconds(rate_period, rate_denominator, expected_seconds):
 
 
 # ---------------------------------------------------------------------------
-# get_queues / set_queues
+# get_queues / save_role
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_get_queues(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
-    await queue_config_adapter.set_queues("role1", {"queue1", "queue2"})
+    await queue_config_adapter.save_role("role1", {"queue1", "queue2"})
     queues = await queue_config_adapter.get_queues("role1")
     assert queues == {"queue1", "queue2"}
 
@@ -60,21 +60,21 @@ async def test_get_queues_empty(queue_config_adapter):
 
 
 @pytest.mark.asyncio
-async def test_set_queues(queue_config_adapter):
+async def test_save_role(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
-    await queue_config_adapter.set_queues("role1", {"queue1", "queue2"})
+    await queue_config_adapter.save_role("role1", {"queue1", "queue2"})
     queues = await queue_config_adapter.get_queues("role1")
     assert queues == {"queue1", "queue2"}
 
 
 @pytest.mark.asyncio
-async def test_set_queues_replaces_existing(queue_config_adapter):
+async def test_save_role_replaces_existing(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue3"))
-    await queue_config_adapter.set_queues("role1", {"queue1", "queue2"})
-    await queue_config_adapter.set_queues("role1", {"queue3"})
+    await queue_config_adapter.save_role("role1", {"queue1", "queue2"})
+    await queue_config_adapter.save_role("role1", {"queue3"})
     queues = await queue_config_adapter.get_queues("role1")
     assert queues == {"queue3"}
 
@@ -106,8 +106,8 @@ async def test_get_all_queues_empty(queue_config_adapter):
 async def test_get_all_roles(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue2"))
-    await queue_config_adapter.set_queues("role1", {"queue1"})
-    await queue_config_adapter.set_queues("role2", {"queue2"})
+    await queue_config_adapter.save_role("role1", {"queue1"})
+    await queue_config_adapter.save_role("role2", {"queue2"})
     roles = await queue_config_adapter.get_all_roles()
     assert set(roles) == {"role1", "role2"}
 

@@ -193,7 +193,7 @@ async def test_set_queues():
 
         assert response.status_code == 200
         assert response.json() == {"message": "Queues set successfully"}
-        mock_queue_adapter.set_queues.assert_called_once_with("role1", {"queue1", "queue2"})
+        mock_queue_adapter.save_role.assert_called_once_with("role1", {"queue1", "queue2"})
 
 @pytest.mark.asyncio
 async def test_set_queues_rolls_back_on_invalid_queue(patch_sqlite):
