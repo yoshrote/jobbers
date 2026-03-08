@@ -53,7 +53,7 @@ class TaskProcessor:
             await self.state_manager.save_task(task)
 
             with self.state_manager.task_in_registry(task):
-                await task.heartbeat()
+                await self.state_manager.update_task_heartbeat(task)
                 self._current_promise = task.task_config.function(**task.parameters)
                 if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                     self._current_promise = asyncio.shield(self._current_promise)

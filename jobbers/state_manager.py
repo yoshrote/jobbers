@@ -171,6 +171,11 @@ class StateManager:
         await pipe.execute()
         return tasks
 
+    async def update_task_heartbeat(self, task: Task) -> None:
+        """Update the heartbeat timestamp for a task."""
+        task.heartbeat_at = dt.datetime.now(dt.UTC)
+        await self.ta.update_task_heartbeat(task)
+
     async def remove_task_heartbeat(self, task: Task) -> None:
         """Remove a task from the heartbeat sorted set."""
         await self.ta.remove_task_heartbeat(task)
