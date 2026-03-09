@@ -43,6 +43,9 @@ async def slow_task() -> dict[Any, Any]:
     await sleep(60)
     return {}
 
+class CustomException(Exception):
+    pass
+
 @register_task(
     name="fail_task",
     version=1,
@@ -50,9 +53,9 @@ async def slow_task() -> dict[Any, Any]:
     timeout=None,
     max_retries=3,
     retry_delay=10,
-    expected_exceptions=None,
+    expected_exceptions=(CustomException,),
     dead_letter_policy=DeadLetterPolicy.SAVE
 )
 async def fail_task() -> dict[Any, Any]:
     await sleep(30)
-    raise Exception("Task failed")
+    raise CustomException("Task failed")
