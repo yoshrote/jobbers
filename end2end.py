@@ -1,6 +1,7 @@
 from asyncio import sleep
 from typing import Any
 
+from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.registry import register_task
 
 
@@ -26,7 +27,7 @@ async def fast_task() -> dict[Any, Any]:
     expected_exceptions=None
 )
 async def medium_task() -> dict[Any, Any]:
-    await sleep(1)
+    await sleep(30)
     return {}
 
 @register_task(
@@ -39,5 +40,22 @@ async def medium_task() -> dict[Any, Any]:
     expected_exceptions=None
 )
 async def slow_task() -> dict[Any, Any]:
-    await sleep(10)
+    await sleep(60)
     return {}
+
+class CustomException(Exception):
+    pass
+
+@register_task(
+    name="fail_task",
+    version=1,
+    max_concurrent=None,
+    timeout=None,
+    max_retries=3,
+    retry_delay=10,
+    expected_exceptions=(CustomException,),
+    dead_letter_policy=DeadLetterPolicy.SAVE
+)
+async def fail_task() -> dict[Any, Any]:
+    await sleep(30)
+    raise CustomException("Task failed")

@@ -71,7 +71,7 @@ def _load_task_module(arg: str) -> None:
             raise ImportError(f"Cannot load task module from path: {arg}")
         module = importlib.util.module_from_spec(spec)
         sys.modules["_user_tasks"] = module
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        spec.loader.exec_module(module)
     else:
         importlib.import_module(arg)
 
@@ -80,8 +80,8 @@ def run() -> None:
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-worker")
-    logging.basicConfig(level=logging.DEBUG, handlers=handlers)
-    # logging.getLogger("jobbers").setLevel(logging.DEBUG)
+    logging.basicConfig(level=logging.INFO, handlers=handlers)
+    logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
     # register tasks
     _load_task_module(sys.argv[1])

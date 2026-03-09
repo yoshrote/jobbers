@@ -15,7 +15,7 @@ def register_task(
         timeout: int | None=None,
         max_retries: int=3,
         retry_delay: int | None=None,
-        expected_exceptions: tuple[Exception] | None=None,
+        expected_exceptions: tuple[type[Exception]] | None=None,
         max_heartbeat_interval: dt.timedelta | None=None,
         backoff_strategy: BackoffStrategy=BackoffStrategy.EXPONENTIAL,
         dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE

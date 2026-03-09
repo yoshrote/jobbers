@@ -357,12 +357,37 @@ class TaskAdapter:
             task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.UTC)
         return task
 
+    async def remove_from_queue(self, task: Task) -> None:
+        """Remove a task from its queue."""
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
+        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        await pipe.execute()
+
     async def update_task_heartbeat(self, task: Task) -> None:
         """Update the heartbeat for a task."""
         assert task.heartbeat_at  # noqa: S101
         pipe = self.data_store.pipeline(transaction=True)
         pipe.zadd(self.HEARTBEAT_SCORES(queue=task.queue), {bytes(task.id): task.heartbeat_at.timestamp()})
         await pipe.execute()
+
+    async def remove_task_heartbeat(self, task: Task) -> None:
+        """Remove a task from the heartbeat sorted set."""
+        await self.data_store.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
+
+    async def get_active_tasks(self, queues: set[str]) -> list["Task"]:
+        """Return all tasks currently present in any heartbeat sorted set."""
+        task_id_bytes: set[bytes] = set()
+        for queue in queues:
+            members: list[bytes] = await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1)
+            task_id_bytes.update(members)
+        if not task_id_bytes:
+            return []
+        results: list[Task] = []
+        async with TaskGroup() as group:
+            for raw_id in task_id_bytes:
+                group.create_task(self._add_task_to_results(ULID.from_bytes(raw_id), results))
+        return results
 
     async def get_stale_tasks(self, queues: set[str], stale_time: dt.timedelta) -> AsyncGenerator[Task, None]:
         """Get tasks that have not had a heartbeat update in the stale time."""
