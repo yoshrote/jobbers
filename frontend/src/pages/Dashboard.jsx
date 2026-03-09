@@ -65,6 +65,7 @@ export default function Dashboard() {
           <li><Link to="/dlq">Dead letter queue</Link></li>
           <li><Link to="/queues">Manage queues</Link></li>
           <li><Link to="/submit">Submit a task</Link></li>
+          <li><Link to="http://localhost:5080/">Metrics and Monitoring</Link></li>
         </ul>
       </div>
     </div>

@@ -12,9 +12,9 @@ const NAV_LINKS = [
   { to: '/', label: 'Dashboard' },
   { to: '/active', label: 'Active Tasks' },
   { to: '/tasks', label: 'Queued Tasks' },
-  { to: '/scheduled', label: 'Scheduled' },
+  { to: '/scheduled', label: 'Scheduled Tasks' },
   { to: '/dlq', label: 'Dead Letter Queue' },
-  { to: '/queues', label: 'Queues' },
+  { to: '/queues', label: 'Queue Configuration' },
   { to: '/submit', label: 'Submit Task' },
 ]
 

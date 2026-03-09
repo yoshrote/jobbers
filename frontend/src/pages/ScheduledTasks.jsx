@@ -33,7 +33,7 @@ export default function ScheduledTasks() {
 
   return (
     <div>
-      <h1>Scheduled tasks</h1>
+      <h1>Scheduled Tasks</h1>
 
       <div className="card">
         <div className="filter-bar">
