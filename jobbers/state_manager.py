@@ -222,7 +222,7 @@ class StateManager:
         while True:
             pipe = self.data_store.pipeline()
             await pipe.watch(task_key)
-            task_data: bytes | None = await pipe.get(task_key)
+            task_data: dict[str, object] | None = await pipe.json().get(task_key)  # type: ignore[misc]
             if task_data is None or Task.unpack(task.id, task_data).status == TaskStatus.CANCELLED:
                 await pipe.unwatch()  # type: ignore[no-untyped-call]
                 return task

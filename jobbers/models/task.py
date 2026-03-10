@@ -1,5 +1,6 @@
 import datetime as dt
 import inspect
+import json
 import logging
 from asyncio import TaskGroup
 from collections.abc import AsyncGenerator, Awaitable
@@ -9,14 +10,11 @@ from typing import Any, Self, cast
 from opentelemetry import metrics
 from pydantic import BaseModel, Field
 from redis.asyncio.client import Pipeline, Redis
+from redis.exceptions import ResponseError
 from ulid import ULID
 
 from jobbers.constants import TIME_ZERO
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
-from jobbers.utils.serialization import (
-    deserialize,
-    serialize,
-)
 
 from .queue_config import QueueConfig
 from .task_config import TaskConfig
@@ -109,9 +107,12 @@ class Task(BaseModel):
         self.heartbeat_at = dt.datetime.now(dt.UTC)
         await self._ta.update_task_heartbeat(self)
 
-    def pack(self) -> bytes:
-        """Serialize all task fields to a single msgpack blob for Redis storage."""
-        return serialize({
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize task fields to a dict for RedisJSON storage."""
+        def _ts(d: dt.datetime | None) -> float | None:
+            return d.timestamp() if d is not None else None
+
+        return {
             "name": self.name,
             "queue": self.queue,
             "version": self.version,
@@ -119,18 +120,26 @@ class Task(BaseModel):
             "results": self.results or {},
             "errors": self.errors,
             "retry_attempt": self.retry_attempt,
-            "status": self.status,
-            "submitted_at": self.submitted_at,
-            "retried_at": self.retried_at,
-            "started_at": self.started_at,
-            "heartbeat_at": self.heartbeat_at,
-            "completed_at": self.completed_at,
-        })
+            "status": str(self.status),
+            "submitted_at": _ts(self.submitted_at),
+            "retried_at": _ts(self.retried_at),
+            "started_at": _ts(self.started_at),
+            "heartbeat_at": _ts(self.heartbeat_at),
+            "completed_at": _ts(self.completed_at),
+        }
+
+    def pack(self) -> str:
+        """Serialize task fields to a JSON string (used for Lua script ARGV values)."""
+        return json.dumps(self.to_dict())
 
     @classmethod
-    def unpack(cls, task_id: ULID, data: bytes) -> "Self":
-        """Deserialize a task from a single msgpack blob."""
-        raw = deserialize(data)
+    def unpack(cls, task_id: ULID, data: str | dict[str, Any]) -> "Self":
+        """Deserialize a task from a JSON string or dict."""
+        raw: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
+
+        def _dt(ts: float | None) -> dt.datetime | None:
+            return dt.datetime.fromtimestamp(ts, dt.UTC) if ts is not None else None
+
         return cls(
             id=task_id,
             name=raw.get("name", ""),
@@ -141,11 +150,11 @@ class Task(BaseModel):
             errors=raw.get("errors") or [],
             retry_attempt=raw.get("retry_attempt", 0),
             status=raw.get("status", TaskStatus.UNSUBMITTED),
-            submitted_at=raw.get("submitted_at"),
-            retried_at=raw.get("retried_at"),
-            started_at=raw.get("started_at"),
-            heartbeat_at=raw.get("heartbeat_at"),
-            completed_at=raw.get("completed_at"),
+            submitted_at=_dt(raw.get("submitted_at")),
+            retried_at=_dt(raw.get("retried_at")),
+            started_at=_dt(raw.get("started_at")),
+            heartbeat_at=_dt(raw.get("heartbeat_at")),
+            completed_at=_dt(raw.get("completed_at")),
         )
 
     def set_status(self, status: TaskStatus) -> None:
@@ -176,16 +185,12 @@ class TaskPagination(BaseModel):
 
     queue: str = Field()
     limit: int = Field(default=10, gt=0, le=100)
+    offset: int = Field(default=0, ge=0)
     start: ULID | None = Field(default=None)
     order_by: PaginationOrder = Field(default=PaginationOrder.SUBMITTED_AT)
     task_name: str | None = Field(default=None)
     task_version: int | None = Field(default=None)
-    # status: TaskStatus | None = Field(default=None)
-
-    def start_param(self) -> int:
-        if not self.start:
-            return 0
-        return int(self.start.datetime.timestamp())
+    status: TaskStatus | None = Field(default=None)
 
 
 class TaskAdapter:
@@ -194,7 +199,8 @@ class TaskAdapter:
 
     - `task-queues:<queue>`: Sorted set of task ID => submitted at timestamp for each queue
         - ZPOPMIN to get the oldest task from a set of queues
-    - `task:<task_id>`: String containing the packed task state (name, status, etc).
+    - `task:<task_id>`: RedisJSON document containing the task state (name, status, etc).
+    - `task-idx`: RediSearch index over task JSON documents for filtered queries.
     """
 
     TASKS_BY_QUEUE = "task-queues:{queue}".format
@@ -203,6 +209,7 @@ class TaskAdapter:
     TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     DLQ_MISSING_DATA = "dlq-missing-data"
+    INDEX_NAME = "task-idx"
 
     # Atomically enqueue a new task (no rate limiting).
     # Skips the ZADD if the task details key already exists (idempotent re-submit guard).
@@ -212,13 +219,13 @@ class TaskAdapter:
     # ARGV[1] = submitted_at timestamp (score for the queue sorted set)
     # ARGV[2] = task_id bytes (member for sorted sets)
     # ARGV[3] = '1' to SADD the type index, '0' to SREM
-    # ARGV[4] = packed task blob (msgpack)
+    # ARGV[4] = JSON-encoded task blob
     SUBMIT_SCRIPT = """
         local exists = redis.call('EXISTS', KEYS[2])
         if exists == 0 then
             redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
         end
-        redis.call('SET', KEYS[2], ARGV[4])
+        redis.call('JSON.SET', KEYS[2], '$', ARGV[4])
         if ARGV[3] == '1' then
             redis.call('SADD', KEYS[3], ARGV[2])
         else
@@ -229,7 +236,7 @@ class TaskAdapter:
 
     # Atomically check the rate limit and enqueue a new task.
     # Skips the queue ZADD when either the task already exists or the rate limit is reached.
-    # Always writes task details (SET) and updates the type index.
+    # Always writes task details (JSON.SET) and updates the type index.
     # KEYS[1] = rate-limiter:{queue}
     # KEYS[2] = task-queues:{queue}
     # KEYS[3] = task:{task_id}
@@ -239,7 +246,7 @@ class TaskAdapter:
     # ARGV[3] = submitted_at timestamp (score for rate-limiter and task-queues sorted sets)
     # ARGV[4] = task_id bytes (member for sorted sets)
     # ARGV[5] = '1' to SADD the type index, '0' to SREM
-    # ARGV[6] = packed task blob (msgpack)
+    # ARGV[6] = JSON-encoded task blob
     # Returns: 1 if enqueued, 0 if rate-limited
     SUBMIT_RATE_LIMITED_SCRIPT = """
         local enqueued = 0
@@ -251,11 +258,11 @@ class TaskAdapter:
             if numerator ~= 0 and count < numerator then
                 redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
                 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
-                redis.call('SET', KEYS[3], ARGV[6])
+                redis.call('JSON.SET', KEYS[3], '$', ARGV[6])
                 enqueued = 1
             end
         else
-            redis.call('SET', KEYS[3], ARGV[6])
+            redis.call('JSON.SET', KEYS[3], '$', ARGV[6])
             enqueued = 1
         end
         if enqueued == 1 and ARGV[5] == '1' then
@@ -320,8 +327,8 @@ class TaskAdapter:
         return result == 1
 
     def stage_save(self, pipe: Pipeline, task: Task) -> None:
-        """Queue SET task-details + type-index update onto pipe (no execute)."""
-        pipe.set(self.TASK_DETAILS(task_id=task.id), task.pack())
+        """Queue JSON.SET task-details + type-index update onto pipe (no execute)."""
+        pipe.json().set(self.TASK_DETAILS(task_id=task.id), "$", task.to_dict())
         if task.status in TaskStatus.active_statuses():
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
@@ -346,8 +353,10 @@ class TaskAdapter:
         await pipe.execute()
 
     async def get_task(self, task_id: ULID) -> Task | None:
-        raw_data: bytes | None = await self.data_store.get(self.TASK_DETAILS(task_id=task_id))
-        if not raw_data:
+        raw_data: dict[str, Any] | None = await self.data_store.json().get(  # type: ignore[misc]
+            self.TASK_DETAILS(task_id=task_id)
+        )
+        if raw_data is None:
             return None
         task = Task.unpack(task_id, raw_data)
         heartbeat_score: float | None = await self.data_store.zscore(
@@ -412,29 +421,62 @@ class TaskAdapter:
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
         return does_exists == 1
 
+    async def ensure_index(self) -> None:
+        """Create the RediSearch index on task JSON documents if it does not exist."""
+        from redis.commands.search.field import NumericField, TagField
+        from redis.commands.search.indexDefinition import (  # type: ignore[import-not-found]
+            IndexDefinition,
+            IndexType,
+        )
+
+        try:
+            await self.data_store.ft(self.INDEX_NAME).info()  # type: ignore[no-untyped-call]
+        except ResponseError:
+            await self.data_store.ft(self.INDEX_NAME).create_index(
+                fields=[
+                    TagField("$.name", as_name="name"),
+                    TagField("$.queue", as_name="queue"),
+                    TagField("$.status", as_name="status"),
+                    NumericField("$.version", as_name="version"),
+                    NumericField("$.submitted_at", as_name="submitted_at", sortable=True),
+                ],
+                definition=IndexDefinition(prefix=["task:"], index_type=IndexType.JSON),
+            )
+
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
-        if pagination.order_by == "submitted_at":
-            # tasks will be ordered by SUBMISSION time
-            task_ids = await self.data_store.zrangebyscore(
-                self.TASKS_BY_QUEUE(queue=pagination.queue),
-                pagination.start_param(), '+inf',
-                start=pagination.start_param(),
-                num=pagination.limit
-            )
-        else:
-            # tasks will be ordered by TASK ID, which is roughly creation time but not exactly
-            task_ids = await self.data_store.zrange(
-                self.TASKS_BY_QUEUE(queue=pagination.queue),
-                pagination.start_param(), int(dt.datetime.now(dt.UTC).timestamp()),
-                num=pagination.limit
-            )
-        if not task_ids:
+        """Query tasks via the RediSearch index with optional filters."""
+        from redis.commands.search.query import Query as SearchQuery
+
+        def _escape_tag(value: str) -> str:
+            """Escape special characters for a RediSearch TAG query value."""
+            special = set(r',.<>{}[]"\':;!@#$%^&*()\-+=~| ')
+            return "".join(f"\\{c}" if c in special else c for c in value)
+
+        query_parts = [f"@queue:{{{_escape_tag(pagination.queue)}}}"]
+        if pagination.task_name:
+            query_parts.append(f"@name:{{{_escape_tag(pagination.task_name)}}}")
+        if pagination.task_version is not None:
+            query_parts.append(f"@version:[{pagination.task_version} {pagination.task_version}]")
+        if pagination.status is not None:
+            query_parts.append(f"@status:{{{_escape_tag(str(pagination.status))}}}")
+
+        q: SearchQuery = (
+            SearchQuery(" ".join(query_parts))
+            .no_content()
+            .paging(pagination.offset, pagination.limit)
+        )
+        if pagination.order_by == PaginationOrder.SUBMITTED_AT:
+            q = q.sort_by("submitted_at", asc=True)
+
+        search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
+        if not search_results.docs:
             return []
+
         results: list[Task] = []
-        # TODO: do some batching in case there are tons of tasks
         async with TaskGroup() as group:
-            for task_id in task_ids:
-                group.create_task(self._add_task_to_results(ULID(task_id), results))
+            for doc in search_results.docs:
+                task_id = ULID.from_str(doc.id.removeprefix("task:"))
+                group.create_task(self._add_task_to_results(task_id, results))
         return results
 
     async def _add_task_to_results(self, task_id: ULID, results: list[Task]) -> list[Task]:
@@ -485,15 +527,14 @@ class TaskAdapter:
         }
         cutoff = now - max_age
         async for raw_key in self.data_store.scan_iter("task:*"):
-            key = raw_key if isinstance(raw_key, bytes) else raw_key.encode()
-            task_data: bytes | None = await self.data_store.get(key)
-            if task_data is None:
-                continue
-            key_str = key.decode()
+            key_str = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
             task_id_str = key_str.removeprefix("task:")
             try:
                 task_id = ULID.from_str(task_id_str)
             except ValueError:
+                continue
+            task_data: dict[str, Any] | None = await self.data_store.json().get(key_str)  # type: ignore[misc]
+            if task_data is None:
                 continue
             task = Task.unpack(task_id, task_data)
             if task.status not in terminal_statuses:
@@ -501,7 +542,7 @@ class TaskAdapter:
             if task.completed_at is None or task.completed_at >= cutoff:
                 continue
             pipe = self.data_store.pipeline(transaction=True)
-            pipe.delete(key)
+            pipe.delete(key_str)
             pipe.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id))
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task_id))
             await pipe.execute()

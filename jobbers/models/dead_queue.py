@@ -52,7 +52,7 @@ class DeadQueue:
     async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return the per-attempt error history for a DLQ task from its stored task blob."""
         u = ULID.from_str(task_id)
-        task_data: bytes | None = await self.data_store.get(f"task:{u}")
+        task_data: dict[str, Any] | None = await self.data_store.json().get(f"task:{u}")  # type: ignore[misc]
         if task_data is None:
             return []
         task = Task.unpack(u, task_data)

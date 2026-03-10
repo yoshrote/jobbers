@@ -118,7 +118,7 @@ class TaskScheduler:
             if len(results) >= limit:
                 break
             task_id = ULID.from_bytes(raw_id)
-            task_data: bytes | None = await self.data_store.get(f"task:{task_id}")
+            task_data: dict[str, Any] | None = await self.data_store.json().get(f"task:{task_id}")  # type: ignore[misc]
             if task_data is None:
                 continue
             task = Task.unpack(task_id, task_data)
@@ -172,7 +172,7 @@ class TaskScheduler:
         for i in range(0, len(raw), 2):
             task_id = ULID.from_bytes(raw[i])
             run_at = dt.datetime.fromtimestamp(float(raw[i + 1]), dt.UTC)
-            task_data: bytes | None = await self.data_store.get(f"task:{task_id}")
+            task_data: dict[str, Any] | None = await self.data_store.json().get(f"task:{task_id}")  # type: ignore[misc]
             if task_data is not None:
                 task = Task.unpack(task_id, task_data)
                 results.append((task, run_at))
