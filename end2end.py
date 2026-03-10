@@ -44,6 +44,8 @@ async def slow_task() -> dict[Any, Any]:
     return {}
 
 class CustomException(Exception):
+    """Custom exception for testing expected exceptions in task processing."""
+
     pass
 
 @register_task(

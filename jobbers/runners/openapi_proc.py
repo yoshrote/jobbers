@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+import anyio
 import httpx
 
 
@@ -22,7 +23,8 @@ async def _write_spec(output_path: Path) -> None:
         response = await client.get("/openapi.json")
         response.raise_for_status()
 
-    output_path.write_text(json.dumps(response.json(), indent=2))
+    async_path = anyio.Path(output_path)
+    await async_path.write_text(json.dumps(response.json(), indent=2))
     print(f"OpenAPI spec written to {output_path}")
 
 

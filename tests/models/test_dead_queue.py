@@ -383,5 +383,5 @@ async def test_clean_removes_secondary_indexes(dq, redis):
 
 @pytest.mark.asyncio
 async def test_clean_empty_queue_is_silent(dq):
-    """clean on an empty DLQ should not raise."""
+    """Clean on an empty DLQ should not raise."""
     await dq.clean(dt.datetime(2025, 1, 1, tzinfo=dt.UTC))
