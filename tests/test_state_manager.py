@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import datetime as dt
 from collections import defaultdict
 from unittest.mock import patch
@@ -14,7 +16,7 @@ from jobbers.models.queue_config import QueueConfig, create_schema
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_status import TaskStatus
-from jobbers.state_manager import StateManager
+from jobbers.state_manager import StateManager, UserCancellationError
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -572,3 +574,28 @@ async def test_remove_from_queue_is_idempotent(redis, state_manager):
 
     assert await redis.zscore("task-queues:default", ULID1.bytes) is None
     assert not await redis.sismember("task-type-idx:my_task", ULID1.bytes)
+
+
+# ── monitor_task_cancellation ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_monitor_task_cancellation_raises_on_cancel_message(state_manager, redis):
+    """monitor_task_cancellation raises UserCancellationError when a cancel message is published."""
+    task_id = ULID1
+    monitor = asyncio.create_task(state_manager.monitor_task_cancellation(task_id))
+    await asyncio.sleep(0.05)  # let the subscription establish
+    await redis.publish(f"task_cancel_{task_id}", "cancel")
+    with pytest.raises(UserCancellationError):
+        await monitor
+
+
+@pytest.mark.asyncio
+async def test_monitor_task_cancellation_does_not_exit_without_message(state_manager):
+    """monitor_task_cancellation keeps running when no cancel message is sent."""
+    task_id = ULID1
+    monitor = asyncio.create_task(state_manager.monitor_task_cancellation(task_id))
+    await asyncio.sleep(0.1)  # let it spin a few poll iterations
+    assert not monitor.done(), "monitor should still be running when no cancel message is sent"
+    monitor.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await monitor

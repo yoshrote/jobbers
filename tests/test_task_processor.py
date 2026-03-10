@@ -670,9 +670,10 @@ async def test_task_processor_run_exits_early_on_pubsub_cancel():
 
     Sequence:
     1. monitor raises UserCancellationError → handle_user_cancelled_task sets CANCELLED.
-    2. TaskGroup cancels process → handle_system_cancelled_task sets STALLED (default STOP policy).
+    2. TaskGroup cancels process → CancelledError caught, but status is already CANCELLED so
+       handle_system_cancelled_task is skipped; process() returns cleanly.
     3. TaskGroup raises ExceptionGroup([UserCancellationError]) → run() catches and suppresses it.
-    run() returns normally (no exception); the task is not COMPLETED.
+    run() returns normally (no exception); the task status is CANCELLED.
     """
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -724,10 +725,43 @@ async def test_task_processor_run_exits_early_on_pubsub_cancel():
 
     await fake_store.aclose()
 
-    # The task was interrupted before completing.
-    assert task.status != TaskStatus.COMPLETED
+    assert task.status == TaskStatus.CANCELLED
     # State was saved at least twice: once when started, once when interrupted.
     assert state_manager.save_task.call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_process_does_not_overwrite_cancelled_status_on_system_cancel():
+    """
+    process() skips handle_system_cancelled_task when status is already CANCELLED.
+
+    This prevents the TaskGroup-injected CancelledError (a side-effect of user cancellation)
+    from overwriting CANCELLED with STALLED.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+
+    async def cancel_immediately() -> dict[str, object]:
+        # Simulate handle_user_cancelled_task having set status before CancelledError propagates
+        task.set_status(TaskStatus.CANCELLED)
+        raise asyncio.CancelledError()
+
+    task_config = TaskConfig(name="test_task", version=1, function=cancel_immediately, timeout=60)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        with patch.object(processor, "handle_system_cancelled_task", new_callable=AsyncMock) as mock_sys:
+            await processor.process(task)
+
+    mock_sys.assert_not_called()
+    assert task.status == TaskStatus.CANCELLED
 
 
 @pytest.mark.asyncio

@@ -65,8 +65,11 @@ class TaskProcessor:
                 except TimeoutError:
                     task = await self.handle_timeout_exception(task)
                 except asyncio.CancelledError as exc:
-                    ex = exc
-                    await self.handle_system_cancelled_task(task)
+                    if task.status == TaskStatus.CANCELLED:
+                        pass  # user cancellation already handled; keep CANCELLED status
+                    else:
+                        ex = exc
+                        await self.handle_system_cancelled_task(task)
                 except Exception as exc:
                     if task.task_config and task.task_config.expected_exceptions and isinstance(exc, task.task_config.expected_exceptions):
                         task = await self.handle_expected_exception(task, exc)
