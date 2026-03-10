@@ -6,6 +6,7 @@ import pytest_asyncio
 import redis.asyncio as aioredis
 
 from jobbers.models.task import Task
+from jobbers.models.task_adapter import TaskAdapter
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
@@ -28,7 +29,7 @@ async def redis():
 
 @pytest_asyncio.fixture
 async def scheduler(redis):
-    yield TaskScheduler(redis)
+    yield TaskScheduler(redis, TaskAdapter(redis))
 
 
 # ── basic CRUD ────────────────────────────────────────────────────────────────
@@ -41,7 +42,7 @@ async def test_next_due_empty(scheduler):
 @pytest.mark.asyncio
 async def test_add_and_next_due(scheduler, redis):
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     result = await scheduler.next_due(["default"])
     assert result is not None
@@ -52,7 +53,7 @@ async def test_add_and_next_due(scheduler, redis):
 async def test_remove_prevents_next_due(scheduler, redis):
     task = make_task()
     # Store task data so next_due can load it
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     await scheduler.remove(task.id)
     assert await scheduler.next_due(["default"]) is None
@@ -62,7 +63,7 @@ async def test_remove_prevents_next_due(scheduler, redis):
 async def test_add_replaces_existing(scheduler, redis):
     """Re-adding a task that was already acquired makes it available again."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     await scheduler.next_due(["default"])    # acquires (removes from sorted set)
     await scheduler.add(task, PAST)          # re-adds to sorted set
@@ -80,7 +81,7 @@ async def test_future_task_not_returned(scheduler):
 @pytest.mark.asyncio
 async def test_past_task_is_returned(scheduler, redis):
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     assert await scheduler.next_due(["default"]) is not None
 
@@ -102,7 +103,7 @@ async def test_next_due_wrong_queue_returns_none(scheduler):
 @pytest.mark.asyncio
 async def test_next_due_correct_queue_returned(scheduler, redis):
     task = make_task(queue="other")
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     result = await scheduler.next_due(["other"])
     assert result is not None
@@ -113,7 +114,7 @@ async def test_next_due_multi_queue_filter(scheduler, redis):
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="alpha")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", queue="beta")
     for t in (t1, t2):
-        await redis.set(f"task:{t.id}", t.pack())
+        await redis.json().set(f"task:{t.id}", "$", t.to_dict())
         await scheduler.add(t, PAST)
     result = await scheduler.next_due(["alpha", "beta"])
     assert result is not None
@@ -125,7 +126,7 @@ async def test_next_due_multi_queue_filter(scheduler, redis):
 async def test_next_due_acquires_once(scheduler, redis):
     """A second call should not return the same task."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     first = await scheduler.next_due(["default"])
     second = await scheduler.next_due(["default"])
@@ -142,7 +143,7 @@ async def test_next_due_returns_earliest_run_at(scheduler, redis):
     earlier_time = dt.datetime(2020, 3, 1, tzinfo=dt.UTC)
     later_time = dt.datetime(2020, 6, 1, tzinfo=dt.UTC)
     for t in (earlier, later):
-        await redis.set(f"task:{t.id}", t.pack())
+        await redis.json().set(f"task:{t.id}", "$", t.to_dict())
     # Insert in reverse order to prove sorting is by run_at, not insertion order
     await scheduler.add(later, later_time)
     await scheduler.add(earlier, earlier_time)
@@ -157,7 +158,7 @@ async def test_next_due_returns_earliest_run_at(scheduler, redis):
 async def test_next_due_none_returns_due_task(scheduler, redis):
     """next_due(None) matches any queue when all-queues set is populated."""
     task = make_task(queue="alpha")
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await redis.sadd("all-queues", "alpha")
     await scheduler.add(task, PAST)
     assert await scheduler.next_due(None) is not None
@@ -175,7 +176,7 @@ async def test_next_due_none_skips_future_task(scheduler, redis):
 async def test_next_due_none_acquires_once(scheduler, redis):
     """next_due(None) will not return the same task twice."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await redis.sadd("all-queues", "default")
     await scheduler.add(task, PAST)
     assert await scheduler.next_due(None) is not None
@@ -188,7 +189,7 @@ async def test_next_due_none_acquires_once(scheduler, redis):
 async def test_next_due_bulk_returns_task_run_at_tuples(scheduler, redis):
     """next_due_bulk returns (Task, datetime) pairs."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     results = await scheduler.next_due_bulk(10, queues=["default"])
     assert len(results) == 1
@@ -203,7 +204,7 @@ async def test_next_due_bulk_run_at_matches_scheduled_time(scheduler, redis):
     """The run_at in each tuple equals the datetime passed to add()."""
     scheduled_time = dt.datetime(2020, 6, 15, 12, 0, 0, tzinfo=dt.UTC)
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, scheduled_time)
     (_, run_at), = await scheduler.next_due_bulk(10, queues=["default"])
     # Compare at second precision (timestamps are floats)
@@ -219,7 +220,7 @@ async def test_next_due_bulk_respects_limit(scheduler, redis):
         make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03"),
     ]
     for t in tasks:
-        await redis.set(f"task:{t.id}", t.pack())
+        await redis.json().set(f"task:{t.id}", "$", t.to_dict())
         await scheduler.add(t, PAST)
     assert len(await scheduler.next_due_bulk(2, queues=["default"])) == 2
 
@@ -228,7 +229,7 @@ async def test_next_due_bulk_respects_limit(scheduler, redis):
 async def test_next_due_bulk_empty_queue_list_returns_empty(scheduler, redis):
     """next_due_bulk(queues=[]) returns [] without touching Redis."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     assert await scheduler.next_due_bulk(10, queues=[]) == []
 
@@ -237,7 +238,7 @@ async def test_next_due_bulk_empty_queue_list_returns_empty(scheduler, redis):
 async def test_next_due_bulk_acquires_so_second_call_returns_empty(scheduler, redis):
     """Tasks returned by next_due_bulk are removed and not returned again."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     assert len(await scheduler.next_due_bulk(10, queues=["default"])) == 1
     assert await scheduler.next_due_bulk(10, queues=["default"]) == []
@@ -249,7 +250,7 @@ async def test_next_due_bulk_acquires_so_second_call_returns_empty(scheduler, re
 async def test_get_by_filter_returns_scheduled_tasks(scheduler, redis):
     """get_by_filter returns tasks currently in the schedule for a queue."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     results = await scheduler.get_by_filter(queue="default")
     assert len(results) == 1
@@ -260,7 +261,7 @@ async def test_get_by_filter_returns_scheduled_tasks(scheduler, redis):
 async def test_get_by_filter_by_task_name(scheduler, redis):
     """get_by_filter filters by task_name."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     assert len(await scheduler.get_by_filter(queue="default", task_name="test_task")) == 1
     assert len(await scheduler.get_by_filter(queue="default", task_name="other")) == 0
@@ -270,7 +271,7 @@ async def test_get_by_filter_by_task_name(scheduler, redis):
 async def test_get_by_filter_by_task_version(scheduler, redis):
     """get_by_filter filters by task_version."""
     task = make_task()
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
     await scheduler.add(task, PAST)
     assert len(await scheduler.get_by_filter(queue="default", task_version=1)) == 1
     assert len(await scheduler.get_by_filter(queue="default", task_version=99)) == 0
@@ -282,7 +283,7 @@ async def test_get_by_filter_cursor_pagination(scheduler, redis):
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await redis.set(f"task:{t.id}", t.pack())
+        await redis.json().set(f"task:{t.id}", "$", t.to_dict())
         await scheduler.add(t, PAST)
     results = await scheduler.get_by_filter(queue="default", start_after=str(t1.id))
     assert len(results) == 1

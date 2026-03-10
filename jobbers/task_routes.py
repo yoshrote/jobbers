@@ -12,7 +12,7 @@ from ulid import ULID
 
 from jobbers import db, registry
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
-from jobbers.models.task import Task, TaskAdapter, TaskPagination
+from jobbers.models.task import Task, TaskPagination
 from jobbers.state_manager import TaskException
 from jobbers.validation import ValidationError, validate_task
 
@@ -69,7 +69,7 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     """Retrieve the status of a specific task."""
     logger.info("Getting task status for task ID %s", task_id)
     task_uid: ULID = ULID.from_str(task_id)
-    task = await TaskAdapter(db.get_client()).get_task(task_uid)
+    task = await db.get_task_adapter().get_task(task_uid)
     if task:
         return task.summarized()
     raise HTTPException(status_code=404, detail="Task not found")
@@ -121,7 +121,7 @@ async def cancel_tasks(request: BulkCancelRequest) -> dict[str, Any]:
 async def get_task_list(filter_query: Annotated[TaskPagination, Query()]) -> dict[str, Any]:
     """Retrieve the list of all tasks."""
     logger.info("Getting all tasks")
-    tasks = await TaskAdapter(db.get_client()).get_all_tasks(filter_query)
+    tasks = await db.get_task_adapter().get_all_tasks(filter_query)
     return {"tasks": tasks}
 
 @app.get("/queues/{role}")

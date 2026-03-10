@@ -7,6 +7,7 @@ import redis.asyncio as aioredis
 
 from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.task import Task
+from jobbers.models.task_adapter import TaskAdapter
 from jobbers.models.task_status import TaskStatus
 
 FAILED_AT = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -43,12 +44,12 @@ async def redis():
 
 @pytest_asyncio.fixture
 async def dq(redis):
-    yield DeadQueue(redis)
+    yield DeadQueue(redis, TaskAdapter(redis))
 
 
 async def store_task(redis: aioredis.Redis, task: Task) -> None:
     """Pre-store task data at task:<id> so DLQ reads can find it."""
-    await redis.set(f"task:{task.id}", task.pack())
+    await redis.json().set(f"task:{task.id}", "$", task.to_dict())
 
 
 # ── add / get_by_ids ──────────────────────────────────────────────────────────

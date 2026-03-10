@@ -1,13 +1,18 @@
-import datetime as dt
+from __future__ import annotations
+
+import asyncio
 from typing import TYPE_CHECKING, Any, cast
 
-from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 if TYPE_CHECKING:
+    import datetime as dt
     from collections.abc import Awaitable
 
-from jobbers.models.task import Task
+    from redis.asyncio.client import Pipeline, Redis
+
+    from jobbers.models.task import Task
+    from jobbers.models.task_adapter import TaskAdapterProtocol
 
 
 class DeadQueue:
@@ -26,10 +31,11 @@ class DeadQueue:
     DLQ_NAME = "dlq-name:{name}".format
     DLQ_META = "dlq-meta"
 
-    def __init__(self, data_store: Redis) -> None:
+    def __init__(self, data_store: Redis, task_adapter: TaskAdapterProtocol) -> None:
         self.data_store = data_store
+        self.ta = task_adapter
 
-    def stage_add(self, pipe: Pipeline, task: "Task", failed_at: dt.datetime) -> None:
+    def stage_add(self, pipe: Pipeline, task: Task, failed_at: dt.datetime) -> None:
         """Queue all four DLQ index writes onto pipe (no execute)."""
         pipe.zadd(self.DLQ, {bytes(task.id): failed_at.timestamp()})
         pipe.sadd(self.DLQ_QUEUE(queue=task.queue), bytes(task.id))
@@ -43,7 +49,7 @@ class DeadQueue:
         pipe.srem(self.DLQ_NAME(name=name), bytes(task_id))
         pipe.hdel(self.DLQ_META, str(task_id))
 
-    async def add(self, task: "Task", failed_at: dt.datetime) -> None:
+    async def add(self, task: Task, failed_at: dt.datetime) -> None:
         """Insert or replace the DLQ entry for a task (latest failure wins)."""
         pipe = self.data_store.pipeline(transaction=True)
         self.stage_add(pipe, task, failed_at)
@@ -52,13 +58,12 @@ class DeadQueue:
     async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return the per-attempt error history for a DLQ task from its stored task blob."""
         u = ULID.from_str(task_id)
-        task_data: dict[str, Any] | None = await self.data_store.json().get(f"task:{u}")  # type: ignore[misc]
-        if task_data is None:
+        task = await self.ta.get_task(u)
+        if task is None:
             return []
-        task = Task.unpack(u, task_data)
         return [{"attempt": i, "error": e} for i, e in enumerate(task.errors)]
 
-    async def get_by_ids(self, task_ids: list[str]) -> list["Task"]:
+    async def get_by_ids(self, task_ids: list[str]) -> list[Task]:
         """Fetch DLQ entries by explicit task ID list."""
         if not task_ids:
             return []
@@ -71,12 +76,8 @@ class DeadQueue:
         valid_ulids = [u for u, s in zip(ulids, scores) if s is not None]
         if not valid_ulids:
             return []
-        # Batch-fetch task data for confirmed DLQ members
-        pipe2 = self.data_store.pipeline(transaction=False)
-        for u in valid_ulids:
-            pipe2.get(f"task:{u}")
-        task_bytes_list = await pipe2.execute()
-        return [Task.unpack(u, tb) for u, tb in zip(valid_ulids, task_bytes_list) if tb is not None]
+        tasks: list[Task | None] = await asyncio.gather(*[self.ta.get_task(u) for u in valid_ulids])
+        return [t for t in tasks if t is not None]
 
     async def get_by_filter(
         self,
@@ -84,7 +85,7 @@ class DeadQueue:
         task_name: str | None = None,
         task_version: int | None = None,
         limit: int = 100,
-    ) -> list["Task"]:
+    ) -> list[Task]:
         """Fetch DLQ entries matching the given filter criteria."""
         if queue is not None and task_name is not None:
             raw_ids: set[bytes] = await cast(
@@ -110,19 +111,14 @@ class DeadQueue:
             )
         if not raw_ids:
             return []
-        # Batch-fetch task data
         ulid_list = [ULID.from_bytes(b) for b in raw_ids]
-        pipe = self.data_store.pipeline(transaction=False)
-        for u in ulid_list:
-            pipe.get(f"task:{u}")
-        task_bytes_list = await pipe.execute()
+        fetched: list[Task | None] = await asyncio.gather(*[self.ta.get_task(u) for u in ulid_list])
         results: list[Task] = []
-        for u, tb in zip(ulid_list, task_bytes_list):
+        for task in fetched:
             if len(results) >= limit:
                 break
-            if tb is None:
+            if task is None:
                 continue
-            task = Task.unpack(u, tb)
             if task_version is not None and task.version != task_version:
                 continue
             results.append(task)

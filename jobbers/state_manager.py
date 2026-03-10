@@ -13,7 +13,7 @@ from redis.exceptions import WatchError
 from jobbers import registry
 from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.queue_config import QueueConfigAdapter
-from jobbers.models.task import Task, TaskAdapter
+from jobbers.models.task_adapter import JsonTaskAdapter, TaskAdapterProtocol
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     import aiosqlite
     from redis.asyncio.client import Redis
     from ulid import ULID
+
+    from jobbers.models.task import Task
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -43,14 +45,19 @@ class UserCancellationError(Exception):
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
 
-    def __init__(self, data_store: Redis, sqlite_conn: aiosqlite.Connection) -> None:
+    def __init__(
+        self,
+        data_store: Redis,
+        sqlite_conn: aiosqlite.Connection,
+        task_adapter: TaskAdapterProtocol | None = None,
+    ) -> None:
         self.data_store: Redis = data_store
         self.qca = QueueConfigAdapter(sqlite_conn)
-        self.ta = TaskAdapter(data_store)
+        self.ta: TaskAdapterProtocol = task_adapter if task_adapter is not None else JsonTaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(data_store, self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
-        self.dead_queue = DeadQueue(data_store)
-        self.task_scheduler = TaskScheduler(data_store)
+        self.dead_queue = DeadQueue(data_store, self.ta)
+        self.task_scheduler = TaskScheduler(data_store, self.ta)
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -222,8 +229,8 @@ class StateManager:
         while True:
             pipe = self.data_store.pipeline()
             await pipe.watch(task_key)
-            task_data: dict[str, object] | None = await pipe.json().get(task_key)  # type: ignore[misc]
-            if task_data is None or Task.unpack(task.id, task_data).status == TaskStatus.CANCELLED:
+            watched_task: Task | None = await self.ta.read_for_watch(pipe, task.id)
+            if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
                 await pipe.unwatch()  # type: ignore[no-untyped-call]
                 return task
             task.set_status(TaskStatus.SUBMITTED)

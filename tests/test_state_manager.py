@@ -25,7 +25,7 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 @pytest_asyncio.fixture(autouse=True)
 async def redis():
     """Fixture to reset the tasks in the mocked Redis before each test."""
-    fake_store = fakeredis.FakeRedis(server_type="redis-stack")
+    fake_store = fakeredis.FakeRedis()
     yield fake_store
     await fake_store.close()
 

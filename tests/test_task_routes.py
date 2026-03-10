@@ -11,8 +11,9 @@ from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, create_schema
 from jobbers.models.task import Task
+from jobbers.models.task_adapter import TaskAdapter
 from jobbers.models.task_config import TaskConfig
-from jobbers.state_manager import StateManager, TaskAdapter
+from jobbers.state_manager import StateManager
 from jobbers.task_routes import app
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -45,8 +46,10 @@ async def patch_sqlite():
 @pytest_asyncio.fixture(autouse=True)
 async def patch_state_manager(redis_db, patch_sqlite):
     """Provide a real StateManager backed by the test redis and sqlite connections."""
-    sm = StateManager(redis_db, patch_sqlite)
-    with patch("jobbers.task_routes.db.get_state_manager", return_value=sm):
+    ta = TaskAdapter(redis_db)
+    sm = StateManager(redis_db, patch_sqlite, task_adapter=ta)
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=sm), \
+         patch("jobbers.db.get_task_adapter", return_value=ta):
         yield sm
 
 @pytest.mark.asyncio
@@ -137,7 +140,7 @@ async def test_get_task_status_not_found():
     mock_task_adapter = AsyncMock()
     mock_task_adapter.get_task.return_value = None
 
-    with patch("jobbers.task_routes.TaskAdapter", return_value=mock_task_adapter):
+    with patch("jobbers.db.get_task_adapter", return_value=mock_task_adapter):
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get(f"/task-status/{ULID1}")
@@ -155,7 +158,7 @@ async def test_get_task_list():
         {"id": str(ULID2), "name": "Task 2", "status": "completed"},
     ]
 
-    with patch("jobbers.task_routes.TaskAdapter", return_value=mock_task_adapter):
+    with patch("jobbers.db.get_task_adapter", return_value=mock_task_adapter):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/task-list", params={"queue": "default"})
 

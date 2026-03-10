@@ -1,13 +1,18 @@
-import datetime as dt
+from __future__ import annotations
+
+import asyncio
 from typing import TYPE_CHECKING, Any, cast
 
-from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 if TYPE_CHECKING:
+    import datetime as dt
     from collections.abc import Awaitable
 
-from jobbers.models.task import Task
+    from redis.asyncio.client import Pipeline, Redis
+
+    from jobbers.models.task import Task
+    from jobbers.models.task_adapter import TaskAdapterProtocol
 
 
 class TaskScheduler:
@@ -44,8 +49,9 @@ class TaskScheduler:
         return results
     """
 
-    def __init__(self, data_store: Redis) -> None:
+    def __init__(self, data_store: Redis, task_adapter: TaskAdapterProtocol) -> None:
         self.data_store = data_store
+        self.ta = task_adapter
 
     def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
         """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
@@ -113,15 +119,14 @@ class TaskScheduler:
             cursor = bytes(ULID.from_str(start_after))
             raw_ids = [r for r in raw_ids if r > cursor]
 
+        ulid_list = [ULID.from_bytes(r) for r in raw_ids]
+        fetched: list[Task | None] = await asyncio.gather(*[self.ta.get_task(u) for u in ulid_list])
         results: list[Task] = []
-        for raw_id in raw_ids:
+        for task in fetched:
             if len(results) >= limit:
                 break
-            task_id = ULID.from_bytes(raw_id)
-            task_data: dict[str, Any] | None = await self.data_store.json().get(f"task:{task_id}")  # type: ignore[misc]
-            if task_data is None:
+            if task is None:
                 continue
-            task = Task.unpack(task_id, task_data)
             if task_name is not None and task.name != task_name:
                 continue
             if task_version is not None and task.version != task_version:
@@ -149,6 +154,8 @@ class TaskScheduler:
         - ``queues=[]``   — return [] immediately
         - ``queues=[...]`` — only match tasks in the given queues
         """
+        import datetime as dt
+
         if queues is not None and not queues:
             return []
 
@@ -168,13 +175,7 @@ class TaskScheduler:
             self.data_store.eval(self._ACQUIRE_SCRIPT, len(keys), *keys, str(now), n),
         )
 
-        results: list[tuple[Task, dt.datetime]] = []
-        for i in range(0, len(raw), 2):
-            task_id = ULID.from_bytes(raw[i])
-            run_at = dt.datetime.fromtimestamp(float(raw[i + 1]), dt.UTC)
-            task_data: dict[str, Any] | None = await self.data_store.json().get(f"task:{task_id}")  # type: ignore[misc]
-            if task_data is not None:
-                task = Task.unpack(task_id, task_data)
-                results.append((task, run_at))
-
-        return results
+        task_ids = [ULID.from_bytes(raw[i]) for i in range(0, len(raw), 2)]
+        run_ats = [dt.datetime.fromtimestamp(float(raw[i + 1]), dt.UTC) for i in range(0, len(raw), 2)]
+        tasks: list[Task | None] = await asyncio.gather(*[self.ta.get_task(u) for u in task_ids])
+        return [(task, run_at) for task, run_at in zip(tasks, run_ats) if task is not None]
