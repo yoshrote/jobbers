@@ -279,6 +279,35 @@ async def resubmit_from_dlq(request: DLQResubmitRequest) -> dict[str, Any]:
     }
 
 
+class BulkStatusRequest(BaseModel):
+    """Request body for bulk task status query."""
+
+    task_ids: list[str] = Field(description="List of task IDs to check status for.")
+
+
+@app.post("/task-status/bulk")
+async def get_bulk_task_status(request: BulkStatusRequest) -> dict[str, Any]:
+    """
+    Retrieve the status of multiple tasks in a single request.
+
+    Returns a mapping of task_id → status string. Tasks not found return ``"unknown"``.
+    Useful for executors that need to poll many tasks without N individual round-trips.
+    """
+    adapter = TaskAdapter(db.get_client())
+
+    async def _fetch_one(task_id_str: str) -> tuple[str, str]:
+        try:
+            task_uid = ULID.from_str(task_id_str)
+            task = await adapter.get_task(task_uid)
+            return task_id_str, str(task.status) if task else "unknown"
+        except Exception:
+            logger.exception("Error fetching status for task %s", task_id_str)
+            return task_id_str, "unknown"
+
+    pairs = await asyncio.gather(*(_fetch_one(tid) for tid in request.task_ids))
+    return {"statuses": dict(pairs)}
+
+
 @app.get("/active-tasks")
 async def get_active_tasks(queue: str | None = None) -> dict[str, Any]:
     """Retrieve tasks currently being executed (those with an active heartbeat record)."""
