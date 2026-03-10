@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
@@ -76,7 +75,7 @@ class DeadQueue:
         valid_ulids = [u for u, s in zip(ulids, scores) if s is not None]
         if not valid_ulids:
             return []
-        tasks: list[Task | None] = await asyncio.gather(*[self.ta.get_task(u) for u in valid_ulids])
+        tasks: list[Task | None] = await self.ta.get_tasks_bulk(valid_ulids)
         return [t for t in tasks if t is not None]
 
     async def get_by_filter(
@@ -112,7 +111,7 @@ class DeadQueue:
         if not raw_ids:
             return []
         ulid_list = [ULID.from_bytes(b) for b in raw_ids]
-        fetched: list[Task | None] = await asyncio.gather(*[self.ta.get_task(u) for u in ulid_list])
+        fetched: list[Task | None] = await self.ta.get_tasks_bulk(ulid_list)
         results: list[Task] = []
         for task in fetched:
             if len(results) >= limit:

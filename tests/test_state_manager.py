@@ -247,8 +247,8 @@ async def test_clean_completed_task_age_removes_old_terminal_tasks(redis, state_
                     completed_at=FROZEN_TIME - dt.timedelta(days=8))
     active_task = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.STARTED,
                        started_at=FROZEN_TIME - dt.timedelta(hours=1))
-    await redis.json().set(f"task:{ULID1}", "$", old_task.to_dict())
-    await redis.json().set(f"task:{ULID2}", "$", active_task.to_dict())
+    await state_manager.ta.save_task(old_task)
+    await state_manager.ta.save_task(active_task)
     await state_manager.qca.save_queue_config(QueueConfig(name="default"))
 
     with patch("datetime.datetime") as mock_datetime:
@@ -296,7 +296,7 @@ async def test_clean_stale_time_skips_terminal_tasks(redis, state_manager):
     completed = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED,
                      completed_at=two_hours_ago + dt.timedelta(minutes=30),
                      heartbeat_at=two_hours_ago)
-    await redis.json().set(f"task:{ULID1}", "$", completed.to_dict())
+    await state_manager.ta.save_task(completed)
     await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
     await state_manager.qca.save_queue_config(QueueConfig(name="default"))
 
@@ -315,7 +315,7 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager)
     two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
     started = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED,
                    started_at=two_hours_ago, heartbeat_at=two_hours_ago)
-    await redis.json().set(f"task:{ULID1}", "$", started.to_dict())
+    await state_manager.ta.save_task(started)
     await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
     await state_manager.qca.save_queue_config(QueueConfig(name="default"))
 
@@ -335,7 +335,7 @@ async def test_dispatch_scheduled_task(redis, state_manager):
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
     run_at = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
     # Pre-store task data (normally set by submit_task/save_task before scheduling)
-    await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+    await state_manager.ta.save_task(task)
     await state_manager.task_scheduler.add(task, run_at)
 
     due = await state_manager.task_scheduler.next_due(["default"])
@@ -355,7 +355,7 @@ async def test_dispatch_scheduled_task_skips_cancelled(redis, state_manager):
     # Simulate: scheduler acquired the task with a stale SCHEDULED status object, but
     # by the time dispatch runs the cancel path has already written CANCELLED to Redis.
     cancelled = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.CANCELLED, retry_attempt=1)
-    await redis.json().set(f"task:{ULID1}", "$", cancelled.to_dict())
+    await state_manager.ta.save_task(cancelled)
 
     stale = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
     await state_manager.dispatch_scheduled_task(stale)
@@ -440,8 +440,8 @@ async def test_resubmit_dead_tasks_requeues_and_clears_dlq(redis, state_manager)
     """All tasks are enqueued in Redis and removed from the DLQ."""
     task1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
     task2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e2"])
-    await redis.json().set(f"task:{ULID1}", "$", task1.to_dict())
-    await redis.json().set(f"task:{ULID2}", "$", task2.to_dict())
+    await state_manager.ta.save_task(task1)
+    await state_manager.ta.save_task(task2)
     await state_manager.dead_queue.add(task1, FROZEN_TIME)
     await state_manager.dead_queue.add(task2, FROZEN_TIME)
 
@@ -458,7 +458,7 @@ async def test_resubmit_dead_tasks_requeues_and_clears_dlq(redis, state_manager)
 async def test_resubmit_dead_tasks_is_idempotent(redis, state_manager):
     """Re-running resubmit for a task already in Redis does not raise and clears the DLQ."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
-    await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+    await state_manager.ta.save_task(task)
     await state_manager.dead_queue.add(task, FROZEN_TIME)
 
     # First run — normal path.
@@ -484,7 +484,7 @@ async def test_schedule_retry_task_self_heals_via_dispatch(redis, state_manager)
 
     # Simulate: task already existed in Redis (it was running) but the status update to
     # SCHEDULED was lost (crash before save_task). The scheduler write did complete.
-    await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+    await state_manager.ta.save_task(task)
     await state_manager.task_scheduler.add(task, run_at)
 
     # Scheduler picks it up and dispatches — this should update Redis.
@@ -503,7 +503,7 @@ async def test_dispatch_acquired_record_not_requeued(redis, state_manager):
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
     run_at = FROZEN_TIME
 
-    await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+    await state_manager.ta.save_task(task)
     await state_manager.task_scheduler.add(task, run_at)
     # Acquire the task, simulating dispatch completing the Redis write
     # but crashing before calling remove().

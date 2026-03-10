@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
@@ -120,7 +119,7 @@ class TaskScheduler:
             raw_ids = [r for r in raw_ids if r > cursor]
 
         ulid_list = [ULID.from_bytes(r) for r in raw_ids]
-        fetched: list[Task | None] = await asyncio.gather(*[self.ta.get_task(u) for u in ulid_list])
+        fetched: list[Task | None] = await self.ta.get_tasks_bulk(ulid_list)
         results: list[Task] = []
         for task in fetched:
             if len(results) >= limit:
@@ -177,5 +176,5 @@ class TaskScheduler:
 
         task_ids = [ULID.from_bytes(raw[i]) for i in range(0, len(raw), 2)]
         run_ats = [dt.datetime.fromtimestamp(float(raw[i + 1]), dt.UTC) for i in range(0, len(raw), 2)]
-        tasks: list[Task | None] = await asyncio.gather(*[self.ta.get_task(u) for u in task_ids])
+        tasks: list[Task | None] = await self.ta.get_tasks_bulk(task_ids)
         return [(task, run_at) for task, run_at in zip(tasks, run_ats) if task is not None]

@@ -70,6 +70,7 @@ class TaskAdapterProtocol(Protocol):
 
     # -- read path -----------------------------------------------------------
     async def get_task(self, task_id: ULID) -> Task | None: ...
+    async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]: ...
     async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None: ...
     async def task_exists(self, task_id: ULID) -> bool: ...
     async def get_active_tasks(self, queues: set[str]) -> list[Task]: ...
@@ -150,6 +151,39 @@ class _BaseTaskAdapter:
         """Remove a task from the heartbeat sorted set."""
         await self.data_store.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
 
+    async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]:
+        """Fetch multiple tasks in 2 batched round-trips instead of 2N individual calls."""
+        if not task_ids:
+            return []
+        # Round-trip 1: batch fetch all task documents
+        raws = await self._fetch_task_data_bulk(task_ids)
+        tasks: list[Task | None] = []
+        valid: list[tuple[int, Task]] = []
+        for i, (task_id, raw) in enumerate(zip(task_ids, raws)):
+            if raw is None:
+                tasks.append(None)
+            else:
+                task = self._decode_task(task_id, raw)
+                tasks.append(task)
+                valid.append((i, task))
+        if not valid:
+            return tasks
+        # Round-trip 2: batch fetch heartbeat scores for all found tasks
+        pipe = self.data_store.pipeline(transaction=False)
+        for _, task in valid:
+            pipe.zscore(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
+        scores = await pipe.execute()
+        for (_, task), score in zip(valid, scores):
+            if score is not None:
+                task.heartbeat_at = dt.datetime.fromtimestamp(score, dt.UTC)
+        return tasks
+
+    async def _fetch_task_data_bulk(self, _task_ids: list[ULID]) -> list[Any]:
+        raise NotImplementedError
+
+    def _decode_task(self, _task_id: ULID, _raw: Any) -> Task:
+        raise NotImplementedError
+
     async def get_active_tasks(self, queues: set[str]) -> list[Task]:
         """Return all tasks currently present in any heartbeat sorted set."""
         task_id_bytes: set[bytes] = set()
@@ -158,11 +192,8 @@ class _BaseTaskAdapter:
             task_id_bytes.update(members)
         if not task_id_bytes:
             return []
-        results: list[Task] = []
-        async with TaskGroup() as group:
-            for raw_id in task_id_bytes:
-                group.create_task(self._add_task_to_results(ULID.from_bytes(raw_id), results))
-        return results
+        fetched = await self.get_tasks_bulk([ULID.from_bytes(b) for b in task_id_bytes])
+        return [t for t in fetched if t is not None]
 
     async def get_stale_tasks(self, queues: set[str], stale_time: dt.timedelta) -> AsyncGenerator[Task, None]:
         """Get tasks that have not had a heartbeat update in the stale time."""
@@ -174,16 +205,10 @@ class _BaseTaskAdapter:
                 self.HEARTBEAT_SCORES(queue=queue), min=0, max=cutoff_time.timestamp()
             )
             stale_task_ids.update(task_ids)
-
-        async def fetch_task(task_id: bytes) -> Task | None:
-            return await self.get_task(ULID.from_bytes(task_id))
-
-        async with TaskGroup() as group:
-            tasks = [group.create_task(fetch_task(task_id)) for task_id in stale_task_ids]
-
-        for task in tasks:
-            if (result := task.result()) is not None:
-                yield result
+        fetched = await self.get_tasks_bulk([ULID.from_bytes(b) for b in stale_task_ids])
+        for task in fetched:
+            if task is not None:
+                yield task
 
     async def task_exists(self, task_id: ULID) -> bool:
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
@@ -388,6 +413,15 @@ class JsonTaskAdapter(_BaseTaskAdapter):
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
+    async def _fetch_task_data_bulk(self, task_ids: list[ULID]) -> list[Any]:
+        pipe = self.data_store.pipeline(transaction=False)
+        for task_id in task_ids:
+            pipe.json().get(self.TASK_DETAILS(task_id=task_id))
+        return await pipe.execute()  # type: ignore[no-any-return]
+
+    def _decode_task(self, task_id: ULID, raw: Any) -> Task:
+        return Task.unpack(task_id, raw)
 
     async def get_task(self, task_id: ULID) -> Task | None:
         raw_data: dict[str, Any] | None = await self.data_store.json().get(  # type: ignore[misc]
@@ -636,6 +670,15 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
+    async def _fetch_task_data_bulk(self, task_ids: list[ULID]) -> list[Any]:
+        pipe = self.data_store.pipeline(transaction=False)
+        for task_id in task_ids:
+            pipe.get(self.TASK_DETAILS(task_id=task_id))
+        return await pipe.execute()  # type: ignore[no-any-return]
+
+    def _decode_task(self, task_id: ULID, raw: Any) -> Task:
+        return self._unpack(task_id, raw)
 
     async def get_task(self, task_id: ULID) -> Task | None:
         raw_data: bytes | None = await self.data_store.get(self.TASK_DETAILS(task_id=task_id))

@@ -2,7 +2,6 @@ import asyncio
 import datetime as dt
 from unittest.mock import patch
 
-import fakeredis.aioredis as fakeredis
 import pytest
 import pytest_asyncio
 import redis.asyncio as aioredis
@@ -10,25 +9,12 @@ from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task, TaskPagination, TaskStatus
-from jobbers.models.task_adapter import TaskAdapter
 from jobbers.models.task_config import TaskConfig
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def redis():
-    """Fixture to reset the tasks in the mocked Redis before each test."""
-    fake_store = fakeredis.FakeRedis()
-    yield fake_store
-    await fake_store.close()
-
-@pytest.fixture
-def task_adapter(redis):
-    """Fixture to provide a TaskAdapter instance with a fake Redis data store."""
-    return TaskAdapter(redis)
 
 @pytest.fixture
 def sample_task():
@@ -185,12 +171,10 @@ async def test_submit_task_twice_updates_only(redis, task_adapter):
     assert saved_task.submitted_at == task.submitted_at
 
 @pytest.mark.asyncio
-async def test_get_task(redis, task_adapter):
+async def test_get_task(task_adapter):
     """Test retrieving a task from Redis."""
-    # Add a task to Redis
-    await redis.zadd("worker-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp()})
-    await redis.json().set(f"task:{ULID1}", "$", Task(id=ULID1, name="Test Task", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME).to_dict())
-    # Retrieve the task
+    task_to_save = Task(id=ULID1, name="Test Task", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME)
+    await task_adapter.save_task(task_to_save)
     task = await task_adapter.get_task(ULID1)
     assert task is not None
     assert task.id == ULID1
@@ -205,15 +189,11 @@ async def test_get_task_not_found(task_adapter):
     assert task is None
 
 @pytest.mark.asyncio
-async def test_task_exists(redis, task_adapter):
+async def test_task_exists(task_adapter):
     """Test checking if a task exists in Redis."""
-    # Add a task to Redis
-    await redis.zadd("worker-queues:default", {bytes(ULID1): FROZEN_TIME.timestamp()})
-    await redis.json().set(f"task:{ULID1}", "$", Task(id=ULID1, name="Test Task", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME).to_dict())
-    # Check if the task exists
+    await task_adapter.save_task(Task(id=ULID1, name="Test Task", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME))
     exists = await task_adapter.task_exists(ULID1)
     assert exists
-    # Check for a non-existent task
     exists = await task_adapter.task_exists(999)
     assert not exists
 
@@ -436,7 +416,7 @@ class TestCleanTerminalTasks:
         """A completed task blob older than max_age is deleted."""
         task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
                     completed_at=FROZEN_TIME - dt.timedelta(days=8))
-        await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+        await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
 
@@ -447,7 +427,7 @@ class TestCleanTerminalTasks:
         """The heartbeat sorted-set entry is removed along with the task blob."""
         task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
                     completed_at=FROZEN_TIME - dt.timedelta(days=8))
-        await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+        await task_adapter.save_task(task)
         await redis.zadd(task_adapter.HEARTBEAT_SCORES(queue="default"),
                          {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=8)).timestamp()})
 
@@ -461,7 +441,7 @@ class TestCleanTerminalTasks:
         """Orphaned task-type-idx entries are removed alongside the task blob."""
         task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
                     completed_at=FROZEN_TIME - dt.timedelta(days=8))
-        await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+        await task_adapter.save_task(task)
         await redis.sadd(task_adapter.TASK_BY_TYPE_IDX(name="test_task"), ULID1.bytes)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
@@ -474,7 +454,7 @@ class TestCleanTerminalTasks:
         """Tasks in active statuses are never deleted regardless of age."""
         task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.STARTED,
                     started_at=FROZEN_TIME - dt.timedelta(days=100))
-        await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+        await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(seconds=0))
 
@@ -485,7 +465,7 @@ class TestCleanTerminalTasks:
         """A completed task whose completed_at is within max_age is not deleted."""
         task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
                     completed_at=FROZEN_TIME - dt.timedelta(hours=1))
-        await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+        await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
 
@@ -496,7 +476,7 @@ class TestCleanTerminalTasks:
         """A terminal task with no completed_at is not deleted."""
         task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.FAILED,
                     completed_at=None)
-        await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+        await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(seconds=0))
 
@@ -514,7 +494,7 @@ class TestCleanTerminalTasks:
         """All five terminal statuses are eligible for cleanup when old enough."""
         task = Task(id=ULID1, name="test_task", queue="default", status=status,
                     completed_at=FROZEN_TIME - dt.timedelta(days=8))
-        await redis.json().set(f"task:{ULID1}", "$", task.to_dict())
+        await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
 
@@ -527,8 +507,8 @@ class TestCleanTerminalTasks:
                         completed_at=FROZEN_TIME - dt.timedelta(days=8))
         recent_task = Task(id=ULID2, name="test_task", queue="default", status=TaskStatus.COMPLETED,
                            completed_at=FROZEN_TIME - dt.timedelta(hours=1))
-        await redis.json().set(f"task:{ULID1}", "$", old_task.to_dict())
-        await redis.json().set(f"task:{ULID2}", "$", recent_task.to_dict())
+        await task_adapter.save_task(old_task)
+        await task_adapter.save_task(recent_task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
 
