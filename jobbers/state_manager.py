@@ -267,10 +267,12 @@ class StateManager:
         """Monitor for user cancellation of the task."""
         async with self.data_store.pubsub() as pubsub:
             await pubsub.subscribe(f"task_cancel_{task_id}")
-            message = await pubsub.get_message(ignore_subscribe_messages=True)
-            if message is not None:
-                logger.info("Received cancellation for task %s", task_id)
-                raise UserCancellationError(f"Task {task_id} was cancelled by user request.")
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True)
+                if message is not None:
+                    logger.info("Received cancellation message %s for task %s", message, task_id)
+                    raise UserCancellationError(f"Task {task_id} was cancelled by user request.")
+                await asyncio.sleep(0.01)
 
 class SubmissionRateLimiter:
     """
