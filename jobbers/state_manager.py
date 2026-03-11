@@ -11,9 +11,9 @@ from opentelemetry import metrics
 from redis.exceptions import WatchError
 
 from jobbers import registry
-from jobbers.models.dead_queue import DeadQueue
+from jobbers.adapters.json_redis import JsonTaskAdapter
+from jobbers.adapters.raw_redis import DeadQueue
 from jobbers.models.queue_config import QueueConfigAdapter
-from jobbers.models.task_adapter import JsonTaskAdapter, TaskAdapterProtocol
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from redis.asyncio.client import Redis
     from ulid import ULID
 
+    from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
     from jobbers.models.task import Task
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,7 @@ class StateManager:
         self.ta: TaskAdapterProtocol = task_adapter if task_adapter is not None else JsonTaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(data_store, self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
-        self.dead_queue = DeadQueue(data_store, self.ta)
+        self.dead_queue: DeadQueueProtocol = DeadQueue(data_store, self.ta)
         self.task_scheduler = TaskScheduler(data_store, self.ta)
 
     @property

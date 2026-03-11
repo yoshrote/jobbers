@@ -528,10 +528,10 @@ def _default_queue_config(rate_numerator: int = 2) -> QueueConfig:
 # ── submit_rate_limited_task ───────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_submit_rate_limited_enqueues_when_empty(redis, task_adapter):
+async def test_submit_rate_limited_enqueues_when_empty(redis, task_adapter, task_adapter_dt_module):
     """Atomically enqueues the task and records it in the rate-limiter when the set is empty."""
     task = _make_rate_task(ULID1, FROZEN_TIME)
-    with patch("jobbers.models.task_adapter.dt") as mock_dt:
+    with patch(task_adapter_dt_module) as mock_dt:
         mock_dt.datetime.now.return_value = FROZEN_TIME
         mock_dt.timedelta = dt.timedelta
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
@@ -542,11 +542,11 @@ async def test_submit_rate_limited_enqueues_when_empty(redis, task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_submit_rate_limited_enqueues_with_room(redis, task_adapter):
+async def test_submit_rate_limited_enqueues_with_room(redis, task_adapter, task_adapter_dt_module):
     """Enqueues when one slot is already used out of two."""
     await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp() - 1})
     task = _make_rate_task(ULID2, FROZEN_TIME)
-    with patch("jobbers.models.task_adapter.dt") as mock_dt:
+    with patch(task_adapter_dt_module) as mock_dt:
         mock_dt.datetime.now.return_value = FROZEN_TIME
         mock_dt.timedelta = dt.timedelta
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
@@ -555,14 +555,14 @@ async def test_submit_rate_limited_enqueues_with_room(redis, task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_submit_rate_limited_prunes_expired_entries(redis, task_adapter):
+async def test_submit_rate_limited_prunes_expired_entries(redis, task_adapter, task_adapter_dt_module):
     """Expired rate-limiter entries are pruned; the new task is accepted."""
     # Both entries are > 60 s old — outside the 1-minute window
     await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp() - 60})
     await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp() - 61})
     new_id = ULID()
     task = _make_rate_task(new_id, FROZEN_TIME)
-    with patch("jobbers.models.task_adapter.dt") as mock_dt:
+    with patch(task_adapter_dt_module) as mock_dt:
         mock_dt.datetime.now.return_value = FROZEN_TIME
         mock_dt.timedelta = dt.timedelta
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
@@ -571,13 +571,13 @@ async def test_submit_rate_limited_prunes_expired_entries(redis, task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_submit_rate_limited_rejects_when_full(redis, task_adapter):
+async def test_submit_rate_limited_rejects_when_full(redis, task_adapter, task_adapter_dt_module):
     """Task is not enqueued and task details are not written when rate limit is reached."""
     await redis.zadd("rate-limiter:default", {ULID1.bytes: FROZEN_TIME.timestamp() - 1})
     await redis.zadd("rate-limiter:default", {ULID2.bytes: FROZEN_TIME.timestamp() - 2})
     new_id = ULID()
     task = _make_rate_task(new_id, FROZEN_TIME)
-    with patch("jobbers.models.task_adapter.dt") as mock_dt:
+    with patch(task_adapter_dt_module) as mock_dt:
         mock_dt.datetime.now.return_value = FROZEN_TIME
         mock_dt.timedelta = dt.timedelta
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())

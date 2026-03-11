@@ -15,7 +15,7 @@ from .task_config import TaskConfig
 from .task_status import TaskStatus
 
 if TYPE_CHECKING:
-    from jobbers.models.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.task_adapter import TaskAdapterProtocol
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)

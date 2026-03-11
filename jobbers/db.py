@@ -9,10 +9,10 @@ import redis.asyncio as redis
 from jobbers.models.queue_config import create_schema
 
 if TYPE_CHECKING:
-    from jobbers.models.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.task_adapter import TaskAdapterProtocol
     from jobbers.state_manager import StateManager
 
-TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER_BACKEND", "json")
+TASK_ADAPTER_BACKEND = "json"
 
 _client: redis.Redis | None = None
 _state_manager: StateManager | None = None
@@ -58,8 +58,8 @@ async def close_sqlite_conn() -> None:
 
 
 def create_task_adapter(client: redis.Redis) -> TaskAdapterProtocol:
-    """Create a TaskAdapter based on the TASK_ADAPTER_BACKEND environment variable."""
-    from jobbers.models.task_adapter import JsonTaskAdapter, MsgpackTaskAdapter
+    """Create a TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
+    from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
 
     if TASK_ADAPTER_BACKEND == "msgpack":
         return MsgpackTaskAdapter(client)

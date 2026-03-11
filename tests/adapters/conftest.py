@@ -27,9 +27,9 @@ class DummyTaskAdapter:
     """
     Minimal in-memory TaskAdapterProtocol for use as a test dependency.
 
-    Only ``save_task`` and ``get_task`` are implemented. Any other protocol
-    method raises ``NotImplementedError`` immediately, so accidental use is
-    caught at the call site.
+    Only ``save_task``, ``get_task``, and ``get_tasks_bulk`` are implemented.
+    Any other protocol method raises ``NotImplementedError`` immediately,
+    so accidental use is caught at the call site.
     """
 
     TASKS_BY_QUEUE = _BaseTaskAdapter.TASKS_BY_QUEUE
@@ -59,9 +59,3 @@ class DummyTaskAdapter:
 def dummy_task_adapter() -> DummyTaskAdapter:
     """Fixture providing a fresh DummyTaskAdapter for each test."""
     return DummyTaskAdapter()
-
-
-@pytest.fixture
-def task_adapter_dt_module(task_adapter) -> str:
-    """Return the dotted module path for patching 'dt' in the active task adapter."""
-    return f"{type(task_adapter).__module__}.dt"
