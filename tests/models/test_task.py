@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
-import redis.asyncio as aioredis
 from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
@@ -197,37 +196,22 @@ async def test_task_exists(task_adapter):
     exists = await task_adapter.task_exists(999)
     assert not exists
 
-@pytest_asyncio.fixture
-async def real_redis_adapter():
-    """Fixture providing a real Redis Stack connection for RediSearch tests."""
-    from jobbers.models.task_adapter import TaskAdapter
-
-    r = aioredis.Redis(host="localhost", port=6379, db=0)
-    await r.flushdb()
-    ta = TaskAdapter(r)
-    await ta.ensure_index()
-    yield ta
-    await r.flushdb()
-    await r.aclose()
-
-
 @pytest.mark.asyncio
-async def test_get_all_tasks(real_redis_adapter):
-    """Test retrieving all tasks from Redis (requires real Redis Stack with RediSearch)."""
-    ta = real_redis_adapter
+async def test_get_all_tasks(real_task_adapter):
+    """Test retrieving all tasks from Redis."""
     t1 = Task(id=ULID1, name="Task 1", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME)
     t2 = Task(id=ULID2, name="Task 2", status=TaskStatus.COMPLETED, submitted_at=FROZEN_TIME)
-    await ta.submit_task(t1)
-    await ta.submit_task(t2)
-    tasks = await ta.get_all_tasks(TaskPagination(queue="default"))
+    await real_task_adapter.submit_task(t1)
+    await real_task_adapter.submit_task(t2)
+    tasks = await real_task_adapter.get_all_tasks(TaskPagination(queue="default"))
     assert len(tasks) == 2
     assert {t.id for t in tasks} == {ULID1, ULID2}
 
 
 @pytest.mark.asyncio
-async def test_get_all_tasks_empty(real_redis_adapter):
+async def test_get_all_tasks_empty(real_task_adapter):
     """Test retrieving tasks when no tasks exist."""
-    tasks = await real_redis_adapter.get_all_tasks(TaskPagination(queue="default"))
+    tasks = await real_task_adapter.get_all_tasks(TaskPagination(queue="default"))
     assert tasks == []
 
 

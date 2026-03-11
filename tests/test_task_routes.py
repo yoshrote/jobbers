@@ -3,15 +3,14 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
-import fakeredis
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from ulid import ULID
 
+from jobbers.adapters import MsgpackTaskAdapter as TaskAdapter
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, create_schema
 from jobbers.models.task import Task
-from jobbers.models.task_adapter import TaskAdapter
 from jobbers.models.task_config import TaskConfig
 from jobbers.state_manager import StateManager
 from jobbers.task_routes import app
@@ -19,19 +18,6 @@ from jobbers.task_routes import app
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
-@pytest_asyncio.fixture
-async def redis_db():
-    # Connect to a test Redis instance (e.g., managed by pytest-redis)
-    client = fakeredis.aioredis.FakeRedis()
-    yield client
-    # Clean up after the test (e.g., flush the database)
-    await client.flushdb()
-    await client.close()
-
-@pytest.fixture(autouse=True)
-def patch_redis(redis_db):
-     with patch("jobbers.task_routes.db.get_client", return_value=redis_db):
-         yield
 
 @pytest_asyncio.fixture(autouse=True)
 async def patch_sqlite():
@@ -44,16 +30,16 @@ async def patch_sqlite():
             yield conn
 
 @pytest_asyncio.fixture(autouse=True)
-async def patch_state_manager(redis_db, patch_sqlite):
+async def patch_state_manager(redis, patch_sqlite):
     """Provide a real StateManager backed by the test redis and sqlite connections."""
-    ta = TaskAdapter(redis_db)
-    sm = StateManager(redis_db, patch_sqlite, task_adapter=ta)
+    ta = TaskAdapter(redis)
+    sm = StateManager(redis, patch_sqlite, task_adapter=ta)
     with patch("jobbers.task_routes.db.get_state_manager", return_value=sm), \
          patch("jobbers.db.get_task_adapter", return_value=ta):
         yield sm
 
 @pytest.mark.asyncio
-async def test_main_page(redis_db):
+async def test_main_page():
     """
     Test the task submission and status endpoints.
 
@@ -69,7 +55,7 @@ async def test_main_page(redis_db):
     assert response_data["tasks"] == []
 
 @pytest.mark.asyncio
-async def test_submit_valid_task(redis_db):
+async def test_submit_valid_task(redis):
     """
     Test the task submission and status endpoints.
 
@@ -100,11 +86,11 @@ async def test_submit_valid_task(redis_db):
 
     assert simplify(response_task) == simplify(task_data)
     # Check that it actually exists in redis
-    assert simplify(task_data) == simplify(await TaskAdapter(redis_db).get_task(task_data.id))
+    assert simplify(task_data) == simplify(await TaskAdapter(redis).get_task(task_data.id))
 
 @pytest.mark.asyncio
 # @pytest.mark.skip(reason="Need to add a registered task with a param to hit this error")
-async def test_submit_invalid_task(redis_db):
+async def test_submit_invalid_task():
     """Test the task submission fails when given bad input."""
     # jobber_registry.register_task("test_task", test_task_function, parameters=["foo"])
     # add a task config with a function that requires a parameter to the jobber registry
@@ -121,11 +107,11 @@ async def test_submit_invalid_task(redis_db):
     assert response.status_code == 400
 
 @pytest.mark.asyncio
-async def test_get_task_status_found(redis_db):
+async def test_get_task_status_found(redis):
     """Test retrieving the status of an existing task."""
     # Status must != "unsubmitted" or submit_task will change Task details
     task_data = Task(id=ULID1, name="Test Task", status="submitted", submitted_at=dt.datetime.now(dt.UTC), parameters={})
-    await TaskAdapter(redis_db).submit_task(task_data)
+    await TaskAdapter(redis).submit_task(task_data)
 
     # Check that it exists via API
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

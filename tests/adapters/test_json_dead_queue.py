@@ -35,9 +35,18 @@ def make_task(
 
 @pytest_asyncio.fixture
 async def redis():
-    """Real Redis instance on db=15 for Redis Stack tests."""
-    client = aioredis.Redis(host="localhost", port=6379, db=15)
-    await client.flushdb()
+    """
+    Real Redis instance on db=0 for Redis Stack tests.
+
+    FakeRedis doesn't support RediSearch and we can only create indexes on db=0.
+    """
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    client = aioredis.Redis(host="localhost", port=6379, db=0)
+    try:
+        await client.flushdb()
+    except RedisConnectionError as exc:
+        await client.aclose()
+        pytest.skip(f"Redis not available: {exc}")
     yield client
     await client.flushdb()
     await client.aclose()
@@ -46,8 +55,12 @@ async def redis():
 @pytest_asyncio.fixture
 async def task_adapter(redis):
     """JsonTaskAdapter backed by real Redis Stack instance."""
+    from redis.exceptions import ResponseError
     adapter = JsonTaskAdapter(redis)
-    await adapter.ensure_index()
+    try:
+        await adapter.ensure_index()
+    except ResponseError as exc:
+        pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
     return adapter
 
 

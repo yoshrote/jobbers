@@ -1,12 +1,11 @@
-"""Tests for RedisTaskScheduler using a real Redis instance (db=14)."""
+"""Tests for TaskScheduler."""
 import datetime as dt
 
 import pytest
 import pytest_asyncio
-import redis.asyncio as aioredis
 
+from jobbers.adapters import JsonTaskAdapter
 from jobbers.models.task import Task
-from jobbers.models.task_adapter import TaskAdapter
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
@@ -19,17 +18,8 @@ def make_task(task_id: str = "01JQC31AJP7TSA9X8AEP64XG08", queue: str = "default
 
 
 @pytest_asyncio.fixture
-async def redis():
-    client = aioredis.Redis(host="localhost", port=6379, db=14)
-    await client.flushdb()
-    yield client
-    await client.flushdb()
-    await client.aclose()
-
-
-@pytest_asyncio.fixture
 async def scheduler(redis):
-    yield TaskScheduler(redis, TaskAdapter(redis))
+    yield TaskScheduler(redis, JsonTaskAdapter(redis))
 
 
 # ── basic CRUD ────────────────────────────────────────────────────────────────

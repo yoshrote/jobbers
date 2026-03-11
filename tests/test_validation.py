@@ -1,7 +1,6 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
-import fakeredis
 import pytest
 import pytest_asyncio
 from ulid import ULID
@@ -14,12 +13,6 @@ from jobbers.validation import ValidationError, validate_task
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 
-@pytest_asyncio.fixture(autouse=True)
-async def redis():
-    """Fixture to reset the tasks in the mocked Redis before each test."""
-    fake_store = fakeredis.aioredis.FakeRedis()
-    yield fake_store
-    await fake_store.aclose()
 
 @pytest_asyncio.fixture
 async def sqlite_conn():

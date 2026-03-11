@@ -5,10 +5,8 @@ from collections import defaultdict
 from unittest.mock import patch
 
 import aiosqlite
-import fakeredis.aioredis as fakeredis
 import pytest
 import pytest_asyncio
-import redis.asyncio as aioredis
 from ulid import ULID
 
 from jobbers import registry
@@ -21,13 +19,6 @@ from jobbers.state_manager import StateManager, UserCancellationError
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
-
-@pytest_asyncio.fixture(autouse=True)
-async def redis():
-    """Fixture to reset the tasks in the mocked Redis before each test."""
-    fake_store = fakeredis.FakeRedis()
-    yield fake_store
-    await fake_store.close()
 
 @pytest_asyncio.fixture
 async def sqlite_conn():
@@ -42,19 +33,6 @@ async def state_manager(redis, sqlite_conn):
     """Fixture to provide a StateManager instance with a fake Redis and in-memory SQLite."""
     return StateManager(redis, sqlite_conn)
 
-@pytest_asyncio.fixture
-async def real_redis():
-    """Real Redis fixture for commands not supported by fakeredis (e.g. bzpopmin with multiple keys)."""
-    client = aioredis.Redis(host="localhost", port=6379, db=15)
-    await client.flushdb()
-    yield client
-    await client.flushdb()
-    await client.aclose()
-
-@pytest_asyncio.fixture
-async def real_state_manager(real_redis, sqlite_conn):
-    """StateManager backed by a real Redis instance."""
-    return StateManager(real_redis, sqlite_conn)
 
 @pytest.mark.asyncio
 async def test_get_refresh_tag(state_manager):
@@ -69,14 +47,14 @@ async def test_get_refresh_tag(state_manager):
 
 
 @pytest.mark.asyncio
-async def test_get_next_task_returns_task(real_redis, real_state_manager):
+async def test_get_next_task_returns_task(redis, state_manager):
     """Test that get_next_task retrieves the next task from the queues."""
     task_id = ULID()
     task_obj = Task(id=task_id, name="Test Task", queue="queue1", version=1, status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
-    await real_redis.zadd("task-queues:queue1", {task_id.bytes: 1})
-    await real_redis.json().set(f"task:{task_id}", "$", task_obj.to_dict())
+    await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
+    await redis.json().set(f"task:{task_id}", "$", task_obj.to_dict())
 
-    task = await real_state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
+    task = await state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
 
     assert task is not None
     assert task.id == task_id
@@ -85,28 +63,28 @@ async def test_get_next_task_returns_task(real_redis, real_state_manager):
 
 
 @pytest.mark.asyncio
-async def test_get_next_task_no_task_found(real_state_manager):
+async def test_get_next_task_no_task_found(state_manager):
     """Test that get_next_task returns None if no task is found."""
-    task = await real_state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
+    task = await state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
 
     assert task is None
 
 
 @pytest.mark.asyncio
-async def test_get_next_task_missing_task_data(real_redis, real_state_manager):
+async def test_get_next_task_missing_task_data(redis, state_manager):
     """Test that a task with missing data is moved to dlq-missing-data and None is returned."""
     task_id = ULID()
-    await real_redis.zadd("task-queues:queue1", {task_id.bytes: 1})
+    await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
 
-    task = await real_state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
+    task = await state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
 
     assert task is None
-    dlq_members = await real_redis.zrange("dlq-missing-data", 0, -1)
+    dlq_members = await redis.zrange("dlq-missing-data", 0, -1)
     assert task_id.bytes in dlq_members
 
 
 @pytest.mark.asyncio
-async def test_get_next_task_skips_missing_data_and_returns_valid(real_redis, real_state_manager):
+async def test_get_next_task_skips_missing_data_and_returns_valid(redis, state_manager):
     """When the first queued task has missing data it is skipped and the next valid task is returned."""
     missing_id = ULID()
     valid_id = ULID()
@@ -114,14 +92,14 @@ async def test_get_next_task_skips_missing_data_and_returns_valid(real_redis, re
                       status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME)
 
     # missing_id has a lower score so it is popped first
-    await real_redis.zadd("task-queues:queue1", {missing_id.bytes: 1, valid_id.bytes: 2})
-    await real_redis.json().set(f"task:{valid_id}", "$", valid_task.to_dict())
+    await redis.zadd("task-queues:queue1", {missing_id.bytes: 1, valid_id.bytes: 2})
+    await redis.json().set(f"task:{valid_id}", "$", valid_task.to_dict())
 
-    task = await real_state_manager.get_next_task(["queue1"], pop_timeout=1)
+    task = await state_manager.get_next_task(["queue1"], pop_timeout=1)
 
     assert task is not None
     assert task.id == valid_id
-    dlq_members = await real_redis.zrange("dlq-missing-data", 0, -1)
+    dlq_members = await redis.zrange("dlq-missing-data", 0, -1)
     assert missing_id.bytes in dlq_members
 
 @pytest.fixture

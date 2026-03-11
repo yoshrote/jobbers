@@ -1,67 +1,34 @@
-import fakeredis.aioredis as fakeredis
 import pytest
 import pytest_asyncio
-from ulid import ULID
+import redis.asyncio as aioredis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError
 
 from jobbers.adapters.json_redis import JsonTaskAdapter
 from jobbers.adapters.raw_redis import MsgpackTaskAdapter
-from jobbers.adapters.task_adapter import _BaseTaskAdapter
-from jobbers.models.task import Task
-
-
-@pytest_asyncio.fixture(autouse=True)
-async def redis():
-    """Fixture to reset the tasks in the mocked Redis before each test."""
-    fake_store = fakeredis.FakeRedis()
-    yield fake_store
-    await fake_store.close()
-
-
-@pytest.fixture(params=[JsonTaskAdapter, MsgpackTaskAdapter], ids=["json", "msgpack"])
-def task_adapter(redis, request):
-    """Fixture providing a task adapter instance parametrized over all implementations."""
-    return request.param(redis)
-
-
-class DummyTaskAdapter:
-    """
-    Minimal in-memory TaskAdapterProtocol for use as a test dependency.
-
-    Only ``save_task`` and ``get_task`` are implemented. Any other protocol
-    method raises ``NotImplementedError`` immediately, so accidental use is
-    caught at the call site.
-    """
-
-    TASKS_BY_QUEUE = _BaseTaskAdapter.TASKS_BY_QUEUE
-    TASK_DETAILS = _BaseTaskAdapter.TASK_DETAILS
-    HEARTBEAT_SCORES = _BaseTaskAdapter.HEARTBEAT_SCORES
-    TASK_BY_TYPE_IDX = _BaseTaskAdapter.TASK_BY_TYPE_IDX
-    QUEUE_RATE_LIMITER = _BaseTaskAdapter.QUEUE_RATE_LIMITER
-    DLQ_MISSING_DATA = _BaseTaskAdapter.DLQ_MISSING_DATA
-
-    def __init__(self) -> None:
-        self._store: dict[ULID, Task] = {}
-
-    async def save_task(self, task: Task) -> None:
-        self._store[task.id] = task
-
-    async def get_task(self, task_id: ULID) -> Task | None:
-        return self._store.get(task_id)
-
-    async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]:
-        return [self._store.get(task_id) for task_id in task_ids]
-
-    def __getattr__(self, name: str) -> object:
-        raise NotImplementedError(f"DummyTaskAdapter.{name} is not implemented")
-
-
-@pytest.fixture
-def dummy_task_adapter() -> DummyTaskAdapter:
-    """Fixture providing a fresh DummyTaskAdapter for each test."""
-    return DummyTaskAdapter()
 
 
 @pytest.fixture
 def task_adapter_dt_module(task_adapter) -> str:
     """Return the dotted module path for patching 'dt' in the active task adapter."""
     return f"{type(task_adapter).__module__}.dt"
+
+
+@pytest_asyncio.fixture(params=[JsonTaskAdapter, MsgpackTaskAdapter], ids=["json", "msgpack"])
+async def real_task_adapter(request):
+    """Both adapter implementations on real Redis; skips if Redis/RediSearch unavailable."""
+    client = aioredis.Redis(host="localhost", port=6379, db=0)
+    try:
+        await client.flushdb()
+    except RedisConnectionError as exc:
+        await client.aclose()
+        pytest.skip(f"Redis not available: {exc}")
+    adapter = request.param(client)
+    try:
+        await adapter.ensure_index()
+    except ResponseError as exc:
+        await client.aclose()
+        pytest.skip(f"RediSearch not available: {exc}")
+    yield adapter
+    await client.flushdb()
+    await client.aclose()

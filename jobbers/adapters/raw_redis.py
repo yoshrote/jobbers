@@ -218,7 +218,7 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         for raw_id in raw_ids:
             if len(results) >= pagination.limit:
                 break
-            task_id = ULID(raw_id)
+            task_id = ULID.from_bytes(raw_id)
             raw_data: bytes | None = await self.data_store.get(self.TASK_DETAILS(task_id=task_id))
             if raw_data is None:
                 continue
