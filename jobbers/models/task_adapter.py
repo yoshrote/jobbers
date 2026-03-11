@@ -418,7 +418,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         pipe = self.data_store.pipeline(transaction=False)
         for task_id in task_ids:
             pipe.json().get(self.TASK_DETAILS(task_id=task_id))
-        return await pipe.execute()  # type: ignore[no-any-return]
+        return await pipe.execute()
 
     def _decode_task(self, task_id: ULID, raw: Any) -> Task:
         return Task.unpack(task_id, raw)
@@ -675,7 +675,7 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         pipe = self.data_store.pipeline(transaction=False)
         for task_id in task_ids:
             pipe.get(self.TASK_DETAILS(task_id=task_id))
-        return await pipe.execute()  # type: ignore[no-any-return]
+        return await pipe.execute()
 
     def _decode_task(self, task_id: ULID, raw: Any) -> Task:
         return self._unpack(task_id, raw)
