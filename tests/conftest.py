@@ -29,7 +29,8 @@ class DummyTaskAdapter:
     """
     Minimal in-memory TaskAdapterProtocol for use as a test dependency.
 
-    Only ``save_task``, ``get_task``, and ``get_tasks_bulk`` are implemented.
+    Implements ``stage_save``, ``get_task``, and ``get_tasks_bulk``.
+    ``save_task`` is kept as a test-convenience wrapper (not part of the protocol).
     Any other protocol method raises ``NotImplementedError`` immediately,
     so accidental use is caught at the call site.
     """
@@ -44,8 +45,11 @@ class DummyTaskAdapter:
     def __init__(self) -> None:
         self._store: dict[ULID, Task] = {}
 
-    async def save_task(self, task: Task) -> None:
+    def stage_save(self, pipe: object, task: Task) -> None:
         self._store[task.id] = task
+
+    async def save_task(self, task: Task) -> None:
+        self.stage_save(None, task)
 
     async def get_task(self, task_id: ULID) -> Task | None:
         return self._store.get(task_id)

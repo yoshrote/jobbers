@@ -149,7 +149,9 @@ class StateManager:
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
-        await self.ta.save_task(task=task)
+        pipe = self.data_store.pipeline(transaction=True)
+        self.ta.stage_save(pipe, task)
+        await pipe.execute()
         return task
 
     async def fail_task(self, task: Task) -> Task:
@@ -191,11 +193,6 @@ class StateManager:
     async def get_active_tasks(self, queues: set[str]) -> list[Task]:
         """Return all tasks currently present in any heartbeat sorted set."""
         return await self.ta.get_active_tasks(queues)
-
-    async def complete_task(self, task: Task) -> Task:
-        """Persist a completed task."""
-        #TODO set a ttl for the data in redis after completion
-        return await self.save_task(task)
 
     async def schedule_retry_task(self, task: Task, run_at: dt.datetime) -> Task:
         """Add a task to the scheduler and save its state in a single atomic transaction."""
