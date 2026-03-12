@@ -54,8 +54,7 @@ async def test_task_processor_success():
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
     # save_task called once when starting; complete_task called when done
-    state_manager.save_task.assert_called_once_with(task)
-    state_manager.complete_task.assert_called_once_with(task)
+    state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 @pytest.mark.asyncio
@@ -414,8 +413,7 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
     assert result_task.results == {"result": "success"}
 
     # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_called_once_with(task)
-    state_manager.complete_task.assert_called_once_with(task)
+    state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 @pytest.mark.asyncio
@@ -456,8 +454,7 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
     assert result_task.results == {"result": "success"}
 
     # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_called_once_with(task)
-    state_manager.complete_task.assert_called_once_with(task)
+    state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 @pytest.mark.asyncio
@@ -498,8 +495,7 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
     assert result_task.results == {"result": "success"}
 
     # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_called_once_with(task)
-    state_manager.complete_task.assert_called_once_with(task)
+    state_manager.save_task.assert_has_calls([call(task), call(task)])
 
 
 # ── scheduled-retry tests (TaskScheduler present + retry_delay configured) ───
