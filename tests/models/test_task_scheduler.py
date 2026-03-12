@@ -283,3 +283,72 @@ async def test_get_by_filter_cursor_pagination(scheduler, dummy_task_adapter):
     results = await scheduler.get_by_filter(queue="default", start_after=str(t1.id))
     assert len(results) == 1
     assert results[0].id == t2.id
+
+
+# ── get_by_filter: queue=None (all-queues path) ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_queue_none_returns_from_all_queues(scheduler, redis, dummy_task_adapter):
+    """get_by_filter with queue=None fetches tasks from every queue in the all-queues set."""
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", queue="q2")
+    for t in (t1, t2):
+        await dummy_task_adapter.save_task(t)
+        await schedule(scheduler, t, PAST)
+    await redis.sadd("all-queues", b"q1", b"q2")
+
+    results = await scheduler.get_by_filter(queue=None)
+    assert {r.id for r in results} == {t1.id, t2.id}
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_queue_none_empty_all_queues_returns_empty(scheduler, redis, dummy_task_adapter):
+    """get_by_filter with queue=None and an empty all-queues set returns []."""
+    await redis.delete("all-queues")
+    results = await scheduler.get_by_filter(queue=None)
+    assert results == []
+
+
+# ── get_by_filter: task_name / task_version filters ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_task_name_excludes_non_matching(scheduler, dummy_task_adapter):
+    """get_by_filter skips tasks whose name does not match the filter."""
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    t2.name = "other_task"
+    for t in (t1, t2):
+        await dummy_task_adapter.save_task(t)
+        await schedule(scheduler, t, PAST)
+
+    results = await scheduler.get_by_filter(queue="default", task_name="test_task")
+    assert len(results) == 1
+    assert results[0].id == t1.id
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_task_version_excludes_non_matching(scheduler, dummy_task_adapter):
+    """get_by_filter skips tasks whose version does not match the filter."""
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    t2.version = 99
+    for t in (t1, t2):
+        await dummy_task_adapter.save_task(t)
+        await schedule(scheduler, t, PAST)
+
+    results = await scheduler.get_by_filter(queue="default", task_version=1)
+    assert len(results) == 1
+    assert results[0].id == t1.id
+
+
+# ── next_due_bulk: queues=None with empty all-queues set ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_next_due_bulk_queues_none_empty_redis_returns_empty(scheduler, redis):
+    """next_due_bulk with queues=None returns [] when all-queues set is empty."""
+    await redis.delete("all-queues")
+    result = await scheduler.next_due_bulk(1, queues=None)
+    assert result == []

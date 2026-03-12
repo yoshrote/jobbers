@@ -524,3 +524,316 @@ async def test_cancel_tasks_mixed_results():
     assert results[1]["status"] == "not_found"
     assert results[2]["status"] == "error"
     assert "cannot be cancelled" in results[2]["detail"]
+
+
+# ── Queue CRUD routes ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_queue():
+    """POST /queues creates a new queue."""
+    mock_qca = AsyncMock()
+    mock_qca.get_queue_config.return_value = None
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/queues", json={"name": "myqueue"})
+
+    assert response.status_code == 201
+    mock_qca.save_queue_config.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_queue_conflict_returns_409():
+    """POST /queues returns 409 when the queue already exists."""
+    mock_qca = AsyncMock()
+    mock_qca.get_queue_config.return_value = QueueConfig(name="myqueue")
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/queues", json={"name": "myqueue"})
+
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_get_queue_config_found():
+    """GET /queues/{name}/config returns the queue config."""
+    mock_qca = AsyncMock()
+    mock_qca.get_queue_config.return_value = QueueConfig(name="myqueue")
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/queues/myqueue/config")
+
+    assert response.status_code == 200
+    assert response.json()["queue"]["name"] == "myqueue"
+
+
+@pytest.mark.asyncio
+async def test_get_queue_config_not_found():
+    """GET /queues/{name}/config returns 404 when queue doesn't exist."""
+    mock_qca = AsyncMock()
+    mock_qca.get_queue_config.return_value = None
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/queues/noqueue/config")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_queue():
+    """PUT /queues/{name} updates the queue config."""
+    mock_qca = AsyncMock()
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.put("/queues/myqueue", json={"name": "myqueue"})
+
+    assert response.status_code == 200
+    mock_qca.save_queue_config.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_found():
+    """DELETE /queues/{name} removes the queue."""
+    mock_qca = AsyncMock()
+    mock_qca.get_all_queues.return_value = ["myqueue"]
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.delete("/queues/myqueue")
+
+    assert response.status_code == 200
+    mock_qca.delete_queue.assert_called_once_with("myqueue")
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_not_found():
+    """DELETE /queues/{name} returns 404 when the queue doesn't exist."""
+    mock_qca = AsyncMock()
+    mock_qca.get_all_queues.return_value = []
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.delete("/queues/noqueue")
+
+    assert response.status_code == 404
+
+
+# ── DLQ routes ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_dead_letter_queue(patch_state_manager):
+    """GET /dead-letter-queue returns tasks from the DLQ."""
+    task = Task(id=ULID1, name="failed_task", version=1, queue="default",
+                status="failed")
+    patch_state_manager.dead_queue.get_by_filter = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/dead-letter-queue")
+
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_dlq_task_history(patch_state_manager):
+    """GET /dead-letter-queue/{id}/history returns the error history."""
+    patch_state_manager.dead_queue.get_history = AsyncMock(
+        return_value=[{"attempt": 0, "error": "boom"}]
+    )
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(f"/dead-letter-queue/{ULID1}/history")
+
+    assert response.status_code == 200
+    assert response.json()["history"][0]["error"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_remove_from_dlq(patch_state_manager):
+    """DELETE /dead-letter-queue removes the specified task IDs."""
+    patch_state_manager.dead_queue.remove_many = AsyncMock()
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.request("DELETE", "/dead-letter-queue", json={"task_ids": [str(ULID1)]})
+
+    assert response.status_code == 200
+    assert response.json()["removed"] == 1
+    patch_state_manager.dead_queue.remove_many.assert_called_once()
+
+
+# ── Active tasks route ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_active_tasks_with_queue_filter(patch_state_manager):
+    """GET /active-tasks?queue=default returns active tasks for that queue."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status="started")
+    patch_state_manager.get_active_tasks = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/active-tasks", params={"queue": "default"})
+
+    assert response.status_code == 200
+    assert len(response.json()["tasks"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_active_tasks_no_filter_uses_all_queues(patch_state_manager, patch_sqlite):
+    """GET /active-tasks without a queue filter uses all queues from SQLite."""
+    patch_state_manager.get_active_tasks = AsyncMock(return_value=[])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager), \
+         patch("jobbers.task_routes.db.get_sqlite_conn", return_value=patch_sqlite):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/active-tasks")
+
+    assert response.status_code == 200
+
+
+# ── Role CRUD routes ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_role():
+    """POST /roles creates a new role."""
+    mock_qca = AsyncMock()
+    mock_qca.get_queues.return_value = set()
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/roles", json={"name": "myrole", "queues": ["default"]})
+
+    assert response.status_code == 201
+    mock_qca.save_role.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_role_conflict_returns_409():
+    """POST /roles returns 409 when the role already exists."""
+    mock_qca = AsyncMock()
+    mock_qca.get_queues.return_value = {"default"}
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/roles", json={"name": "myrole", "queues": ["default"]})
+
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_get_role_found():
+    """GET /roles/{name} returns the queues for the role."""
+    mock_qca = AsyncMock()
+    mock_qca.get_all_roles.return_value = ["myrole"]
+    mock_qca.get_queues.return_value = {"default"}
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/roles/myrole")
+
+    assert response.status_code == 200
+    assert response.json()["queues"] == ["default"]
+
+
+@pytest.mark.asyncio
+async def test_get_role_not_found():
+    """GET /roles/{name} returns 404 when the role doesn't exist."""
+    mock_qca = AsyncMock()
+    mock_qca.get_all_roles.return_value = []
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/roles/norole")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_role_found():
+    """PUT /roles/{name} replaces the queues for the role."""
+    mock_qca = AsyncMock()
+    mock_qca.get_all_roles.return_value = ["myrole"]
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.put("/roles/myrole", json=["default"])
+
+    assert response.status_code == 200
+    mock_qca.save_role.assert_called_once_with("myrole", {"default"})
+
+
+@pytest.mark.asyncio
+async def test_update_role_not_found():
+    """PUT /roles/{name} returns 404 when the role doesn't exist."""
+    mock_qca = AsyncMock()
+    mock_qca.get_all_roles.return_value = []
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.put("/roles/norole", json=["default"])
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_role_found():
+    """DELETE /roles/{name} removes the role."""
+    mock_qca = AsyncMock()
+    mock_qca.get_all_roles.return_value = ["myrole"]
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.delete("/roles/myrole")
+
+    assert response.status_code == 200
+    mock_qca.delete_role.assert_called_once_with("myrole")
+
+
+@pytest.mark.asyncio
+async def test_delete_role_not_found():
+    """DELETE /roles/{name} returns 404 when the role doesn't exist."""
+    mock_qca = AsyncMock()
+    mock_qca.get_all_roles.return_value = []
+
+    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.delete("/roles/norole")
+
+    assert response.status_code == 404
+
+
+# ── submit_task: TaskException branch ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_submit_task_raises_400_on_task_exception():
+    """POST /submit-task returns 400 when the state manager raises TaskException."""
+    from jobbers.state_manager import TaskException
+
+    mock_sm = MagicMock()
+    mock_sm.submit_task = AsyncMock(side_effect=TaskException("bad params"))
+
+    async def task_function(foo: int) -> None:
+        pass
+
+    from jobbers.models.task_config import TaskConfig
+    test_task_config = TaskConfig(name="Test Task", function=task_function)
+    task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm), \
+         patch("jobbers.registry.get_task_config", return_value=test_task_config):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))
+
+    assert response.status_code == 400
+    assert "bad params" in response.json()["detail"]

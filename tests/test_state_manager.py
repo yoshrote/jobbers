@@ -586,3 +586,100 @@ async def test_monitor_task_cancellation_does_not_exit_without_message(state_man
     monitor.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await monitor
+
+
+# ── update_task_heartbeat / remove_task_heartbeat ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_task_heartbeat_stores_score(redis, state_manager):
+    """update_task_heartbeat writes a score to the heartbeat sorted set."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
+    await state_manager.update_task_heartbeat(task)
+    score = await redis.zscore(state_manager.ta.HEARTBEAT_SCORES(queue="default"), bytes(ULID1))
+    assert score is not None
+
+
+@pytest.mark.asyncio
+async def test_remove_task_heartbeat_clears_score(redis, state_manager):
+    """remove_task_heartbeat removes the score from the heartbeat sorted set."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
+    await state_manager.update_task_heartbeat(task)
+    await state_manager.remove_task_heartbeat(task)
+    score = await redis.zscore(state_manager.ta.HEARTBEAT_SCORES(queue="default"), bytes(ULID1))
+    assert score is None
+
+
+# ── get_active_tasks ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_active_tasks_returns_tasks_with_heartbeats(redis, state_manager):
+    """get_active_tasks returns tasks that have a heartbeat entry."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
+    await state_manager.ta.save_task(task)
+    await state_manager.update_task_heartbeat(task)
+
+    result = await state_manager.get_active_tasks({"default"})
+    assert len(result) == 1
+    assert result[0].id == ULID1
+
+
+# ── schedule_retry_task ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_task_adds_to_scheduler(redis, state_manager):
+    """schedule_retry_task saves the task and adds it to the scheduled queue."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SCHEDULED)
+    run_at = FROZEN_TIME + dt.timedelta(minutes=5)
+
+    result = await state_manager.schedule_retry_task(task, run_at)
+
+    assert result is task
+    due = await state_manager.task_scheduler.next_due(["default"])
+    assert due is not None
+    assert due.id == ULID1
+
+
+# ── queue_retry_task ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_queue_retry_task_requeues_immediately(redis, state_manager):
+    """queue_retry_task sets status to SUBMITTED and enqueues the task."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+
+    result = await state_manager.queue_retry_task(task)
+
+    assert result is task
+    assert result.status == TaskStatus.SUBMITTED
+    members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) in members
+
+
+# ── request_task_cancellation: task not found ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_request_task_cancellation_returns_none_for_missing_task(state_manager):
+    """request_task_cancellation returns None when the task does not exist."""
+    result = await state_manager.request_task_cancellation(ULID1)
+    assert result is None
+
+
+# ── dispatch_scheduled_task: WatchError retry ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scheduled_task_skips_cancelled_task(redis, state_manager):
+    """dispatch_scheduled_task silently skips tasks that are already CANCELLED."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.CANCELLED)
+    await state_manager.ta.save_task(task)
+
+    result = await state_manager.dispatch_scheduled_task(task)
+
+    assert result is task
+    # Task should NOT have been re-enqueued
+    members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) not in members

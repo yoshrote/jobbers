@@ -585,3 +585,111 @@ async def test_submit_rate_limited_concurrent_respects_limit(redis, task_adapter
     assert accepted == limit
     assert await redis.zcard("rate-limiter:default") == limit
     assert await redis.zcard("task-queues:default") == limit
+
+
+# ── valid_task_params: no task_config ─────────────────────────────────────────
+
+def test_valid_task_params_no_task_config():
+    """valid_task_params returns True immediately when task_config is None."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+    assert task.task_config is None
+    assert task.valid_task_params() is True
+
+
+# ── shutdown ───────────────────────────────────────────────────────────────────
+
+def test_shutdown_no_task_config_is_noop():
+    """shutdown() returns immediately when task_config is None."""
+    from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
+    task.shutdown()  # should not raise
+    assert task.status == TaskStatus.STARTED
+
+
+def test_shutdown_continue_policy_is_noop():
+    """shutdown() with CONTINUE policy leaves the task status unchanged."""
+    from jobbers.models.task_config import TaskConfig
+    from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+
+    async def noop() -> None: ...
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
+    task.task_config = TaskConfig(name="t", function=noop, on_shutdown=TaskShutdownPolicy.CONTINUE)
+    task.shutdown()
+    assert task.status == TaskStatus.STARTED
+
+
+# ── should_retry / should_schedule ───────────────────────────────────────────
+
+def test_should_retry_true_when_retries_remain():
+    from jobbers.models.task_config import TaskConfig
+    async def noop() -> None: ...
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+    task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
+    task.retry_attempt = 1
+    assert task.should_retry() is True
+
+
+def test_should_retry_false_when_exhausted():
+    from jobbers.models.task_config import TaskConfig
+    async def noop() -> None: ...
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+    task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
+    task.retry_attempt = 3
+    assert task.should_retry() is False
+
+
+def test_should_schedule_true_when_retry_delay_set():
+    from jobbers.models.task_config import TaskConfig
+    async def noop() -> None: ...
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+    task.task_config = TaskConfig(name="t", function=noop, retry_delay=10)
+    assert task.should_schedule() is True
+
+
+def test_should_schedule_false_when_no_retry_delay():
+    from jobbers.models.task_config import TaskConfig
+    async def noop() -> None: ...
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+    task.task_config = TaskConfig(name="t", function=noop, retry_delay=None)
+    assert task.should_schedule() is False
+
+
+# ── summarized: with errors ───────────────────────────────────────────────────
+
+def test_summarized_includes_last_error_when_errors_present():
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED,
+                errors=["first", "last error"])
+    summary = task.summarized()
+    assert summary["last_error"] == "last error"
+
+
+def test_summarized_omits_last_error_when_no_errors():
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+    summary = task.summarized()
+    assert "last_error" not in summary
+
+
+# ── set_status: retried_at and SCHEDULED/UNSUBMITTED branches ────────────────
+
+def test_set_status_started_sets_retried_at_when_already_started():
+    """Second STARTED transition sets retried_at instead of started_at."""
+    task = Task(id=ULID1, name="t", version=1, queue="default",
+                status=TaskStatus.SUBMITTED,
+                started_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC))
+    task.set_status(TaskStatus.STARTED)
+    assert task.retried_at is not None
+
+
+def test_set_status_scheduled_increments_retry_attempt():
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+    before = task.retry_attempt
+    task.set_status(TaskStatus.SCHEDULED)
+    assert task.retry_attempt == before + 1
+    assert task.status == TaskStatus.SCHEDULED
+
+
+def test_set_status_unsubmitted_increments_retry_attempt():
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+    before = task.retry_attempt
+    task.set_status(TaskStatus.UNSUBMITTED)
+    assert task.retry_attempt == before + 1

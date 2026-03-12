@@ -132,3 +132,13 @@ class TestMaxRetryDelay:
         for _ in range(10):
             result = config.compute_retry_at(10)
             assert result <= frozen_now + dt.timedelta(seconds=100)
+
+    def test_exponential_exceeds_max_retry_delay_is_capped(self, frozen_now):
+        """When exponential delay > max_retry_delay, result is capped at max."""
+        config = make_config(
+            retry_delay=1000,
+            backoff_strategy=BackoffStrategy.EXPONENTIAL,
+            max_retry_delay=60,
+        )
+        result = config.compute_retry_at(5)  # 1000 * 2^5 = 32000 >> 60
+        assert result <= frozen_now + dt.timedelta(seconds=60)
