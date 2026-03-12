@@ -1,3 +1,4 @@
+import aiosqlite
 import fakeredis
 import pytest
 import pytest_asyncio
@@ -6,6 +7,7 @@ from ulid import ULID
 from jobbers.adapters.json_redis import JsonTaskAdapter
 from jobbers.adapters.raw_redis import MsgpackTaskAdapter
 from jobbers.adapters.task_adapter import _BaseTaskAdapter
+from jobbers.models.queue_config import create_schema
 from jobbers.models.task import Task
 
 
@@ -59,3 +61,12 @@ class DummyTaskAdapter:
 def dummy_task_adapter() -> DummyTaskAdapter:
     """Fixture providing a fresh DummyTaskAdapter for each test."""
     return DummyTaskAdapter()
+
+
+@pytest_asyncio.fixture
+async def sqlite_conn():
+    """In-memory SQLite connection with schema applied."""
+    async with aiosqlite.connect(":memory:") as conn:
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await create_schema(conn)
+        yield conn

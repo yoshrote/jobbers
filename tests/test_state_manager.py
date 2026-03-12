@@ -4,13 +4,12 @@ import datetime as dt
 from collections import defaultdict
 from unittest.mock import patch
 
-import aiosqlite
 import pytest
 import pytest_asyncio
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.models.queue_config import QueueConfig, create_schema
+from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_status import TaskStatus
@@ -19,14 +18,6 @@ from jobbers.state_manager import StateManager, UserCancellationError
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
-
-@pytest_asyncio.fixture
-async def sqlite_conn():
-    """In-memory SQLite connection with schema applied."""
-    async with aiosqlite.connect(":memory:") as conn:
-        await conn.execute("PRAGMA foreign_keys = ON")
-        await create_schema(conn)
-        yield conn
 
 @pytest_asyncio.fixture
 async def state_manager(redis, sqlite_conn):

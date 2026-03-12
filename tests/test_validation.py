@@ -1,11 +1,10 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import aiosqlite
 import pytest
 import pytest_asyncio
 from ulid import ULID
 
-from jobbers.models.queue_config import QueueConfig, create_schema
+from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.state_manager import StateManager
@@ -13,14 +12,6 @@ from jobbers.validation import ValidationError, validate_task
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 
-
-@pytest_asyncio.fixture
-async def sqlite_conn():
-    """In-memory SQLite connection with schema applied."""
-    async with aiosqlite.connect(":memory:") as conn:
-        await conn.execute("PRAGMA foreign_keys = ON")
-        await create_schema(conn)
-        yield conn
 
 @pytest_asyncio.fixture
 async def state_manager(redis, sqlite_conn):

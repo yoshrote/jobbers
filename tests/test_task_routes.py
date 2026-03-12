@@ -2,14 +2,13 @@ import datetime as dt
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import aiosqlite
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from ulid import ULID
 
 from jobbers.adapters import MsgpackTaskAdapter as TaskAdapter
-from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, create_schema
+from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.state_manager import StateManager
@@ -19,15 +18,17 @@ ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
 
+@pytest_asyncio.fixture
+async def sqlite_with_default_queue(sqlite_conn):
+    """Seed the in-memory SQLite DB with a 'default' queue."""
+    await QueueConfigAdapter(sqlite_conn).save_queue_config(QueueConfig(name="default"))
+    return sqlite_conn
+
 @pytest_asyncio.fixture(autouse=True)
-async def patch_sqlite():
-    """Provide an in-memory SQLite DB with a 'default' queue for validation."""
-    async with aiosqlite.connect(":memory:") as conn:
-        await conn.execute("PRAGMA foreign_keys = ON")
-        await create_schema(conn)
-        await QueueConfigAdapter(conn).save_queue_config(QueueConfig(name="default"))
-        with patch("jobbers.validation.db.get_sqlite_conn", return_value=conn):
-            yield conn
+async def patch_sqlite(sqlite_with_default_queue):
+    """Patch get_sqlite_conn for validation with the seeded in-memory SQLite DB."""
+    with patch("jobbers.validation.db.get_sqlite_conn", return_value=sqlite_with_default_queue):
+        yield sqlite_with_default_queue
 
 @pytest_asyncio.fixture(autouse=True)
 async def patch_state_manager(redis, patch_sqlite):
