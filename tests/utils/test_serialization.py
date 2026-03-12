@@ -35,3 +35,18 @@ def test_ext_hook_with_unknown_code():
     assert isinstance(result, msgpack.ExtType)
     assert result.code == 99
     assert result.data == b"some_data"
+
+
+def test_default_with_timedelta():
+    obj = datetime.timedelta(seconds=90, microseconds=500000)
+    result = default(obj)
+    assert isinstance(result, msgpack.ExtType)
+    assert result.code == 2
+    assert result.data == str(obj.total_seconds()).encode()
+
+
+def test_ext_hook_with_timedelta_code():
+    data = b"90.5"
+    result = ext_hook(2, data)
+    assert isinstance(result, datetime.timedelta)
+    assert result == datetime.timedelta(seconds=90, microseconds=500000)

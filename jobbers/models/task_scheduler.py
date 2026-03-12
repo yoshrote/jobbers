@@ -1,13 +1,17 @@
-import datetime as dt
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Any, cast
 
-from redis.asyncio.client import Pipeline, Redis
 from ulid import ULID
 
 if TYPE_CHECKING:
+    import datetime as dt
     from collections.abc import Awaitable
 
-from jobbers.models.task import Task
+    from redis.asyncio.client import Pipeline, Redis
+
+    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.models.task import Task
 
 
 class TaskScheduler:
@@ -44,8 +48,9 @@ class TaskScheduler:
         return results
     """
 
-    def __init__(self, data_store: Redis) -> None:
+    def __init__(self, data_store: Redis, task_adapter: TaskAdapterProtocol) -> None:
         self.data_store = data_store
+        self.ta = task_adapter
 
     def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
         """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
@@ -56,24 +61,6 @@ class TaskScheduler:
         """Queue ZREM schedule-queue + HDEL schedule-task-queue onto pipe (no execute)."""
         pipe.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
         pipe.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
-
-    async def add(self, task: Task, run_at: dt.datetime) -> None:
-        """Schedule a task to run at run_at. Re-adding an existing task resets its run_at."""
-        pipe = self.data_store.pipeline(transaction=True)
-        self.stage_add(pipe, task, run_at)
-        await pipe.execute()
-
-    async def remove(self, task_id: ULID) -> None:
-        """Remove a scheduled task by ID."""
-        queue_bytes: bytes | None = await cast(
-            "Awaitable[bytes | None]",
-            self.data_store.hget(self.SCHEDULE_TASK_QUEUE, str(task_id)),
-        )
-        if queue_bytes is None:
-            return
-        pipe = self.data_store.pipeline(transaction=True)
-        self.stage_remove(pipe, task_id, queue_bytes.decode())
-        await pipe.execute()
 
     async def get_by_filter(
         self,
@@ -113,15 +100,14 @@ class TaskScheduler:
             cursor = bytes(ULID.from_str(start_after))
             raw_ids = [r for r in raw_ids if r > cursor]
 
+        ulid_list = [ULID.from_bytes(r) for r in raw_ids]
+        fetched: list[Task | None] = await self.ta.get_tasks_bulk(ulid_list)
         results: list[Task] = []
-        for raw_id in raw_ids:
+        for task in fetched:
             if len(results) >= limit:
                 break
-            task_id = ULID.from_bytes(raw_id)
-            task_data: bytes | None = await self.data_store.get(f"task:{task_id}")
-            if task_data is None:
+            if task is None:
                 continue
-            task = Task.unpack(task_id, task_data)
             if task_name is not None and task.name != task_name:
                 continue
             if task_version is not None and task.version != task_version:
@@ -149,6 +135,8 @@ class TaskScheduler:
         - ``queues=[]``   — return [] immediately
         - ``queues=[...]`` — only match tasks in the given queues
         """
+        import datetime as dt
+
         if queues is not None and not queues:
             return []
 
@@ -168,13 +156,7 @@ class TaskScheduler:
             self.data_store.eval(self._ACQUIRE_SCRIPT, len(keys), *keys, str(now), n),
         )
 
-        results: list[tuple[Task, dt.datetime]] = []
-        for i in range(0, len(raw), 2):
-            task_id = ULID.from_bytes(raw[i])
-            run_at = dt.datetime.fromtimestamp(float(raw[i + 1]), dt.UTC)
-            task_data: bytes | None = await self.data_store.get(f"task:{task_id}")
-            if task_data is not None:
-                task = Task.unpack(task_id, task_data)
-                results.append((task, run_at))
-
-        return results
+        task_ids = [ULID.from_bytes(raw[i]) for i in range(0, len(raw), 2)]
+        run_ats = [dt.datetime.fromtimestamp(float(raw[i + 1]), dt.UTC) for i in range(0, len(raw), 2)]
+        tasks: list[Task | None] = await self.ta.get_tasks_bulk(task_ids)
+        return [(task, run_at) for task, run_at in zip(tasks, run_ats) if task is not None]

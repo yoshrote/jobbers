@@ -1,11 +1,13 @@
-"""Tests for RedisDeadQueue using a real Redis instance (db=14)."""
+"""
+Contract tests for DeadQueueProtocol implementations.
+
+Each test runs against all registered implementations via the ``dead_queue``
+fixture defined in ``tests/adapters/conftest.py``.
+"""
 import datetime as dt
 
 import pytest
-import pytest_asyncio
-import redis.asyncio as aioredis
 
-from jobbers.models.dead_queue import DeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 
@@ -32,32 +34,20 @@ def make_task(
     )
 
 
-@pytest_asyncio.fixture
-async def redis():
-    client = aioredis.Redis(host="localhost", port=6379, db=14)
-    await client.flushdb()
-    yield client
-    await client.flushdb()
-    await client.aclose()
-
-
-@pytest_asyncio.fixture
-async def dq(redis):
-    yield DeadQueue(redis)
-
-
-async def store_task(redis: aioredis.Redis, task: Task) -> None:
-    """Pre-store task data at task:<id> so DLQ reads can find it."""
-    await redis.set(f"task:{task.id}", task.pack())
+async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
+    pipe = dq.data_store.pipeline(transaction=True)
+    dq.stage_add(pipe, task, failed_at)
+    await pipe.execute()
 
 
 # ── add / get_by_ids ──────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_add_and_get_by_id(dq, redis):
+async def test_add_and_get_by_id(dead_queue):
+    dq, adapter = dead_queue
     task = make_task()
-    await store_task(redis, task)
-    await dq.add(task, FAILED_AT)
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
 
     results = await dq.get_by_ids([str(task.id)])
     assert len(results) == 1
@@ -67,24 +57,26 @@ async def test_add_and_get_by_id(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_by_ids_multiple(dq, redis):
+async def test_get_by_ids_multiple(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_ids([str(t1.id), str(t2.id)])
     assert {r.id for r in results} == {t1.id, t2.id}
 
 
 @pytest.mark.asyncio
-async def test_get_by_ids_returns_only_matching(dq, redis):
+async def test_get_by_ids_returns_only_matching(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_ids([str(t1.id)])
     assert len(results) == 1
@@ -92,28 +84,30 @@ async def test_get_by_ids_returns_only_matching(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_by_ids_nonexistent_returns_empty(dq):
-    results = await dq.get_by_ids(["01JQC31AJP7TSA9X8AEP64XG99"])
-    assert results == []
+async def test_get_by_ids_nonexistent_returns_empty(dead_queue):
+    dq, _ = dead_queue
+    assert await dq.get_by_ids(["01JQC31AJP7TSA9X8AEP64XG99"]) == []
 
 
 @pytest.mark.asyncio
-async def test_get_by_ids_empty_list_returns_empty(dq, redis):
+async def test_get_by_ids_empty_list_returns_empty(dead_queue):
+    dq, adapter = dead_queue
     task = make_task()
-    await store_task(redis, task)
-    await dq.add(task, FAILED_AT)
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
     assert await dq.get_by_ids([]) == []
 
 
 # ── get_by_filter ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_get_by_filter_queue(dq, redis):
+async def test_get_by_filter_queue(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", queue="q2")
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(queue="q1")
     assert len(results) == 1
@@ -121,12 +115,13 @@ async def test_get_by_filter_queue(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_task_name(dq, redis):
+async def test_get_by_filter_task_name(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", name="task_a")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", name="task_b")
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(task_name="task_a")
     assert len(results) == 1
@@ -134,12 +129,13 @@ async def test_get_by_filter_task_name(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_task_version(dq, redis):
+async def test_get_by_filter_task_version(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", version=1)
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", version=2)
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(task_version=2)
     assert len(results) == 1
@@ -147,13 +143,14 @@ async def test_get_by_filter_task_version(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_version_zero(dq, redis):
+async def test_get_by_filter_version_zero(dead_queue):
     """task_version=0 should be treated as a real filter value, not falsy."""
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", version=0)
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", version=1)
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(task_version=0)
     assert len(results) == 1
@@ -161,13 +158,14 @@ async def test_get_by_filter_version_zero(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_combined(dq, redis):
+async def test_get_by_filter_combined(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", name="task_a", version=1, queue="q1")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", name="task_a", version=2, queue="q1")
     t3 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03", name="task_b", version=1, queue="q1")
     for t in (t1, t2, t3):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(queue="q1", task_name="task_a", task_version=1)
     assert len(results) == 1
@@ -175,80 +173,86 @@ async def test_get_by_filter_combined(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_no_criteria_returns_all(dq, redis):
+async def test_get_by_filter_no_criteria_returns_all(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter()
     assert len(results) == 2
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_limit_respected(dq, redis):
+async def test_get_by_filter_limit_respected(dead_queue):
+    dq, adapter = dead_queue
     tasks = [
         make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01"),
         make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02"),
         make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03"),
     ]
     for t in tasks:
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(limit=2)
     assert len(results) == 2
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_no_match_returns_empty(dq, redis):
+async def test_get_by_filter_no_match_returns_empty(dead_queue):
+    dq, adapter = dead_queue
     task = make_task(queue="q1")
-    await store_task(redis, task)
-    await dq.add(task, FAILED_AT)
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
 
-    results = await dq.get_by_filter(queue="q_nonexistent")
-    assert results == []
+    assert await dq.get_by_filter(queue="q_nonexistent") == []
 
 
 # ── remove ────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_remove_deletes_entry(dq, redis):
+async def test_remove_deletes_entry(dead_queue):
+    dq, adapter = dead_queue
     task = make_task()
-    await store_task(redis, task)
-    await dq.add(task, FAILED_AT)
-    await dq.remove(str(task.id))
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
+    await dq.remove_many([str(task.id)])
 
     assert await dq.get_by_ids([str(task.id)]) == []
 
 
 @pytest.mark.asyncio
-async def test_remove_leaves_other_entries_intact(dq, redis):
+async def test_remove_leaves_other_entries_intact(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
-    await dq.remove(str(t1.id))
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
+    await dq.remove_many([str(t1.id)])
 
     assert await dq.get_by_ids([str(t1.id)]) == []
     assert len(await dq.get_by_ids([str(t2.id)])) == 1
 
 
 @pytest.mark.asyncio
-async def test_remove_nonexistent_is_silent(dq):
+async def test_remove_nonexistent_is_silent(dead_queue):
     """Removing a task that was never added should not raise."""
-    await dq.remove("01JQC31AJP7TSA9X8AEP64XG99")
+    dq, _ = dead_queue
+    await dq.remove_many(["01JQC31AJP7TSA9X8AEP64XG99"])
 
 
 @pytest.mark.asyncio
-async def test_remove_cleans_up_secondary_indexes(dq, redis):
+async def test_remove_cleans_up_secondary_indexes(dead_queue):
     """After remove, the queue and name indexes no longer contain the task."""
+    dq, adapter = dead_queue
     task = make_task(queue="myqueue", name="mytask")
-    await store_task(redis, task)
-    await dq.add(task, FAILED_AT)
-    await dq.remove(str(task.id))
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
+    await dq.remove_many([str(task.id)])
 
     assert await dq.get_by_filter(queue="myqueue") == []
     assert await dq.get_by_filter(task_name="mytask") == []
@@ -257,25 +261,27 @@ async def test_remove_cleans_up_secondary_indexes(dq, redis):
 # ── remove_many ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_remove_many_deletes_all(dq, redis):
+async def test_remove_many_deletes_all(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
     await dq.remove_many([str(t1.id), str(t2.id)])
 
     assert await dq.get_by_ids([str(t1.id), str(t2.id)]) == []
 
 
 @pytest.mark.asyncio
-async def test_remove_many_leaves_unmentioned_entries_intact(dq, redis):
+async def test_remove_many_leaves_unmentioned_entries_intact(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     t3 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03")
     for t in (t1, t2, t3):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
     await dq.remove_many([str(t1.id), str(t2.id)])
 
     assert await dq.get_by_ids([str(t1.id), str(t2.id)]) == []
@@ -283,25 +289,28 @@ async def test_remove_many_leaves_unmentioned_entries_intact(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_remove_many_empty_list_is_silent(dq, redis):
+async def test_remove_many_empty_list_is_silent(dead_queue):
+    dq, adapter = dead_queue
     task = make_task()
-    await store_task(redis, task)
-    await dq.add(task, FAILED_AT)
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
     await dq.remove_many([])
     assert len(await dq.get_by_ids([str(task.id)])) == 1
 
 
 @pytest.mark.asyncio
-async def test_remove_many_nonexistent_ids_are_silent(dq):
+async def test_remove_many_nonexistent_ids_are_silent(dead_queue):
     """IDs that don't exist should not raise."""
+    dq, _ = dead_queue
     await dq.remove_many(["01JQC31AJP7TSA9X8AEP64XG01", "01JQC31AJP7TSA9X8AEP64XG02"])
 
 
 @pytest.mark.asyncio
-async def test_remove_many_partial_match(dq, redis):
+async def test_remove_many_partial_match(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
-    await store_task(redis, t1)
-    await dq.add(t1, FAILED_AT)
+    await adapter.save_task(t1)
+    await add_to_dlq(dq, t1, FAILED_AT)
     await dq.remove_many([str(t1.id), "01JQC31AJP7TSA9X8AEP64XG99"])
 
     assert await dq.get_by_ids([str(t1.id)]) == []
@@ -310,10 +319,11 @@ async def test_remove_many_partial_match(dq, redis):
 # ── get_history ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_get_history_returns_errors_from_task_blob(dq, redis):
+async def test_get_history_returns_errors_from_task_blob(dead_queue):
+    dq, adapter = dead_queue
     task = make_task(errors=["first error", "second error", "third error"])
-    await store_task(redis, task)
-    await dq.add(task, FAILED_AT)
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
 
     history = await dq.get_history(str(task.id))
     assert len(history) == 3
@@ -323,26 +333,29 @@ async def test_get_history_returns_errors_from_task_blob(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_history_empty_when_no_errors(dq, redis):
+async def test_get_history_empty_when_no_errors(dead_queue):
+    dq, adapter = dead_queue
     task = make_task(errors=[])
-    await store_task(redis, task)
-    await dq.add(task, FAILED_AT)
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
 
     assert await dq.get_history(str(task.id)) == []
 
 
 @pytest.mark.asyncio
-async def test_get_history_empty_for_unknown_task(dq):
+async def test_get_history_empty_for_unknown_task(dead_queue):
+    dq, _ = dead_queue
     assert await dq.get_history("01JQC31AJP7TSA9X8AEP64XG99") == []
 
 
 @pytest.mark.asyncio
-async def test_get_history_isolated_by_task_id(dq, redis):
+async def test_get_history_isolated_by_task_id(dead_queue):
+    dq, adapter = dead_queue
     ta = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", errors=["error a"])
     tb = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", errors=["error b1", "error b2"])
     for t in (ta, tb):
-        await store_task(redis, t)
-        await dq.add(t, FAILED_AT)
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
 
     assert len(await dq.get_history(str(ta.id))) == 1
     assert len(await dq.get_history(str(tb.id))) == 2
@@ -351,14 +364,15 @@ async def test_get_history_isolated_by_task_id(dq, redis):
 # ── clean ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_clean_removes_old_entries(dq, redis):
+async def test_clean_removes_old_entries(dead_queue):
     """Tasks added with EARLIER failed_at are removed; LATER ones remain."""
+    dq, adapter = dead_queue
     t_old = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t_new = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
-    await store_task(redis, t_old)
-    await store_task(redis, t_new)
-    await dq.add(t_old, EARLIER)
-    await dq.add(t_new, LATER)
+    for t in (t_old, t_new):
+        await adapter.save_task(t)
+    await add_to_dlq(dq, t_old, EARLIER)
+    await add_to_dlq(dq, t_new, LATER)
 
     cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
     await dq.clean(cutoff)
@@ -368,11 +382,12 @@ async def test_clean_removes_old_entries(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_clean_removes_secondary_indexes(dq, redis):
+async def test_clean_removes_secondary_indexes(dead_queue):
     """After clean, old tasks are gone from queue and name indexes."""
+    dq, adapter = dead_queue
     task = make_task(queue="myqueue", name="mytask")
-    await store_task(redis, task)
-    await dq.add(task, EARLIER)
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, EARLIER)
 
     cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
     await dq.clean(cutoff)
@@ -382,6 +397,7 @@ async def test_clean_removes_secondary_indexes(dq, redis):
 
 
 @pytest.mark.asyncio
-async def test_clean_empty_queue_is_silent(dq):
+async def test_clean_empty_queue_is_silent(dead_queue):
     """Clean on an empty DLQ should not raise."""
+    dq, _ = dead_queue
     await dq.clean(dt.datetime(2025, 1, 1, tzinfo=dt.UTC))

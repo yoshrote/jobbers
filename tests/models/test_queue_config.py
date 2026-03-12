@@ -1,22 +1,11 @@
-import aiosqlite
 import pytest
-import pytest_asyncio
 
-from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, RatePeriod, create_schema
-
-
-@pytest_asyncio.fixture
-async def conn():
-    """In-memory SQLite connection with the queue/role schema applied."""
-    async with aiosqlite.connect(":memory:") as db:
-        await db.execute("PRAGMA foreign_keys = ON")
-        await create_schema(db)
-        yield db
+from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, RatePeriod
 
 
 @pytest.fixture
-def queue_config_adapter(conn):
-    return QueueConfigAdapter(conn)
+def queue_config_adapter(sqlite_conn):
+    return QueueConfigAdapter(sqlite_conn)
 
 
 # ---------------------------------------------------------------------------

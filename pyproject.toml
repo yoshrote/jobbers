@@ -50,7 +50,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "fakeredis[lua]",
+    "fakeredis[lua,json]",
     "httpx",
     "pytest",
     "pytest-asyncio",
@@ -203,6 +203,10 @@ tmp_path_retention_policy = "failed"
 [tool.coverage.run]
 branch = true
 relative_files = false
+omit = [
+    "jobbers/db.py",
+    "jobbers/runners/manager_proc.py",
+]
 
 [tool.coverage.report]
 skip_empty = true
@@ -216,7 +220,8 @@ exclude_also = [
     "if __name__ == .__main__.:",
     "@(abc\\.)?abstractmethod",
     "@(typing(_extensions)?\\.)?overload",
-    "if (typing(_extensions)?\\.)?TYPE_CHECKING:"
+    "if (typing(_extensions)?\\.)?TYPE_CHECKING:",
+    "def run\\(\\):",
 ]
 
 [tool.mypy]

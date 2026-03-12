@@ -11,9 +11,9 @@ from opentelemetry import metrics
 from redis.exceptions import WatchError
 
 from jobbers import registry
-from jobbers.models.dead_queue import DeadQueue
+from jobbers.adapters.json_redis import JsonTaskAdapter
+from jobbers.adapters.raw_redis import DeadQueue
 from jobbers.models.queue_config import QueueConfigAdapter
-from jobbers.models.task import Task, TaskAdapter
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     import aiosqlite
     from redis.asyncio.client import Redis
     from ulid import ULID
+
+    from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
+    from jobbers.models.task import Task
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -43,14 +46,19 @@ class UserCancellationError(Exception):
 class StateManager:
     """Manages tasks in memory and a Redis data store."""
 
-    def __init__(self, data_store: Redis, sqlite_conn: aiosqlite.Connection) -> None:
+    def __init__(
+        self,
+        data_store: Redis,
+        sqlite_conn: aiosqlite.Connection,
+        task_adapter: TaskAdapterProtocol | None = None,
+    ) -> None:
         self.data_store: Redis = data_store
         self.qca = QueueConfigAdapter(sqlite_conn)
-        self.ta = TaskAdapter(data_store)
+        self.ta: TaskAdapterProtocol = task_adapter if task_adapter is not None else JsonTaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(data_store, self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
-        self.dead_queue = DeadQueue(data_store)
-        self.task_scheduler = TaskScheduler(data_store)
+        self.dead_queue: DeadQueueProtocol = DeadQueue(data_store, self.ta)
+        self.task_scheduler = TaskScheduler(data_store, self.ta)
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -141,7 +149,9 @@ class StateManager:
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
-        await self.ta.save_task(task=task)
+        pipe = self.data_store.pipeline(transaction=True)
+        self.ta.stage_save(pipe, task)
+        await pipe.execute()
         return task
 
     async def fail_task(self, task: Task) -> Task:
@@ -184,11 +194,6 @@ class StateManager:
         """Return all tasks currently present in any heartbeat sorted set."""
         return await self.ta.get_active_tasks(queues)
 
-    async def complete_task(self, task: Task) -> Task:
-        """Persist a completed task."""
-        #TODO set a ttl for the data in redis after completion
-        return await self.save_task(task)
-
     async def schedule_retry_task(self, task: Task, run_at: dt.datetime) -> Task:
         """Add a task to the scheduler and save its state in a single atomic transaction."""
         pipe = self.data_store.pipeline(transaction=True)
@@ -202,7 +207,9 @@ class StateManager:
         """Persist an immediate retry: re-enqueue the task without full re-validation."""
         task.set_status(TaskStatus.SUBMITTED)
         logger.info("Task %s requeued for immediate retry.", task.id)
-        await self.ta.requeue_task(task)
+        pipe = self.data_store.pipeline(transaction=True)
+        self.ta.stage_requeue(pipe, task)
+        await pipe.execute()
         return task
 
     async def dispatch_scheduled_task(self, task: Task) -> Task:
@@ -222,8 +229,8 @@ class StateManager:
         while True:
             pipe = self.data_store.pipeline()
             await pipe.watch(task_key)
-            task_data: bytes | None = await pipe.get(task_key)
-            if task_data is None or Task.unpack(task.id, task_data).status == TaskStatus.CANCELLED:
+            watched_task: Task | None = await self.ta.read_for_watch(pipe, task.id)
+            if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
                 await pipe.unwatch()  # type: ignore[no-untyped-call]
                 return task
             task.set_status(TaskStatus.SUBMITTED)
@@ -249,14 +256,18 @@ class StateManager:
         match task.status:
             case TaskStatus.SCHEDULED:
                 # For scheduled tasks, we can just remove them from the scheduler without a pub/sub dance
-                await self.task_scheduler.remove(task_id)
                 task.set_status(TaskStatus.CANCELLED)
-                await self.save_task(task)
+                pipe = self.data_store.pipeline(transaction=True)
+                self.task_scheduler.stage_remove(pipe, task_id, task.queue)
+                self.ta.stage_save(pipe, task)
+                await pipe.execute()
             case TaskStatus.SUBMITTED:
                 # remove from the queue immediately so it can't be claimed by a worker
-                await self.ta.remove_from_queue(task)
                 task.set_status(TaskStatus.CANCELLED)
-                await self.save_task(task)
+                pipe = self.data_store.pipeline(transaction=True)
+                self.ta.stage_remove_from_queue(pipe, task)
+                self.ta.stage_save(pipe, task)
+                await pipe.execute()
             case TaskStatus.STARTED | TaskStatus.HEARTBEAT:
                 await self.data_store.publish(f"task_cancel_{task_id}", "cancel")
             case _:

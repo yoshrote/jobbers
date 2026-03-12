@@ -1,413 +1,486 @@
 # Jobbers
 
-> 💡 **VS Code Dev Containers**
-> The workspace now configures the devcontainer to include `docker-compose.override.yml` alongside `docker-compose.yml`. This ensures VS Code uses the same override settings when spinning up the development containers.
->
-A task execution framework similar to Celery, but with a focus on providing
-support to track and handle the recovery of long running tasks that stall or
-fail.
+A lightweight distributed task execution framework for Python, built on asyncio. If you've used Celery, Jobbers will feel familiar — but with first-class support for task introspection, cancellation, stall detection, and OpenTelemetry observability out of the box.
 
-The name is inspired by the many pro wrestlers who anonymously do the work to
-make the stars look good. A future feature would be to implement an Airflow
-Executor for this.
+---
 
-This framework is intended to allow tasks to make use of asyncio and aims to
-help manage and recover from failures or hang ups that can occur in long running
-tasks.
+## Why Jobbers?
 
-Long running jobs may hang indefinitely for any number of reasons given the
-arbitrary code that may be running. Detecting workers in this state and having
-tools to provide options to recover or kill the tasks are useful to handle these kinds of operational issues.
+| | Celery | Jobbers |
+|---|---|---|
+| asyncio-native tasks | Limited | Yes |
+| Task introspection API | No | Yes |
+| Cancel running/queued/scheduled tasks | No | Yes |
+| Stall detection via heartbeats | No | Yes |
+| Dead letter queue with history | No | Yes |
+| Built-in OpenTelemetry metrics | No | Yes |
+| Per-queue rate limiting | No | Yes |
 
-## OpenTelemetry Metrics
+---
 
-aggregated by task, version, and queue
+## How It Works
 
-| metric | type | description |
-| ------ | ---- | ----------- |
-| tasks_retried | COUNT | one per retry event (expected exception or timeout) |
-| tasks_dead_lettered | COUNT | tasks moved to the dead letter queue |
-| cancellations_requested | COUNT | cancel signals published (does not guarantee the task stopped) |
+Jobbers runs as four independent processes:
 
-aggregated by task, queue, and status
+| Process | Role |
+|---------|------|
+| **Manager** | FastAPI web server (port 8000): task submission, status, cancellation, DLQ, queue/role management |
+| **Worker** | Pulls tasks from Redis queues and executes them; handles retries, heartbeats, cancellation |
+| **Cleaner** | Prunes stale state, rate-limit entries, and detects stalled tasks |
+| **Scheduler** | Polls for due retry-delayed tasks and re-enqueues them |
 
-| metric | type | description |
-| ------ | ---- | ----------- |
-| tasks_processed | COUNT | number of tasks |
-| execution_time | HIST | time from task start to task finish (ms) |
-| end_to_end_latency | HIST | time from enqueue to task finish (ms) |
+Tasks move through the following states:
 
-aggregated by task, queue, and role
-
-| metric | type | description |
-| ------ | ---- | ----------- |
-| time_in_queue | HIST | time from enqueue to task start |
-| tasks_selected | COUNT | number of tasks |
-
-### Useful Insights via OTEL
-
-`time_in_queue`
-
-- judge if more or less workers should be deployed
-- judge if tasks may be merged into a single queue or should be separated for scaling
-
-`tasks_processed[status=dropped]`
-
-- workers are losing or dropping tasks. possibly an old worker receiving new tasks or a bad client sending garbage.
-
-### Common Operational Questions/Issues TODO
-
-Task Health and Management
-
-- (API) status state
-- Detect, halt, and recover frozen tasks (e.g. stalled import/export tasks)
-  - Heartbeats provide a way to detect if a task is frozen.
-  - Including checkpoint info could allow a recovering task to skip redundant work.
-- Detect and recover jobs whose worker were killed (e.g. deployments or aggressive restarts)
-  - Either a new worker should spin up to take over for the dead one or the jobs need to be re-enqueued to be distributed among the remaining workers.
-- which tasks are currently being run, where, and for how long thus far?
-Queue Health and Management
-- (redis q) how long are the queues? ZCARD queue
-- (otel) how fast are tasks submitted?
-Worker Health:
-- (otel) worker uptime
-- (API) which tasks are running/ran on which worker?
-
-## How it works
-
-Jobbers is split into two applications and a cleanup utility.
-
-`manager` is a web application to submit tasks, request results, and get the
-current state of the tasks and queues.
-The manager acts similar to the RMQ exchange in a Celery/Airflow system by
-determining which Redis queue should be used for a particular job.
-
-Multiple `managers` can be deployed to scale the reads/writes to Redis, but if Redis
-becomes the bottleneck then you could shard your workflows across multiple manager/redis clusters
-based on the queues, a parameter (such as a user id) or whatever else to segment the overall
-system across multiple Redis instances.
-
-`worker` is a task consumer to pull tasks from queues and run the actual task code.
-Each worker is independent of the others and so these can be scaled arbitrarily so
-long as the underlying Redis database can handle all of the connections.
-
-`cleaner` clears task state and queues of jobs that meet search criteria
-
-- task type
-- time of submission
-- queue name
-
-## Key Principles
-
-- asyncio native
-- Useful info about the state of tasks and queues should be surfaced via metrics and traces without having to add on extra tooling.
-
-### Task failure and recovery
-
-Given that we are tracking the state of each task while they exist in a queue-like structure, implementing some dead-letter resubmission feature should be easy enough. Depending on the desired policy (at-most-once vs at-least-once) and the task state we can determine which tasks are safe to retry from failure and which should stay failed.
-
-A tool that could do this would run at some cadence to monitor for tasks in a retryable state (configured for whatever is appropriate: specific failures, time outs, infra failure, etc) and resubmit them. APIs to surface those tasks would be useful for observation purposes. Submitting the mass retry may be better handled with a dedicated API rather than forcing a user to make a trip to get all of the tasks and somewhere between 1 and N calls to resubmit those tasks.
-
-## Features
-
-- Worker load management
-  - Memory leak protection via max tasks (env: WORKER_TTL)
-    The number of worker processes and restarting them is left to other tools.
-  - worker concurrency (env: WORKER_CONCURRENT_TASKS)
-  - capacity limits per worker per queue (TBD config)
-- Configurable retry backoff policy (constant, linear, exponential, exponential with jitter)
-- Dead letter queue with per-task failure history and bulk resubmission API
-- Task cancellation API (single and bulk) for running and queued tasks
-- The state of the queues and the last known state of tasks are stored for diagnostic and recovery purposes.
-- Worker crash recovery
-  - on SIGTERM, a worker will handle currently running tasks according to their shutdown policy
-  - policies: finish, re-enqueue, or fail.
-
-## Other niceties
-
-- [ULID](https://github.com/ulid/spec) for task ids so that clients could generate them in advance if needed.
-
-## Planned features
-
-- system/smoke tests
-- Long-running tasks can issue a heartbeat so that a user can differentiate between
-a slow task and a frozen task
-- on task read
-  1. (optional) update heartbeat
-     - configuration needed to avoid thundering herd issues
-     - TODO: how to handle if we want to track many operations downstream from another?
-  2. do the thing
-  3. (optional) update heartbeat again
-     - depending on the expected duration of the task. a slow task would want a record, but a fast task may not
-     - TODO: more high contention on updating any shared heartbeat
-  4. pass along the work to the next node in the DAG
-- Validate the APIs against registered queues to avoid garbage input
-- implement task search and retry tools for debugging and recovery (generalize work from StateManager.clean)
-- Wrap task functions can be called via `foo.delay()` like Celery does to submit jobs
-- Authentication for the API
-- task DAG
-  - maps what to do (python function)
-  - distribution strategy for 1 parent:N child tasks
-    - round-robin, hash by key, etc
-  - decide whether to inline multiple tasks in the same worker for 1:1 tasks or throw subtasks on the queue
-  - current location within DAG (and summary/audit of where it's been)
-
-Tech stack
-
-- Python3
-  - <https://github.com/aiortc/aioquic> for http server support
-- Redis for task state management
-- Redis for task queue implementation (to be pluggable with Kafka)
-- Open Telemetry for Admin
-  - configure trace and metric granularity per task type to aggregate small tasks for efficiently
-  - <https://opentelemetry-python-contrib.readthedocs.io/en/latest/instrumentation/fastapi/fastapi.html>
-  - uptrace.dev as otel viewer/collector (docker-compose to orchestrate?)
-- FastAPI for task submission, task status, and Admin API/UX
-
-Side quests:
-
-- We can do code generation from an input file
-- run/port airflow workflows and tasks
-
-Top Problems:
-
-- example task
-- heartbeat reporting hook for example task
-- rate limiting per task + params per pool (check on submission)
-- batch fetching tasks off the queue to optimize large numbers of small tasks
-- task chaining (DAG support)
-  - task distribution strategies across queues (random, hash by parameter, etc)
-- enable good dashboards with useful metrics
-  - total queue length over time
-  - time-in-queue aggregates per queue
-  - which workers are/were running which tasks (diagnostics and failure recovery)
-  - aggregate task execution time (possibly per task+queue in case the queue assignment is significant)
-  - task completion rates (per task or per task per queue)
-- discover and handle when role -> queue mapping changes
-
-## Retry and Dead Letter Queue Configuration
-
-### TaskConfig retry fields
-
-| field | type | default | description |
-| ----- | ---- | ------- | ----------- |
-| `max_retries` | `int` | `3` | Maximum number of retry attempts before the task is failed permanently |
-| `retry_delay` | `int \| None` | `None` | Base delay in seconds between retries. When `None`, retries are immediate (no backoff). |
-| `backoff_strategy` | `BackoffStrategy` | `exponential` | How the delay grows with each attempt (see below) |
-| `max_retry_delay` | `int` | `3600` | Upper bound on the computed delay in seconds (1 hour) |
-| `dead_letter_policy` | `DeadLetterPolicy` | `none` | Whether to persist permanently failed tasks for later inspection |
-
-### BackoffStrategy
-
-| value | behaviour |
-| ----- | --------- |
-| `constant` | Fixed delay of `retry_delay` seconds each attempt |
-| `linear` | `retry_delay * attempt` seconds |
-| `exponential` | `retry_delay * 2^attempt` seconds |
-| `exponential_jitter` | Uniform random value in `[0, retry_delay * 2^attempt]` to spread out thundering-herd retries |
-
-All strategies are capped at `max_retry_delay`.
-
-### DeadLetterPolicy
-
-| value | behaviour |
-| ----- | --------- |
-| `none` | Failed tasks stay in FAILED status in Redis only |
-| `save` | Failed tasks are also written to the SQLite dead letter queue for later inspection and resubmission. Each failure event is appended to the task's audit history. |
-
-### Example
-
-```python
-from jobbers.registry import register_task
-from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy
-
-@register_task(
-    name="my_task",
-    version=1,
-    max_retries=5,
-    retry_delay=10,                        # 10s base delay
-    backoff_strategy=BackoffStrategy.EXPONENTIAL_JITTER,
-    max_retry_delay=300,                   # cap at 5 minutes
-    dead_letter_policy=DeadLetterPolicy.SAVE,
-)
-async def my_task(**kwargs):
-    ...
+```
+UNSUBMITTED → SUBMITTED → STARTED → COMPLETED
+                                   → FAILED → [DLQ if policy=save]
+                                   → SCHEDULED (retry delay, re-queued by Scheduler)
+                                   → CANCELLED
+                                   → STALLED (heartbeat timeout or SIGTERM + stop policy)
+                                   → DROPPED (unknown task type)
 ```
 
-## Queue and Role Management API
+---
 
-### Queue endpoints
+## Quick Start
 
-Queues hold task configuration (concurrency limits and rate limits) independently of the roles that reference them.
+### 1. Define a task
 
-| method | path | description |
-| ------ | ---- | ----------- |
-| `GET` | `/queues` | List all queue names across all roles |
-| `POST` | `/queues` | Create a new queue with its config (201, 409 if already exists) |
-| `GET` | `/queues/{queue_name}/config` | Get the config for a specific queue (404 if not found) |
-| `PUT` | `/queues/{queue_name}` | Create or update a queue's config (upsert) |
-| `DELETE` | `/queues/{queue_name}` | Delete a queue and remove it from all roles (404 if not found) |
-
-#### `POST /queues` and `PUT /queues/{queue_name}` request body
-
-| field | type | default | description |
-| ----- | ---- | ------- | ----------- |
-| `name` | `str` | required | Queue name (ignored for PUT — path name is used) |
-| `max_concurrent` | `int \| null` | `10` | Max concurrent tasks from this queue per worker |
-| `rate_numerator` | `int \| null` | `null` | Number of tasks allowed per rate window |
-| `rate_denominator` | `int \| null` | `null` | Size of the rate window |
-| `rate_period` | `"second" \| "minute" \| "hour" \| "day" \| null` | `null` | Unit for the rate window |
-
-Rate limiting example: `rate_numerator=5, rate_denominator=2, rate_period="minute"` → 5 tasks every 2 minutes.
-
-```json
-{
-  "name": "imports",
-  "max_concurrent": 5,
-  "rate_numerator": 100,
-  "rate_denominator": 1,
-  "rate_period": "hour"
-}
-```
-
-### Role endpoints
-
-Roles group queues together for workers. A worker is assigned a role and will consume tasks from all queues in that role.
-
-| method | path | description |
-| ------ | ---- | ----------- |
-| `GET` | `/roles` | List all role names |
-| `POST` | `/roles` | Create a new role with an initial queue list (201, 409 if already exists) |
-| `GET` | `/roles/{role_name}` | Get the queues assigned to a specific role (404 if not found) |
-| `PUT` | `/roles/{role_name}` | Replace the queue list for a role (404 if not found) |
-| `DELETE` | `/roles/{role_name}` | Delete a role (queue configs are preserved) (404 if not found) |
-
-#### `POST /roles` request body
-
-| field | type | description |
-| ----- | ---- | ----------- |
-| `name` | `str` | Role name |
-| `queues` | `list[str]` | Initial set of queues assigned to this role |
-
-```json
-{ "name": "import-workers", "queues": ["imports", "default"] }
-```
-
-#### `PUT /roles/{role_name}` request body
-
-A plain JSON array of queue names that replaces the current list:
-
-```json
-["imports", "exports", "default"]
-```
-
-### Dead Letter Queue API
-
-| method | path | description |
-| ------ | ---- | ----------- |
-| `GET` | `/dead-letter-queue` | Search DLQ entries; filter by `queue`, `task_name`, `task_version`, `limit` |
-| `GET` | `/dead-letter-queue/{task_id}/history` | Full chronological failure history for a task |
-| `POST` | `/dead-letter-queue/resubmit` | Bulk resubmit DLQ tasks by explicit IDs or filter criteria |
-| `GET` | `/scheduled-tasks` | List tasks currently waiting for a delayed retry |
-
-#### `POST /dead-letter-queue/resubmit` request body
-
-| field | type | default | description |
-| ----- | ---- | ------- | ----------- |
-| `task_ids` | `list[str] \| null` | `null` | Explicit list of task IDs to resubmit |
-| `queue` | `str \| null` | `null` | Filter: resubmit tasks from this queue |
-| `task_name` | `str \| null` | `null` | Filter: resubmit tasks with this name |
-| `task_version` | `int \| null` | `null` | Filter: resubmit tasks with this version |
-| `reset_retry_count` | `bool` | `true` | Reset `retry_attempt` to 0 before resubmitting |
-| `limit` | `int` | `100` | Maximum tasks to resubmit when using filter mode (max 1000) |
-
-Provide either `task_ids` **or** at least one filter field (`queue`, `task_name`, `task_version`).
-
-## Task Cancellation
-
-Tasks in `SUBMITTED`, `STARTED`, or `SCHEDULED` status can be cancelled via the API.
-
-### How cancellation works
-
-| task status | what happens |
-| ----------- | ------------ |
-| `SUBMITTED` / `STARTED` | A cancel signal is published to a Redis pubsub channel (`task_cancel_{task_id}`). The worker monitoring that channel interrupts the task and finalises it according to its [shutdown policy](#task-shutdown-policy-on-cancellation). The API returns immediately — poll `/task-status/{task_id}` to confirm the task has stopped. |
-| `SCHEDULED` | Removed from the delay queue and marked `CANCELLED` synchronously in the same API call. |
-| anything else | Returns `409 Conflict`. |
-
-### Cancellation API
-
-| method | path | description |
-| ------ | ---- | ----------- |
-| `POST` | `/task/{task_id}/cancel` | Cancel a single task |
-| `POST` | `/tasks/cancel` | Cancel multiple tasks in one request |
-
-#### `POST /task/{task_id}/cancel`
-
-Returns `200` with the task summary if a cancel signal was sent (or for `SCHEDULED` tasks, after synchronous cancellation). Returns `404` if the task does not exist. Returns `409` if the task cannot be cancelled.
-
-```json
-{
-  "message": "Cancellation request sent",
-  "task": { "id": "01ABC...", "name": "my_task", "status": "started", ... }
-}
-```
-
-#### `POST /tasks/cancel`
-
-Accepts a list of task IDs and returns a per-task result for each one. Always returns `200` — individual errors are reported inline.
-
-Request body:
-
-```json
-{ "task_ids": ["01ABC...", "01DEF...", "01GHI..."] }
-```
-
-Response:
-
-```json
-{
-  "results": [
-    { "task_id": "01ABC...", "status": "cancellation_requested" },
-    { "task_id": "01DEF...", "status": "not_found" },
-    { "task_id": "01GHI...", "status": "error", "detail": "Task has status 'completed' and cannot be cancelled." }
-  ]
-}
-```
-
-Possible `status` values per task: `cancellation_requested`, `not_found`, `error`.
-
-## Task shutdown policy on **system-triggered** cancellation
-
-When a running task receives the cancellation signal its final state depends on the `on_shutdown` policy set in `TaskConfig`:
-
-| policy | behaviour |
-| ------ | --------- |
-| `stop` (default) | Task is interrupted at the next `await` point and marked `STALLED`. |
-| `resubmit` | Task is interrupted and re-enqueued (`UNSUBMITTED`) for another worker to pick up. |
-| `continue` | The running coroutine is shielded from cancellation and runs to completion; the cancel signal is effectively ignored. |
-
-## Task Heartbeat Configuration
-
-The heartbeat function allows you to monitor the health and progress of long-running tasks. Here's how to configure and use it:
-
-### Basic Setup
+Tasks are plain async functions decorated with `@register_task`. No class inheritance, no special return types.
 
 ```python
 import datetime as dt
 from jobbers.registry import register_task
+from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy
 
-# Create a task
 @register_task(
-  name="Long Running Job", 
-  version=1, 
-  max_heartbeat_interval=dt.timedelta(minutes=5)
+    name="generate_report",
+    version=1,
+    max_retries=3,
+    retry_delay=30,
+    backoff_strategy=BackoffStrategy.EXPONENTIAL_JITTER,
+    max_retry_delay=300,
+    dead_letter_policy=DeadLetterPolicy.SAVE,
+    max_heartbeat_interval=dt.timedelta(minutes=5),
 )
-def long_running_task(task):
-  for chunk in get_list_of_things():
-    do_the_thing(chunk)
-    task.heartbeat()
+async def generate_report(**kwargs: object) -> dict[str, object]:
+    report_id = kwargs["report_id"]
+
+    for section in get_sections(report_id):
+        await process_section(section)
+        task.heartbeat()  # tell Jobbers this task is still alive
+
+    return {"url": f"/reports/{report_id}.pdf"}
 ```
 
-If the task does not update its heartbeat within 5 minutes it may be detected
-as having stalled and we can detect that and react.
+### 2. Submit a task
+
+```bash
+curl -X POST http://localhost:8000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"name": "generate_report", "version": 1, "queue": "reports", "params": {"report_id": 42}}'
+```
+
+```json
+{
+  "id": "01JBKR2E5F3G4H5J6K7L8M9N0P",
+  "name": "generate_report",
+  "status": "submitted",
+  "queue": "reports",
+  "submitted_at": "2026-03-12T10:00:00Z"
+}
+```
+
+### 3. Inspect a task
+
+```bash
+curl http://localhost:8000/task-status/01JBKR2E5F3G4H5J6K7L8M9N0P
+```
+
+```json
+{
+  "id": "01JBKR2E5F3G4H5J6K7L8M9N0P",
+  "name": "generate_report",
+  "status": "started",
+  "queue": "reports",
+  "submitted_at": "2026-03-12T10:00:00Z",
+  "started_at": "2026-03-12T10:00:01Z",
+  "last_heartbeat_at": "2026-03-12T10:03:45Z",
+  "retry_attempt": 0
+}
+```
+
+You can also list all tasks by status, queue, or task name:
+
+```bash
+curl "http://localhost:8000/tasks?status=started&queue=reports"
+```
+
+### 4. Retrieve results or errors
+
+When a task completes, its result is stored and available via the status endpoint:
+
+```json
+{
+  "id": "01JBKR2E5F3G4H5J6K7L8M9N0P",
+  "status": "completed",
+  "result": {"url": "/reports/42.pdf"},
+  "completed_at": "2026-03-12T10:04:10Z"
+}
+```
+
+If the task exhausts its retries, it moves to `failed` (and to the DLQ if configured):
+
+```json
+{
+  "id": "01JBKR2E5F3G4H5J6K7L8M9N0P",
+  "status": "failed",
+  "error": "ConnectionError: upstream timed out",
+  "retry_attempt": 3
+}
+```
+
+Inspect the dead letter queue for full failure history:
+
+```bash
+curl "http://localhost:8000/dead-letter-queue?task_name=generate_report"
+curl "http://localhost:8000/dead-letter-queue/01JBKR2E5F3G4H5J6K7L8M9N0P/history"
+```
+
+Resubmit failed tasks in bulk:
+
+```bash
+curl -X POST http://localhost:8000/dead-letter-queue/resubmit \
+  -H "Content-Type: application/json" \
+  -d '{"task_name": "generate_report", "reset_retry_count": true, "limit": 50}'
+```
+
+### 5. Cancel a task
+
+Cancellation works regardless of whether the task is queued, running, or waiting on a retry delay.
+
+```bash
+curl -X POST http://localhost:8000/task/01JBKR2E5F3G4H5J6K7L8M9N0P/cancel
+```
+
+| Task status | What happens |
+|-------------|-------------|
+| `submitted` / `started` | Cancel signal sent via Redis pubsub; worker interrupts the task at the next `await`. Poll status to confirm. |
+| `scheduled` | Removed from the delay queue and marked `cancelled` synchronously. |
+| anything else | Returns `409 Conflict`. |
+
+Cancel multiple tasks at once:
+
+```bash
+curl -X POST http://localhost:8000/tasks/cancel \
+  -H "Content-Type: application/json" \
+  -d '{"task_ids": ["01ABC...", "01DEF..."]}'
+```
+
+---
+
+## Key Features
+
+### asyncio Native
+
+Every task function is a plain `async def`. You get the full asyncio ecosystem — `aiohttp`, `asyncpg`, `anyio`, etc. — without wrappers or thread-pool workarounds.
+
+### Task Introspection
+
+Query live task state at any time. Jobbers stores the last known state of every task in Redis so you can answer questions Celery can't:
+
+- Which tasks are currently running, on which worker, and for how long?
+- How many tasks are queued per queue?
+- Which tasks are waiting on a retry delay?
+- What failed, when, and why?
+
+```bash
+# Active tasks
+curl "http://localhost:8000/tasks?status=started"
+
+# Tasks waiting on retry delay
+curl http://localhost:8000/scheduled-tasks
+
+# Dead letter queue
+curl "http://localhost:8000/dead-letter-queue?queue=reports&limit=25"
+```
+
+### Stall Detection via Heartbeats
+
+Long-running tasks call `task.heartbeat()` periodically. If the heartbeat goes silent for longer than `max_heartbeat_interval`, the Cleaner marks the task as `stalled`. You can then alert on it, resubmit it, or investigate.
+
+```python
+@register_task(name="bulk_import", version=1, max_heartbeat_interval=dt.timedelta(minutes=2))
+async def bulk_import(**kwargs: object) -> None:
+    for batch in get_batches(kwargs["file_id"]):
+        await import_batch(batch)
+        task.heartbeat()  # reset the stall clock
+```
+
+### Retry Policies
+
+Per-task retry configuration with four backoff strategies:
+
+| Strategy | Delay per attempt |
+|----------|------------------|
+| `constant` | Fixed `retry_delay` seconds |
+| `linear` | `retry_delay × attempt` |
+| `exponential` | `retry_delay × 2^attempt` |
+| `exponential_jitter` | Random in `[0, retry_delay × 2^attempt]` — avoids thundering herd |
+
+All strategies are capped at `max_retry_delay`. Tasks that exhaust retries can be saved to the dead letter queue (`dead_letter_policy=DeadLetterPolicy.SAVE`) for later inspection and bulk resubmission.
+
+#### Expected vs. unexpected exceptions
+
+Not every exception should trigger a retry. Jobbers distinguishes between the two via the `expected_exceptions` parameter:
+
+- **Expected exceptions** — transient failures you anticipate and want to retry (e.g. `httpx.TimeoutException`, `ConnectionError`). List them in `expected_exceptions`. When one of these is raised, Jobbers applies the backoff strategy and re-enqueues the task (up to `max_retries`).
+- **Unexpected exceptions** — bugs or unrecoverable errors not in `expected_exceptions`. These cause the task to move immediately to `FAILED` with no retry attempt, regardless of how many retries remain.
+- **Timeouts** — if a `timeout` is configured and the task exceeds it, it is treated like an expected exception and will retry with backoff.
+
+```python
+@register_task(
+    name="send_webhook",
+    version=1,
+    max_retries=5,
+    retry_delay=10,
+    backoff_strategy=BackoffStrategy.EXPONENTIAL_JITTER,
+    max_retry_delay=300,
+    dead_letter_policy=DeadLetterPolicy.SAVE,
+    timeout=30,                                    # fail the attempt after 30s
+    expected_exceptions=(httpx.TimeoutException, ConnectionError),
+)
+async def send_webhook(**kwargs: object) -> None: ...
+```
+
+### Cancellation
+
+Tasks can be cancelled at any point in their lifecycle — queued, running, or waiting on a retry delay. Running tasks are interrupted at the next `await` point. The `on_shutdown` policy controls what happens next:
+
+| Policy | Behaviour |
+|--------|-----------|
+| `stop` (default) | Interrupted and marked `stalled` |
+| `resubmit` | Interrupted and re-enqueued for another worker |
+| `continue` | Shielded from cancellation; runs to completion |
+
+### Rate Limiting and Concurrency Controls
+
+Each queue has independent concurrency and rate-limit settings, enforced per worker:
+
+```bash
+curl -X POST http://localhost:8000/queues \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "reports",
+    "max_concurrent": 5,
+    "rate_numerator": 100,
+    "rate_denominator": 1,
+    "rate_period": "hour"
+  }'
+```
+
+This creates a `reports` queue that runs at most 5 tasks concurrently per worker and processes no more than 100 tasks per hour.
+
+### OpenTelemetry Instrumentation
+
+Jobbers emits OTLP metrics automatically — no instrumentation code required in your tasks.
+
+Metrics aggregated by task, version, and queue:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tasks_retried` | Count | Retry events |
+| `tasks_dead_lettered` | Count | Tasks moved to DLQ |
+| `cancellations_requested` | Count | Cancel signals sent |
+
+Metrics aggregated by task, queue, and status:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `tasks_processed` | Count | Tasks completed (any terminal status) |
+| `execution_time` | Histogram | Time from start to finish (ms) |
+| `end_to_end_latency` | Histogram | Time from submission to finish (ms) |
+
+Metrics aggregated by task, queue, and role:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `time_in_queue` | Histogram | Time from submission to start |
+| `tasks_selected` | Count | Tasks pulled by workers |
+
+Use `time_in_queue` to decide whether to scale workers or split queues. Use `tasks_processed[status=dropped]` to detect workers running stale task versions.
+
+---
+
+## Queue and Role Management
+
+**Queues** are named buckets with their own concurrency limit and optional rate limit. **Roles** are named sets of queues. Workers are assigned a role and consume all queues in that role.
+
+This lets you partition work by resource profile — for example, CPU-intensive tasks and I/O-bound tasks can share workers or be isolated based on how you group queues into roles.
+
+```
+Role: "heavy-workers"   → queues: ["reports", "exports"]
+Role: "light-workers"   → queues: ["notifications", "webhooks", "default"]
+```
+
+Workers detect role and queue changes automatically via a TTL-based refresh tag — no restart required.
+
+### Queue API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/queues` | List all queues |
+| `POST` | `/queues` | Create a queue |
+| `GET` | `/queues/{name}/config` | Get queue config |
+| `PUT` | `/queues/{name}` | Create or update a queue |
+| `DELETE` | `/queues/{name}` | Delete a queue |
+
+### Role API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/roles` | List all roles |
+| `POST` | `/roles` | Create a role |
+| `GET` | `/roles/{name}` | Get queues for a role |
+| `PUT` | `/roles/{name}` | Replace a role's queue list |
+| `DELETE` | `/roles/{name}` | Delete a role |
+
+---
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKER_ROLE` | `default` | Role assigned to this worker |
+| `WORKER_TTL` | `50` | Max tasks before worker restarts (memory leak protection) |
+| `WORKER_CONCURRENT_TASKS` | `5` | Max tasks running simultaneously per worker |
+| `SCHEDULER_POLL_INTERVAL` | `5.0` | Seconds between scheduler polls |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
+| `SQLITE_PATH` | `jobbers.db` | SQLite path for queue/role config and DLQ |
+
+---
+
+## Running Jobbers
+
+After installing the package (`pip install -e .`), five CLI commands are available. All of them emit OpenTelemetry logs and metrics automatically.
+
+---
+
+### `jobbers_manager <task_module>`
+
+Starts the FastAPI web server on port 8000. This is the process clients talk to — it handles task submission, status queries, cancellation, DLQ inspection, and queue/role management.
+
+The `<task_module>` argument tells the manager which tasks exist so it can validate submitted task names and signatures. It accepts either a dotted Python module name or a file path:
+
+```bash
+# Dotted module name
+jobbers_manager myapp.tasks
+
+# Absolute or relative file path
+jobbers_manager /srv/myapp/tasks.py
+```
+
+Run one or more manager instances. Because all state lives in Redis and SQLite, any number of managers can run concurrently behind a load balancer.
+
+---
+
+### `jobbers_worker <task_module>`
+
+Starts a worker process that pulls tasks from Redis queues and executes them. Like the manager, it loads your task module so the registered task functions are available to run.
+
+```bash
+WORKER_ROLE=heavy-workers \
+WORKER_CONCURRENT_TASKS=10 \
+WORKER_TTL=100 \
+jobbers_worker myapp.tasks
+```
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `WORKER_ROLE` | `default` | The role this worker consumes. Workers pull from all queues assigned to this role. |
+| `WORKER_CONCURRENT_TASKS` | `5` | Maximum number of tasks running concurrently within this process. |
+| `WORKER_TTL` | `50` | Worker exits after processing this many tasks and is expected to be restarted by a process supervisor (e.g. Docker, systemd). Protects against memory leaks in long-running task code. Set to `0` to run indefinitely. |
+
+Scale workers horizontally by running more instances. Each worker is fully independent — they share no state except through Redis and SQLite.
+
+On `SIGTERM`, each in-flight task is handled according to its `on_shutdown` policy (`stop`, `resubmit`, or `continue`) before the process exits.
+
+---
+
+### `jobbers_cleaner`
+
+A one-shot maintenance command. Run it on a cron schedule (e.g. hourly or nightly) to prune stale Redis entries, detect stalled tasks, and trim the dead letter queue.
+
+```bash
+jobbers_cleaner \
+  --stale-time 600 \
+  --completed-task-age 86400 \
+  --dlq-age 2592000 \
+  --rate-limit-age 604800
+```
+
+All arguments are in **seconds** and are optional — omit any you don't need.
+
+| Argument | Description |
+|----------|-------------|
+| `--stale-time <seconds>` | Mark tasks whose heartbeat is older than this as `stalled`. Use this to surface tasks that have silently frozen. |
+| `--completed-task-age <seconds>` | Delete stored state and heartbeat entries for tasks that reached a terminal status (`completed`, `failed`, `cancelled`) longer than this ago. Keeps Redis lean. |
+| `--dlq-age <seconds>` | Remove dead letter queue entries older than this. |
+| `--rate-limit-age <seconds>` | Prune rate-limit tracking entries older than this. |
+| `--min-queue-age <seconds>` | Lower bound (epoch seconds) for queue entries to consider during cleanup. |
+| `--max-queue-age <seconds>` | Upper bound (epoch seconds) for queue entries to consider during cleanup. |
+
+A typical cron setup runs the cleaner frequently with a short `--stale-time` for stall detection, and less frequently with longer ages for general pruning:
+
+```bash
+# Every 5 minutes: detect stalled tasks
+*/5 * * * * jobbers_cleaner --stale-time 300
+
+# Nightly: prune old state
+0 2 * * * jobbers_cleaner --completed-task-age 86400 --dlq-age 2592000 --rate-limit-age 604800
+```
+
+---
+
+### `jobbers_scheduler`
+
+A long-running process that polls for tasks waiting on a retry delay and re-enqueues them when their scheduled time arrives. Run exactly one scheduler per Redis instance.
+
+```bash
+SCHEDULER_POLL_INTERVAL=5.0 \
+SCHEDULER_BATCH_SIZE=10 \
+SCHEDULER_ROLE=default \
+jobbers_scheduler
+```
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `SCHEDULER_POLL_INTERVAL` | `5.0` | Seconds to sleep between polls when no tasks are due. |
+| `SCHEDULER_BATCH_SIZE` | `1` | Maximum tasks to dispatch per poll iteration. Increase if your workload produces many simultaneous retry delays. |
+| `SCHEDULER_ROLE` | `default` | Limits the scheduler to queues belonging to this role. |
+
+The scheduler has no persistent state of its own — it is safe to restart at any time. Tasks whose `run_at` time has passed while the scheduler was down will be dispatched on the next poll.
+
+---
+
+### `jobbers_openapi [output_path]`
+
+Writes the OpenAPI specification to a JSON file without starting a real server. Useful for generating client SDKs or keeping the spec in version control.
+
+```bash
+# Write to openapi.json (default)
+jobbers_openapi
+
+# Write to a custom path
+jobbers_openapi docs/api/openapi.json
+```
+
+---
+
+## Running Locally with Docker
+
+```bash
+docker compose up
+```
+
+This starts all four processes (manager, worker, cleaner, scheduler) along with Redis. The manager API is available at `http://localhost:8000`.
