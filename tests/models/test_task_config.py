@@ -3,7 +3,23 @@ from unittest.mock import patch
 
 import pytest
 
-from jobbers.models.task_config import BackoffStrategy, TaskConfig
+from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
+
+
+def test_all_backoff_strategy_values() -> None:
+    assert set(BackoffStrategy) == {
+        BackoffStrategy.CONSTANT,
+        BackoffStrategy.LINEAR,
+        BackoffStrategy.EXPONENTIAL,
+        BackoffStrategy.EXPONENTIAL_JITTER,
+    }
+
+
+def test_all_dead_letter_policy_values() -> None:
+    assert set(DeadLetterPolicy) == {
+        DeadLetterPolicy.NONE,
+        DeadLetterPolicy.SAVE,
+    }
 
 
 async def dummy_task(): # pragma: no cover
