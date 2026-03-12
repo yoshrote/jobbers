@@ -6,8 +6,14 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from jobbers.adapters.json_redis import JsonDeadQueue, JsonTaskAdapter
-from jobbers.adapters.raw_redis import DeadQueue
+from jobbers.adapters.raw_redis import DeadQueue, MsgpackTaskAdapter
 from jobbers.db import DEFAULT_REDIS_URL
+
+
+@pytest.fixture
+def msgpack_adapter(redis) -> MsgpackTaskAdapter:
+    """Fixture providing a MsgpackTaskAdapter instance."""
+    return MsgpackTaskAdapter(redis)
 
 
 @pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])

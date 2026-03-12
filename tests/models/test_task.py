@@ -600,7 +600,6 @@ def test_valid_task_params_no_task_config():
 
 def test_shutdown_no_task_config_is_noop():
     """shutdown() returns immediately when task_config is None."""
-    from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
     task.shutdown()  # should not raise
     assert task.status == TaskStatus.STARTED
