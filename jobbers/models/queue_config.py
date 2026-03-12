@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Self, cast
+from typing import Any, Self
 
 import aiosqlite
 from pydantic import BaseModel
@@ -198,7 +198,7 @@ class QueueConfigAdapter:
         ) as cursor:
             row = await cursor.fetchone()
         if row is not None:
-            return cast("ULID", ULID.from_str(row[0]))
+            return ULID.from_str(row[0])
 
         init_tag = ULID()
         await self.conn.execute(

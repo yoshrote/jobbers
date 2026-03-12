@@ -3,7 +3,6 @@ import datetime as dt
 from unittest.mock import patch
 
 import pytest
-import pytest_asyncio
 from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
