@@ -71,6 +71,7 @@ class TaskAdapterProtocol(Protocol):
     async def get_next_task(self, queues: set[str], pop_timeout: int) -> Task | None: ...
 
     # -- queue management ----------------------------------------------------
+    def stage_remove_from_queue(self, pipe: Pipeline, task: Task) -> None: ...
     async def remove_from_queue(self, task: Task) -> None: ...
     async def update_task_heartbeat(self, task: Task) -> None: ...
     async def remove_task_heartbeat(self, task: Task) -> None: ...
@@ -147,11 +148,15 @@ class _BaseTaskAdapter:
         self.stage_save(pipe, task)
         await pipe.execute()
 
+    def stage_remove_from_queue(self, pipe: Pipeline, task: Task) -> None:
+        """Queue ZREM task-queue + SREM type-index commands onto pipe (no execute)."""
+        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
+        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
     async def remove_from_queue(self, task: Task) -> None:
         """Remove a task from its queue."""
         pipe = self.data_store.pipeline(transaction=True)
-        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
-        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        self.stage_remove_from_queue(pipe, task)
         await pipe.execute()
 
     async def update_task_heartbeat(self, task: Task) -> None:

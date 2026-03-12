@@ -257,14 +257,18 @@ class StateManager:
         match task.status:
             case TaskStatus.SCHEDULED:
                 # For scheduled tasks, we can just remove them from the scheduler without a pub/sub dance
-                await self.task_scheduler.remove(task_id)
                 task.set_status(TaskStatus.CANCELLED)
-                await self.save_task(task)
+                pipe = self.data_store.pipeline(transaction=True)
+                self.task_scheduler.stage_remove(pipe, task_id, task.queue)
+                self.ta.stage_save(pipe, task)
+                await pipe.execute()
             case TaskStatus.SUBMITTED:
                 # remove from the queue immediately so it can't be claimed by a worker
-                await self.ta.remove_from_queue(task)
                 task.set_status(TaskStatus.CANCELLED)
-                await self.save_task(task)
+                pipe = self.data_store.pipeline(transaction=True)
+                self.ta.stage_remove_from_queue(pipe, task)
+                self.ta.stage_save(pipe, task)
+                await pipe.execute()
             case TaskStatus.STARTED | TaskStatus.HEARTBEAT:
                 await self.data_store.publish(f"task_cancel_{task_id}", "cancel")
             case _:
