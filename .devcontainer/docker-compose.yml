@@ -7,9 +7,9 @@ services:
     # docker-compose.yml file (the first in the devcontainer.json "dockerComposeFile"
     # array). The sample below assumes your primary file is in the root of your project.
     #
-    build: .
-      # context: .
-      # dockerfile: .devcontainer/Dockerfile
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
     environment:
       # # Logs are disabled by default
       OTEL_LOGS_EXPORTER: "otlp"

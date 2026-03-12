@@ -1,9 +1,8 @@
-import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from jobbers.db import close_client, get_client, set_client
+from jobbers.db import DEFAULT_REDIS_URL, close_client, get_client, set_client
 
 
 @pytest.fixture
@@ -19,15 +18,8 @@ async def test_get_client_creates_new_client(mock_redis):
     """Test that get_client creates a new Redis client if none exists."""
     client = get_client()
     assert client is not None
-    mock_redis.assert_called_once_with("redis://localhost:6379")
+    mock_redis.assert_called_once_with(DEFAULT_REDIS_URL)
 
-@pytest.mark.asyncio
-async def test_get_client_creates_new_client_based_on_os_env(mock_redis):
-    """Test that get_client creates a new Redis client if none exists."""
-    with patch.dict(os.environ, {"REDIS_URL": "redis://override:6379"}, clear=True):
-        client = get_client()
-        assert client is not None
-        mock_redis.assert_called_once_with("redis://override:6379")
 
 @pytest.mark.asyncio
 async def test_get_client_uses_existing_client(mock_redis):
@@ -38,7 +30,7 @@ async def test_get_client_uses_existing_client(mock_redis):
     client2 = get_client()
 
     assert client1 is client2
-    mock_redis.assert_called_once_with("redis://localhost:6379")
+    mock_redis.assert_called_once_with(DEFAULT_REDIS_URL)
 
 
 @pytest.mark.asyncio

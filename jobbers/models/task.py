@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Self
 
 from opentelemetry import metrics
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from ulid import ULID
 
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
+
 
 class Task(BaseModel):
     """A task to be executed."""
@@ -41,6 +42,11 @@ class Task(BaseModel):
     completed_at: dt.datetime | None = None
 
     task_config: TaskConfig | None = Field(default=None, exclude=True)
+
+    @field_serializer("id", when_used="json")
+    def serialize_id(self, value: ULID) -> str:
+        """Serialize ULID to string for JSON output."""
+        return str(value)
 
     def valid_task_params(self) -> bool:
         if not self.task_config:
@@ -87,10 +93,12 @@ class Task(BaseModel):
         return []
 
     def summarized(self) -> dict[str, Any]:
-        summary = self.model_dump(include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"})
+        summary = self.model_dump(
+            include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"}
+        )
         summary["id"] = str(self.id)
         if self.errors:
-            summary["last_error"] =  self.errors[-1]
+            summary["last_error"] = self.errors[-1]
         return summary
 
     @property
@@ -105,6 +113,7 @@ class Task(BaseModel):
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize task fields to a dict for RedisJSON storage."""
+
         def _ts(d: dt.datetime | None) -> float | None:
             return d.timestamp() if d is not None else None
 
@@ -162,8 +171,13 @@ class Task(BaseModel):
                     self.retried_at = dt.datetime.now(dt.UTC)
             case TaskStatus.SUBMITTED:
                 self.submitted_at = dt.datetime.now(dt.UTC)
-            case TaskStatus.COMPLETED | TaskStatus.FAILED | \
-                 TaskStatus.CANCELLED | TaskStatus.STALLED | TaskStatus.DROPPED:
+            case (
+                TaskStatus.COMPLETED
+                | TaskStatus.FAILED
+                | TaskStatus.CANCELLED
+                | TaskStatus.STALLED
+                | TaskStatus.DROPPED
+            ):
                 self.completed_at = dt.datetime.now(dt.UTC)
             case TaskStatus.SCHEDULED | TaskStatus.UNSUBMITTED:
                 self.retry_attempt += 1
@@ -175,6 +189,7 @@ class PaginationOrder(StrEnum):
 
     SUBMITTED_AT = "submitted_at"
     TASK_ID = "task_id"
+
 
 class TaskPagination(BaseModel):
     "Pagination details."
@@ -188,4 +203,7 @@ class TaskPagination(BaseModel):
     task_version: int | None = Field(default=None)
     status: TaskStatus | None = Field(default=None)
 
-
+    @field_serializer("start", when_used="json")
+    def serialize_start(self, value: ULID | None) -> str | None:
+        """Serialize ULID to string for JSON output."""
+        return str(value) if value is not None else None

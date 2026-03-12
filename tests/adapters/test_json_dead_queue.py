@@ -1,4 +1,5 @@
 """Tests specific to JsonDeadQueue (Redis Stack: RedisJSON + RediSearch)."""
+
 import datetime as dt
 
 import pytest
@@ -8,6 +9,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from jobbers.adapters.json_redis import JsonDeadQueue, JsonTaskAdapter
+from jobbers.db import DEFAULT_REDIS_URL
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 
@@ -22,6 +24,7 @@ def make_task(
     queue: str = "default",
 ) -> Task:
     from ulid import ULID
+
     return Task(
         id=ULID.from_str(task_id),
         name=name,
@@ -35,7 +38,7 @@ def make_task(
 @pytest_asyncio.fixture
 async def redis():
     """Real Redis instance on db=0 for Redis Stack tests."""
-    client = aioredis.Redis(host="localhost", port=6379, db=0)
+    client = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
     try:
         await client.flushdb()
     except RedisConnectionError as exc:
@@ -75,6 +78,7 @@ async def add_to_dlq(dq: JsonDeadQueue, task: Task, failed_at: dt.datetime) -> N
 
 
 # ── json-specific ─────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_get_by_filter_sorted_by_failed_at_desc(dq, task_adapter):

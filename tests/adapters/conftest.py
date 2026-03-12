@@ -7,6 +7,7 @@ from redis.exceptions import ResponseError
 
 from jobbers.adapters.json_redis import JsonDeadQueue, JsonTaskAdapter
 from jobbers.adapters.raw_redis import DeadQueue
+from jobbers.db import DEFAULT_REDIS_URL
 
 
 @pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])
@@ -23,7 +24,7 @@ async def dead_queue(request, dummy_task_adapter):
         yield dq, dummy_task_adapter
         await r.aclose()
     else:
-        r = aioredis.Redis(host="localhost", port=6379, db=0)
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
         try:
             await r.flushdb()
         except RedisConnectionError as exc:

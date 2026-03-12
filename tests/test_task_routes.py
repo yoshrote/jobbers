@@ -24,20 +24,25 @@ async def sqlite_with_default_queue(sqlite_conn):
     await QueueConfigAdapter(sqlite_conn).save_queue_config(QueueConfig(name="default"))
     return sqlite_conn
 
+
 @pytest_asyncio.fixture(autouse=True)
 async def patch_sqlite(sqlite_with_default_queue):
     """Patch get_sqlite_conn for validation with the seeded in-memory SQLite DB."""
     with patch("jobbers.validation.db.get_sqlite_conn", return_value=sqlite_with_default_queue):
         yield sqlite_with_default_queue
 
+
 @pytest_asyncio.fixture(autouse=True)
 async def patch_state_manager(redis, patch_sqlite):
     """Provide a real StateManager backed by the test redis and sqlite connections."""
     ta = TaskAdapter(redis)
     sm = StateManager(redis, patch_sqlite, task_adapter=ta)
-    with patch("jobbers.task_routes.db.get_state_manager", return_value=sm), \
-         patch("jobbers.db.get_task_adapter", return_value=ta):
+    with (
+        patch("jobbers.task_routes.db.get_state_manager", return_value=sm),
+        patch("jobbers.db.get_task_adapter", return_value=ta),
+    ):
         yield sm
+
 
 @pytest.mark.asyncio
 async def test_main_page():
@@ -52,8 +57,9 @@ async def test_main_page():
     response_data = response.json()
     assert response.status_code == 200
     # check that the task details are the same as task_data other than status and submitted_at
-    assert response_data["message"] ==  "Welcome to Task Manager!"
+    assert response_data["message"] == "Welcome to Task Manager!"
     assert response_data["tasks"] == []
+
 
 @pytest.mark.asyncio
 async def test_submit_valid_task(redis):
@@ -62,6 +68,7 @@ async def test_submit_valid_task(redis):
 
     This task may flake out if there is a worker listening to the queue
     """
+
     async def task_function(foo: int) -> None:
         pass
 
@@ -70,7 +77,9 @@ async def test_submit_valid_task(redis):
 
     with patch("jobbers.registry.get_task_config", return_value=test_task_config):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))
+            response = await client.post(
+                "/submit-task", json=task_data.model_dump(mode="json", exclude_unset=True)
+            )
 
     response_data = response.json()
     assert response.status_code == 200
@@ -80,19 +89,24 @@ async def test_submit_valid_task(redis):
     response_task = Task.model_validate(response_data["task"])
 
     def simplify(task: Task) -> dict[str, Any]:
-        return task.model_dump(exclude=[
-            # changed since submission
-            "status", "submitted_at",
-        ])
+        return task.model_dump(
+            exclude=[
+                # changed since submission
+                "status",
+                "submitted_at",
+            ]
+        )
 
     assert simplify(response_task) == simplify(task_data)
     # Check that it actually exists in redis
     assert simplify(task_data) == simplify(await TaskAdapter(redis).get_task(task_data.id))
 
+
 @pytest.mark.asyncio
 # @pytest.mark.skip(reason="Need to add a registered task with a param to hit this error")
 async def test_submit_invalid_task():
     """Test the task submission fails when given bad input."""
+
     # jobber_registry.register_task("test_task", test_task_function, parameters=["foo"])
     # add a task config with a function that requires a parameter to the jobber registry
     async def task_function(foo: int) -> None:
@@ -103,15 +117,20 @@ async def test_submit_invalid_task():
     # try to submit a task without the required parameter
     with patch("jobbers.registry.get_task_config", return_value=test_task_config):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))
+            response = await client.post(
+                "/submit-task", json=task_data.model_dump(mode="json", exclude_unset=True)
+            )
     # this should raise a validation error
     assert response.status_code == 400
+
 
 @pytest.mark.asyncio
 async def test_get_task_status_found(redis):
     """Test retrieving the status of an existing task."""
     # Status must != "unsubmitted" or submit_task will change Task details
-    task_data = Task(id=ULID1, name="Test Task", status="submitted", submitted_at=dt.datetime.now(dt.UTC), parameters={})
+    task_data = Task(
+        id=ULID1, name="Test Task", status="submitted", submitted_at=dt.datetime.now(dt.UTC), parameters={}
+    )
     await TaskAdapter(redis).submit_task(task_data)
 
     # Check that it exists via API
@@ -121,6 +140,7 @@ async def test_get_task_status_found(redis):
     assert response.status_code == 200
     assert Task.model_validate(response.json()) == task_data
 
+
 @pytest.mark.asyncio
 async def test_get_task_status_not_found():
     """Test retrieving the status of a non-existent task."""
@@ -128,13 +148,13 @@ async def test_get_task_status_not_found():
     mock_task_adapter.get_task.return_value = None
 
     with patch("jobbers.db.get_task_adapter", return_value=mock_task_adapter):
-
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get(f"/task-status/{ULID1}")
 
         assert response.status_code == 404
         assert response.json() == {"detail": "Task not found"}
         mock_task_adapter.get_task.assert_called_once_with(ULID1)
+
 
 @pytest.mark.asyncio
 async def test_get_task_list():
@@ -158,6 +178,7 @@ async def test_get_task_list():
         }
         mock_task_adapter.get_all_tasks.assert_called_once()
 
+
 @pytest.mark.asyncio
 async def test_get_queues():
     """Test retrieving the list of all queues for a given role."""
@@ -172,6 +193,7 @@ async def test_get_queues():
         assert response.json() == {"queues": ["queue1", "queue2"]}
         mock_queue_adapter.get_queues.assert_called_once_with("role1")
 
+
 @pytest.mark.asyncio
 async def test_set_queues():
     """Test setting the list of all queues for a given role."""
@@ -184,6 +206,7 @@ async def test_set_queues():
         assert response.status_code == 200
         assert response.json() == {"message": "Queues set successfully"}
         mock_queue_adapter.save_role.assert_called_once_with("role1", {"queue1", "queue2"})
+
 
 @pytest.mark.asyncio
 async def test_set_queues_rolls_back_on_invalid_queue(patch_sqlite):
@@ -214,6 +237,7 @@ async def test_get_all_queues():
         assert response.json() == {"queues": ["queue1", "queue2", "queue3"]}
         mock_queue_adapter.get_all_queues.assert_called_once()
 
+
 @pytest.mark.asyncio
 async def test_get_all_roles():
     """Test retrieving the list of all roles."""
@@ -227,6 +251,7 @@ async def test_get_all_roles():
         assert response.status_code == 200
         assert response.json() == {"roles": ["role1", "role2"]}
         mock_queue_adapter.get_all_roles.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_get_scheduled_tasks_no_optional_filters():
@@ -341,6 +366,7 @@ async def test_resubmit_from_dlq_by_ids():
     mock_sm.dead_queue.get_by_ids.assert_called_once_with([str(ULID1)])
     mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=True)
 
+
 @pytest.mark.asyncio
 async def test_resubmit_from_dlq_by_filter():
     """Test resubmitting DLQ tasks by filter criteria."""
@@ -368,6 +394,7 @@ async def test_resubmit_from_dlq_by_filter():
     )
     mock_sm.resubmit_dead_tasks.assert_called_once_with([task], reset_retry_count=True)
 
+
 @pytest.mark.asyncio
 async def test_resubmit_from_dlq_no_filter_returns_400():
     """Test that omitting all filter criteria returns 400."""
@@ -381,6 +408,7 @@ async def test_resubmit_from_dlq_no_filter_returns_400():
     assert "Provide task_ids" in response.json()["detail"]
     mock_sm.dead_queue.get_by_ids.assert_not_called()
     mock_sm.dead_queue.get_by_filter.assert_not_called()
+
 
 @pytest.mark.asyncio
 async def test_resubmit_from_dlq_reset_retry_false():
@@ -403,6 +431,7 @@ async def test_resubmit_from_dlq_reset_retry_false():
 
 
 # --- Cancellation tests ---
+
 
 @pytest.mark.asyncio
 async def test_cancel_task_submitted():
@@ -629,8 +658,7 @@ async def test_delete_queue_not_found():
 @pytest.mark.asyncio
 async def test_get_dead_letter_queue(patch_state_manager):
     """GET /dead-letter-queue returns tasks from the DLQ."""
-    task = Task(id=ULID1, name="failed_task", version=1, queue="default",
-                status="failed")
+    task = Task(id=ULID1, name="failed_task", version=1, queue="default", status="failed")
     patch_state_manager.dead_queue.get_by_filter = AsyncMock(return_value=[task])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager):
@@ -644,9 +672,7 @@ async def test_get_dead_letter_queue(patch_state_manager):
 @pytest.mark.asyncio
 async def test_get_dlq_task_history(patch_state_manager):
     """GET /dead-letter-queue/{id}/history returns the error history."""
-    patch_state_manager.dead_queue.get_history = AsyncMock(
-        return_value=[{"attempt": 0, "error": "boom"}]
-    )
+    patch_state_manager.dead_queue.get_history = AsyncMock(return_value=[{"attempt": 0, "error": "boom"}])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -692,8 +718,10 @@ async def test_get_active_tasks_no_filter_uses_all_queues(patch_state_manager, p
     """GET /active-tasks without a queue filter uses all queues from SQLite."""
     patch_state_manager.get_active_tasks = AsyncMock(return_value=[])
 
-    with patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager), \
-         patch("jobbers.task_routes.db.get_sqlite_conn", return_value=patch_sqlite):
+    with (
+        patch("jobbers.task_routes.db.get_state_manager", return_value=patch_state_manager),
+        patch("jobbers.task_routes.db.get_sqlite_conn", return_value=patch_sqlite),
+    ):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.get("/active-tasks")
 
@@ -827,13 +855,18 @@ async def test_submit_task_raises_400_on_task_exception():
         pass
 
     from jobbers.models.task_config import TaskConfig
+
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
 
-    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm), \
-         patch("jobbers.registry.get_task_config", return_value=test_task_config):
+    with (
+        patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm),
+        patch("jobbers.registry.get_task_config", return_value=test_task_config),
+    ):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.post("/submit-task", data=task_data.model_dump_json(exclude_unset=True))
+            response = await client.post(
+                "/submit-task", json=task_data.model_dump(mode="json", exclude_unset=True)
+            )
 
     assert response.status_code == 400
     assert "bad params" in response.json()["detail"]
