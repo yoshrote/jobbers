@@ -27,19 +27,15 @@ async def dead_queue(request, dummy_task_adapter):
         r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
         try:
             await r.flushdb()
-        except RedisConnectionError as exc:
+        except RedisConnectionError as exc: # pragma: no cover
             await r.aclose()
             pytest.skip(f"Redis not available: {exc}")
         adapter = JsonTaskAdapter(r)
-        try:
-            await adapter.ensure_index()
-        except ResponseError as exc:
-            await r.aclose()
-            pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
         jdq = JsonDeadQueue(r, adapter)
         try:
+            await adapter.ensure_index()
             await jdq.ensure_index()
-        except ResponseError as exc:
+        except ResponseError as exc: # pragma: no cover
             await r.aclose()
             pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
         yield jdq, adapter

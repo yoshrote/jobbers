@@ -76,11 +76,6 @@ async def test_main_processes_tasks_until_exhausted():
     mock_processor = MagicMock()
     mock_processor.run = fake_run
 
-    async def fake_generator_anext(gen: object) -> Task:
-        if not process_calls:
-            return task
-        raise StopAsyncIteration
-
     state_manager = _make_state_manager()
 
     with (

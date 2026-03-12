@@ -21,13 +21,13 @@ async def real_task_adapter(request):
     client = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
     try:
         await client.flushdb()
-    except RedisConnectionError as exc:
+    except RedisConnectionError as exc: # pragma: no cover
         await client.aclose()
         pytest.skip(f"Redis not available: {exc}")
     adapter = request.param(client)
     try:
         await adapter.ensure_index()
-    except ResponseError as exc:
+    except ResponseError as exc: # pragma: no cover
         await client.aclose()
         pytest.skip(f"RediSearch not available: {exc}")
     yield adapter

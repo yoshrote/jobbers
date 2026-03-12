@@ -69,7 +69,7 @@ async def test_submit_valid_task(redis):
     This task may flake out if there is a worker listening to the queue
     """
 
-    async def task_function(foo: int) -> None:
+    async def task_function(foo: int) -> None: # pragma: no cover
         pass
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
@@ -109,7 +109,7 @@ async def test_submit_invalid_task():
 
     # jobber_registry.register_task("test_task", test_task_function, parameters=["foo"])
     # add a task config with a function that requires a parameter to the jobber registry
-    async def task_function(foo: int) -> None:
+    async def task_function(foo: int) -> None: # pragma: no cover
         pass
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
@@ -851,7 +851,7 @@ async def test_submit_task_raises_400_on_task_exception():
     mock_sm = MagicMock()
     mock_sm.submit_task = AsyncMock(side_effect=TaskException("bad params"))
 
-    async def task_function(foo: int) -> None:
+    async def task_function(foo: int) -> None: # pragma: no cover
         pass
 
     from jobbers.models.task_config import TaskConfig

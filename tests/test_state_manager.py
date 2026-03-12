@@ -375,7 +375,7 @@ if __name__ == "__main__":
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def dummy_fn():
+async def dummy_fn(): # pragma: no cover
     pass
 
 

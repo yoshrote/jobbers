@@ -6,7 +6,7 @@ import pytest
 from jobbers.models.task_config import BackoffStrategy, TaskConfig
 
 
-async def dummy_task():
+async def dummy_task(): # pragma: no cover
     pass
 
 
