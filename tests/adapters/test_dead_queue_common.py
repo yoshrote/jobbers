@@ -1,10 +1,13 @@
-"""Tests for DeadQueue (plain Redis sorted-set implementation)."""
+"""
+Contract tests for DeadQueueProtocol implementations.
+
+Each test runs against all registered implementations via the ``dead_queue``
+fixture defined in ``tests/adapters/conftest.py``.
+"""
 import datetime as dt
 
 import pytest
-import pytest_asyncio
 
-from jobbers.adapters.raw_redis import DeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 
@@ -31,12 +34,7 @@ def make_task(
     )
 
 
-@pytest_asyncio.fixture
-async def dq(redis, dummy_task_adapter):
-    yield DeadQueue(redis, dummy_task_adapter)
-
-
-async def add_to_dlq(dq: DeadQueue, task: Task, failed_at: dt.datetime) -> None:
+async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
     pipe = dq.data_store.pipeline(transaction=True)
     dq.stage_add(pipe, task, failed_at)
     await pipe.execute()
@@ -45,9 +43,10 @@ async def add_to_dlq(dq: DeadQueue, task: Task, failed_at: dt.datetime) -> None:
 # ── add / get_by_ids ──────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_add_and_get_by_id(dq, dummy_task_adapter):
+async def test_add_and_get_by_id(dead_queue):
+    dq, adapter = dead_queue
     task = make_task()
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, FAILED_AT)
 
     results = await dq.get_by_ids([str(task.id)])
@@ -58,11 +57,12 @@ async def test_add_and_get_by_id(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_ids_multiple(dq, dummy_task_adapter):
+async def test_get_by_ids_multiple(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_ids([str(t1.id), str(t2.id)])
@@ -70,11 +70,12 @@ async def test_get_by_ids_multiple(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_ids_returns_only_matching(dq, dummy_task_adapter):
+async def test_get_by_ids_returns_only_matching(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_ids([str(t1.id)])
@@ -83,15 +84,16 @@ async def test_get_by_ids_returns_only_matching(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_ids_nonexistent_returns_empty(dq):
-    results = await dq.get_by_ids(["01JQC31AJP7TSA9X8AEP64XG99"])
-    assert results == []
+async def test_get_by_ids_nonexistent_returns_empty(dead_queue):
+    dq, _ = dead_queue
+    assert await dq.get_by_ids(["01JQC31AJP7TSA9X8AEP64XG99"]) == []
 
 
 @pytest.mark.asyncio
-async def test_get_by_ids_empty_list_returns_empty(dq, dummy_task_adapter):
+async def test_get_by_ids_empty_list_returns_empty(dead_queue):
+    dq, adapter = dead_queue
     task = make_task()
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, FAILED_AT)
     assert await dq.get_by_ids([]) == []
 
@@ -99,11 +101,12 @@ async def test_get_by_ids_empty_list_returns_empty(dq, dummy_task_adapter):
 # ── get_by_filter ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_get_by_filter_queue(dq, dummy_task_adapter):
+async def test_get_by_filter_queue(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", queue="q2")
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(queue="q1")
@@ -112,11 +115,12 @@ async def test_get_by_filter_queue(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_task_name(dq, dummy_task_adapter):
+async def test_get_by_filter_task_name(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", name="task_a")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", name="task_b")
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(task_name="task_a")
@@ -125,11 +129,12 @@ async def test_get_by_filter_task_name(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_task_version(dq, dummy_task_adapter):
+async def test_get_by_filter_task_version(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", version=1)
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", version=2)
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(task_version=2)
@@ -138,12 +143,13 @@ async def test_get_by_filter_task_version(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_version_zero(dq, dummy_task_adapter):
+async def test_get_by_filter_version_zero(dead_queue):
     """task_version=0 should be treated as a real filter value, not falsy."""
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", version=0)
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", version=1)
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(task_version=0)
@@ -152,12 +158,13 @@ async def test_get_by_filter_version_zero(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_combined(dq, dummy_task_adapter):
+async def test_get_by_filter_combined(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", name="task_a", version=1, queue="q1")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", name="task_a", version=2, queue="q1")
     t3 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03", name="task_b", version=1, queue="q1")
     for t in (t1, t2, t3):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(queue="q1", task_name="task_a", task_version=1)
@@ -166,11 +173,12 @@ async def test_get_by_filter_combined(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_no_criteria_returns_all(dq, dummy_task_adapter):
+async def test_get_by_filter_no_criteria_returns_all(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter()
@@ -178,14 +186,15 @@ async def test_get_by_filter_no_criteria_returns_all(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_limit_respected(dq, dummy_task_adapter):
+async def test_get_by_filter_limit_respected(dead_queue):
+    dq, adapter = dead_queue
     tasks = [
         make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01"),
         make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02"),
         make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03"),
     ]
     for t in tasks:
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     results = await dq.get_by_filter(limit=2)
@@ -193,21 +202,22 @@ async def test_get_by_filter_limit_respected(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_no_match_returns_empty(dq, dummy_task_adapter):
+async def test_get_by_filter_no_match_returns_empty(dead_queue):
+    dq, adapter = dead_queue
     task = make_task(queue="q1")
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, FAILED_AT)
 
-    results = await dq.get_by_filter(queue="q_nonexistent")
-    assert results == []
+    assert await dq.get_by_filter(queue="q_nonexistent") == []
 
 
 # ── remove ────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_remove_deletes_entry(dq, dummy_task_adapter):
+async def test_remove_deletes_entry(dead_queue):
+    dq, adapter = dead_queue
     task = make_task()
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, FAILED_AT)
     await dq.remove_many([str(task.id)])
 
@@ -215,11 +225,12 @@ async def test_remove_deletes_entry(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_remove_leaves_other_entries_intact(dq, dummy_task_adapter):
+async def test_remove_leaves_other_entries_intact(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
     await dq.remove_many([str(t1.id)])
 
@@ -228,16 +239,18 @@ async def test_remove_leaves_other_entries_intact(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_remove_nonexistent_is_silent(dq):
+async def test_remove_nonexistent_is_silent(dead_queue):
     """Removing a task that was never added should not raise."""
+    dq, _ = dead_queue
     await dq.remove_many(["01JQC31AJP7TSA9X8AEP64XG99"])
 
 
 @pytest.mark.asyncio
-async def test_remove_cleans_up_secondary_indexes(dq, dummy_task_adapter):
+async def test_remove_cleans_up_secondary_indexes(dead_queue):
     """After remove, the queue and name indexes no longer contain the task."""
+    dq, adapter = dead_queue
     task = make_task(queue="myqueue", name="mytask")
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, FAILED_AT)
     await dq.remove_many([str(task.id)])
 
@@ -248,11 +261,12 @@ async def test_remove_cleans_up_secondary_indexes(dq, dummy_task_adapter):
 # ── remove_many ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_remove_many_deletes_all(dq, dummy_task_adapter):
+async def test_remove_many_deletes_all(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t1, t2):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
     await dq.remove_many([str(t1.id), str(t2.id)])
 
@@ -260,12 +274,13 @@ async def test_remove_many_deletes_all(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_remove_many_leaves_unmentioned_entries_intact(dq, dummy_task_adapter):
+async def test_remove_many_leaves_unmentioned_entries_intact(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     t3 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03")
     for t in (t1, t2, t3):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
     await dq.remove_many([str(t1.id), str(t2.id)])
 
@@ -274,24 +289,27 @@ async def test_remove_many_leaves_unmentioned_entries_intact(dq, dummy_task_adap
 
 
 @pytest.mark.asyncio
-async def test_remove_many_empty_list_is_silent(dq, dummy_task_adapter):
+async def test_remove_many_empty_list_is_silent(dead_queue):
+    dq, adapter = dead_queue
     task = make_task()
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, FAILED_AT)
     await dq.remove_many([])
     assert len(await dq.get_by_ids([str(task.id)])) == 1
 
 
 @pytest.mark.asyncio
-async def test_remove_many_nonexistent_ids_are_silent(dq):
+async def test_remove_many_nonexistent_ids_are_silent(dead_queue):
     """IDs that don't exist should not raise."""
+    dq, _ = dead_queue
     await dq.remove_many(["01JQC31AJP7TSA9X8AEP64XG01", "01JQC31AJP7TSA9X8AEP64XG02"])
 
 
 @pytest.mark.asyncio
-async def test_remove_many_partial_match(dq, dummy_task_adapter):
+async def test_remove_many_partial_match(dead_queue):
+    dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
-    await dummy_task_adapter.save_task(t1)
+    await adapter.save_task(t1)
     await add_to_dlq(dq, t1, FAILED_AT)
     await dq.remove_many([str(t1.id), "01JQC31AJP7TSA9X8AEP64XG99"])
 
@@ -301,9 +319,10 @@ async def test_remove_many_partial_match(dq, dummy_task_adapter):
 # ── get_history ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_get_history_returns_errors_from_task_blob(dq, dummy_task_adapter):
+async def test_get_history_returns_errors_from_task_blob(dead_queue):
+    dq, adapter = dead_queue
     task = make_task(errors=["first error", "second error", "third error"])
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, FAILED_AT)
 
     history = await dq.get_history(str(task.id))
@@ -314,25 +333,28 @@ async def test_get_history_returns_errors_from_task_blob(dq, dummy_task_adapter)
 
 
 @pytest.mark.asyncio
-async def test_get_history_empty_when_no_errors(dq, dummy_task_adapter):
+async def test_get_history_empty_when_no_errors(dead_queue):
+    dq, adapter = dead_queue
     task = make_task(errors=[])
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, FAILED_AT)
 
     assert await dq.get_history(str(task.id)) == []
 
 
 @pytest.mark.asyncio
-async def test_get_history_empty_for_unknown_task(dq):
+async def test_get_history_empty_for_unknown_task(dead_queue):
+    dq, _ = dead_queue
     assert await dq.get_history("01JQC31AJP7TSA9X8AEP64XG99") == []
 
 
 @pytest.mark.asyncio
-async def test_get_history_isolated_by_task_id(dq, dummy_task_adapter):
+async def test_get_history_isolated_by_task_id(dead_queue):
+    dq, adapter = dead_queue
     ta = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", errors=["error a"])
     tb = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", errors=["error b1", "error b2"])
     for t in (ta, tb):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
         await add_to_dlq(dq, t, FAILED_AT)
 
     assert len(await dq.get_history(str(ta.id))) == 1
@@ -342,12 +364,13 @@ async def test_get_history_isolated_by_task_id(dq, dummy_task_adapter):
 # ── clean ─────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_clean_removes_old_entries(dq, dummy_task_adapter):
+async def test_clean_removes_old_entries(dead_queue):
     """Tasks added with EARLIER failed_at are removed; LATER ones remain."""
+    dq, adapter = dead_queue
     t_old = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
     t_new = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
     for t in (t_old, t_new):
-        await dummy_task_adapter.save_task(t)
+        await adapter.save_task(t)
     await add_to_dlq(dq, t_old, EARLIER)
     await add_to_dlq(dq, t_new, LATER)
 
@@ -359,10 +382,11 @@ async def test_clean_removes_old_entries(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_clean_removes_secondary_indexes(dq, dummy_task_adapter):
+async def test_clean_removes_secondary_indexes(dead_queue):
     """After clean, old tasks are gone from queue and name indexes."""
+    dq, adapter = dead_queue
     task = make_task(queue="myqueue", name="mytask")
-    await dummy_task_adapter.save_task(task)
+    await adapter.save_task(task)
     await add_to_dlq(dq, task, EARLIER)
 
     cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
@@ -373,6 +397,7 @@ async def test_clean_removes_secondary_indexes(dq, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_clean_empty_queue_is_silent(dq):
+async def test_clean_empty_queue_is_silent(dead_queue):
     """Clean on an empty DLQ should not raise."""
+    dq, _ = dead_queue
     await dq.clean(dt.datetime(2025, 1, 1, tzinfo=dt.UTC))
