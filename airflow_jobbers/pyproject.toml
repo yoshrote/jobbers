@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "airflow-jobbers"
+version = "0.0.1"
+description = "Apache Airflow executor backed by the Jobbers task execution framework"
+requires-python = ">=3.11"
+authors = [
+    { name = "Josh Forman", email = "josh@yoshrote.com" },
+]
+dependencies = [
+    "apache-airflow>=2.6",
+    "httpx",
+    "python-ulid",
+]
+
+[project.urls]
+Homepage = "https://github.com/yoshrote/jobbers"
+
+[tool.hatch.build.targets.wheel]
+packages = ["airflow_jobbers"]

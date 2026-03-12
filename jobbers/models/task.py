@@ -4,7 +4,7 @@ import logging
 from asyncio import TaskGroup
 from collections.abc import AsyncGenerator, Awaitable
 from enum import StrEnum
-from typing import Any, Self, cast
+from typing import Any, Self, cast, get_origin
 
 from opentelemetry import metrics
 from pydantic import BaseModel, Field
@@ -55,7 +55,12 @@ class Task(BaseModel):
         signature = inspect.get_annotations(self.task_config.function)
         for param, psig in signature.items():
             # Skip the return type annotation
-            if param != "return" and not isinstance(self.parameters[param], psig):
+            if param == "return":
+                continue
+            # get_origin handles generic aliases (e.g. list[str] → list) so that
+            # isinstance() works correctly; falls back to psig for plain types.
+            check_type = get_origin(psig) or psig
+            if not isinstance(self.parameters[param], check_type):
                 return False
         return True
 
