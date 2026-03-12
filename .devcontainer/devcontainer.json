@@ -8,9 +8,6 @@
 	"dockerComposeFile": [
 		// Primary compose file defined at the repo root
 		"../docker-compose.yaml",
-		// Local overrides for development are picked up by docker-compose when present
-		// and should also be included here so VS Code uses the same set of services.
-		"../docker-compose.override.yml",
 		// Any additional container-specific overrides under .devcontainer
 		"docker-compose.yml"
 	],
@@ -30,10 +27,28 @@
 	},
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	"forwardPorts": [6379, 3000],
+	"forwardPorts": [6379, 3000, 8000, 5080],
+	"portsAttributes": {
+		"6379": {
+			"label": "Redis",
+			"onAutoForward": "silent"
+		},
+		"3000": {
+			"label": "Frontend (Vite)",
+			"onAutoForward": "openBrowser"
+		},
+		"8000": {
+			"label": "Manager API (FastAPI)",
+			"onAutoForward": "silent"
+		},
+		"5080": {
+			"label": "OpenObserve UI",
+			"onAutoForward": "silent"
+		}
+	},
 
 	// Uncomment the next line if you want start specific services in your Docker Compose config.
-	"runServices": ["redis"],
+	"runServices": ["redis", "collector", "openobserve", "frontend", "manager", "worker"],
 
 	// Uncomment the next line if you want to keep your containers running after VS Code shuts down.
 	"shutdownAction": "stopCompose",
@@ -48,7 +63,10 @@
 				"ms-python.python",
 				"ms-python.vscode-pylance",
 				"charliermarsh.ruff",
-				"ms-python.debugpy"
+				"ms-python.debugpy",
+				"anthropics.claude-code",
+				"GitHub.vscode-pull-request-github",
+				"redis.redis-for-vscode"
 			],
 			"settings": {
 				"python.defaultInterpreterPath": "/usr/local/bin/python",
