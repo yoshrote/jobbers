@@ -17,7 +17,7 @@ services:
       REDIS_URL: "redis://redis:6379"
     volumes:
       # Update this to wherever you want VS Code to mount the folder of your project
-      - .:/usr/src/app
+      - ..:/usr/src/app
       # - ../.devcontainer/launch.json:/app/.vscode/launch.json:ro
 
     # Uncomment the next four lines if you will use a ptrace-based debugger like C++, Go, and Rust.
