@@ -2,12 +2,10 @@
 
 import datetime as dt
 
-import fakeredis
 import pytest
-import pytest_asyncio
 from ulid import ULID
 
-from jobbers.adapters.raw_redis import DeadQueue, MsgpackTaskAdapter
+from jobbers.adapters.raw_redis import DeadQueue
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
