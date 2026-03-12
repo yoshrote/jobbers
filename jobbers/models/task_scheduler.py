@@ -62,24 +62,6 @@ class TaskScheduler:
         pipe.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
         pipe.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
 
-    async def add(self, task: Task, run_at: dt.datetime) -> None:
-        """Schedule a task to run at run_at. Re-adding an existing task resets its run_at."""
-        pipe = self.data_store.pipeline(transaction=True)
-        self.stage_add(pipe, task, run_at)
-        await pipe.execute()
-
-    async def remove(self, task_id: ULID) -> None:
-        """Remove a scheduled task by ID."""
-        queue_bytes: bytes | None = await cast(
-            "Awaitable[bytes | None]",
-            self.data_store.hget(self.SCHEDULE_TASK_QUEUE, str(task_id)),
-        )
-        if queue_bytes is None:
-            return
-        pipe = self.data_store.pipeline(transaction=True)
-        self.stage_remove(pipe, task_id, queue_bytes.decode())
-        await pipe.execute()
-
     async def get_by_filter(
         self,
         queue: str | None = None,

@@ -183,4 +183,4 @@ class TaskProcessor:
     async def handle_success(self, task: Task) -> None:
         logger.info("Task %s completed.", task.id)
         task.set_status(TaskStatus.COMPLETED)
-        await self.state_manager.complete_task(task)
+        await self.state_manager.save_task(task)

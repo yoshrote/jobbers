@@ -510,8 +510,6 @@ def _make_state_manager():
     state_manager.task_scheduler = AsyncMock(spec=TaskScheduler)
 
     async def _schedule_retry_task(task: Task, run_at: dt.datetime) -> Task:
-        """Mimic StateManager.schedule_retry_task: add to scheduler with the provided run_at."""
-        state_manager.task_scheduler.add(task, run_at)
         return task
 
     async def _queue_retry_task(task: Task) -> Task:
@@ -554,8 +552,6 @@ async def test_expected_exception_scheduled_with_backoff():
     task_function = AsyncMock(side_effect=ValueError("boom"))
     task_config = _retryable_config()
     task_config = task_config.model_copy(update={"function": task_function})
-    scheduler = state_manager.task_scheduler
-
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result = await processor.process(task)
@@ -563,9 +559,6 @@ async def test_expected_exception_scheduled_with_backoff():
     assert result.status == TaskStatus.SCHEDULED
     assert result.retry_attempt == 1
     state_manager.schedule_retry_task.assert_called_once_with(task, ANY)
-    scheduler.add.assert_called_once()
-    scheduled_task, run_at = scheduler.add.call_args.args
-    assert scheduled_task.id == task.id
 
 
 @pytest.mark.asyncio
@@ -590,8 +583,6 @@ async def test_timeout_scheduled_with_backoff():
         retry_delay=5,
         backoff_strategy=BackoffStrategy.CONSTANT,
     )
-    scheduler = state_manager.task_scheduler
-
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result = await processor.process(task)
@@ -599,7 +590,6 @@ async def test_timeout_scheduled_with_backoff():
     assert result.status == TaskStatus.SCHEDULED
     assert result.retry_attempt == 1
     state_manager.schedule_retry_task.assert_called_once_with(task, ANY)
-    scheduler.add.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -616,8 +606,6 @@ async def test_expected_exception_max_retries_fails_even_with_scheduler():
     task_function = AsyncMock(side_effect=ValueError("boom"))
     task_config = _retryable_config(max_retries=3)
     task_config = task_config.model_copy(update={"function": task_function})
-    scheduler = state_manager.task_scheduler
-
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result = await processor.process(task)
@@ -625,7 +613,7 @@ async def test_expected_exception_max_retries_fails_even_with_scheduler():
     assert result.status == TaskStatus.FAILED
     assert result.retry_attempt == 3
     state_manager.fail_task.assert_called_once_with(task)
-    scheduler.add.assert_not_called()
+    state_manager.schedule_retry_task.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -649,8 +637,6 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
         retry_delay=5,
         backoff_strategy=BackoffStrategy.CONSTANT,
     )
-    scheduler = state_manager.task_scheduler
-
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         result = await processor.process(task)
@@ -658,7 +644,7 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
     assert result.status == TaskStatus.FAILED
     assert result.completed_at is not None
     state_manager.fail_task.assert_called_once_with(task)
-    scheduler.add.assert_not_called()
+    state_manager.schedule_retry_task.assert_not_called()
 
 
 # ── pubsub cancellation ───────────────────────────────────────────────────────

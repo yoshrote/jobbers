@@ -158,7 +158,9 @@ class TaskGenerator:
                 task = await self.state_manager.get_next_task(task_queues)
             except asyncio.CancelledError:
                 if task:
-                    await self.state_manager.ta.requeue_task(task)
+                    pipe = self.state_manager.data_store.pipeline()
+                    self.state_manager.ta.stage_requeue(pipe, task)
+                    await pipe.execute()
                 raise
         if not task:
             # TODO: We need to monitor how often the generator dies this way

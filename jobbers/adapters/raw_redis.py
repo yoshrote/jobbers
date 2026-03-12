@@ -307,12 +307,6 @@ class DeadQueue:
         pipe.srem(self.DLQ_NAME(name=name), bytes(task_id))
         pipe.hdel(self.DLQ_META, str(task_id))
 
-    async def add(self, task: Task, failed_at: dt.datetime) -> None:
-        """Insert or replace the DLQ entry for a task (latest failure wins)."""
-        pipe = self.data_store.pipeline(transaction=True)
-        self.stage_add(pipe, task, failed_at)
-        await pipe.execute()
-
     async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return the per-attempt error history for a DLQ task from its stored task blob."""
         u = ULID.from_str(task_id)
@@ -381,20 +375,6 @@ class DeadQueue:
                 continue
             results.append(task)
         return results
-
-    async def remove(self, task_id: str) -> None:
-        """Remove a single entry from the dead letter queue."""
-        u = ULID.from_str(task_id)
-        meta_bytes: bytes | None = await cast(
-            "Awaitable[bytes | None]",
-            self.data_store.hget(self.DLQ_META, str(u)),
-        )
-        if meta_bytes is None:
-            return
-        queue, name, _ = meta_bytes.decode().split("\0")
-        pipe = self.data_store.pipeline(transaction=True)
-        self.stage_remove(pipe, u, queue, name)
-        await pipe.execute()
 
     async def remove_many(self, task_ids: list[str]) -> None:
         """Remove multiple entries from the dead letter queue in a single transaction."""

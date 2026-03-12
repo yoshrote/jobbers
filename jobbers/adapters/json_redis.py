@@ -345,12 +345,6 @@ class JsonDeadQueue:
         """Queue DELETE of the DLQ JSON document onto pipe (no execute)."""
         pipe.delete(self.DLQ_KEY(task_id=task_id))
 
-    async def add(self, task: Task, failed_at: dt.datetime) -> None:
-        """Insert or replace the DLQ entry for a task (latest failure wins)."""
-        pipe = self.data_store.pipeline(transaction=True)
-        self.stage_add(pipe, task, failed_at)
-        await pipe.execute()
-
     async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return per-attempt error history for a DLQ task from its stored task blob."""
         u = ULID.from_str(task_id)
@@ -416,19 +410,13 @@ class JsonDeadQueue:
             results.append(task)
         return results
 
-    async def remove(self, task_id: str) -> None:
-        """Remove a single entry from the dead letter queue."""
-        u = ULID.from_str(task_id)
-        await self.data_store.delete(self.DLQ_KEY(task_id=u))
-
     async def remove_many(self, task_ids: list[str]) -> None:
         """Remove multiple entries from the dead letter queue in a single transaction."""
         if not task_ids:
             return
         pipe = self.data_store.pipeline(transaction=True)
         for tid in task_ids:
-            u = ULID.from_str(tid)
-            pipe.delete(self.DLQ_KEY(task_id=u))
+            self.stage_remove(pipe, ULID.from_str(tid), "", "")  # queue and name are not needed for removal
         await pipe.execute()
 
     async def clean(self, earlier_than: dt.datetime) -> None:

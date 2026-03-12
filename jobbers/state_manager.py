@@ -210,7 +210,9 @@ class StateManager:
         """Persist an immediate retry: re-enqueue the task without full re-validation."""
         task.set_status(TaskStatus.SUBMITTED)
         logger.info("Task %s requeued for immediate retry.", task.id)
-        await self.ta.requeue_task(task)
+        pipe = self.data_store.pipeline(transaction=True)
+        self.ta.stage_requeue(pipe, task)
+        await pipe.execute()
         return task
 
     async def dispatch_scheduled_task(self, task: Task) -> Task:
