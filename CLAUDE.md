@@ -45,9 +45,10 @@ All four run as separate processes (separate Docker containers in production).
 ## Tech Stack
 
 - **Python 3.11+**, FastAPI, asyncio, aiosqlite
-- **Redis** — task queues and live task state
-- **SQLite** — queue/role config, task scheduler, dead letter queue
-- **Two interchangeable adapters:** `JsonTaskAdapter` (Redis JSON + RediSearch) and `MsgpackTaskAdapter` (plain Redis + msgpack + sorted sets)
+- **Redis** — task queues, task scheduler, dead letter queue, task state
+- **SQLite** — queue/role config
+- **Two interchangeable task adapters:** `JsonTaskAdapter` (Redis JSON + RediSearch) and `MsgpackTaskAdapter` (plain Redis + msgpack + sorted sets)
+- **Two interchangeable dead letter adapters:** `JsonDeadQueue` (Redis JSON + RediSearch) and `DeadQueue` (plain Redis + sorted sets)
 - **React 19 + Vite 7 + React Router 6** (no TypeScript, plain CSS)
 - **OpenTelemetry** (OTLP → OpenObserve)
 
@@ -109,11 +110,42 @@ async def my_task(**kwargs):
 - Key test files: `test_state_manager.py`, `test_task_processor.py`, `test_task_routes.py`, `test_task_generator.py`
 - Run with: `pytest` (coverage configured in `pyproject.toml`, excludes `otel.py`)
 
-## Docker
+## Code Quality
 
-```
-docker compose up
+Install dev dependencies first:
+
+```bash
+pip install -e ".[test]"
 ```
 
-Services: `redis`, `manager` (8000), `worker`, `collector` (OTLP 4317), `openobserve` (5080), `frontend` (3000).
-Vite proxies `/api/*` → `http://manager:8000`.
+### pytest — run tests with coverage
+
+```bash
+pytest
+# or with explicit coverage report:
+pytest --cov=jobbers --cov-report=term-missing
+```
+
+### ruff — lint and format
+
+```bash
+# Check for lint errors
+ruff check .
+
+# Auto-fix lint errors
+ruff check --fix .
+
+# Check formatting (non-destructive)
+ruff format --check .
+
+# Apply formatting
+ruff format .
+```
+
+### mypy — static type checking
+
+```bash
+mypy jobbers
+```
+
+mypy is configured with `strict = true` and runs only on the `jobbers/` package (tests are excluded).
