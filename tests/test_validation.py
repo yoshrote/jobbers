@@ -10,6 +10,7 @@ from jobbers.validation import ValidationError, validate_task
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 
+
 @pytest.mark.asyncio
 async def test_validate_task_unregistered():
     """Unregistered task raises ValidationError without any Redis calls."""
@@ -22,7 +23,8 @@ async def test_validate_task_unregistered():
 @pytest.mark.asyncio
 async def test_validate_task_invalid_params():
     """Task with wrong parameter type raises ValidationError."""
-    async def task_function(foo: int) -> None: # pragma: no cover
+
+    async def task_function(foo: int) -> None:  # pragma: no cover
         pass
 
     task_config = TaskConfig(name="Test Task", function=task_function)
@@ -35,7 +37,8 @@ async def test_validate_task_invalid_params():
 @pytest.mark.asyncio
 async def test_validate_task_valid_sets_task_config():
     """Valid task passes validation and task_config is set on the task."""
-    async def task_function(foo: int) -> None: # pragma: no cover
+
+    async def task_function(foo: int) -> None:  # pragma: no cover
         pass
 
     task_config = TaskConfig(name="Test Task", function=task_function)
@@ -54,7 +57,8 @@ async def test_validate_task_valid_sets_task_config():
 @pytest.mark.asyncio
 async def test_validate_task_missing_queue_config():
     """Task targeting an unconfigured queue raises ValidationError."""
-    async def task_function(foo: int) -> None: # pragma: no cover
+
+    async def task_function(foo: int) -> None:  # pragma: no cover
         pass
 
     task_config = TaskConfig(name="Test Task", function=task_function)

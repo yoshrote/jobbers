@@ -7,6 +7,7 @@ Environment variables:
 - SCHEDULER_DB_PATH: path to the SQLite schedule database (default task_schedule.db)
 - REDIS_URL: Redis connection URL (default redis://localhost:6379)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,9 +41,7 @@ async def main(poll_interval: float, role: str, batch_size: int) -> None:
         task_entries = await state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues)
         if task_entries:
             logger.info("Dispatching %d scheduled task(s)", len(task_entries))
-            await asyncio.gather(
-                *(state_manager.dispatch_scheduled_task(task) for task, _ in task_entries)
-            )
+            await asyncio.gather(*(state_manager.dispatch_scheduled_task(task) for task, _ in task_entries))
             now = dt.datetime.now(dt.UTC)
             for task, run_at in task_entries:
                 dispatch_latency.record(

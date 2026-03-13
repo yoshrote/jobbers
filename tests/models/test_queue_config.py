@@ -12,26 +12,27 @@ def queue_config_adapter(sqlite_conn):
 # RatePeriod
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize(("rate_period", "rate_denominator", "expected_seconds"), [
-    (None, 1, None),
-    (RatePeriod.SECOND, None, None),
-    (RatePeriod.SECOND, 1, 1),
-    (RatePeriod.MINUTE, 1, 60),
-    (RatePeriod.HOUR, 1, 3600),
-    (RatePeriod.DAY, 1, 86400),
-])
+
+@pytest.mark.parametrize(
+    ("rate_period", "rate_denominator", "expected_seconds"),
+    [
+        (None, 1, None),
+        (RatePeriod.SECOND, None, None),
+        (RatePeriod.SECOND, 1, 1),
+        (RatePeriod.MINUTE, 1, 60),
+        (RatePeriod.HOUR, 1, 3600),
+        (RatePeriod.DAY, 1, 86400),
+    ],
+)
 def test_period_in_seconds(rate_period, rate_denominator, expected_seconds):
-    config = QueueConfig(
-        name="test_queue",
-        rate_denominator=rate_denominator,
-        rate_period=rate_period
-    )
+    config = QueueConfig(name="test_queue", rate_denominator=rate_denominator, rate_period=rate_period)
     assert config.period_in_seconds() == expected_seconds
 
 
 # ---------------------------------------------------------------------------
 # get_queues / save_role
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_get_queues(queue_config_adapter):
@@ -72,6 +73,7 @@ async def test_save_role_replaces_existing(queue_config_adapter):
 # get_all_queues
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_get_all_queues(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue1"))
@@ -90,6 +92,7 @@ async def test_get_all_queues_empty(queue_config_adapter):
 # ---------------------------------------------------------------------------
 # get_all_roles
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_get_all_roles(queue_config_adapter):
@@ -110,6 +113,7 @@ async def test_get_all_roles_empty(queue_config_adapter):
 # ---------------------------------------------------------------------------
 # get_queue_limits
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_get_queue_limits_empty_set(queue_config_adapter):
@@ -162,13 +166,15 @@ async def test_get_queue_limits_mixed_existing_and_nonexistent(queue_config_adap
 
 @pytest.mark.asyncio
 async def test_get_queue_limits_with_rate_limiting_config(queue_config_adapter):
-    await queue_config_adapter.save_queue_config(QueueConfig(
-        name="rate_limited_queue",
-        max_concurrent=15,
-        rate_numerator=5,
-        rate_denominator=2,
-        rate_period=RatePeriod.MINUTE,
-    ))
+    await queue_config_adapter.save_queue_config(
+        QueueConfig(
+            name="rate_limited_queue",
+            max_concurrent=15,
+            rate_numerator=5,
+            rate_denominator=2,
+            rate_period=RatePeriod.MINUTE,
+        )
+    )
     result = await queue_config_adapter.get_queue_limits({"rate_limited_queue"})
     assert result == {"rate_limited_queue": 15}
 

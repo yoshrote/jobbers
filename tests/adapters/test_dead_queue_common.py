@@ -4,6 +4,7 @@ Contract tests for DeadQueueProtocol implementations.
 Each test runs against all registered implementations via the ``dead_queue``
 fixture defined in ``tests/adapters/conftest.py``.
 """
+
 import datetime as dt
 
 import pytest
@@ -24,6 +25,7 @@ def make_task(
     errors: list[str] | None = None,
 ) -> Task:
     from ulid import ULID
+
     return Task(
         id=ULID.from_str(task_id),
         name=name,
@@ -41,6 +43,7 @@ async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
 
 
 # ── add / get_by_ids ──────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_add_and_get_by_id(dead_queue):
@@ -99,6 +102,7 @@ async def test_get_by_ids_empty_list_returns_empty(dead_queue):
 
 
 # ── get_by_filter ─────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_get_by_filter_queue(dead_queue):
@@ -213,6 +217,7 @@ async def test_get_by_filter_no_match_returns_empty(dead_queue):
 
 # ── remove ────────────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_remove_deletes_entry(dead_queue):
     dq, adapter = dead_queue
@@ -259,6 +264,7 @@ async def test_remove_cleans_up_secondary_indexes(dead_queue):
 
 
 # ── remove_many ───────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_remove_many_deletes_all(dead_queue):
@@ -318,6 +324,7 @@ async def test_remove_many_partial_match(dead_queue):
 
 # ── get_history ───────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_get_history_returns_errors_from_task_blob(dead_queue):
     dq, adapter = dead_queue
@@ -362,6 +369,7 @@ async def test_get_history_isolated_by_task_id(dead_queue):
 
 
 # ── clean ─────────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_clean_removes_old_entries(dead_queue):

@@ -41,7 +41,7 @@ async def redis():
     client = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
     try:
         await client.flushdb()
-    except RedisConnectionError as exc: # pragma: no cover
+    except RedisConnectionError as exc:  # pragma: no cover
         await client.aclose()
         pytest.skip(f"Redis not available: {exc}")
     yield client
@@ -55,7 +55,7 @@ async def task_adapter(redis):
     adapter = JsonTaskAdapter(redis)
     try:
         await adapter.ensure_index()
-    except ResponseError as exc: # pragma: no cover
+    except ResponseError as exc:  # pragma: no cover
         pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
     return adapter
 
@@ -66,7 +66,7 @@ async def dq(redis, task_adapter):
     jdq = JsonDeadQueue(redis, task_adapter)
     try:
         await jdq.ensure_index()
-    except ResponseError as exc: # pragma: no cover
+    except ResponseError as exc:  # pragma: no cover
         pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
     yield jdq
 

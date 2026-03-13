@@ -24,7 +24,6 @@ def make_task(
     return task
 
 
-
 # ── stage_requeue ─────────────────────────────────────────────────────────────
 
 
@@ -147,13 +146,21 @@ async def test_clean_noop_when_no_age_params(msgpack_adapter, redis):
 async def test_get_next_task_skips_missing_data_and_returns_none(msgpack_adapter, redis):
     """When a task is popped from the queue but its blob is absent, it is logged and None is returned."""
     fake_id = ULID1
-    queue_key = msgpack_adapter.TASKS_BY_QUEUE(queue="default").encode() if isinstance(msgpack_adapter.TASKS_BY_QUEUE(queue="default"), str) else msgpack_adapter.TASKS_BY_QUEUE(queue="default")
+    queue_key = (
+        msgpack_adapter.TASKS_BY_QUEUE(queue="default").encode()
+        if isinstance(msgpack_adapter.TASKS_BY_QUEUE(queue="default"), str)
+        else msgpack_adapter.TASKS_BY_QUEUE(queue="default")
+    )
     # bzpopmin returns (key, member, score); first call returns the fake ID, second returns None (timeout)
-    pop_results = iter([
-        (queue_key, bytes(fake_id), FROZEN_TIME.timestamp()),
-        None,
-    ])
-    with patch.object(msgpack_adapter.data_store, "bzpopmin", new_callable=AsyncMock, side_effect=pop_results):
+    pop_results = iter(
+        [
+            (queue_key, bytes(fake_id), FROZEN_TIME.timestamp()),
+            None,
+        ]
+    )
+    with patch.object(
+        msgpack_adapter.data_store, "bzpopmin", new_callable=AsyncMock, side_effect=pop_results
+    ):
         result = await msgpack_adapter.get_next_task(queues={"default"}, pop_timeout=1)
     assert result is None
     # The missing ID should be tracked in the DLQ missing-data key

@@ -16,6 +16,7 @@ async def test_local_ttl_initial_refresh():
 
     assert ttl.last_refreshed is not None, "last_refreshed should be updated after the first use"
 
+
 @pytest.mark.asyncio
 async def test_local_ttl_no_refresh_within_ttl():
     """Test that LocalTTL does not refresh within the TTL duration."""
@@ -26,6 +27,7 @@ async def test_local_ttl_no_refresh_within_ttl():
         assert needs_refresh is False, "LocalTTL should not refresh within the TTL duration"
 
     assert ttl.last_refreshed is not None, "last_refreshed should remain unchanged"
+
 
 @pytest.mark.asyncio
 async def test_local_ttl_refresh_after_ttl():

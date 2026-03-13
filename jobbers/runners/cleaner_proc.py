@@ -42,6 +42,7 @@ parser.add_argument(
     help="Delete task blobs and heartbeat entries for terminal tasks older than this many seconds",
 )
 
+
 async def cleaner(args: argparse.Namespace) -> None:
     from jobbers import db
 
@@ -55,10 +56,12 @@ async def cleaner(args: argparse.Namespace) -> None:
         completed_task_age=args.completed_task_age,
     )
 
+
 def run() -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
 
     from jobbers.utils.otel import enable_otel
+
     enable_otel(handlers, service_name="jobbers-cleaner")
 
     logging.basicConfig(level=logging.INFO, handlers=handlers)
@@ -67,6 +70,4 @@ def run() -> None:
     args = parser.parse_args()
 
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(
-        cleaner(args)
-    )
+    loop.run_until_complete(cleaner(args))

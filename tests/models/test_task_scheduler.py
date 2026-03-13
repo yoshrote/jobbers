@@ -1,4 +1,5 @@
 """Tests for TaskScheduler."""
+
 import datetime as dt
 
 import pytest
@@ -26,7 +27,9 @@ async def schedule(s: TaskScheduler, task: Task, run_at: dt.datetime) -> None:
     s.stage_add(pipe, task, run_at)
     await pipe.execute()
 
+
 # ── basic CRUD ────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_next_due_empty(scheduler):
@@ -60,12 +63,13 @@ async def test_add_replaces_existing(scheduler, dummy_task_adapter):
     task = make_task()
     await dummy_task_adapter.save_task(task)
     await schedule(scheduler, task, PAST)
-    await scheduler.next_due(["default"])    # acquires (removes from sorted set)
-    await schedule(scheduler, task, PAST)          # re-adds to sorted set
+    await scheduler.next_due(["default"])  # acquires (removes from sorted set)
+    await schedule(scheduler, task, PAST)  # re-adds to sorted set
     assert await scheduler.next_due(["default"]) is not None
 
 
 # ── run_at filtering ──────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_future_task_not_returned(scheduler):
@@ -82,6 +86,7 @@ async def test_past_task_is_returned(scheduler, dummy_task_adapter):
 
 
 # ── queue filtering ───────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_next_due_empty_queue_list(scheduler):
@@ -117,6 +122,7 @@ async def test_next_due_multi_queue_filter(scheduler, dummy_task_adapter):
 
 # ── acquire semantics ─────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_next_due_acquires_once(scheduler, dummy_task_adapter):
     """A second call should not return the same task."""
@@ -130,6 +136,7 @@ async def test_next_due_acquires_once(scheduler, dummy_task_adapter):
 
 
 # ── ordering ──────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_next_due_returns_earliest_run_at(scheduler, dummy_task_adapter):
@@ -148,6 +155,7 @@ async def test_next_due_returns_earliest_run_at(scheduler, dummy_task_adapter):
 
 
 # ── queues=None (all-queues mode) ─────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_next_due_none_returns_due_task(scheduler, redis, dummy_task_adapter):
@@ -180,6 +188,7 @@ async def test_next_due_none_acquires_once(scheduler, redis, dummy_task_adapter)
 
 # ── next_due_bulk ──────────────────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_next_due_bulk_returns_task_run_at_tuples(scheduler, dummy_task_adapter):
     """next_due_bulk returns (Task, datetime) pairs."""
@@ -201,7 +210,7 @@ async def test_next_due_bulk_run_at_matches_scheduled_time(scheduler, dummy_task
     task = make_task()
     await dummy_task_adapter.save_task(task)
     await schedule(scheduler, task, scheduled_time)
-    (_, run_at), = await scheduler.next_due_bulk(10, queues=["default"])
+    ((_, run_at),) = await scheduler.next_due_bulk(10, queues=["default"])
     # Compare at second precision (timestamps are floats)
     assert abs((run_at - scheduled_time).total_seconds()) < 0.001
 
@@ -240,6 +249,7 @@ async def test_next_due_bulk_acquires_so_second_call_returns_empty(scheduler, du
 
 
 # ── get_by_filter ─────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_get_by_filter_returns_scheduled_tasks(scheduler, dummy_task_adapter):

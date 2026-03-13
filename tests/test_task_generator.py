@@ -10,6 +10,7 @@ from jobbers.task_generator import TaskGenerator
 
 EXHAUSTED = object()
 
+
 @pytest.mark.asyncio
 async def test_find_queues_default_role():
     """Test that TaskGenerator finds default queues for the 'default' role."""
@@ -49,16 +50,13 @@ async def test_find_queues_custom_role_no_queues():
     assert queues == set()
     queue_config_adapter.get_queues.assert_called_once_with("custom_role")
 
+
 @pytest.mark.asyncio
 async def test_task_generator_iteration():
     """Test that TaskGenerator iterates over tasks."""
     state_manager = Mock(spec=StateManager)
     task = Task(
-        id=ULID(),
-        name="test_task",
-        version=1,
-        status=TaskStatus.SUBMITTED,
-        submitted_at=datetime.now(tz=UTC)
+        id=ULID(), name="test_task", version=1, status=TaskStatus.SUBMITTED, submitted_at=datetime.now(tz=UTC)
     )
     state_manager.get_next_task.return_value = task
     state_manager.active_tasks_per_queue = {}
@@ -69,6 +67,7 @@ async def test_task_generator_iteration():
     assert await anext(task_generator, EXHAUSTED) == task
 
     state_manager.get_next_task.assert_called_once_with({"default"})
+
 
 @pytest.mark.asyncio
 async def test_task_generator_stops_iteration():
@@ -83,6 +82,7 @@ async def test_task_generator_stops_iteration():
     assert await anext(task_generator, EXHAUSTED) == EXHAUSTED
 
     state_manager.get_next_task.assert_called_once_with({"default"})
+
 
 @pytest.mark.asyncio
 async def test_task_generator_stops_after_max_tasks():
@@ -213,17 +213,17 @@ async def test_filter_by_worker_queue_capacity_mixed_scenarios():
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {
         "queue1": 3,  # Under limit (5)
-        "queue2": 10, # At limit (10)
-        "queue3": 15, # Over limit (12)
+        "queue2": 10,  # At limit (10)
+        "queue3": 15,  # Over limit (12)
         "queue4": 2,  # No active tasks recorded, should default to 0
     }
     queue_config_adapter = Mock(spec=QueueConfigAdapter)
     queue_config_adapter.get_queue_limits.return_value = {
-        "queue1": 5,   # Limit set
+        "queue1": 5,  # Limit set
         "queue2": 10,  # Limit set
         "queue3": 12,  # Limit set
-        "queue4": 5,   # Limit set, no active tasks
-        "queue5": 0,   # No limit (0 means unlimited)
+        "queue4": 5,  # Limit set, no active tasks
+        "queue5": 0,  # No limit (0 means unlimited)
     }
     task_generator = TaskGenerator(state_manager, queue_config_adapter)
 

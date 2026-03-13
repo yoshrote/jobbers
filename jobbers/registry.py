@@ -6,20 +6,21 @@ from typing import Any
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
 
 logger = logging.getLogger(__name__)
-_task_function_map : dict[tuple[str, int], TaskConfig] = {}
+_task_function_map: dict[tuple[str, int], TaskConfig] = {}
+
 
 def register_task(
-        name: str,
-        version: int,
-        max_concurrent: int | None=1,
-        timeout: int | None=None,
-        max_retries: int=3,
-        retry_delay: int | None=None,
-        expected_exceptions: tuple[type[Exception]] | None=None,
-        max_heartbeat_interval: dt.timedelta | None=None,
-        backoff_strategy: BackoffStrategy=BackoffStrategy.EXPONENTIAL,
-        dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE
-    ) -> Callable[..., Any]:
+    name: str,
+    version: int,
+    max_concurrent: int | None = 1,
+    timeout: int | None = None,
+    max_retries: int = 3,
+    retry_delay: int | None = None,
+    expected_exceptions: tuple[type[Exception]] | None = None,
+    max_heartbeat_interval: dt.timedelta | None = None,
+    backoff_strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
+    dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE,
+) -> Callable[..., Any]:
     """Register a task function with the given name and version."""
 
     def decorator(func: Callable[..., Any]) -> Any:
@@ -29,7 +30,9 @@ def register_task(
             raise ValueError("Task function must be callable")
         if (name, version) in _task_function_map:
             if _task_function_map[(name, version)].function != func:
-                logger.exception("Task %s version %d is already registered to another function", name, version)
+                logger.exception(
+                    "Task %s version %d is already registered to another function", name, version
+                )
                 raise ValueError(f"Task {name} version {version} is already registered to another function")
             else:
                 # Allow re-registration of the same function for the same name and version
@@ -45,18 +48,22 @@ def register_task(
             expected_exceptions=expected_exceptions,
             max_heartbeat_interval=max_heartbeat_interval,
             backoff_strategy=backoff_strategy,
-            dead_letter_policy=dead_letter_policy
+            dead_letter_policy=dead_letter_policy,
         )
         _task_function_map[(name, version)] = task_conf
         return func
+
     return decorator
+
 
 def get_task_config(name: str, version: int) -> TaskConfig | None:
     """Retrieve a task function given its name."""
     return _task_function_map.get((name, version))
 
+
 def get_tasks() -> Iterator[tuple[str, int]]:
     return iter(_task_function_map.keys())
+
 
 def clear_registry() -> None:
     """Clear all registered tasks (for testing purposes)."""

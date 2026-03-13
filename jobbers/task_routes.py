@@ -31,20 +31,20 @@ meter = metrics.get_meter(__name__)
 hit_counter = meter.create_up_down_counter("hit_counter")
 cancellations_requested = meter.create_counter("cancellations_requested", unit="1")
 
+
 class RootResponse(BaseModel):
     """Response model for the root endpoint."""
 
     message: str = Field(description="Welcome message.")
     tasks: list[tuple[str, int]] = Field(description="List of registered tasks with their versions.")
 
+
 @app.get("/")
 async def read_root() -> RootResponse:
     """Serve the index page."""
     logger.info("Serving the index page")
-    return RootResponse(
-        message="Welcome to Task Manager!",
-        tasks=list(registry.get_tasks())
-    )
+    return RootResponse(message="Welcome to Task Manager!", tasks=list(registry.get_tasks()))
+
 
 @app.post("/submit-task")
 async def submit_task(task: Task) -> dict[str, Any]:
@@ -64,6 +64,7 @@ async def submit_task(task: Task) -> dict[str, Any]:
         "task": task.summarized(),
     }
 
+
 @app.get("/task-status/{task_id}")
 async def get_task_status(task_id: str) -> dict[str, Any]:
     """Retrieve the status of a specific task."""
@@ -73,6 +74,7 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     if task:
         return task.summarized()
     raise HTTPException(status_code=404, detail="Task not found")
+
 
 @app.post("/task/{task_id}/cancel")
 async def cancel_task(task_id: str) -> dict[str, Any]:
@@ -124,12 +126,16 @@ async def get_task_list(filter_query: Annotated[TaskPagination, Query()]) -> dic
     tasks = await db.get_task_adapter().get_all_tasks(filter_query)
     return {"tasks": tasks}
 
+
 @app.get("/queues/{role}")
 async def get_queues(role: str) -> dict[str, Any]:
     """Retrieve the list of all queues for a given role."""
     logger.info("Getting all queues for role %s", role)
-    queues = await QueueConfigAdapter(db.get_sqlite_conn()).get_queues(role)  # Ensure the queues are sorted for consistency
+    queues = await QueueConfigAdapter(db.get_sqlite_conn()).get_queues(
+        role
+    )  # Ensure the queues are sorted for consistency
     return {"queues": sorted(queues)}
+
 
 @app.post("/queues/{role}")
 async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
@@ -138,12 +144,14 @@ async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
     await QueueConfigAdapter(db.get_sqlite_conn()).save_role(role, set(queues))
     return {"message": "Queues set successfully"}
 
+
 @app.get("/queues")
 async def get_all_queues() -> dict[str, Any]:
     """Retrieve the list of all queues."""
     logger.info("Getting all queues")
     queues = await QueueConfigAdapter(db.get_sqlite_conn()).get_all_queues()
     return {"queues": queues}
+
 
 @app.post("/queues", status_code=201)
 async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
@@ -155,6 +163,7 @@ async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
     await qca.save_queue_config(queue_config)
     return {"message": "Queue created successfully", "queue": queue_config.model_dump()}
 
+
 @app.get("/queues/{queue_name}/config")
 async def get_queue_config(queue_name: str) -> dict[str, Any]:
     """Retrieve the configuration for a specific queue."""
@@ -163,12 +172,14 @@ async def get_queue_config(queue_name: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
     return {"queue": config.model_dump()}
 
+
 @app.put("/queues/{queue_name}")
 async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, Any]:
     """Create or update the configuration for a queue. The name in the body is ignored; the path name is used."""
     queue_config.name = queue_name
     await QueueConfigAdapter(db.get_sqlite_conn()).save_queue_config(queue_config)
     return {"message": "Queue updated successfully", "queue": queue_config.model_dump()}
+
 
 @app.delete("/queues/{queue_name}", status_code=200)
 async def delete_queue(queue_name: str) -> dict[str, Any]:
@@ -179,6 +190,7 @@ async def delete_queue(queue_name: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
     await qca.delete_queue(queue_name)
     return {"message": f"Queue '{queue_name}' deleted successfully."}
+
 
 class DLQFilter(BaseModel):
     """Filter criteria for searching the dead letter queue."""
@@ -235,7 +247,9 @@ class DLQResubmitRequest(BaseModel):
     task_name: str | None = Field(default=None, description="Resubmit only tasks with this name.")
     task_version: int | None = Field(default=None, description="Resubmit only tasks with this version.")
     reset_retry_count: bool = Field(default=True, description="Reset retry_attempt to 0 before resubmitting.")
-    limit: int = Field(default=100, gt=0, le=1000, description="Maximum number of tasks to resubmit (filter mode only).")
+    limit: int = Field(
+        default=100, gt=0, le=1000, description="Maximum number of tasks to resubmit (filter mode only)."
+    )
 
 
 class DLQRemoveRequest(BaseModel):
@@ -330,6 +344,7 @@ async def create_role(role: RoleRequest) -> dict[str, Any]:
     await qca.save_role(role.name, set(role.queues))
     return {"message": "Role created successfully", "role": role.name, "queues": sorted(role.queues)}
 
+
 @app.get("/roles/{role_name}")
 async def get_role(role_name: str) -> dict[str, Any]:
     """Retrieve the queues assigned to a specific role."""
@@ -340,6 +355,7 @@ async def get_role(role_name: str) -> dict[str, Any]:
     queues = await qca.get_queues(role_name)
     return {"role": role_name, "queues": sorted(queues)}
 
+
 @app.put("/roles/{role_name}")
 async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
     """Replace the queue list for a role. Returns 404 if the role does not exist."""
@@ -349,6 +365,7 @@ async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
     await qca.save_role(role_name, set(queues))
     return {"message": "Role updated successfully", "role": role_name, "queues": sorted(queues)}
+
 
 @app.delete("/roles/{role_name}", status_code=200)
 async def delete_role(role_name: str) -> dict[str, Any]:

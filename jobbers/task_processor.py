@@ -21,6 +21,7 @@ tasks_retried = meter.create_counter("tasks_retried", unit="1")
 execution_time = meter.create_histogram("task_execution_time", unit="ms")
 end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms")
 
+
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
 
@@ -71,7 +72,11 @@ class TaskProcessor:
                         ex = exc
                         await self.handle_system_cancelled_task(task)
                 except Exception as exc:
-                    if task.task_config and task.task_config.expected_exceptions and isinstance(exc, task.task_config.expected_exceptions):
+                    if (
+                        task.task_config
+                        and task.task_config.expected_exceptions
+                        and isinstance(exc, task.task_config.expected_exceptions)
+                    ):
                         task = await self.handle_expected_exception(task, exc)
                     else:
                         await self.handle_unexpected_exception(task, exc)
@@ -85,12 +90,12 @@ class TaskProcessor:
         if task.started_at and task.completed_at:
             execution_time.record(
                 (task.completed_at - task.started_at).total_seconds() * 1000,
-                {"queue": task.queue, "task": task.name, "status": task.status}
+                {"queue": task.queue, "task": task.name, "status": task.status},
             )
         if task.submitted_at and task.completed_at:
             end_to_end_latency.record(
                 (task.completed_at - task.submitted_at).total_seconds() * 1000,
-                {"queue": task.queue, "task": task.name, "status": task.status}
+                {"queue": task.queue, "task": task.name, "status": task.status},
             )
 
         if task.status == TaskStatus.COMPLETED:
