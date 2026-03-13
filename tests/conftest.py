@@ -9,6 +9,7 @@ from jobbers.adapters.raw_redis import MsgpackTaskAdapter
 from jobbers.adapters.task_adapter import _BaseTaskAdapter
 from jobbers.models.queue_config import create_schema
 from jobbers.models.task import Task
+from jobbers.state_manager import StateManager
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -23,6 +24,12 @@ async def redis():
 def task_adapter(redis, request):
     """Fixture providing a task adapter instance parametrized over all implementations."""
     return request.param(redis)
+
+
+@pytest_asyncio.fixture
+async def state_manager(redis, sqlite_conn):
+    """Fixture to provide a StateManager instance with a fake Redis and in-memory SQLite."""
+    return StateManager(redis, sqlite_conn)
 
 
 class DummyTaskAdapter:
