@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.task_adapter import TaskAdapterProtocol, TaskPipeline
     from jobbers.models.queue_config import QueueConfig
 
 
@@ -156,13 +156,14 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         )
         return result == 1
 
-    def stage_save(self, pipe: Pipeline, task: Task) -> None:
+    def stage_save(self, pipe: TaskPipeline, task: Task) -> None:
         """Queue SET task-details + type-index update onto pipe (no execute)."""
-        pipe.set(self.TASK_DETAILS(task_id=task.id), self._pack(task))
+        p = cast("Pipeline", pipe)
+        p.set(self.TASK_DETAILS(task_id=task.id), self._pack(task))
         if task.status in TaskStatus.active_statuses():
-            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+            p.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
-            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+            p.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
 
     async def _fetch_task_data_bulk(self, task_ids: list[ULID]) -> list[Any]:
         pipe = self.data_store.pipeline(transaction=False)
@@ -185,9 +186,10 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
             task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.UTC)
         return task
 
-    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None:
+    async def read_for_watch(self, pipe: TaskPipeline, task_id: ULID) -> Task | None:
         """Read task data via a WATCH pipeline (msgpack format)."""
-        raw_data: bytes | None = await pipe.get(self.TASK_DETAILS(task_id=task_id))
+        p = cast("Pipeline", pipe)
+        raw_data: bytes | None = await p.get(self.TASK_DETAILS(task_id=task_id))
         if not raw_data:
             return None
         return self._unpack(task_id, raw_data)
@@ -293,19 +295,24 @@ class DeadQueue:
     async def ensure_index(self) -> None:
         """No-op: plain-Redis dead queue does not use a search index."""
 
-    def stage_add(self, pipe: Pipeline, task: Task, failed_at: dt.datetime) -> None:
-        """Queue all four DLQ index writes onto pipe (no execute)."""
-        pipe.zadd(self.DLQ, {bytes(task.id): failed_at.timestamp()})
-        pipe.sadd(self.DLQ_QUEUE(queue=task.queue), bytes(task.id))
-        pipe.sadd(self.DLQ_NAME(name=task.name), bytes(task.id))
-        pipe.hset(self.DLQ_META, str(task.id), f"{task.queue}\0{task.name}\0{task.version}")
+    def pipeline(self) -> Pipeline:
+        return self.data_store.pipeline(transaction=True)  # type: ignore[return-value]
 
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str, name: str) -> None:
+    def stage_add(self, pipe: TaskPipeline, task: Task, failed_at: dt.datetime) -> None:
+        """Queue all four DLQ index writes onto pipe (no execute)."""
+        p = cast("Pipeline", pipe)
+        p.zadd(self.DLQ, {bytes(task.id): failed_at.timestamp()})
+        p.sadd(self.DLQ_QUEUE(queue=task.queue), bytes(task.id))
+        p.sadd(self.DLQ_NAME(name=task.name), bytes(task.id))
+        p.hset(self.DLQ_META, str(task.id), f"{task.queue}\0{task.name}\0{task.version}")
+
+    def stage_remove(self, pipe: TaskPipeline, task_id: ULID, queue: str, name: str) -> None:
         """Queue all four DLQ index deletes onto pipe (no execute)."""
-        pipe.zrem(self.DLQ, bytes(task_id))
-        pipe.srem(self.DLQ_QUEUE(queue=queue), bytes(task_id))
-        pipe.srem(self.DLQ_NAME(name=name), bytes(task_id))
-        pipe.hdel(self.DLQ_META, str(task_id))
+        p = cast("Pipeline", pipe)
+        p.zrem(self.DLQ, bytes(task_id))
+        p.srem(self.DLQ_QUEUE(queue=queue), bytes(task_id))
+        p.srem(self.DLQ_NAME(name=name), bytes(task_id))
+        p.hdel(self.DLQ_META, str(task_id))
 
     async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return the per-attempt error history for a DLQ task from its stored task blob."""

@@ -1,3 +1,4 @@
+import aiosqlite
 import fakeredis
 import pytest
 import pytest_asyncio
@@ -7,6 +8,7 @@ from redis.exceptions import ResponseError
 
 from jobbers.adapters.json_redis import JsonDeadQueue, JsonTaskAdapter
 from jobbers.adapters.raw_redis import DeadQueue, MsgpackTaskAdapter
+from jobbers.adapters.sql import SqlDeadQueue, SqlTaskAdapter
 from jobbers.db import DEFAULT_REDIS_URL
 
 
@@ -16,19 +18,27 @@ def msgpack_adapter(redis) -> MsgpackTaskAdapter:
     return MsgpackTaskAdapter(redis)
 
 
-@pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])
+@pytest_asyncio.fixture(params=["raw", "json", "sql"], ids=["raw", "json", "sql"])
 async def dead_queue(request, dummy_task_adapter):
     """
     Parameterized fixture yielding (dq, task_adapter) for each DeadQueueProtocol implementation.
 
     - ``"raw"``: DeadQueue backed by FakeAsyncRedis + DummyTaskAdapter
     - ``"json"``: JsonDeadQueue backed by real Redis Stack; skips if unavailable
+    - ``"sql"``: SqlDeadQueue backed by in-memory SQLite
     """
     if request.param == "raw":
         r = fakeredis.FakeAsyncRedis()
         dq = DeadQueue(r, dummy_task_adapter)
         yield dq, dummy_task_adapter
         await r.aclose()
+    elif request.param == "sql":
+        async with aiosqlite.connect(":memory:") as c:
+            c.row_factory = aiosqlite.Row
+            adapter = SqlTaskAdapter(c)
+            await adapter.ensure_index()
+            dq = SqlDeadQueue(c, adapter)
+            yield dq, adapter
     else:
         r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
         try:

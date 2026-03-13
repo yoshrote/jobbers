@@ -58,11 +58,19 @@ async def close_sqlite_conn() -> None:
         _sqlite_conn = None
 
 
-def create_task_adapter(client: redis.Redis) -> TaskAdapterProtocol:
+def create_task_adapter(
+    client: redis.Redis,
+    sqlite_conn: aiosqlite.Connection | None = None,
+) -> TaskAdapterProtocol:
     """Create a TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
-    from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
+    from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter, SqlTaskAdapter
 
-    if TASK_ADAPTER_BACKEND == "msgpack":
+    backend = os.environ.get("TASK_ADAPTER_BACKEND", TASK_ADAPTER_BACKEND)
+    if backend == "sql":
+        if sqlite_conn is None:
+            raise RuntimeError("TASK_ADAPTER_BACKEND=sql requires a SQLite connection.")
+        return SqlTaskAdapter(sqlite_conn)
+    if backend == "msgpack":
         return MsgpackTaskAdapter(client)
     return JsonTaskAdapter(client)
 
@@ -83,9 +91,22 @@ async def init_state_manager() -> StateManager:
     await _sqlite_conn.execute("PRAGMA foreign_keys = ON")
     await create_schema(_sqlite_conn)
     client = get_client()
-    _task_adapter = create_task_adapter(client)
+    _task_adapter = create_task_adapter(client, _sqlite_conn)
     await _task_adapter.ensure_index()
-    _state_manager = StateManager(client, _sqlite_conn, task_adapter=_task_adapter)
+
+    # Select the matching DLQ implementation.
+    backend = os.environ.get("TASK_ADAPTER_BACKEND", TASK_ADAPTER_BACKEND)
+    if backend == "sql":
+        from jobbers.adapters.sql import SqlDeadQueue
+
+        dead_queue = SqlDeadQueue(_sqlite_conn, _task_adapter)  # type: ignore[arg-type]
+        await dead_queue.ensure_index()
+    else:
+        from jobbers.adapters.raw_redis import DeadQueue
+
+        dead_queue = DeadQueue(client, _task_adapter)  # type: ignore[assignment]
+
+    _state_manager = StateManager(client, _sqlite_conn, task_adapter=_task_adapter, dead_queue=dead_queue)
     return _state_manager
 
 

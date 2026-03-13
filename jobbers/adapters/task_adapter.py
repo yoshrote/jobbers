@@ -10,6 +10,7 @@ Concrete implementations live in the sibling modules:
 
 * ``jobbers.adapters.json_redis``  – Redis Stack (RedisJSON + RediSearch) backed classes.
 * ``jobbers.adapters.raw_redis``   – plain Redis (msgpack / sorted-set) backed classes.
+* ``jobbers.adapters.sql``         – SQLite (aiosqlite) backed classes.
 """
 
 from __future__ import annotations
@@ -28,8 +29,14 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
+    from jobbers.adapters.pipeline import SqlPipeline
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
+
+    # Union of the Redis pipeline and the SQL command-accumulator.  Use this as
+    # the declared parameter type in all ``stage_*`` and ``pipeline()`` methods
+    # so that both adapter families can share a single Protocol interface.
+    TaskPipeline = Pipeline | SqlPipeline
 
 logger = logging.getLogger(__name__)
 tasks_missing_data = metrics.get_meter(__name__).create_counter("tasks_missing_data", unit="1")
@@ -55,13 +62,14 @@ class TaskAdapterProtocol(Protocol):
     # -- write path ----------------------------------------------------------
     async def submit_task(self, task: Task) -> bool: ...
     async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool: ...
-    def stage_save(self, pipe: Pipeline, task: Task) -> None: ...
-    def stage_requeue(self, pipe: Pipeline, task: Task) -> None: ...
+    def pipeline(self) -> TaskPipeline: ...
+    def stage_save(self, pipe: TaskPipeline, task: Task) -> None: ...
+    def stage_requeue(self, pipe: TaskPipeline, task: Task) -> None: ...
 
     # -- read path -----------------------------------------------------------
     async def get_task(self, task_id: ULID) -> Task | None: ...
     async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]: ...
-    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None: ...
+    async def read_for_watch(self, pipe: TaskPipeline, task_id: ULID) -> Task | None: ...
     async def task_exists(self, task_id: ULID) -> bool: ...
     async def get_active_tasks(self, queues: set[str]) -> list[Task]: ...
     def get_stale_tasks(self, queues: set[str], stale_time: dt.timedelta) -> AsyncGenerator[Task, None]: ...
@@ -69,7 +77,7 @@ class TaskAdapterProtocol(Protocol):
     async def get_next_task(self, queues: set[str], pop_timeout: int) -> Task | None: ...
 
     # -- queue management ----------------------------------------------------
-    def stage_remove_from_queue(self, pipe: Pipeline, task: Task) -> None: ...
+    def stage_remove_from_queue(self, pipe: TaskPipeline, task: Task) -> None: ...
     async def update_task_heartbeat(self, task: Task) -> None: ...
     async def remove_task_heartbeat(self, task: Task) -> None: ...
 
@@ -89,8 +97,8 @@ class DeadQueueProtocol(Protocol):
     """Interface for dead letter queue operations."""
 
     async def ensure_index(self) -> None: ...
-    def stage_add(self, pipe: Pipeline, task: Task, failed_at: dt.datetime) -> None: ...
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str, name: str) -> None: ...
+    def stage_add(self, pipe: TaskPipeline, task: Task, failed_at: dt.datetime) -> None: ...
+    def stage_remove(self, pipe: TaskPipeline, task_id: ULID, queue: str, name: str) -> None: ...
     async def get_history(self, task_id: str) -> list[dict[str, Any]]: ...
     async def get_by_ids(self, task_ids: list[str]) -> list[Task]: ...
     async def get_by_filter(
@@ -122,31 +130,41 @@ class _BaseTaskAdapter:
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
 
-    def stage_requeue(self, pipe: Pipeline, task: Task) -> None:
-        """Queue ZADD task-queue + save-task commands onto pipe (no execute)."""
-        assert task.submitted_at  # noqa: S101
-        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
-        self.stage_save(pipe, task)
+    def pipeline(self) -> Pipeline:
+        """Return a new Redis pipeline (transaction=True) for use with stage_* methods."""
+        return self.data_store.pipeline(transaction=True)
 
-    def stage_save(self, pipe: Pipeline, task: Task) -> None:
+    def stage_requeue(self, pipe: TaskPipeline, task: Task) -> None:
+        """Queue ZADD task-queue + save-task commands onto pipe (no execute)."""
+        from typing import cast
+
+        assert task.submitted_at  # noqa: S101
+        p = cast("Pipeline", pipe)
+        p.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        self.stage_save(p, task)
+
+    def stage_save(self, pipe: TaskPipeline, task: Task) -> None:
         raise NotImplementedError
 
     async def save_task(self, task: Task) -> None:
         """Save task state to the Redis data store."""
-        pipe = self.data_store.pipeline(transaction=True)
+        pipe = self.pipeline()
         self.stage_save(pipe, task)
         await pipe.execute()
 
-    def stage_remove_from_queue(self, pipe: Pipeline, task: Task) -> None:
+    def stage_remove_from_queue(self, pipe: TaskPipeline, task: Task) -> None:
         """Queue ZREM task-queue + SREM type-index commands onto pipe (no execute)."""
-        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
-        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        from typing import cast
+
+        p = cast("Pipeline", pipe)
+        p.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
+        p.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
 
     async def update_task_heartbeat(self, task: Task) -> None:
         """Update the heartbeat for a task."""
         assert task.heartbeat_at  # noqa: S101
-        pipe = self.data_store.pipeline(transaction=True)
-        pipe.zadd(self.HEARTBEAT_SCORES(queue=task.queue), {bytes(task.id): task.heartbeat_at.timestamp()})
+        pipe = self.pipeline()
+        pipe.zadd(self.HEARTBEAT_SCORES(queue=task.queue), {bytes(task.id): task.heartbeat_at.timestamp()})  # type: ignore[union-attr]
         await pipe.execute()
 
     async def remove_task_heartbeat(self, task: Task) -> None:
@@ -174,7 +192,7 @@ class _BaseTaskAdapter:
         pipe = self.data_store.pipeline(transaction=False)
         for _, task in valid:
             pipe.zscore(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
-        scores = await pipe.execute()
+        scores: list[Any] = await pipe.execute()
         for (_, task), score in zip(valid, scores):
             if score is not None:
                 task.heartbeat_at = dt.datetime.fromtimestamp(score, dt.UTC)
@@ -272,7 +290,7 @@ class _BaseTaskAdapter:
     async def get_task(self, task_id: ULID) -> Task | None:
         raise NotImplementedError
 
-    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None:
+    async def read_for_watch(self, pipe: TaskPipeline, task_id: ULID) -> Task | None:
         raise NotImplementedError
 
     async def ensure_index(self) -> None:
