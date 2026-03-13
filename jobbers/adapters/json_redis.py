@@ -11,6 +11,7 @@ Both require a Redis Stack instance with the RedisJSON and RediSearch modules.
 from __future__ import annotations
 
 import datetime as dt
+import json
 from asyncio import TaskGroup
 from typing import TYPE_CHECKING, Any, cast
 
@@ -109,6 +110,15 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         return enqueued
     """
 
+    def pack(self, task: Task) -> str:
+        """Serialize a task to a JSON string."""
+        return json.dumps(task.to_dict())
+
+    def unpack(self, task_id: ULID, data: str | dict[str, Any]) -> Task:
+        """Deserialize a task from a JSON string or dict."""
+        raw: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
+        return Task.from_dict(task_id, raw)
+
     async def submit_task(self, task: Task) -> bool:
         """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
         assert task.submitted_at  # noqa: S101
@@ -124,7 +134,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
                 task.submitted_at.timestamp(),
                 bytes(task.id),
                 is_active,
-                task.pack(),
+                self.pack(task),
             ),
         )
         return result == 1
@@ -149,7 +159,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
                 task.submitted_at.timestamp(),
                 bytes(task.id),
                 is_active,
-                task.pack(),
+                self.pack(task),
             ),
         )
         return result == 1
@@ -169,7 +179,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         return await pipe.execute()
 
     def _decode_task(self, task_id: ULID, raw: Any) -> Task:
-        return Task.unpack(task_id, raw)
+        return self.unpack(task_id, raw)
 
     async def get_task(self, task_id: ULID) -> Task | None:
         raw_data: dict[str, Any] | None = await self.data_store.json().get(  # type: ignore[misc]
@@ -177,7 +187,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         )
         if raw_data is None:
             return None
-        task = Task.unpack(task_id, raw_data)
+        task = self.unpack(task_id, raw_data)
         heartbeat_score: float | None = await self.data_store.zscore(
             self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id)
         )
@@ -192,7 +202,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         )
         if raw_data is None:
             return None
-        return Task.unpack(task_id, raw_data)
+        return self.unpack(task_id, raw_data)
 
     async def ensure_index(self) -> None:
         """Create the RediSearch index on task JSON documents if it does not exist."""
@@ -267,7 +277,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
             task_data: dict[str, Any] | None = await self.data_store.json().get(key_str)  # type: ignore[misc]
             if task_data is None:
                 continue
-            task = Task.unpack(task_id, task_data)
+            task = self.unpack(task_id, task_data)
             if task.status not in terminal_statuses:
                 continue
             if task.completed_at is None or task.completed_at >= cutoff:

@@ -6,7 +6,7 @@ import pytest
 from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
-from jobbers.models.task import Task, TaskFormat, TaskPagination, TaskStatus
+from jobbers.models.task import Task, TaskPagination, TaskStatus
 from jobbers.models.task_config import TaskConfig
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -26,29 +26,6 @@ def sample_task():
         status=TaskStatus.STARTED,
         started_at=dt.datetime.now(dt.UTC),
     )
-
-
-def test_task_serialization_and_deserialization():
-    """Test that a Task can be packed and unpacked correctly."""
-    task_id = ULID()
-    task = Task(
-        id=task_id,
-        name="Test Task",
-        version=1,
-        parameters={"key": "value"},
-        results={"result_key": "result_value"},
-        errors=[],
-        status=TaskStatus.STARTED,
-        submitted_at=dt.datetime(2025, 4, 4, 12, 0, 0, tzinfo=dt.UTC),
-        started_at=dt.datetime(2025, 4, 4, 12, 5, 0, tzinfo=dt.UTC),
-        heartbeat_at=None,
-        completed_at=None,
-    )
-
-    packed = task.pack()
-    deserialized_task = Task.unpack(task_id, packed)
-
-    assert task == deserialized_task
 
 
 def test_valid_params():
@@ -85,51 +62,6 @@ def test_valid_params():
 
     task.parameters = {"foo": "spam", "bar": "baz"}
     assert not task.valid_task_params()
-
-
-def test_task_serialization_with_none_values():
-    """Test that Task pack/unpack roundtrip handles None values properly."""
-    task_id = ULID()
-    task = Task(
-        id=task_id,
-        name="Test Task",
-        version=1,
-        parameters={},
-        results={},
-        status=TaskStatus.UNSUBMITTED,
-        submitted_at=None,
-        started_at=None,
-        heartbeat_at=None,
-        completed_at=None,
-    )
-
-    packed = task.pack()
-    deserialized_task = Task.unpack(task_id, packed)
-
-    assert task == deserialized_task
-
-
-def test_task_serialization_with_non_none_values():
-    """Test that Task pack/unpack roundtrip handles non-None values properly."""
-    task_id = ULID()
-    task = Task(
-        id=task_id,
-        name="Test Task",
-        version=1,
-        parameters={"key": "value"},
-        results={"result_key": "result_value"},
-        errors=["Some error occurred"],
-        status=TaskStatus.COMPLETED,
-        submitted_at=dt.datetime(2025, 4, 4, 12, 0, 0, tzinfo=dt.UTC),
-        started_at=dt.datetime(2025, 4, 4, 12, 5, 0, tzinfo=dt.UTC),
-        heartbeat_at=dt.datetime(2025, 4, 4, 12, 10, 0, tzinfo=dt.UTC),
-        completed_at=dt.datetime(2025, 4, 4, 12, 15, 0, tzinfo=dt.UTC),
-    )
-
-    packed = task.pack()
-    deserialized_task = Task.unpack(task_id, packed)
-
-    assert task == deserialized_task
 
 
 @pytest.mark.asyncio

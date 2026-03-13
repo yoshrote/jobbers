@@ -103,13 +103,13 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         return enqueued
     """
 
-    def _pack(self, task: Task) -> bytes:
-        """Serialize task to msgpack bytes."""
+    def pack(self, task: Task) -> bytes:
+        """Serialize a task to msgpack bytes."""
         return serialize(task.to_dict())
 
-    def _unpack(self, task_id: ULID, data: bytes) -> Task:
-        """Deserialize task from msgpack bytes."""
-        return Task.unpack(task_id, deserialize(data))
+    def unpack(self, task_id: ULID, data: bytes) -> Task:
+        """Deserialize a task from msgpack bytes."""
+        return Task.from_dict(task_id, deserialize(data))
 
     async def submit_task(self, task: Task) -> bool:
         """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
@@ -126,7 +126,7 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
                 task.submitted_at.timestamp(),
                 bytes(task.id),
                 is_active,
-                self._pack(task),
+                self.pack(task),
             ),
         )
         return result == 1
@@ -151,14 +151,14 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
                 task.submitted_at.timestamp(),
                 bytes(task.id),
                 is_active,
-                self._pack(task),
+                self.pack(task),
             ),
         )
         return result == 1
 
     def stage_save(self, pipe: Pipeline, task: Task) -> None:
         """Queue SET task-details + type-index update onto pipe (no execute)."""
-        pipe.set(self.TASK_DETAILS(task_id=task.id), self._pack(task))
+        pipe.set(self.TASK_DETAILS(task_id=task.id), self.pack(task))
         if task.status in TaskStatus.active_statuses():
             pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
@@ -171,13 +171,13 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         return await pipe.execute()
 
     def _decode_task(self, task_id: ULID, raw: Any) -> Task:
-        return self._unpack(task_id, raw)
+        return self.unpack(task_id, raw)
 
     async def get_task(self, task_id: ULID) -> Task | None:
         raw_data: bytes | None = await self.data_store.get(self.TASK_DETAILS(task_id=task_id))
         if not raw_data:
             return None
-        task = self._unpack(task_id, raw_data)
+        task = self.unpack(task_id, raw_data)
         heartbeat_score: float | None = await self.data_store.zscore(
             self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id)
         )
@@ -190,7 +190,7 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         raw_data: bytes | None = await pipe.get(self.TASK_DETAILS(task_id=task_id))
         if not raw_data:
             return None
-        return self._unpack(task_id, raw_data)
+        return self.unpack(task_id, raw_data)
 
     async def ensure_index(self) -> None:
         """No-op: msgpack backend does not use a search index."""
@@ -222,7 +222,7 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
             raw_data: bytes | None = await self.data_store.get(self.TASK_DETAILS(task_id=task_id))
             if raw_data is None:
                 continue
-            task = self._unpack(task_id, raw_data)
+            task = self.unpack(task_id, raw_data)
             if pagination.task_name is not None and task.name != pagination.task_name:
                 continue
             if pagination.task_version is not None and task.version != pagination.task_version:
@@ -253,7 +253,7 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
                 task_id = ULID.from_str(task_id_str)
             except ValueError:
                 continue
-            task = self._unpack(task_id, task_data)
+            task = self.unpack(task_id, task_data)
             if task.status not in terminal_statuses:
                 continue
             if task.completed_at is None or task.completed_at >= cutoff:
