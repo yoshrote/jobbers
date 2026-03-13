@@ -21,7 +21,9 @@ class QueueConfig(BaseModel):
     """Configuration for a task queue."""
 
     name: str  # Name of the queue
-    max_concurrent: int | None = 10  # Maximum number of concurrent tasks that can be processed from this queue
+    max_concurrent: int | None = (
+        10  # Maximum number of concurrent tasks that can be processed from this queue
+    )
     # Rate limiting is {task_number} tasks every {rate_number} {rate_period}
     #  e.g. 5 tasks every 2 minutes
     rate_numerator: int | None = None  # Number of tasks to process from this queue
@@ -96,9 +98,7 @@ class QueueConfigAdapter:
         self.conn = conn
 
     async def get_queues(self, role: str) -> set[str]:
-        async with self.conn.execute(
-            "SELECT queue FROM role_queues WHERE role = ?", (role,)
-        ) as cursor:
+        async with self.conn.execute("SELECT queue FROM role_queues WHERE role = ?", (role,)) as cursor:
             return {row[0] for row in await cursor.fetchall()}
 
     async def save_role(self, role: str, queues: set[str]) -> None:
@@ -193,9 +193,7 @@ class QueueConfigAdapter:
 
     async def get_refresh_tag(self, role: str) -> ULID:
         """Return the current refresh tag for a role, creating one if needed."""
-        async with self.conn.execute(
-            "SELECT refresh_tag FROM roles WHERE name = ?", (role,)
-        ) as cursor:
+        async with self.conn.execute("SELECT refresh_tag FROM roles WHERE name = ?", (role,)) as cursor:
             row = await cursor.fetchone()
         if row is not None:
             return ULID.from_str(row[0])
@@ -207,8 +205,6 @@ class QueueConfigAdapter:
         )
         await self.conn.commit()
         # Re-read in case another process won the race
-        async with self.conn.execute(
-            "SELECT refresh_tag FROM roles WHERE name = ?", (role,)
-        ) as cursor:
+        async with self.conn.execute("SELECT refresh_tag FROM roles WHERE name = ?", (role,)) as cursor:
             row = await cursor.fetchone()
         return ULID.from_str(row[0]) if row else init_tag

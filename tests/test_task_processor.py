@@ -18,12 +18,13 @@ from jobbers.task_processor import TaskProcessor
 @pytest.fixture(autouse=True)
 def register_test_task():
     @register_task(name="test_task", version=1)
-    def test_function(): # pragma: no cover
+    def test_function():  # pragma: no cover
         pass
 
     yield
 
     clear_registry()
+
 
 @pytest.mark.asyncio
 async def test_task_processor_success():
@@ -77,7 +78,6 @@ async def test_task_processor_dropped_task():
     state_manager.save_task.assert_called_once_with(task)
 
 
-
 @pytest.mark.asyncio
 async def test_task_processor_expected_exception_with_retry():
     """Test that TaskProcessor handles an expected exception."""
@@ -110,6 +110,7 @@ async def test_task_processor_expected_exception_with_retry():
     # save_task called when starting; queue_retry_task called for immediate retry (no retry_delay)
     state_manager.save_task.assert_called_once_with(task)
     state_manager.queue_retry_task.assert_called_once_with(task)
+
 
 @pytest.mark.asyncio
 async def test_task_processor_expected_exception_without_retry():
@@ -175,7 +176,6 @@ async def test_task_processor_unexpected_exception():
     # save_task called when starting; fail_task called when failing
     state_manager.save_task.assert_called_once_with(task)
     state_manager.fail_task.assert_called_once_with(task)
-
 
 
 @pytest.mark.asyncio
@@ -399,9 +399,10 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
         on_shutdown=TaskShutdownPolicy.CONTINUE,
     )
 
-    with patch("jobbers.task_processor.get_task_config", return_value=task_config), \
-         patch("asyncio.shield", wraps=asyncio.shield) as mock_shield:
-
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch("asyncio.shield", wraps=asyncio.shield) as mock_shield,
+    ):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -440,9 +441,10 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
         on_shutdown=TaskShutdownPolicy.STOP,
     )
 
-    with patch("jobbers.task_processor.get_task_config", return_value=task_config), \
-         patch("asyncio.shield") as mock_shield:
-
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch("asyncio.shield") as mock_shield,
+    ):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -481,9 +483,10 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
         on_shutdown=TaskShutdownPolicy.RESUBMIT,
     )
 
-    with patch("jobbers.task_processor.get_task_config", return_value=task_config), \
-         patch("asyncio.shield") as mock_shield:
-
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch("asyncio.shield") as mock_shield,
+    ):
         processor = TaskProcessor(state_manager)
         result_task = await processor.process(task)
 
@@ -499,6 +502,7 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
 
 
 # ── scheduled-retry tests (TaskScheduler present + retry_delay configured) ───
+
 
 def _make_state_manager():
     """Return a mock StateManager whose retry_task mirrors the real SM behaviour."""
@@ -644,6 +648,7 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
 
 
 # ── pubsub cancellation ───────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_task_processor_run_exits_early_on_pubsub_cancel():

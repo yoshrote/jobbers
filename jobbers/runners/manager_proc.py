@@ -9,6 +9,7 @@ import uvicorn
 
 ENABLE_OTEL = True
 
+
 def _load_task_module(arg: str) -> None:
     if os.path.isabs(arg) or arg.endswith(".py"):
         spec = importlib.util.spec_from_file_location("_user_tasks", arg)
@@ -20,6 +21,7 @@ def _load_task_module(arg: str) -> None:
     else:
         importlib.import_module(arg)
 
+
 def run() -> None:
     from jobbers.task_routes import app
 
@@ -27,9 +29,11 @@ def run() -> None:
 
     if ENABLE_OTEL:
         from jobbers.utils.otel import enable_otel
+
         enable_otel(handlers, service_name="jobbers-manager")
 
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
         FastAPIInstrumentor.instrument_app(app)
 
     logging.basicConfig(level=logging.INFO, handlers=handlers)
@@ -39,6 +43,7 @@ def run() -> None:
     _load_task_module(sys.argv[1])
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 if __name__ == "__main__":
     run()

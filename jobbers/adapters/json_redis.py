@@ -231,9 +231,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
             query_parts.append(f"@status:{{{_escape_tag(str(pagination.status))}}}")
 
         q: SearchQuery = (
-            SearchQuery(" ".join(query_parts))
-            .no_content()
-            .paging(pagination.offset, pagination.limit)
+            SearchQuery(" ".join(query_parts)).no_content().paging(pagination.offset, pagination.limit)
         )
         if pagination.order_by == PaginationOrder.SUBMITTED_AT:
             q = q.sort_by("submitted_at", asc=True)
@@ -388,10 +386,7 @@ class JsonDeadQueue:
 
         fetch_limit = limit * 5 if task_version is not None else limit
         q: SearchQuery = (
-            SearchQuery(query_str)
-            .no_content()
-            .sort_by("failed_at", asc=False)
-            .paging(0, fetch_limit)
+            SearchQuery(query_str).no_content().sort_by("failed_at", asc=False).paging(0, fetch_limit)
         )
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
         if not search_results.docs:
@@ -424,11 +419,7 @@ class JsonDeadQueue:
         from redis.commands.search.query import Query as SearchQuery
 
         ts = earlier_than.timestamp()
-        q: SearchQuery = (
-            SearchQuery(f"@failed_at:[-inf ({ts}]")
-            .no_content()
-            .paging(0, 10000)
-        )
+        q: SearchQuery = SearchQuery(f"@failed_at:[-inf ({ts}]").no_content().paging(0, 10000)
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
         if not search_results.docs:
             return

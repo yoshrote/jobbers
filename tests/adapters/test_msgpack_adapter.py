@@ -27,7 +27,6 @@ def make_task(
     return task
 
 
-
 # ── ensure_index ──────────────────────────────────────────────────────────────
 
 
@@ -89,7 +88,9 @@ async def test_get_all_tasks_filters_by_status(msgpack_adapter):
     t2_completed = make_task(ULID2, status=TaskStatus.COMPLETED)
     await msgpack_adapter.save_task(t2_completed)
 
-    results = await msgpack_adapter.get_all_tasks(TaskPagination(queue="default", status=TaskStatus.SUBMITTED))
+    results = await msgpack_adapter.get_all_tasks(
+        TaskPagination(queue="default", status=TaskStatus.SUBMITTED)
+    )
     assert len(results) == 1
     assert results[0].id == ULID1
 

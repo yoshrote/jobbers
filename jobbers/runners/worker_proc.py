@@ -26,13 +26,14 @@ Rate limiting should be implemented by limiting the creation of tasks rather
 than on the consumption of tasks.
 """
 
+
 async def main() -> None:
     num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
     role = os.environ.get("WORKER_ROLE", "default")
-    worker_ttl = int(os.environ.get("WORKER_TTL", 50)) # if 0, will run indefinitely
+    worker_ttl = int(os.environ.get("WORKER_TTL", 50))  # if 0, will run indefinitely
     state_manager = await db.init_state_manager()
     task_generator = TaskGenerator(state_manager, state_manager.qca, role, max_tasks=worker_ttl)
-    await task_generator.queues() # warm up the refresh tag once
+    await task_generator.queues()  # warm up the refresh tag once
 
     semaphore = asyncio.Semaphore(num_concurrent)
     active: set[asyncio.Task[None]] = set()
@@ -64,6 +65,7 @@ async def main() -> None:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
 
+
 def _load_task_module(arg: str) -> None:
     if os.path.isabs(arg) or arg.endswith(".py"):
         spec = importlib.util.spec_from_file_location("_user_tasks", arg)
@@ -74,6 +76,7 @@ def _load_task_module(arg: str) -> None:
         spec.loader.exec_module(module)
     else:
         importlib.import_module(arg)
+
 
 def run() -> None:
     from jobbers.utils.otel import enable_otel

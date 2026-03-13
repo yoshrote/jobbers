@@ -225,7 +225,11 @@ class _BaseTaskAdapter:
             task = await self.get_task(ULID.from_bytes(pop_result[1]))
             if task:
                 return task
-            logger.error("Task %s popped from queue but data not found; adding to %s", pop_result[1], self.DLQ_MISSING_DATA)
+            logger.error(
+                "Task %s popped from queue but data not found; adding to %s",
+                pop_result[1],
+                self.DLQ_MISSING_DATA,
+            )
             tasks_missing_data.add(1)
             now = dt.datetime.now(dt.UTC)
             await self.data_store.zadd(self.DLQ_MISSING_DATA, {pop_result[1]: now.timestamp()})
@@ -249,16 +253,19 @@ class _BaseTaskAdapter:
                 if earliest_time <= latest_time:
                     pipe.zremrangebyscore(
                         self.TASKS_BY_QUEUE(queue=queue.decode()),
-                        min=earliest_time.timestamp(), max=latest_time.timestamp(),
+                        min=earliest_time.timestamp(),
+                        max=latest_time.timestamp(),
                     )
                 else:
                     pipe.zremrangebyscore(
                         self.TASKS_BY_QUEUE(queue=queue.decode()),
-                        min=0, max=earliest_time.timestamp(),
+                        min=0,
+                        max=earliest_time.timestamp(),
                     )
                     pipe.zremrangebyscore(
                         self.TASKS_BY_QUEUE(queue=queue.decode()),
-                        min=latest_time.timestamp(), max=now.timestamp(),
+                        min=latest_time.timestamp(),
+                        max=now.timestamp(),
                     )
                 await pipe.execute()
 

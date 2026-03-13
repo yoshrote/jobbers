@@ -32,10 +32,12 @@ logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
 
+
 class TaskException(Exception):
     "Top-level exception for stuff gone wrong."
 
     pass
+
 
 class UserCancellationError(Exception):
     """Exception raised when a task is cancelled by user request."""
@@ -54,7 +56,9 @@ class StateManager:
     ) -> None:
         self.data_store: Redis = data_store
         self.qca = QueueConfigAdapter(sqlite_conn)
-        self.ta: TaskAdapterProtocol = task_adapter if task_adapter is not None else JsonTaskAdapter(data_store)
+        self.ta: TaskAdapterProtocol = (
+            task_adapter if task_adapter is not None else JsonTaskAdapter(data_store)
+        )
         self.submission_limiter = SubmissionRateLimiter(data_store, self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self.dead_queue: DeadQueueProtocol = DeadQueue(data_store, self.ta)
@@ -113,7 +117,10 @@ class StateManager:
                 task_config = registry.get_task_config(task_type, task_version)
                 if task_config and task_config.max_heartbeat_interval:
                     for task in tasks:
-                        if task.heartbeat_at and (now - task.heartbeat_at) > task_config.max_heartbeat_interval:
+                        if (
+                            task.heartbeat_at
+                            and (now - task.heartbeat_at) > task_config.max_heartbeat_interval
+                        ):
                             task.set_status(TaskStatus.STALLED)
                             pipe = self.data_store.pipeline(transaction=True)
                             self.ta.stage_save(pipe, task)
@@ -124,8 +131,7 @@ class StateManager:
 
         await asyncio.gather(*clean_ops)
 
-
-    async def get_next_task(self, queues: set[str], pop_timeout: int=0) -> Task | None:
+    async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
         if not queues:
             logger.info("no queues defined")
@@ -142,7 +148,12 @@ class StateManager:
     async def submit_task(self, task: Task) -> None:
         queue_config = await self.qca.get_queue_config(queue=task.queue)
         task.set_status(TaskStatus.SUBMITTED)
-        if queue_config and queue_config.rate_numerator and queue_config.rate_denominator and queue_config.rate_period:
+        if (
+            queue_config
+            and queue_config.rate_numerator
+            and queue_config.rate_denominator
+            and queue_config.rate_period
+        ):
             await self.ta.submit_rate_limited_task(task=task, queue_config=queue_config)
         else:
             await self.ta.submit_task(task=task)
@@ -285,6 +296,7 @@ class StateManager:
                     raise UserCancellationError(f"Task {task_id} was cancelled by user request.")
                 await asyncio.sleep(0.01)
 
+
 class SubmissionRateLimiter:
     """
     Rate limiter for tasks in a Redis data store.
@@ -301,7 +313,9 @@ class SubmissionRateLimiter:
         self.data_store = data_store
         self.qca = queue_config_adapter
 
-    async def concurrency_limits(self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]) -> set[str]:
+    async def concurrency_limits(
+        self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]
+    ) -> set[str]:
         """Limit the number of concurrent tasks in each queue."""
         queues_to_use = set()
         queues = list(task_queues)
@@ -320,5 +334,7 @@ class SubmissionRateLimiter:
         earliest_time = now - rate_limit_age
         pipe = self.data_store.pipeline(transaction=True)
         for queue in queues:
-            pipe.zremrangebyscore(self.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp())
+            pipe.zremrangebyscore(
+                self.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp()
+            )
         await pipe.execute()

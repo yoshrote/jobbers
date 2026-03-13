@@ -12,10 +12,11 @@ from jobbers.registry import register_task
     timeout=None,
     max_retries=3,
     retry_delay=None,
-    expected_exceptions=None
+    expected_exceptions=None,
 )
 async def fast_task() -> dict[Any, Any]:
     return {}
+
 
 @register_task(
     name="medium_task",
@@ -24,11 +25,12 @@ async def fast_task() -> dict[Any, Any]:
     timeout=None,
     max_retries=3,
     retry_delay=None,
-    expected_exceptions=None
+    expected_exceptions=None,
 )
 async def medium_task() -> dict[Any, Any]:
     await sleep(30)
     return {}
+
 
 @register_task(
     name="slow_task",
@@ -37,16 +39,18 @@ async def medium_task() -> dict[Any, Any]:
     timeout=None,
     max_retries=3,
     retry_delay=None,
-    expected_exceptions=None
+    expected_exceptions=None,
 )
 async def slow_task() -> dict[Any, Any]:
     await sleep(60)
     return {}
 
+
 class CustomException(Exception):
     """Custom exception for testing expected exceptions in task processing."""
 
     pass
+
 
 @register_task(
     name="fail_task",
@@ -56,7 +60,7 @@ class CustomException(Exception):
     max_retries=3,
     retry_delay=10,
     expected_exceptions=(CustomException,),
-    dead_letter_policy=DeadLetterPolicy.SAVE
+    dead_letter_policy=DeadLetterPolicy.SAVE,
 )
 async def fail_task() -> dict[Any, Any]:
     await sleep(30)

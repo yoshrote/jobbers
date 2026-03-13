@@ -1,4 +1,5 @@
 """Write the application's OpenAPI spec to a file without starting a real server."""
+
 import asyncio
 import json
 import sys

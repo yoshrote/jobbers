@@ -6,7 +6,7 @@ import pytest
 from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
-from jobbers.models.task import Task, TaskPagination, TaskStatus
+from jobbers.models.task import Task, TaskFormat, TaskPagination, TaskStatus
 from jobbers.models.task_config import TaskConfig
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -24,7 +24,7 @@ def sample_task():
         queue="default",
         parameters={},
         status=TaskStatus.STARTED,
-        started_at=dt.datetime.now(dt.UTC)
+        started_at=dt.datetime.now(dt.UTC),
     )
 
 
@@ -50,6 +50,7 @@ def test_task_serialization_and_deserialization():
 
     assert task == deserialized_task
 
+
 def test_valid_params():
     task_id = ULID()
     task = Task(
@@ -66,7 +67,7 @@ def test_valid_params():
         completed_at=None,
     )
 
-    def task_function(foo: str, bar: int|None=5) -> None: # pragma: no cover
+    def task_function(foo: str, bar: int | None = 5) -> None:  # pragma: no cover
         pass
 
     task.task_config = TaskConfig(
@@ -145,6 +146,7 @@ async def test_submit_task(redis, task_adapter):
     assert saved_task.status == TaskStatus.SUBMITTED
     assert saved_task.submitted_at == task.submitted_at
 
+
 @pytest.mark.asyncio
 async def test_submit_task_twice_updates_only(redis, task_adapter):
     """Test that submitting a task twice updates the task but does not add it to the task-list again."""
@@ -168,6 +170,7 @@ async def test_submit_task_twice_updates_only(redis, task_adapter):
     assert saved_task.status == TaskStatus.COMPLETED
     assert saved_task.submitted_at == task.submitted_at
 
+
 @pytest.mark.asyncio
 async def test_get_task(task_adapter):
     """Test retrieving a task from Redis."""
@@ -180,20 +183,25 @@ async def test_get_task(task_adapter):
     assert task.status == TaskStatus.STARTED
     assert task.submitted_at == FROZEN_TIME
 
+
 @pytest.mark.asyncio
 async def test_get_task_not_found(task_adapter):
     """Test retrieving a non-existent task."""
     task = await task_adapter.get_task(ULID1)
     assert task is None
 
+
 @pytest.mark.asyncio
 async def test_task_exists(task_adapter):
     """Test checking if a task exists in Redis."""
-    await task_adapter.save_task(Task(id=ULID1, name="Test Task", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME))
+    await task_adapter.save_task(
+        Task(id=ULID1, name="Test Task", status=TaskStatus.STARTED, submitted_at=FROZEN_TIME)
+    )
     exists = await task_adapter.task_exists(ULID1)
     assert exists
     exists = await task_adapter.task_exists(999)
     assert not exists
+
 
 @pytest.mark.asyncio
 async def test_get_all_tasks(real_task_adapter):
@@ -243,8 +251,7 @@ class TestUpdateTaskHeartbeat:
 
         # Assert
         scores = await task_adapter.data_store.zrange(
-            task_adapter.HEARTBEAT_SCORES(queue=sample_task.queue),
-            0, -1, withscores=True
+            task_adapter.HEARTBEAT_SCORES(queue=sample_task.queue), 0, -1, withscores=True
         )
         assert any(bytes(sample_task.id) == task_id for task_id, _ in scores)
 
@@ -264,8 +271,7 @@ class TestUpdateTaskHeartbeat:
 
         # Assert
         scores = await task_adapter.data_store.zrange(
-            task_adapter.HEARTBEAT_SCORES(queue=sample_task.queue),
-            0, -1, withscores=True
+            task_adapter.HEARTBEAT_SCORES(queue=sample_task.queue), 0, -1, withscores=True
         )
         score = next(score for task_id, score in scores if bytes(sample_task.id) == task_id)
         assert score == second_time.timestamp()
@@ -288,7 +294,7 @@ class TestGetStaleTasks:
             queue="default",
             status=TaskStatus.STARTED,
             started_at=now,
-            heartbeat_at=now - dt.timedelta(minutes=10)
+            heartbeat_at=now - dt.timedelta(minutes=10),
         )
         await task_adapter.save_task(stale_task)
         await task_adapter.update_task_heartbeat(stale_task)
@@ -314,7 +320,7 @@ class TestGetStaleTasks:
             queue="default",
             status=TaskStatus.STARTED,
             started_at=now,
-            heartbeat_at=now - dt.timedelta(minutes=1)
+            heartbeat_at=now - dt.timedelta(minutes=1),
         )
         await task_adapter.save_task(recent_task)
         await task_adapter.update_task_heartbeat(recent_task)
@@ -339,7 +345,7 @@ class TestGetStaleTasks:
             queue="default",
             status=TaskStatus.STARTED,
             started_at=now,
-            heartbeat_at=now - dt.timedelta(minutes=10)
+            heartbeat_at=now - dt.timedelta(minutes=10),
         )
         stale_task_2 = Task(
             id=ULID(),
@@ -347,7 +353,7 @@ class TestGetStaleTasks:
             queue="high_priority",
             status=TaskStatus.STARTED,
             started_at=now,
-            heartbeat_at=now - dt.timedelta(minutes=10)
+            heartbeat_at=now - dt.timedelta(minutes=10),
         )
         await task_adapter.save_task(stale_task_1)
         await task_adapter.save_task(stale_task_2)
@@ -355,7 +361,9 @@ class TestGetStaleTasks:
         await task_adapter.update_task_heartbeat(stale_task_2)
 
         # Act
-        stale_tasks = [task async for task in task_adapter.get_stale_tasks({"default", "high_priority"}, stale_time)]
+        stale_tasks = [
+            task async for task in task_adapter.get_stale_tasks({"default", "high_priority"}, stale_time)
+        ]
 
         # Assert
         assert len(stale_tasks) == 2
@@ -376,7 +384,7 @@ class TestGetStaleTasks:
             queue="default",
             status=TaskStatus.STARTED,
             started_at=now,
-            heartbeat_at=now - dt.timedelta(minutes=10)
+            heartbeat_at=now - dt.timedelta(minutes=10),
         )
         await task_adapter.save_task(stale_task)
         await task_adapter.update_task_heartbeat(stale_task)
@@ -397,8 +405,13 @@ class TestCleanTerminalTasks:
     @pytest.mark.asyncio
     async def test_deletes_old_completed_task_blob(self, task_adapter, redis):
         """A completed task blob older than max_age is deleted."""
-        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
-                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        task = Task(
+            id=ULID1,
+            name="test_task",
+            queue="default",
+            status=TaskStatus.COMPLETED,
+            completed_at=FROZEN_TIME - dt.timedelta(days=8),
+        )
         await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
@@ -408,11 +421,18 @@ class TestCleanTerminalTasks:
     @pytest.mark.asyncio
     async def test_removes_heartbeat_entry(self, task_adapter, redis):
         """The heartbeat sorted-set entry is removed along with the task blob."""
-        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
-                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        task = Task(
+            id=ULID1,
+            name="test_task",
+            queue="default",
+            status=TaskStatus.COMPLETED,
+            completed_at=FROZEN_TIME - dt.timedelta(days=8),
+        )
         await task_adapter.save_task(task)
-        await redis.zadd(task_adapter.HEARTBEAT_SCORES(queue="default"),
-                         {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=8)).timestamp()})
+        await redis.zadd(
+            task_adapter.HEARTBEAT_SCORES(queue="default"),
+            {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=8)).timestamp()},
+        )
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
 
@@ -422,8 +442,13 @@ class TestCleanTerminalTasks:
     @pytest.mark.asyncio
     async def test_removes_type_index_entry(self, task_adapter, redis):
         """Orphaned task-type-idx entries are removed alongside the task blob."""
-        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
-                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        task = Task(
+            id=ULID1,
+            name="test_task",
+            queue="default",
+            status=TaskStatus.COMPLETED,
+            completed_at=FROZEN_TIME - dt.timedelta(days=8),
+        )
         await task_adapter.save_task(task)
         await redis.sadd(task_adapter.TASK_BY_TYPE_IDX(name="test_task"), ULID1.bytes)
 
@@ -435,8 +460,13 @@ class TestCleanTerminalTasks:
     @pytest.mark.asyncio
     async def test_skips_active_task(self, task_adapter, redis):
         """Tasks in active statuses are never deleted regardless of age."""
-        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.STARTED,
-                    started_at=FROZEN_TIME - dt.timedelta(days=100))
+        task = Task(
+            id=ULID1,
+            name="test_task",
+            queue="default",
+            status=TaskStatus.STARTED,
+            started_at=FROZEN_TIME - dt.timedelta(days=100),
+        )
         await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(seconds=0))
@@ -446,8 +476,13 @@ class TestCleanTerminalTasks:
     @pytest.mark.asyncio
     async def test_skips_task_within_age(self, task_adapter, redis):
         """A completed task whose completed_at is within max_age is not deleted."""
-        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
-                    completed_at=FROZEN_TIME - dt.timedelta(hours=1))
+        task = Task(
+            id=ULID1,
+            name="test_task",
+            queue="default",
+            status=TaskStatus.COMPLETED,
+            completed_at=FROZEN_TIME - dt.timedelta(hours=1),
+        )
         await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
@@ -457,26 +492,33 @@ class TestCleanTerminalTasks:
     @pytest.mark.asyncio
     async def test_skips_task_without_completed_at(self, task_adapter, redis):
         """A terminal task with no completed_at is not deleted."""
-        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.FAILED,
-                    completed_at=None)
+        task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.FAILED, completed_at=None)
         await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(seconds=0))
 
         assert await redis.exists(f"task:{ULID1}")
 
-    @pytest.mark.parametrize("status", [
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-        TaskStatus.STALLED,
-        TaskStatus.DROPPED,
-    ])
+    @pytest.mark.parametrize(
+        "status",
+        [
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.STALLED,
+            TaskStatus.DROPPED,
+        ],
+    )
     @pytest.mark.asyncio
     async def test_cleans_all_terminal_statuses(self, task_adapter, redis, status):
         """All five terminal statuses are eligible for cleanup when old enough."""
-        task = Task(id=ULID1, name="test_task", queue="default", status=status,
-                    completed_at=FROZEN_TIME - dt.timedelta(days=8))
+        task = Task(
+            id=ULID1,
+            name="test_task",
+            queue="default",
+            status=status,
+            completed_at=FROZEN_TIME - dt.timedelta(days=8),
+        )
         await task_adapter.save_task(task)
 
         await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
@@ -486,10 +528,20 @@ class TestCleanTerminalTasks:
     @pytest.mark.asyncio
     async def test_leaves_other_tasks_untouched(self, task_adapter, redis):
         """Only old terminal tasks are deleted; active and recent tasks remain."""
-        old_task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
-                        completed_at=FROZEN_TIME - dt.timedelta(days=8))
-        recent_task = Task(id=ULID2, name="test_task", queue="default", status=TaskStatus.COMPLETED,
-                           completed_at=FROZEN_TIME - dt.timedelta(hours=1))
+        old_task = Task(
+            id=ULID1,
+            name="test_task",
+            queue="default",
+            status=TaskStatus.COMPLETED,
+            completed_at=FROZEN_TIME - dt.timedelta(days=8),
+        )
+        recent_task = Task(
+            id=ULID2,
+            name="test_task",
+            queue="default",
+            status=TaskStatus.COMPLETED,
+            completed_at=FROZEN_TIME - dt.timedelta(hours=1),
+        )
         await task_adapter.save_task(old_task)
         await task_adapter.save_task(recent_task)
 
@@ -501,14 +553,21 @@ class TestCleanTerminalTasks:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def _make_rate_task(task_id: ULID, submitted_at: dt.datetime) -> Task:
-    return Task(id=task_id, name="test", queue="default", status=TaskStatus.SUBMITTED, submitted_at=submitted_at)
+    return Task(
+        id=task_id, name="test", queue="default", status=TaskStatus.SUBMITTED, submitted_at=submitted_at
+    )
+
 
 def _default_queue_config(rate_numerator: int = 2) -> QueueConfig:
-    return QueueConfig(name="default", rate_numerator=rate_numerator, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    return QueueConfig(
+        name="default", rate_numerator=rate_numerator, rate_denominator=1, rate_period=RatePeriod.MINUTE
+    )
 
 
 # ── submit_rate_limited_task ───────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_submit_rate_limited_enqueues_when_empty(redis, task_adapter, task_adapter_dt_module):
@@ -577,9 +636,7 @@ async def test_submit_rate_limited_concurrent_respects_limit(redis, task_adapter
     queue_config = _default_queue_config(rate_numerator=limit)
     tasks = [_make_rate_task(ULID(), now) for _ in range(10)]
 
-    results = await asyncio.gather(
-        *[task_adapter.submit_rate_limited_task(t, queue_config) for t in tasks]
-    )
+    results = await asyncio.gather(*[task_adapter.submit_rate_limited_task(t, queue_config) for t in tasks])
 
     accepted = sum(1 for r in results if r)
     assert accepted == limit
@@ -589,6 +646,7 @@ async def test_submit_rate_limited_concurrent_respects_limit(redis, task_adapter
 
 # ── valid_task_params: no task_config ─────────────────────────────────────────
 
+
 def test_valid_task_params_no_task_config():
     """valid_task_params returns True immediately when task_config is None."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
@@ -597,6 +655,7 @@ def test_valid_task_params_no_task_config():
 
 
 # ── shutdown ───────────────────────────────────────────────────────────────────
+
 
 def test_shutdown_no_task_config_is_noop():
     """shutdown() returns immediately when task_config is None."""
@@ -611,6 +670,7 @@ def test_shutdown_continue_policy_is_noop():
     from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 
     async def noop() -> None: ...
+
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
     task.task_config = TaskConfig(name="t", function=noop, on_shutdown=TaskShutdownPolicy.CONTINUE)
     task.shutdown()
@@ -619,9 +679,12 @@ def test_shutdown_continue_policy_is_noop():
 
 # ── should_retry / should_schedule ───────────────────────────────────────────
 
+
 def test_should_retry_true_when_retries_remain():
     from jobbers.models.task_config import TaskConfig
+
     async def noop() -> None: ...
+
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
     task.retry_attempt = 1
@@ -630,7 +693,9 @@ def test_should_retry_true_when_retries_remain():
 
 def test_should_retry_false_when_exhausted():
     from jobbers.models.task_config import TaskConfig
+
     async def noop() -> None: ...
+
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
     task.retry_attempt = 3
@@ -639,7 +704,9 @@ def test_should_retry_false_when_exhausted():
 
 def test_should_schedule_true_when_retry_delay_set():
     from jobbers.models.task_config import TaskConfig
+
     async def noop() -> None: ...
+
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, retry_delay=10)
     assert task.should_schedule() is True
@@ -647,7 +714,9 @@ def test_should_schedule_true_when_retry_delay_set():
 
 def test_should_schedule_false_when_no_retry_delay():
     from jobbers.models.task_config import TaskConfig
+
     async def noop() -> None: ...
+
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, retry_delay=None)
     assert task.should_schedule() is False
@@ -655,9 +724,16 @@ def test_should_schedule_false_when_no_retry_delay():
 
 # ── summarized: with errors ───────────────────────────────────────────────────
 
+
 def test_summarized_includes_last_error_when_errors_present():
-    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED,
-                errors=["first", "last error"])
+    task = Task(
+        id=ULID1,
+        name="t",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        errors=["first", "last error"],
+    )
     summary = task.summarized()
     assert summary["last_error"] == "last error"
 
@@ -670,11 +746,17 @@ def test_summarized_omits_last_error_when_no_errors():
 
 # ── set_status: retried_at and SCHEDULED/UNSUBMITTED branches ────────────────
 
+
 def test_set_status_started_sets_retried_at_when_already_started():
     """Second STARTED transition sets retried_at instead of started_at."""
-    task = Task(id=ULID1, name="t", version=1, queue="default",
-                status=TaskStatus.SUBMITTED,
-                started_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC))
+    task = Task(
+        id=ULID1,
+        name="t",
+        version=1,
+        queue="default",
+        status=TaskStatus.SUBMITTED,
+        started_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
+    )
     task.set_status(TaskStatus.STARTED)
     assert task.retried_at is not None
 

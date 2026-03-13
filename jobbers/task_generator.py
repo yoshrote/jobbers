@@ -18,6 +18,7 @@ meter = metrics.get_meter(__name__)
 time_in_queue = meter.create_histogram("time_in_queue", unit="ms")
 tasks_selected = meter.create_counter("tasks_selected", unit="1")
 
+
 class LocalTTL:
     """
     A context manager to manage time-to-live (TTL) for local operations.
@@ -39,7 +40,9 @@ class LocalTTL:
         self._now = dt.datetime.now(dt.UTC)
         return self._older_than_ttl(self._now)
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None
+    ) -> None:
         if self._older_than_ttl(self._now):
             self.last_refreshed = self._now
 
@@ -47,6 +50,7 @@ class LocalTTL:
         if self.last_refreshed and self.config_ttl:
             return (now - self.last_refreshed).total_seconds() >= self.config_ttl
         return True
+
 
 class MaxTaskCounter:
     """
@@ -63,7 +67,7 @@ class MaxTaskCounter:
         Check if the maximum task limit has been reached.
     """
 
-    def __init__(self, max_tasks: int=0):
+    def __init__(self, max_tasks: int = 0):
         self.max_tasks: int = max_tasks
         self._task_count: int = 0
 
@@ -79,20 +83,25 @@ class MaxTaskCounter:
             self._task_count += 1
         return self._task_count
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None
+    ) -> None:
         pass
+
 
 class TaskGenerator:
     """Generates tasks from the Redis list 'task-list'."""
 
     DEFAULT_QUEUES = {"default"}
 
-    def __init__(self,
-                 state_manager: StateManager,
-                 query_config_adapter: QueueConfigAdapter,
-                 role: str="default",
-                 max_tasks: int=100,
-                 config_ttl: int=60) -> None:
+    def __init__(
+        self,
+        state_manager: StateManager,
+        query_config_adapter: QueueConfigAdapter,
+        role: str = "default",
+        max_tasks: int = 100,
+        config_ttl: int = 60,
+    ) -> None:
         self.role: str = role
         self.state_manager: StateManager = state_manager
         self.query_config_adapter = query_config_adapter
@@ -118,7 +127,8 @@ class TaskGenerator:
         logger.debug("Queues: %s; Active: %s; Limits: %s", queues, active_tasks, queue_worker_limits)
         # TODO: write tests to make sure this filters correctly
         return {
-            q for q in queues
+            q
+            for q in queues
             if not queue_worker_limits.get(q, 0) or active_tasks.get(q, 0) < (queue_worker_limits.get(q) or 0)
         }
 
@@ -133,11 +143,7 @@ class TaskGenerator:
         new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
         if new_refresh_tag != self.refresh_tag:
             self.refresh_tag = new_refresh_tag
-            self.task_queues = {
-                queue
-                for queue in await self.find_queues()
-                if queue
-            }
+            self.task_queues = {queue for queue in await self.find_queues() if queue}
             logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
         return await self.filter_by_worker_queue_capacity(self.task_queues)
 
@@ -171,12 +177,13 @@ class TaskGenerator:
             "role": self.role,
             "task": task.name,
         }
-        if task.submitted_at is None: # This should never happen
-            logger.fatal("Task %s v%s id=%s is missing a submitted_at timestamp.", task.name, task.version, task.id)
+        if task.submitted_at is None:  # This should never happen
+            logger.fatal(
+                "Task %s v%s id=%s is missing a submitted_at timestamp.", task.name, task.version, task.id
+            )
             raise RuntimeError("Pulled a task that was never submitted")
         time_in_queue.record(
-            (dt.datetime.now(dt.UTC) - task.submitted_at).total_seconds() * 1000,
-            metric_tags
+            (dt.datetime.now(dt.UTC) - task.submitted_at).total_seconds() * 1000, metric_tags
         )
         tasks_selected.add(1, metric_tags)
         return task

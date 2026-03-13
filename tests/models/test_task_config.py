@@ -22,7 +22,7 @@ def test_all_dead_letter_policy_values() -> None:
     }
 
 
-async def dummy_task(): # pragma: no cover
+async def dummy_task():  # pragma: no cover
     pass
 
 
@@ -84,10 +84,10 @@ class TestExponentialBackoff:
 
     def test_delay_doubles_each_attempt(self, frozen_now):
         config = make_config(retry_delay=10, backoff_strategy=BackoffStrategy.EXPONENTIAL)
-        assert config.compute_retry_at(0) == frozen_now + dt.timedelta(seconds=10)   # 10 * 2^0
-        assert config.compute_retry_at(1) == frozen_now + dt.timedelta(seconds=20)   # 10 * 2^1
-        assert config.compute_retry_at(2) == frozen_now + dt.timedelta(seconds=40)   # 10 * 2^2
-        assert config.compute_retry_at(3) == frozen_now + dt.timedelta(seconds=80)   # 10 * 2^3
+        assert config.compute_retry_at(0) == frozen_now + dt.timedelta(seconds=10)  # 10 * 2^0
+        assert config.compute_retry_at(1) == frozen_now + dt.timedelta(seconds=20)  # 10 * 2^1
+        assert config.compute_retry_at(2) == frozen_now + dt.timedelta(seconds=40)  # 10 * 2^2
+        assert config.compute_retry_at(3) == frozen_now + dt.timedelta(seconds=80)  # 10 * 2^3
 
     def test_none_delay_treated_as_zero(self, frozen_now):
         config = make_config(retry_delay=None, backoff_strategy=BackoffStrategy.EXPONENTIAL)
