@@ -107,6 +107,8 @@ async def init_state_manager() -> StateManager:
         dead_queue = DeadQueue(client, _task_adapter)  # type: ignore[assignment]
 
     _state_manager = StateManager(client, _sqlite_conn, task_adapter=_task_adapter, dead_queue=dead_queue)
+    await _task_adapter.ensure_index()
+    await _state_manager.dead_queue.ensure_index()
     return _state_manager
 
 
