@@ -5,7 +5,6 @@ from collections import defaultdict
 from unittest.mock import patch
 
 import pytest
-import pytest_asyncio
 from ulid import ULID
 
 from jobbers import registry
@@ -18,11 +17,6 @@ from jobbers.state_manager import StateManager, UserCancellationError
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
-
-@pytest_asyncio.fixture
-async def state_manager(redis, sqlite_conn):
-    """Fixture to provide a StateManager instance with a fake Redis and in-memory SQLite."""
-    return StateManager(redis, sqlite_conn)
 
 
 async def schedule(sm: StateManager, task: Task, run_at: dt.datetime) -> None:
