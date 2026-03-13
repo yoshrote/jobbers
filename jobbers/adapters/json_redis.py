@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.task_adapter import TaskAdapterProtocol, TaskPipeline
     from jobbers.models.queue_config import QueueConfig
 
 
@@ -154,13 +154,14 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         )
         return result == 1
 
-    def stage_save(self, pipe: Pipeline, task: Task) -> None:
+    def stage_save(self, pipe: TaskPipeline, task: Task) -> None:
         """Queue JSON.SET task-details + type-index update onto pipe (no execute)."""
-        pipe.json().set(self.TASK_DETAILS(task_id=task.id), "$", task.to_dict())
+        p = cast("Pipeline", pipe)
+        p.json().set(self.TASK_DETAILS(task_id=task.id), "$", task.to_dict())
         if task.status in TaskStatus.active_statuses():
-            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+            p.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
-            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+            p.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
 
     async def _fetch_task_data_bulk(self, task_ids: list[ULID]) -> list[Any]:
         pipe = self.data_store.pipeline(transaction=False)
@@ -185,9 +186,10 @@ class JsonTaskAdapter(_BaseTaskAdapter):
             task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.UTC)
         return task
 
-    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None:
+    async def read_for_watch(self, pipe: TaskPipeline, task_id: ULID) -> Task | None:
         """Read task data via a WATCH pipeline (JSON format)."""
-        raw_data: dict[str, Any] | None = await pipe.json().get(  # type: ignore[misc]
+        p = cast("Pipeline", pipe)
+        raw_data: dict[str, Any] | None = await p.json().get(  # type: ignore[misc]
             self.TASK_DETAILS(task_id=task_id)
         )
         if raw_data is None:
@@ -328,9 +330,13 @@ class JsonDeadQueue:
                 definition=IndexDefinition(prefix=["dlq:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
             )
 
-    def stage_add(self, pipe: Pipeline, task: Task, failed_at: dt.datetime) -> None:
+    def pipeline(self) -> Pipeline:
+        return self.data_store.pipeline(transaction=True)  # type: ignore[return-value]
+
+    def stage_add(self, pipe: TaskPipeline, task: Task, failed_at: dt.datetime) -> None:
         """Queue JSON.SET DLQ entry onto pipe (no execute)."""
-        pipe.json().set(
+        p = cast("Pipeline", pipe)
+        p.json().set(
             self.DLQ_KEY(task_id=task.id),
             "$",
             {
@@ -341,9 +347,10 @@ class JsonDeadQueue:
             },
         )
 
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str, name: str) -> None:
+    def stage_remove(self, pipe: TaskPipeline, task_id: ULID, queue: str, name: str) -> None:
         """Queue DELETE of the DLQ JSON document onto pipe (no execute)."""
-        pipe.delete(self.DLQ_KEY(task_id=task_id))
+        p = cast("Pipeline", pipe)
+        p.delete(self.DLQ_KEY(task_id=task_id))
 
     async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return per-attempt error history for a DLQ task from its stored task blob."""

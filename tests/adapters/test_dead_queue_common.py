@@ -35,7 +35,7 @@ def make_task(
 
 
 async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
-    pipe = dq.data_store.pipeline(transaction=True)
+    pipe = dq.pipeline()
     dq.stage_add(pipe, task, failed_at)
     await pipe.execute()
 

@@ -51,13 +51,14 @@ class StateManager:
         data_store: Redis,
         sqlite_conn: aiosqlite.Connection,
         task_adapter: TaskAdapterProtocol | None = None,
+        dead_queue: DeadQueueProtocol | None = None,
     ) -> None:
         self.data_store: Redis = data_store
         self.qca = QueueConfigAdapter(sqlite_conn)
         self.ta: TaskAdapterProtocol = task_adapter if task_adapter is not None else JsonTaskAdapter(data_store)
         self.submission_limiter = SubmissionRateLimiter(data_store, self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
-        self.dead_queue: DeadQueueProtocol = DeadQueue(data_store, self.ta)
+        self.dead_queue: DeadQueueProtocol = dead_queue if dead_queue is not None else DeadQueue(data_store, self.ta)
         self.task_scheduler = TaskScheduler(data_store, self.ta)
 
     @property
@@ -115,10 +116,10 @@ class StateManager:
                     for task in tasks:
                         if task.heartbeat_at and (now - task.heartbeat_at) > task_config.max_heartbeat_interval:
                             task.set_status(TaskStatus.STALLED)
-                            pipe = self.data_store.pipeline(transaction=True)
+                            pipe = self.ta.pipeline()
                             self.ta.stage_save(pipe, task)
-                            pipe.zrem(self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
                             stale_pipes.append(pipe.execute())
+                            stale_pipes.append(self.ta.remove_task_heartbeat(task))
             if stale_pipes:
                 await asyncio.gather(*stale_pipes)
 
@@ -149,7 +150,7 @@ class StateManager:
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
-        pipe = self.data_store.pipeline(transaction=True)
+        pipe = self.ta.pipeline()
         self.ta.stage_save(pipe, task)
         await pipe.execute()
         return task
@@ -157,7 +158,7 @@ class StateManager:
     async def fail_task(self, task: Task) -> Task:
         """Persist a failed task and any DLQ side effects in a single atomic transaction."""
         now = dt.datetime.now(dt.UTC)
-        pipe = self.data_store.pipeline(transaction=True)
+        pipe = self.ta.pipeline()
         self.ta.stage_save(pipe, task)
         if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
             logger.info("Task %s sent to dead letter queue.", task.id)
@@ -174,7 +175,7 @@ class StateManager:
                 task.retry_attempt = 0
             task.errors = []
             task.set_status(TaskStatus.SUBMITTED)
-        pipe = self.data_store.pipeline(transaction=True)
+        pipe = self.ta.pipeline()
         for task in tasks:
             self.ta.stage_requeue(pipe, task)
             self.dead_queue.stage_remove(pipe, task.id, task.queue, task.name)
@@ -195,11 +196,21 @@ class StateManager:
         return await self.ta.get_active_tasks(queues)
 
     async def schedule_retry_task(self, task: Task, run_at: dt.datetime) -> Task:
-        """Add a task to the scheduler and save its state in a single atomic transaction."""
-        pipe = self.data_store.pipeline(transaction=True)
-        self.task_scheduler.stage_add(pipe, task, run_at)
-        self.ta.stage_save(pipe, task)
-        await pipe.execute()
+        """Add a task to the scheduler and save its state."""
+        from jobbers.adapters.sql import SqlTaskAdapter
+
+        if isinstance(self.ta, SqlTaskAdapter):
+            # SQL adapter: save task state and Redis scheduler separately
+            # (they cannot share a pipeline across storage backends).
+            await self.ta.save_task(task)
+            sched_pipe = self.data_store.pipeline(transaction=True)
+            self.task_scheduler.stage_add(sched_pipe, task, run_at)
+            await sched_pipe.execute()
+        else:
+            pipe = self.data_store.pipeline(transaction=True)
+            self.task_scheduler.stage_add(pipe, task, run_at)
+            self.ta.stage_save(pipe, task)
+            await pipe.execute()
         logger.info("Task %s scheduled for retry at %s.", task.id, run_at)
         return task
 
@@ -207,7 +218,7 @@ class StateManager:
         """Persist an immediate retry: re-enqueue the task without full re-validation."""
         task.set_status(TaskStatus.SUBMITTED)
         logger.info("Task %s requeued for immediate retry.", task.id)
-        pipe = self.data_store.pipeline(transaction=True)
+        pipe = self.ta.pipeline()
         self.ta.stage_requeue(pipe, task)
         await pipe.execute()
         return task
@@ -216,20 +227,34 @@ class StateManager:
         """
         Move a due scheduled task into its queue and clean up the scheduler atomically.
 
-        Uses WATCH on the task key for optimistic locking: if the task is modified
-        concurrently (e.g. cancelled between scheduler acquisition and dispatch), the
-        pipeline detects the conflict and retries. If the task is already CANCELLED at
-        read time, dispatch is silently skipped.
+        For Redis adapters: uses WATCH on the task key for optimistic locking.
+        For the SQL adapter: SQLite's ``BEGIN IMMEDIATE`` inside get_next_task
+        already serialises access, so we skip WATCH and do a simple read + requeue.
 
         next_due_bulk's Lua script already removed the task from the schedule-queue sorted
         set before this is called, so stage_remove's ZREM is a no-op; the HDEL cleans up
         the residual schedule-task-queue hash entry.
         """
+        from jobbers.adapters.sql import SqlTaskAdapter
+
+        if isinstance(self.ta, SqlTaskAdapter):
+            watched_task = await self.ta.get_task(task.id)
+            if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
+                return task
+            task.set_status(TaskStatus.SUBMITTED)
+            pipe = self.ta.pipeline()
+            self.ta.stage_requeue(pipe, task)
+            await pipe.execute()
+            sched_pipe = self.data_store.pipeline(transaction=True)
+            self.task_scheduler.stage_remove(sched_pipe, task.id, task.queue)
+            await sched_pipe.execute()
+            return task
+
         task_key = self.ta.TASK_DETAILS(task_id=task.id)
         while True:
             pipe = self.data_store.pipeline()
             await pipe.watch(task_key)
-            watched_task: Task | None = await self.ta.read_for_watch(pipe, task.id)
+            watched_task = await self.ta.read_for_watch(pipe, task.id)
             if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
                 await pipe.unwatch()  # type: ignore[no-untyped-call]
                 return task
@@ -253,18 +278,26 @@ class StateManager:
         task = await self.ta.get_task(task_id)
         if task is None:
             return None
+        from jobbers.adapters.sql import SqlTaskAdapter
+
         match task.status:
             case TaskStatus.SCHEDULED:
                 # For scheduled tasks, we can just remove them from the scheduler without a pub/sub dance
                 task.set_status(TaskStatus.CANCELLED)
-                pipe = self.data_store.pipeline(transaction=True)
-                self.task_scheduler.stage_remove(pipe, task_id, task.queue)
-                self.ta.stage_save(pipe, task)
-                await pipe.execute()
+                if isinstance(self.ta, SqlTaskAdapter):
+                    await self.ta.save_task(task)
+                    sched_pipe = self.data_store.pipeline(transaction=True)
+                    self.task_scheduler.stage_remove(sched_pipe, task_id, task.queue)
+                    await sched_pipe.execute()
+                else:
+                    pipe = self.data_store.pipeline(transaction=True)
+                    self.task_scheduler.stage_remove(pipe, task_id, task.queue)
+                    self.ta.stage_save(pipe, task)
+                    await pipe.execute()
             case TaskStatus.SUBMITTED:
                 # remove from the queue immediately so it can't be claimed by a worker
                 task.set_status(TaskStatus.CANCELLED)
-                pipe = self.data_store.pipeline(transaction=True)
+                pipe = self.ta.pipeline()
                 self.ta.stage_remove_from_queue(pipe, task)
                 self.ta.stage_save(pipe, task)
                 await pipe.execute()

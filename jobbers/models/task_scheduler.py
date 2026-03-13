@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.task_adapter import TaskAdapterProtocol, TaskPipeline
     from jobbers.models.task import Task
 
 
@@ -52,15 +52,17 @@ class TaskScheduler:
         self.data_store = data_store
         self.ta = task_adapter
 
-    def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
+    def stage_add(self, pipe: TaskPipeline, task: Task, run_at: dt.datetime) -> None:
         """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
-        pipe.zadd(self.SCHEDULE_QUEUE(queue=task.queue), {bytes(task.id): run_at.timestamp()})
-        pipe.hset(self.SCHEDULE_TASK_QUEUE, str(task.id), task.queue)
+        p = cast("Pipeline", pipe)
+        p.zadd(self.SCHEDULE_QUEUE(queue=task.queue), {bytes(task.id): run_at.timestamp()})
+        p.hset(self.SCHEDULE_TASK_QUEUE, str(task.id), task.queue)
 
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str) -> None:
+    def stage_remove(self, pipe: TaskPipeline, task_id: ULID, queue: str) -> None:
         """Queue ZREM schedule-queue + HDEL schedule-task-queue onto pipe (no execute)."""
-        pipe.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
-        pipe.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
+        p = cast("Pipeline", pipe)
+        p.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
+        p.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
 
     async def get_by_filter(
         self,
