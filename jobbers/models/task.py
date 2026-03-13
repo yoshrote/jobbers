@@ -1,6 +1,5 @@
 import datetime as dt
 import inspect
-import json
 import logging
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Self
@@ -133,14 +132,9 @@ class Task(BaseModel):
             "completed_at": _ts(self.completed_at),
         }
 
-    def pack(self) -> str:
-        """Serialize task fields to a JSON string (used for Lua script ARGV values)."""
-        return json.dumps(self.to_dict())
-
     @classmethod
-    def unpack(cls, task_id: ULID, data: str | dict[str, Any]) -> "Self":
-        """Deserialize a task from a JSON string or dict."""
-        raw: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
+    def from_dict(cls, task_id: ULID, raw: dict[str, Any]) -> "Self":
+        """Construct a Task from a plain dict (as produced by to_dict())."""
 
         def _dt(ts: float | None) -> dt.datetime | None:
             return dt.datetime.fromtimestamp(ts, dt.UTC) if ts is not None else None
