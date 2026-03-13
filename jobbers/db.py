@@ -84,8 +84,9 @@ async def init_state_manager() -> StateManager:
     await create_schema(_sqlite_conn)
     client = get_client()
     _task_adapter = create_task_adapter(client)
-    await _task_adapter.ensure_index()
     _state_manager = StateManager(client, _sqlite_conn, task_adapter=_task_adapter)
+    await _task_adapter.ensure_index()
+    await _state_manager.dead_queue.ensure_index()
     return _state_manager
 
 
