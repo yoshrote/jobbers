@@ -255,6 +255,12 @@ class JsonTaskAdapter(_BaseTaskAdapter):
             for doc in search_results.docs:
                 task_id = ULID.from_str(doc.id.removeprefix("task:"))
                 group.create_task(self._add_task_to_results(task_id, results))
+
+        # final sort to ensure correct order after async fetches
+        if pagination.order_by == PaginationOrder.SUBMITTED_AT:
+            results.sort(key=lambda t: t.submitted_at or dt.datetime.min)
+        else: # default to sorting by ID (which is roughly creation time) if not sorting by submitted_at
+            results.sort(key=lambda t: t.id)
         return results
 
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
@@ -331,6 +337,7 @@ class JsonDeadQueue:
                 fields=[
                     TagField("$.name", as_name="name"),
                     TagField("$.queue", as_name="queue"),
+                    NumericField("$.version", as_name="version"),
                     NumericField("$.failed_at", as_name="failed_at", sortable=True),
                 ],
                 definition=IndexDefinition(prefix=["dlq:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
@@ -344,6 +351,7 @@ class JsonDeadQueue:
             {
                 "task_id": str(task.id),
                 "name": task.name,
+                "version": task.version,
                 "queue": task.queue,
                 "failed_at": failed_at.timestamp(),
             },
@@ -392,11 +400,12 @@ class JsonDeadQueue:
             query_parts.append(f"@queue:{{{_escape_tag(queue)}}}")
         if task_name is not None:
             query_parts.append(f"@name:{{{_escape_tag(task_name)}}}")
+        if task_version is not None:
+            query_parts.append(f"@version:[{task_version} {task_version}]")
         query_str = " ".join(query_parts) if query_parts else "*"
 
-        fetch_limit = limit * 5 if task_version is not None else limit
         q: SearchQuery = (
-            SearchQuery(query_str).no_content().sort_by("failed_at", asc=False).paging(0, fetch_limit)
+            SearchQuery(query_str).no_content().sort_by("failed_at", asc=False).paging(0, limit)
         )
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
         if not search_results.docs:
@@ -404,16 +413,7 @@ class JsonDeadQueue:
 
         ulids = [ULID.from_str(doc.id.removeprefix("dlq:")) for doc in search_results.docs]
         fetched: list[Task | None] = await self.ta.get_tasks_bulk(ulids)
-        results: list[Task] = []
-        for task in fetched:
-            if len(results) >= limit:
-                break
-            if task is None:
-                continue
-            if task_version is not None and task.version != task_version:
-                continue
-            results.append(task)
-        return results
+        return [task for task in fetched if task is not None]
 
     async def remove_many(self, task_ids: list[str]) -> None:
         """Remove multiple entries from the dead letter queue in a single transaction."""

@@ -206,6 +206,32 @@ async def test_get_by_filter_limit_respected(dead_queue):
 
 
 @pytest.mark.asyncio
+async def test_get_by_filter_respects_limit_with_version_filter(dead_queue):
+    """get_by_filter respects limit when filtering by task_version."""
+    dq, adapter = dead_queue
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", version=1)
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", version=1)
+    for t in (t1, t2):
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
+
+    results = await dq.get_by_filter(task_version=1, limit=1)
+    assert len(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_skips_missing_task_data(dead_queue):
+    """If a task is in the DLQ index but its blob is gone, it is skipped."""
+    dq, _ = dead_queue
+    task = make_task()
+    pipe = dq.data_store.pipeline(transaction=True)
+    dq.stage_add(pipe, task, FAILED_AT)
+    await pipe.execute()
+
+    assert await dq.get_by_filter() == []
+
+
+@pytest.mark.asyncio
 async def test_get_by_filter_no_match_returns_empty(dead_queue):
     dq, adapter = dead_queue
     task = make_task(queue="q1")
@@ -409,3 +435,4 @@ async def test_clean_empty_queue_is_silent(dead_queue):
     """Clean on an empty DLQ should not raise."""
     dq, _ = dead_queue
     await dq.clean(dt.datetime(2025, 1, 1, tzinfo=dt.UTC))
+
