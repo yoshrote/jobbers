@@ -54,6 +54,43 @@ async def task_adapter(request, redis):
         await r.aclose()
 
 
+@pytest_asyncio.fixture
+async def json_adapter():
+    """
+    JsonTaskAdapter backed by real Redis Stack; skips if unavailable.
+
+    Use this for json-specific edge case tests that cannot be expressed as
+    protocol contract tests (e.g., null JSON blob, missing RediSearch doc).
+    """
+    r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+    try:
+        await r.flushdb()
+    except RedisConnectionError as exc:  # pragma: no cover
+        await r.aclose()
+        pytest.skip(f"Redis not available: {exc}")
+    adapter = JsonTaskAdapter(r)
+    try:
+        await adapter.ensure_index()
+    except ResponseError as exc:  # pragma: no cover
+        await r.aclose()
+        pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
+    yield adapter
+    await r.flushdb()
+    await r.aclose()
+
+
+@pytest_asyncio.fixture
+async def json_dead_queue(json_adapter):
+    """
+    JsonDeadQueue backed by real Redis Stack; skips if unavailable (via json_adapter).
+
+    Use this for JsonDeadQueue-specific edge case tests.
+    """
+    dq = JsonDeadQueue(json_adapter.data_store, json_adapter)
+    await dq.ensure_index()
+    yield dq
+
+
 @pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])
 async def dead_queue(request, dummy_task_adapter):
     """

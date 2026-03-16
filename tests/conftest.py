@@ -27,19 +27,30 @@ def task_adapter(redis, request):
 
 
 @pytest_asyncio.fixture
-async def state_manager(redis, sqlite_conn, task_adapter):
-    """Fixture to provide a StateManager instance parametrized over all TaskAdapterProtocol implementations."""
-    return StateManager(redis, sqlite_conn, task_adapter=task_adapter)
+async def state_manager(redis, sqlite_conn, dummy_task_adapter):
+    """StateManager backed by DummyTaskAdapter: fast, single-run, for tests that don't exercise adapter internals."""
+    return StateManager(redis, sqlite_conn, task_adapter=dummy_task_adapter)
+
+
+@pytest_asyncio.fixture
+async def state_manager_real_ta(redis, sqlite_conn):
+    """StateManager backed by MsgpackTaskAdapter for tests that exercise the full adapter call path."""
+    return StateManager(redis, sqlite_conn, task_adapter=MsgpackTaskAdapter(redis))
 
 
 class DummyTaskAdapter:
     """
-    Minimal in-memory TaskAdapterProtocol for use as a test dependency.
+    In-memory TaskAdapterProtocol stub for use as a test dependency.
 
-    Implements ``stage_save``, ``get_task``, and ``get_tasks_bulk``.
-    ``save_task`` is kept as a test-convenience wrapper (not part of the protocol).
-    Any other protocol method raises ``NotImplementedError`` immediately,
-    so accidental use is caught at the call site.
+    Implements the subset of the protocol needed for StateManager tests that
+    exercise orchestration logic rather than adapter internals.  Pipeline-staged
+    methods (stage_requeue, stage_remove_from_queue) add real Redis commands to
+    whatever pipeline they receive from the caller, so tests that verify Redis
+    state via the ``redis`` fixture still work as expected.
+
+    ``save_task`` is a test-convenience wrapper (not part of the protocol).
+    Any unimplemented method raises ``NotImplementedError`` immediately so
+    accidental use is caught at the call site.
     """
 
     TASKS_BY_QUEUE = _BaseTaskAdapter.TASKS_BY_QUEUE
@@ -52,17 +63,42 @@ class DummyTaskAdapter:
     def __init__(self) -> None:
         self._store: dict[ULID, Task] = {}
 
-    def stage_save(self, pipe: object, task: Task) -> None:
-        self._store[task.id] = task
-
-    async def save_task(self, task: Task) -> None:
-        self.stage_save(None, task)
+    # ── read ──────────────────────────────────────────────────────────────────
 
     async def get_task(self, task_id: ULID) -> Task | None:
         return self._store.get(task_id)
 
     async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]:
         return [self._store.get(task_id) for task_id in task_ids]
+
+    async def read_for_watch(self, pipe: object, task_id: ULID) -> Task | None:
+        """Read from in-memory store; the pipe is in WATCH mode but is not used here."""
+        return self._store.get(task_id)
+
+    # ── write ─────────────────────────────────────────────────────────────────
+
+    async def submit_task(self, task: Task) -> bool:
+        self._store[task.id] = task
+        return True
+
+    def stage_save(self, pipe: object, task: Task) -> None:
+        self._store[task.id] = task
+
+    def stage_requeue(self, pipe: object, task: Task) -> None:
+        """Eagerly store the task and add a ZADD to the caller's Redis pipeline."""
+        assert task.submitted_at  # noqa: S101
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})  # type: ignore[union-attr]
+        self._store[task.id] = task
+
+    def stage_remove_from_queue(self, pipe: object, task: Task) -> None:
+        """Add ZREM + SREM commands to the caller's Redis pipeline."""
+        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))  # type: ignore[union-attr]
+        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))  # type: ignore[union-attr]
+
+    # ── convenience (not part of protocol) ───────────────────────────────────
+
+    async def save_task(self, task: Task) -> None:
+        self.stage_save(None, task)
 
     def __getattr__(self, name: str) -> object:
         raise NotImplementedError(f"DummyTaskAdapter.{name} is not implemented")

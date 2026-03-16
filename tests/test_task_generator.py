@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock
 
@@ -289,3 +290,58 @@ async def test_filter_by_worker_queue_capacity_regression_test():
     # The bug was using > instead of <, which would have incorrectly included busy_queue
     assert result == {"available_queue"}
     queue_config_adapter.get_queue_limits.assert_called_once_with(queues)
+
+
+# ── stop() ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stop_prevents_further_iteration():
+    """Calling stop() sets _run=False; the next __anext__ raises StopAsyncIteration."""
+    state_manager = Mock(spec=StateManager)
+    queue_config_adapter = Mock(spec=QueueConfigAdapter)
+    task_generator = TaskGenerator(state_manager, queue_config_adapter)
+
+    task_generator.stop()
+    result = await anext(task_generator, EXHAUSTED)
+    assert result is EXHAUSTED
+
+
+# ── CancelledError handling ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancelled_error_propagates():
+    """CancelledError from get_next_task is re-raised after the except block."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    queue_config_adapter = Mock(spec=QueueConfigAdapter)
+    queue_config_adapter.get_queue_limits.return_value = {}
+    task_generator = TaskGenerator(state_manager, queue_config_adapter)
+
+    state_manager.get_next_task.side_effect = asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await task_generator.__anext__()
+
+
+# ── missing submitted_at ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_missing_submitted_at_raises_runtime_error():
+    """A task returned by get_next_task with no submitted_at raises RuntimeError."""
+    from ulid import ULID as _ULID
+
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    queue_config_adapter = Mock(spec=QueueConfigAdapter)
+    queue_config_adapter.get_queue_limits.return_value = {}
+
+    task = Task(id=_ULID(), name="test_task", version=1)  # submitted_at=None by default
+    state_manager.get_next_task.return_value = task
+
+    task_generator = TaskGenerator(state_manager, queue_config_adapter)
+
+    with pytest.raises(RuntimeError, match="Pulled a task that was never submitted"):
+        await task_generator.__anext__()

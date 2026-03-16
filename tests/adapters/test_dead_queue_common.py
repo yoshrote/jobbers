@@ -208,10 +208,8 @@ async def test_get_by_filter_limit_respected(dead_queue):
 
 @pytest.mark.asyncio
 async def test_get_by_filter_skips_missing_task_data(dead_queue):
-    """If a task is in the DLQ sorted set but its blob is gone, it is skipped."""
+    """If a task is in the DLQ index but its blob is gone, it is skipped."""
     dq, _ = dead_queue
-    if not isinstance(dq, DeadQueue):
-        pytest.skip("raw DeadQueue only: tests blob-missing resilience")
     task = make_task()
     pipe = dq.data_store.pipeline(transaction=True)
     dq.stage_add(pipe, task, FAILED_AT)

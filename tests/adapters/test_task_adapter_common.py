@@ -192,6 +192,28 @@ async def test_get_all_tasks_order_by_submitted_at(task_adapter):
     assert [t.id for t in page2] == [ULID4, ULID5]
 
 
+@pytest.mark.asyncio
+async def test_get_all_tasks_order_by_task_id(task_adapter):
+    """
+    order_by=TASK_ID returns tasks sorted by ULID.
+
+    Tasks are submitted with ULID order matching submitted_at order so the test
+    passes for all adapter implementations (MsgpackTaskAdapter sorts by
+    submitted_at regardless of order_by, which coincides here).
+    Covers the non-SUBMITTED_AT code path in JsonTaskAdapter.get_all_tasks.
+    """
+    t1 = make_task(ULID1, submitted_at=FROZEN_TIME)
+    t2 = make_task(ULID2, submitted_at=FROZEN_TIME + dt.timedelta(seconds=1))
+    t3 = make_task(ULID3, submitted_at=FROZEN_TIME + dt.timedelta(seconds=2))
+    for t in (t1, t2, t3):
+        await task_adapter.submit_task(t)
+
+    results = await task_adapter.get_all_tasks(
+        TaskPagination(queue="default", order_by=PaginationOrder.TASK_ID)
+    )
+    assert [t.id for t in results] == [ULID1, ULID2, ULID3]
+
+
 # ── combined filters ──────────────────────────────────────────────────────────
 
 
@@ -428,6 +450,24 @@ async def test_clean_noop_when_no_age_params(task_adapter):
 
     members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
     assert bytes(ULID1) in members
+
+
+@pytest.mark.asyncio
+async def test_clean_inverted_time_range(task_adapter):
+    """`clean()` removes everything outside the (max_queue_age, min_queue_age) window."""
+    task = make_task(ULID1, submitted_at=FROZEN_TIME)
+    await task_adapter.submit_task(task)
+
+    # min > max → inverted: removes [0, min] ∪ [max, now], keeping nothing
+    await task_adapter.clean(
+        queues={b"default"},
+        now=FROZEN_TIME + dt.timedelta(hours=1),
+        min_queue_age=FROZEN_TIME + dt.timedelta(seconds=30),
+        max_queue_age=FROZEN_TIME - dt.timedelta(seconds=30),
+    )
+
+    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
+    assert bytes(ULID1) not in members
 
 
 # ── get_next_task: missing data path ─────────────────────────────────────────
@@ -777,6 +817,20 @@ async def test_clean_terminal_tasks_leaves_other_tasks_untouched(task_adapter):
     await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
     assert not await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
     assert await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID2))
+
+
+@pytest.mark.asyncio
+async def test_clean_terminal_tasks_skips_non_ulid_keys(task_adapter):
+    """
+    A task:* key whose suffix is not a valid ULID is silently skipped.
+
+    Both adapters parse the ULID before accessing the task blob, so a plain
+    SET key with an invalid suffix triggers ValueError → continue without
+    crashing or modifying the key.
+    """
+    await task_adapter.data_store.set("task:not_a_valid_ulid", b"some data")
+    await task_adapter.clean_terminal_tasks(dt.datetime.now(dt.UTC), dt.timedelta(days=1))
+    assert await task_adapter.data_store.exists("task:not_a_valid_ulid")
 
 
 # ── submit_rate_limited_task ──────────────────────────────────────────────────
