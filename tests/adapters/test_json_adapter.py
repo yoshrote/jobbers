@@ -110,3 +110,23 @@ async def test_get_by_filter_skips_missing_task_blob(json_dead_queue):
 
     results = await json_dead_queue.get_by_filter()
     assert results == []
+
+
+# ── JsonDeadQueue: ordering ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_sorted_by_failed_at_desc(json_dead_queue, json_adapter):
+    """JsonDeadQueue returns get_by_filter results sorted by failed_at descending (most recent first)."""
+    earlier = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+    later = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
+    t1 = make_failed_task(task_id=ULID1)
+    t2 = make_failed_task(task_id=ULID2)
+    await json_adapter.save_task(t1)
+    await json_adapter.save_task(t2)
+    await add_to_dlq(json_dead_queue, t1, earlier)
+    await add_to_dlq(json_dead_queue, t2, later)
+
+    results = await json_dead_queue.get_by_filter()
+    assert len(results) == 2
+    assert results[0].id == t2.id  # LATER first

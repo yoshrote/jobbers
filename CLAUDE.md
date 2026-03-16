@@ -149,3 +149,37 @@ mypy jobbers
 ```
 
 mypy is configured with `strict = true` and runs only on the `jobbers/` package (tests are excluded).
+
+
+### Test Architecture
+
+The test suite follows a layered approach designed for speed and systematic protocol coverage:
+
+#### Three tiers of tests
+
+| Tier | Where | Fixture | Purpose |
+|------|-------|---------|---------|
+| **Protocol contract** | `tests/adapters/test_task_adapter_common.py`, `test_dead_queue_common.py` | `task_adapter` / `dead_queue` (parametrized over all implementations) | Verify every implementation satisfies the protocol. Adding a new adapter means adding a fixture variant — all contract tests run automatically. |
+| **Implementation edge cases** | `tests/adapters/test_msgpack_adapter.py`, `test_json_adapter.py` | `msgpack_adapter` / `json_adapter` | Cover implementation-specific behaviour that is not a protocol requirement (e.g., sorting limitations, null JSON blobs). |
+| **Orchestration** | `test_state_manager.py`, `test_task_processor.py`, `test_task_routes.py`, `test_task_generator.py` | `DummyTaskAdapter` or `Mock(spec=StateManager)` | Test coordination logic without touching real adapters; fast, no Redis Stack required. |
+
+#### Key rules
+
+- **Prefer common tests.** If a behaviour belongs to the protocol, put it in the common file and run it against all implementations.
+- **xfail, don't skip, for known limitations.** If one implementation cannot satisfy a contract test, mark it `@pytest.mark.xfail(strict=True)` with a reason. This keeps the test discoverable and will alert you when the limitation is fixed.
+- **Adapter fixtures**
+  - `task_adapter` (parametrized `["raw", "json"]`) — MsgpackTaskAdapter via FakeRedis + JsonTaskAdapter via real Redis Stack (skipped if unavailable).
+  - `dead_queue` (parametrized `["raw", "json"]`) — same pattern, yields `(dq, task_adapter)`.
+  - `msgpack_adapter` — plain MsgpackTaskAdapter via FakeRedis; for msgpack-specific edge cases.
+  - `json_adapter` — JsonTaskAdapter via real Redis Stack; for json-specific edge cases.
+  - `json_dead_queue` — JsonDeadQueue backed by `json_adapter`; for JsonDeadQueue-specific edge cases.
+  - `DummyTaskAdapter` (in `tests/conftest.py`) — in-memory stub; use for `state_manager` orchestration tests.
+
+#### Known hard-to-cover paths (concurrency guards)
+
+The following lines are defensive race-condition guards that require a key to be deleted between a `scan_iter` and a subsequent `GET`/`JSON.GET`. They cannot be covered reliably without concurrent test execution or low-level patching:
+
+- `jobbers/adapters/raw_redis.py` line 249 — `if task_data is None: continue` in `MsgpackTaskAdapter.clean_terminal_tasks`
+- `jobbers/task_generator.py` lines 167–169 — the `if task:` requeue branch in `TaskGenerator.__anext__`'s `CancelledError` handler (task is always `None` when `get_next_task` raises, making this branch unreachable in practice)
+
+These should be addressed with integration tests or by restructuring the code so the guard is testable.
