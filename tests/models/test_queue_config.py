@@ -188,3 +188,103 @@ async def test_get_queue_limits_large_number_of_queues(queue_config_adapter):
     assert len(result) == 20
     for i, name in enumerate(queue_names):
         assert result[name] == i + 1
+
+
+# ---------------------------------------------------------------------------
+# delete_queue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_removes_queue(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.delete_queue("q1")
+    assert await queue_config_adapter.get_queue_config("q1") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_removes_role_queue_association(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_role("role1", {"q1"})
+    await queue_config_adapter.delete_queue("q1")
+    assert await queue_config_adapter.get_queues("role1") == set()
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_bumps_refresh_tag_for_affected_roles(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_role("role1", {"q1"})
+    tag_before = await queue_config_adapter.get_refresh_tag("role1")
+    await queue_config_adapter.delete_queue("q1")
+    tag_after = await queue_config_adapter.get_refresh_tag("role1")
+    assert tag_after != tag_before
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_does_not_bump_unaffected_roles(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q2"))
+    await queue_config_adapter.save_role("role1", {"q1"})
+    await queue_config_adapter.save_role("role2", {"q2"})
+    tag_before = await queue_config_adapter.get_refresh_tag("role2")
+    await queue_config_adapter.delete_queue("q1")
+    tag_after = await queue_config_adapter.get_refresh_tag("role2")
+    assert tag_after == tag_before
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_leaves_other_queues_intact(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q2"))
+    await queue_config_adapter.delete_queue("q1")
+    assert await queue_config_adapter.get_queue_config("q2") is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_nonexistent_is_silent(queue_config_adapter):
+    await queue_config_adapter.delete_queue("does_not_exist")
+
+
+# ---------------------------------------------------------------------------
+# delete_role
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_role_removes_role(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_role("role1", {"q1"})
+    await queue_config_adapter.delete_role("role1")
+    assert "role1" not in await queue_config_adapter.get_all_roles()
+
+
+@pytest.mark.asyncio
+async def test_delete_role_removes_role_queue_associations(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_role("role1", {"q1"})
+    await queue_config_adapter.delete_role("role1")
+    assert await queue_config_adapter.get_queues("role1") == set()
+
+
+@pytest.mark.asyncio
+async def test_delete_role_preserves_queue_configs(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_role("role1", {"q1"})
+    await queue_config_adapter.delete_role("role1")
+    assert await queue_config_adapter.get_queue_config("q1") is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_role_leaves_other_roles_intact(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q2"))
+    await queue_config_adapter.save_role("role1", {"q1"})
+    await queue_config_adapter.save_role("role2", {"q2"})
+    await queue_config_adapter.delete_role("role1")
+    assert "role2" in await queue_config_adapter.get_all_roles()
+    assert await queue_config_adapter.get_queues("role2") == {"q2"}
+
+
+@pytest.mark.asyncio
+async def test_delete_role_nonexistent_is_silent(queue_config_adapter):
+    await queue_config_adapter.delete_role("does_not_exist")
