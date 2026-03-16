@@ -4,8 +4,8 @@ from enum import StrEnum
 from typing import Any, Self
 
 from pydantic import BaseModel
-from sqlalchemy import delete, select, update
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import delete, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ulid import ULID
 
@@ -80,26 +80,20 @@ class QueueConfigAdapter:
             )
             return {row[0] for row in result.fetchall()}
 
-    async def save_role(self, role: str, queues: set[str]) -> None:
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
         new_tag = str(ULID())
-        async with self.conn.cursor() as cur:
-            try:
-                await cur.execute(
-                    "INSERT INTO roles (name, refresh_tag) VALUES (?, ?)"
-                    " ON CONFLICT(name) DO UPDATE SET refresh_tag = excluded.refresh_tag",
-                    (role, new_tag),
-                )
-                await cur.execute("DELETE FROM role_queues WHERE role = ?", (role,))
-                if queues:
-                    await cur.executemany(
-                        "INSERT INTO role_queues (role, queue) VALUES (?, ?)",
-                        [(role, q) for q in queues],
-                    )
-            except aiosqlite.IntegrityError:
-                await self.conn.rollback()
-                raise
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(select(roles.c.name).where(roles.c.name == role))
+            if existing.fetchone():
+                await session.execute(update(roles).where(roles.c.name == role).values(refresh_tag=new_tag))
             else:
-                await self.conn.commit()
+                await session.execute(insert(roles).values(name=role, refresh_tag=new_tag))
+            await session.execute(delete(role_queues).where(role_queues.c.role == role))
+            if queues_set:
+                await session.execute(
+                    insert(role_queues),
+                    [{"role": role, "queue": q} for q in queues_set],
+                )
 
     async def get_all_queues(self) -> list[str]:
         async with self.session_factory() as session:
@@ -128,23 +122,27 @@ class QueueConfigAdapter:
         return QueueConfig.from_row(row)
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
-        await self.conn.execute(
-            "INSERT INTO queues (name, max_concurrent, rate_numerator, rate_denominator, rate_period)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(name) DO UPDATE SET"
-            "   max_concurrent   = excluded.max_concurrent,"
-            "   rate_numerator   = excluded.rate_numerator,"
-            "   rate_denominator = excluded.rate_denominator,"
-            "   rate_period      = excluded.rate_period",
-            (
-                queue_config.name,
-                queue_config.max_concurrent,
-                queue_config.rate_numerator,
-                queue_config.rate_denominator,
-                queue_config.rate_period,
-            ),
-        )
-        await self.conn.commit()
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(select(queues.c.name).where(queues.c.name == queue_config.name))
+            if existing.fetchone():
+                await session.execute(
+                    update(queues).where(queues.c.name == queue_config.name).values(
+                        max_concurrent=queue_config.max_concurrent,
+                        rate_numerator=queue_config.rate_numerator,
+                        rate_denominator=queue_config.rate_denominator,
+                        rate_period=queue_config.rate_period,
+                    )
+                )
+            else:
+                await session.execute(
+                    insert(queues).values(
+                        name=queue_config.name,
+                        max_concurrent=queue_config.max_concurrent,
+                        rate_numerator=queue_config.rate_numerator,
+                        rate_denominator=queue_config.rate_denominator,
+                        rate_period=queue_config.rate_period,
+                    )
+                )
 
     async def delete_queue(self, queue_name: str) -> None:
         """Delete a queue and cascade to role_queues; bump refresh_tag for affected roles."""
@@ -192,11 +190,11 @@ class QueueConfigAdapter:
             return ULID.from_str(row[0])
 
         init_tag = ULID()
-        await self.conn.execute(
-            "INSERT OR IGNORE INTO roles (name, refresh_tag) VALUES (?, ?)",
-            (role, str(init_tag)),
-        )
-        await self.conn.commit()
+        try:
+            async with self.session_factory.begin() as session:
+                await session.execute(insert(roles).values(name=role, refresh_tag=str(init_tag)))
+        except IntegrityError:
+            pass  # Another process inserted first
         # Re-read in case another process won the race
         async with self.session_factory() as session:
             result = await session.execute(
