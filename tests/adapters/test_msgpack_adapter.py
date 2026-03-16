@@ -1,11 +1,16 @@
-"""Tests specific to MsgpackTaskAdapter methods not covered by protocol contract tests."""
+"""
+MsgpackTaskAdapter-specific tripwires and edge cases not covered by protocol contract tests.
+
+Contract tests (including ensure_index, read_for_watch, get_all_tasks missing-blob) live in
+test_task_adapter_common.py and run against both adapter implementations.
+"""
 
 import datetime as dt
 
 import pytest
 from ulid import ULID
 
-from jobbers.models.task import PaginationOrder, Task, TaskPagination
+from jobbers.models.task import PaginationOrder, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
 FROZEN_TIME = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -22,68 +27,12 @@ def make_task(
     queue: str = "default",
     status: TaskStatus = TaskStatus.SUBMITTED,
     submitted_at: dt.datetime = FROZEN_TIME,
-) -> Task:
+):
+    from jobbers.models.task import Task
+
     task = Task(id=task_id, name=name, version=version, queue=queue, status=status)
     task.submitted_at = submitted_at
     return task
-
-
-# ── ensure_index ──────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_ensure_index_is_noop(msgpack_adapter):
-    """ensure_index completes without error (no-op for msgpack backend)."""
-    await msgpack_adapter.ensure_index()
-
-
-# ── read_for_watch ────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_read_for_watch_returns_task(msgpack_adapter, redis):
-    task = make_task()
-    await msgpack_adapter.save_task(task)
-
-    task_key = msgpack_adapter.TASK_DETAILS(task_id=ULID1)
-    pipe = redis.pipeline()
-    await pipe.watch(task_key)
-    result = await msgpack_adapter.read_for_watch(pipe, ULID1)
-    await pipe.unwatch()
-
-    assert result is not None
-    assert result.id == ULID1
-    assert result.name == "my_task"
-
-
-@pytest.mark.asyncio
-async def test_read_for_watch_returns_none_when_missing(msgpack_adapter, redis):
-    task_key = msgpack_adapter.TASK_DETAILS(task_id=ULID1)
-    pipe = redis.pipeline()
-    await pipe.watch(task_key)
-    result = await msgpack_adapter.read_for_watch(pipe, ULID1)
-    await pipe.unwatch()
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_read_for_watch_preserves_task_fields(msgpack_adapter, redis):
-    task = make_task(status=TaskStatus.STARTED)
-    task.errors = ["oops"]
-    task.retry_attempt = 2
-    await msgpack_adapter.save_task(task)
-
-    task_key = msgpack_adapter.TASK_DETAILS(task_id=ULID1)
-    pipe = redis.pipeline()
-    await pipe.watch(task_key)
-    result = await msgpack_adapter.read_for_watch(pipe, ULID1)
-    await pipe.unwatch()
-
-    assert result is not None
-    assert result.status == TaskStatus.STARTED
-    assert result.errors == ["oops"]
-    assert result.retry_attempt == 2
 
 
 # ── get_all_tasks: known limitations ─────────────────────────────────────────
@@ -182,20 +131,6 @@ async def test_get_all_tasks_task_id_order(msgpack_adapter):
         TaskPagination(queue="default", order_by=PaginationOrder.SUBMITTED_AT)
     )
     assert [r.id for r in results] == [ULID3, ULID2, ULID1]
-
-
-# ── get_all_tasks: raw_data=None (deleted between scan and GET) ───────────────
-
-
-@pytest.mark.asyncio
-async def test_get_all_tasks_skips_missing_data(msgpack_adapter, redis):
-    """Task ID in the queue sorted set but blob deleted → silently skipped."""
-    task = make_task()
-    await msgpack_adapter.submit_task(task)
-    await redis.delete(msgpack_adapter.TASK_DETAILS(task_id=ULID1))
-
-    results = await msgpack_adapter.get_all_tasks(TaskPagination(queue="default"))
-    assert results == []
 
 
 # ── clean_terminal_tasks: edge cases ─────────────────────────────────────────
