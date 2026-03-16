@@ -46,7 +46,7 @@ async def test_validate_task_valid_sets_task_config():
     task = Task(id=ULID1, name="Test Task", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with patch("jobbers.validation.db.get_sqlite_conn", return_value=MagicMock()):
+        with patch("jobbers.validation.db.get_session_factory", return_value=MagicMock()):
             with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
                 MockAdapter.return_value.get_queue_config = AsyncMock(return_value=queue_config)
                 await validate_task(task)
@@ -65,7 +65,7 @@ async def test_validate_task_missing_queue_config():
     task = Task(id=ULID1, name="Test Task", queue="unknown-queue", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with patch("jobbers.validation.db.get_sqlite_conn", return_value=MagicMock()):
+        with patch("jobbers.validation.db.get_session_factory", return_value=MagicMock()):
             with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
                 MockAdapter.return_value.get_queue_config = AsyncMock(return_value=None)
                 with pytest.raises(ValidationError, match="Unknown queue unknown-queue"):

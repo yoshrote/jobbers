@@ -17,11 +17,11 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def setup(sqlite_conn, state_manager):
+async def setup(session_factory, state_manager):
     """Seed the in-memory SQLite DB with a 'default' queue."""
-    await QueueConfigAdapter(sqlite_conn).save_queue_config(QueueConfig(name="default"))
+    await QueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
     patches = [
-        patch("jobbers.validation.db.get_sqlite_conn", return_value=sqlite_conn),
+        patch("jobbers.validation.db.get_session_factory", return_value=session_factory),
         patch("jobbers.task_routes.db.get_state_manager", return_value=state_manager),
         patch("jobbers.db.get_task_adapter", return_value=state_manager.ta),
     ]
@@ -197,15 +197,15 @@ async def test_set_queues():
 
 
 @pytest.mark.asyncio
-async def test_set_queues_rolls_back_on_invalid_queue(sqlite_conn):
+async def test_set_queues_rolls_back_on_invalid_queue(session_factory):
     """Adding a nonexistent queue to a role rolls back: original queues are preserved."""
-    import aiosqlite
+    from sqlalchemy.exc import IntegrityError
 
-    qca = QueueConfigAdapter(sqlite_conn)
+    qca = QueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="extra_queue"))
     await qca.save_role("myrole", {"default", "extra_queue"})
 
-    with pytest.raises(aiosqlite.IntegrityError):
+    with pytest.raises(IntegrityError):
         await qca.save_role("myrole", {"default", "nonexistent_queue"})
 
     assert await qca.get_queues("myrole") == {"default", "extra_queue"}
