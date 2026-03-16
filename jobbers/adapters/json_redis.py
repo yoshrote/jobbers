@@ -255,6 +255,12 @@ class JsonTaskAdapter(_BaseTaskAdapter):
             for doc in search_results.docs:
                 task_id = ULID.from_str(doc.id.removeprefix("task:"))
                 group.create_task(self._add_task_to_results(task_id, results))
+
+        # final sort to ensure correct order after async fetches
+        if pagination.order_by == PaginationOrder.SUBMITTED_AT:
+            results.sort(key=lambda t: t.submitted_at or dt.datetime.min)
+        else: # default to sorting by ID (which is roughly creation time) if not sorting by submitted_at
+            results.sort(key=lambda t: t.id)
         return results
 
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
