@@ -1,5 +1,3 @@
-from collections.abc import AsyncGenerator
-
 import fakeredis
 import pytest
 import pytest_asyncio
@@ -18,35 +16,10 @@ def task_adapter_dt_module(task_adapter) -> str:
     return f"{type(task_adapter).__module__}.dt"
 
 
-@pytest_asyncio.fixture
-async def real_redis() -> AsyncGenerator[aioredis.Redis, None]:
-    """Real Redis Stack instance on db=0, flushed before and after each test."""
-    r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
-    try:
-        await r.flushdb()
-    except RedisConnectionError as exc:  # pragma: no cover
-        await r.aclose()
-        pytest.skip(f"Redis not available: {exc}")
-    yield r
-    await r.flushdb()
-    await r.aclose()
-
-
 @pytest.fixture
 def msgpack_adapter(redis) -> MsgpackTaskAdapter:
     """Fixture providing a MsgpackTaskAdapter instance."""
     return MsgpackTaskAdapter(redis)
-
-
-@pytest_asyncio.fixture
-async def json_adapter(real_redis) -> JsonTaskAdapter:
-    """JsonTaskAdapter backed by real Redis Stack with the search index created."""
-    adapter = JsonTaskAdapter(real_redis)
-    try:
-        await adapter.ensure_index()
-    except ResponseError as exc:  # pragma: no cover
-        pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
-    return adapter
 
 
 @pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])

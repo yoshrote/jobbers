@@ -873,6 +873,78 @@ async def test_submit_rate_limited_concurrent_respects_limit(task_adapter):
     assert await task_adapter.data_store.zcard(task_adapter.TASKS_BY_QUEUE(queue="default")) == limit
 
 
+# ── ensure_index ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ensure_index_does_not_raise(task_adapter):
+    """ensure_index completes without error for every adapter implementation."""
+    await task_adapter.ensure_index()
+
+
+# ── read_for_watch ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_read_for_watch_returns_task(task_adapter):
+    task = make_task()
+    await task_adapter.save_task(task)
+
+    task_key = task_adapter.TASK_DETAILS(task_id=ULID1)
+    pipe = task_adapter.data_store.pipeline()
+    await pipe.watch(task_key)
+    result = await task_adapter.read_for_watch(pipe, ULID1)
+    await pipe.unwatch()
+
+    assert result is not None
+    assert result.id == ULID1
+    assert result.name == "my_task"
+
+
+@pytest.mark.asyncio
+async def test_read_for_watch_returns_none_when_missing(task_adapter):
+    task_key = task_adapter.TASK_DETAILS(task_id=ULID1)
+    pipe = task_adapter.data_store.pipeline()
+    await pipe.watch(task_key)
+    result = await task_adapter.read_for_watch(pipe, ULID1)
+    await pipe.unwatch()
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_read_for_watch_preserves_task_fields(task_adapter):
+    task = make_task(status=TaskStatus.STARTED)
+    task.errors = ["oops"]
+    task.retry_attempt = 2
+    await task_adapter.save_task(task)
+
+    task_key = task_adapter.TASK_DETAILS(task_id=ULID1)
+    pipe = task_adapter.data_store.pipeline()
+    await pipe.watch(task_key)
+    result = await task_adapter.read_for_watch(pipe, ULID1)
+    await pipe.unwatch()
+
+    assert result is not None
+    assert result.status == TaskStatus.STARTED
+    assert result.errors == ["oops"]
+    assert result.retry_attempt == 2
+
+
+# ── get_all_tasks: missing blob ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_all_tasks_skips_missing_data(task_adapter):
+    """Task registered in the queue but blob deleted → not returned by get_all_tasks."""
+    task = make_task()
+    await task_adapter.submit_task(task)
+    await task_adapter.data_store.delete(task_adapter.TASK_DETAILS(task_id=ULID1))
+
+    results = await task_adapter.get_all_tasks(TaskPagination(queue="default"))
+    assert results == []
+
+
 # ── get_tasks_bulk ────────────────────────────────────────────────────────────
 
 
