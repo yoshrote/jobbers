@@ -21,8 +21,8 @@ from jobbers.models.task_status import TaskStatus
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    import aiosqlite
     from redis.asyncio.client import Redis
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
     from ulid import ULID
 
     from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
@@ -51,11 +51,11 @@ class StateManager:
     def __init__(
         self,
         data_store: Redis,
-        sqlite_conn: aiosqlite.Connection,
+        session_factory: async_sessionmaker[AsyncSession],
         task_adapter: TaskAdapterProtocol | None = None,
     ) -> None:
         self.data_store: Redis = data_store
-        self.qca = QueueConfigAdapter(sqlite_conn)
+        self.qca = QueueConfigAdapter(session_factory)
         self.ta: TaskAdapterProtocol = (
             task_adapter if task_adapter is not None else JsonTaskAdapter(data_store)
         )
