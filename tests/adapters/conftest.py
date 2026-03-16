@@ -12,6 +12,12 @@ from jobbers.adapters.raw_redis import DeadQueue, MsgpackTaskAdapter
 from jobbers.db import DEFAULT_REDIS_URL
 
 
+@pytest.fixture
+def task_adapter_dt_module(task_adapter) -> str:
+    """Return the dotted module path for patching 'dt' in the active task adapter."""
+    return f"{type(task_adapter).__module__}.dt"
+
+
 @pytest_asyncio.fixture
 async def real_redis() -> AsyncGenerator[aioredis.Redis, None]:
     """Real Redis Stack instance on db=0, flushed before and after each test."""
