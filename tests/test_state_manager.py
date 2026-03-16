@@ -631,7 +631,3 @@ async def test_queue_retry_task_requeues_immediately(redis, state_manager):
     assert result.status == TaskStatus.SUBMITTED
     members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in members
-
-
-if __name__ == "__main__":
-    pytest.main(["-v", "test_state_manager.py"])
