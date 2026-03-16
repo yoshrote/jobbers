@@ -44,7 +44,7 @@ async def test_get_refresh_tag(state_manager):
 
 
 @pytest.mark.asyncio
-async def test_get_next_task_returns_task(redis, state_manager):
+async def test_get_next_task_returns_task(state_manager):
     """Test that get_next_task retrieves the next task from the queues."""
     task_id = ULID()
     task_obj = Task(
@@ -55,8 +55,7 @@ async def test_get_next_task_returns_task(redis, state_manager):
         status=TaskStatus.SUBMITTED,
         submitted_at=FROZEN_TIME,
     )
-    await redis.zadd("task-queues:queue1", {task_id.bytes: 1})
-    await redis.json().set(f"task:{task_id}", "$", task_obj.to_dict())
+    await state_manager.ta.submit_task(task_obj)
 
     task = await state_manager.get_next_task(["queue1", "queue2"], pop_timeout=1)
 
@@ -101,9 +100,9 @@ async def test_get_next_task_skips_missing_data_and_returns_valid(redis, state_m
         submitted_at=FROZEN_TIME,
     )
 
-    # missing_id has a lower score so it is popped first
-    await redis.zadd("task-queues:queue1", {missing_id.bytes: 1, valid_id.bytes: 2})
-    await redis.json().set(f"task:{valid_id}", "$", valid_task.to_dict())
+    # missing_id has score=1 so it is popped first; FROZEN_TIME >> 1 so valid_task is popped second
+    await redis.zadd("task-queues:queue1", {missing_id.bytes: 1})
+    await state_manager.ta.submit_task(valid_task)
 
     task = await state_manager.get_next_task(["queue1"], pop_timeout=1)
 

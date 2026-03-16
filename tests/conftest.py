@@ -27,9 +27,9 @@ def task_adapter(redis, request):
 
 
 @pytest_asyncio.fixture
-async def state_manager(redis, sqlite_conn):
-    """Fixture to provide a StateManager instance with a fake Redis and in-memory SQLite."""
-    return StateManager(redis, sqlite_conn)
+async def state_manager(redis, sqlite_conn, task_adapter):
+    """Fixture to provide a StateManager instance parametrized over all TaskAdapterProtocol implementations."""
+    return StateManager(redis, sqlite_conn, task_adapter=task_adapter)
 
 
 class DummyTaskAdapter:

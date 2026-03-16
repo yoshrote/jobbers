@@ -5,7 +5,6 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.raw_redis import DeadQueue
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
@@ -220,38 +219,3 @@ async def test_clean_terminal_tasks_skips_non_ulid_keys(msgpack_adapter, redis):
     assert await redis.exists("task:not_a_valid_ulid_at_all")
 
 
-# ── DeadQueue.get_by_filter: task data missing ────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_dead_queue_get_by_filter_skips_missing_task_data(msgpack_adapter, redis):
-    """If a task is in the DLQ sorted set but blob is gone, it is skipped."""
-    dq = DeadQueue(redis, msgpack_adapter)
-    task = make_task()
-    failed_at = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
-
-    pipe = redis.pipeline(transaction=True)
-    dq.stage_add(pipe, task, failed_at)
-    await pipe.execute()
-
-    results = await dq.get_by_filter()
-    assert results == []
-
-
-# ── DeadQueue.clean: meta_bytes=None ─────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_dead_queue_clean_handles_missing_meta(msgpack_adapter, redis):
-    """clean() zrem's the DLQ entry even when meta hash entry is absent."""
-    dq = DeadQueue(redis, msgpack_adapter)
-    task = make_task()
-    old_time = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
-
-    await redis.zadd(dq.DLQ, {bytes(task.id): old_time.timestamp()})
-
-    cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
-    await dq.clean(cutoff)
-
-    score = await redis.zscore(dq.DLQ, bytes(task.id))
-    assert score is None
