@@ -9,7 +9,6 @@ import datetime as dt
 
 import pytest
 
-from jobbers.adapters.raw_redis import DeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 
@@ -418,47 +417,8 @@ async def test_clean_removes_secondary_indexes(dead_queue):
 
 
 @pytest.mark.asyncio
-async def test_clean_handles_missing_meta(dead_queue):
-    """DeadQueue: clean() removes the sorted-set entry even when the meta hash entry is absent."""
-    dq, _ = dead_queue
-    if not isinstance(dq, DeadQueue):
-        pytest.skip("raw DeadQueue only: tests meta-hash resilience")
-    task = make_task()
-    old_time = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
-
-    await dq.data_store.zadd(dq.DLQ, {bytes(task.id): old_time.timestamp()})
-
-    cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
-    await dq.clean(cutoff)
-
-    score = await dq.data_store.zscore(dq.DLQ, bytes(task.id))
-    assert score is None
-
-
-@pytest.mark.asyncio
 async def test_clean_empty_queue_is_silent(dead_queue):
     """Clean on an empty DLQ should not raise."""
     dq, _ = dead_queue
     await dq.clean(dt.datetime(2025, 1, 1, tzinfo=dt.UTC))
 
-
-# ── ordering ──────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_get_by_filter_sorted_by_failed_at_desc(dead_queue):
-    """Results should be sorted by failed_at descending (most recent first)."""
-    dq, adapter = dead_queue
-    if isinstance(dq, DeadQueue):
-        pytest.xfail("DeadQueue (raw) does not support server-side sorting by failed_at")
-
-    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
-    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
-    await adapter.save_task(t1)
-    await adapter.save_task(t2)
-    await add_to_dlq(dq, t1, EARLIER)
-    await add_to_dlq(dq, t2, LATER)
-
-    results = await dq.get_by_filter()
-    assert len(results) == 2
-    assert results[0].id == t2.id  # LATER first

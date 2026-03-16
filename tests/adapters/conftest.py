@@ -22,6 +22,12 @@ def msgpack_adapter(redis) -> MsgpackTaskAdapter:
     return MsgpackTaskAdapter(redis)
 
 
+@pytest.fixture
+def raw_dead_queue(redis, dummy_task_adapter) -> DeadQueue:
+    """DeadQueue backed by FakeAsyncRedis + DummyTaskAdapter; for raw-adapter-specific edge cases."""
+    return DeadQueue(redis, dummy_task_adapter)
+
+
 @pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])
 async def task_adapter(request, redis):
     """

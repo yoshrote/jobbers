@@ -1,8 +1,11 @@
 """
-MsgpackTaskAdapter-specific tripwires and edge cases not covered by protocol contract tests.
+Raw-adapter-specific tripwires and edge cases not covered by protocol contract tests.
+
+Covers MsgpackTaskAdapter (task storage) and DeadQueue (dead letter queue) — the two
+plain-Redis implementations that share a FakeAsyncRedis fixture.
 
 Contract tests (including ensure_index, read_for_watch, get_all_tasks missing-blob) live in
-test_task_adapter_common.py and run against both adapter implementations.
+test_task_adapter_common.py and test_dead_queue_common.py and run against all implementations.
 """
 
 import datetime as dt
@@ -10,7 +13,7 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.models.task import PaginationOrder, TaskPagination
+from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
 FROZEN_TIME = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
@@ -154,3 +157,56 @@ async def test_clean_terminal_tasks_skips_non_ulid_keys(msgpack_adapter, redis):
     assert await redis.exists("task:not_a_valid_ulid_at_all")
 
 
+# ── DeadQueue: edge cases ─────────────────────────────────────────────────────
+
+EARLIER = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+LATER = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
+
+
+async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
+    pipe = dq.data_store.pipeline(transaction=True)
+    dq.stage_add(pipe, task, failed_at)
+    await pipe.execute()
+
+
+@pytest.mark.asyncio
+async def test_clean_handles_missing_meta(raw_dead_queue):
+    """clean() removes the sorted-set entry even when the meta hash entry is absent.
+
+    DeadQueue stores DLQ membership in a sorted set (``dlq``) and queue/name metadata
+    in a separate hash (``dlq-meta``).  If the meta entry is missing (e.g. written by
+    an older code version), clean() must still remove the sorted-set entry without error.
+    """
+    task = make_task(task_id=ULID1, status=TaskStatus.FAILED)
+    old_time = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+
+    await raw_dead_queue.data_store.zadd(raw_dead_queue.DLQ, {bytes(task.id): old_time.timestamp()})
+
+    cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
+    await raw_dead_queue.clean(cutoff)
+
+    score = await raw_dead_queue.data_store.zscore(raw_dead_queue.DLQ, bytes(task.id))
+    assert score is None
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "DeadQueue uses zrange (ascending score) with no server-side sort option; "
+        "results are returned earliest-first, not most-recent-first. "
+        "Remove this xfail if DeadQueue gains sorted get_by_filter support."
+    ),
+)
+@pytest.mark.asyncio
+async def test_get_by_filter_sorted_by_failed_at_desc(raw_dead_queue, dummy_task_adapter):
+    """Tripwire: DeadQueue does not sort get_by_filter results by failed_at descending."""
+    t1 = make_task(task_id=ULID1, status=TaskStatus.FAILED)
+    t2 = make_task(task_id=ULID2, status=TaskStatus.FAILED)
+    await dummy_task_adapter.save_task(t1)
+    await dummy_task_adapter.save_task(t2)
+    await add_to_dlq(raw_dead_queue, t1, EARLIER)
+    await add_to_dlq(raw_dead_queue, t2, LATER)
+
+    results = await raw_dead_queue.get_by_filter()
+    assert len(results) == 2
+    assert results[0].id == t2.id  # LATER first — correct protocol behaviour, not what DeadQueue returns
