@@ -206,6 +206,20 @@ async def test_get_by_filter_limit_respected(dead_queue):
 
 
 @pytest.mark.asyncio
+async def test_get_by_filter_respects_limit_with_version_filter(dead_queue):
+    """get_by_filter respects limit when filtering by task_version."""
+    dq, adapter = dead_queue
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", version=1)
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", version=1)
+    for t in (t1, t2):
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
+
+    results = await dq.get_by_filter(task_version=1, limit=1)
+    assert len(results) == 1
+
+
+@pytest.mark.asyncio
 async def test_get_by_filter_skips_missing_task_data(dead_queue):
     """If a task is in the DLQ index but its blob is gone, it is skipped."""
     dq, _ = dead_queue
