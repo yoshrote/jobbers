@@ -18,7 +18,7 @@ async def run_migrations(engine: AsyncEngine) -> None:
 
 async def run_cli() -> None:
     """CLI entry point: apply the schema to the configured database."""
-    db_path = os.environ.get("SQLITE_PATH", "jobbers.db")
+    db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
     try:
         await run_migrations(engine)

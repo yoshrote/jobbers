@@ -4,7 +4,6 @@ Scheduler runner: promotes due tasks from the TaskScheduler into their Redis que
 Environment variables:
 - SCHEDULER_POLL_INTERVAL: seconds to sleep between polls when no task is due (default 5.0)
 - SCHEDULER_BATCH_SIZE: maximum number of tasks to acquire and dispatch per iteration (default 1)
-- SCHEDULER_DB_PATH: path to the SQLite schedule database (default task_schedule.db)
 - REDIS_URL: Redis connection URL (default redis://localhost:6379)
 """
 

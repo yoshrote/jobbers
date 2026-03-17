@@ -7,7 +7,7 @@ A lightweight distributed task execution framework for Python, built on asyncio.
 ## Why Jobbers?
 
 | | Celery | Jobbers |
-|---|---|---|
+| --- | --- | --- |
 | asyncio-native tasks | Limited | Yes |
 | Task introspection API | No | Yes |
 | Cancel running/queued/scheduled tasks | No | Yes |
@@ -23,7 +23,7 @@ A lightweight distributed task execution framework for Python, built on asyncio.
 Jobbers runs as four independent processes:
 
 | Process | Role |
-|---------|------|
+| --------- | ------ |
 | **Manager** | FastAPI web server (port 8000): task submission, status, cancellation, DLQ, queue/role management |
 | **Worker** | Pulls tasks from Redis queues and executes them; handles retries, heartbeats, cancellation |
 | **Cleaner** | Prunes stale state, rate-limit entries, and detects stalled tasks |
@@ -31,7 +31,7 @@ Jobbers runs as four independent processes:
 
 Tasks move through the following states:
 
-```
+```text
 UNSUBMITTED → SUBMITTED → STARTED → COMPLETED
                                    → FAILED → [DLQ if policy=save]
                                    → SCHEDULED (retry delay, re-queued by Scheduler)
@@ -164,7 +164,7 @@ curl -X POST http://localhost:8000/task/01JBKR2E5F3G4H5J6K7L8M9N0P/cancel
 ```
 
 | Task status | What happens |
-|-------------|-------------|
+| ------------- | ------------- |
 | `submitted` / `started` | Cancel signal sent via Redis pubsub; worker interrupts the task at the next `await`. Poll status to confirm. |
 | `scheduled` | Removed from the delay queue and marked `cancelled` synchronously. |
 | anything else | Returns `409 Conflict`. |
@@ -222,7 +222,7 @@ async def bulk_import(**kwargs: object) -> None:
 Per-task retry configuration with four backoff strategies:
 
 | Strategy | Delay per attempt |
-|----------|------------------|
+| ---------- | ------------------ |
 | `constant` | Fixed `retry_delay` seconds |
 | `linear` | `retry_delay × attempt` |
 | `exponential` | `retry_delay × 2^attempt` |
@@ -258,7 +258,7 @@ async def send_webhook(**kwargs: object) -> None: ...
 Tasks can be cancelled at any point in their lifecycle — queued, running, or waiting on a retry delay. Running tasks are interrupted at the next `await` point. The `on_shutdown` policy controls what happens next:
 
 | Policy | Behaviour |
-|--------|-----------|
+| -------- | ----------- |
 | `stop` (default) | Interrupted and marked `stalled` |
 | `resubmit` | Interrupted and re-enqueued for another worker |
 | `continue` | Shielded from cancellation; runs to completion |
@@ -288,7 +288,7 @@ Jobbers emits OTLP metrics automatically — no instrumentation code required in
 Metrics aggregated by task, version, and queue:
 
 | Metric | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `tasks_retried` | Count | Retry events |
 | `tasks_dead_lettered` | Count | Tasks moved to DLQ |
 | `cancellations_requested` | Count | Cancel signals sent |
@@ -296,7 +296,7 @@ Metrics aggregated by task, version, and queue:
 Metrics aggregated by task, queue, and status:
 
 | Metric | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `tasks_processed` | Count | Tasks completed (any terminal status) |
 | `execution_time` | Histogram | Time from start to finish (ms) |
 | `end_to_end_latency` | Histogram | Time from submission to finish (ms) |
@@ -304,7 +304,7 @@ Metrics aggregated by task, queue, and status:
 Metrics aggregated by task, queue, and role:
 
 | Metric | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `time_in_queue` | Histogram | Time from submission to start |
 | `tasks_selected` | Count | Tasks pulled by workers |
 
@@ -318,7 +318,7 @@ Use `time_in_queue` to decide whether to scale workers or split queues. Use `tas
 
 This lets you partition work by resource profile — for example, CPU-intensive tasks and I/O-bound tasks can share workers or be isolated based on how you group queues into roles.
 
-```
+```text
 Role: "heavy-workers"   → queues: ["reports", "exports"]
 Role: "light-workers"   → queues: ["notifications", "webhooks", "default"]
 ```
@@ -328,7 +328,7 @@ Workers detect role and queue changes automatically via a TTL-based refresh tag 
 ### Queue API
 
 | Method | Path | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `GET` | `/queues` | List all queues |
 | `POST` | `/queues` | Create a queue |
 | `GET` | `/queues/{name}/config` | Get queue config |
@@ -338,7 +338,7 @@ Workers detect role and queue changes automatically via a TTL-based refresh tag 
 ### Role API
 
 | Method | Path | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `GET` | `/roles` | List all roles |
 | `POST` | `/roles` | Create a role |
 | `GET` | `/roles/{name}` | Get queues for a role |
@@ -350,13 +350,13 @@ Workers detect role and queue changes automatically via a TTL-based refresh tag 
 ## Configuration
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| ---------- | --------- | ------------- |
 | `WORKER_ROLE` | `default` | Role assigned to this worker |
 | `WORKER_TTL` | `50` | Max tasks before worker restarts (memory leak protection) |
 | `WORKER_CONCURRENT_TASKS` | `5` | Max tasks running simultaneously per worker |
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Seconds between scheduler polls |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
-| `SQLITE_PATH` | `jobbers.db` | SQLite path for queue/role config and DLQ |
+| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQL URL path for queue/role config |
 
 ---
 
@@ -396,7 +396,7 @@ jobbers_worker myapp.tasks
 ```
 
 | Environment variable | Default | Description |
-|----------------------|---------|-------------|
+| ---------------------- | --------- | ------------- |
 | `WORKER_ROLE` | `default` | The role this worker consumes. Workers pull from all queues assigned to this role. |
 | `WORKER_CONCURRENT_TASKS` | `5` | Maximum number of tasks running concurrently within this process. |
 | `WORKER_TTL` | `50` | Worker exits after processing this many tasks and is expected to be restarted by a process supervisor (e.g. Docker, systemd). Protects against memory leaks in long-running task code. Set to `0` to run indefinitely. |
@@ -422,7 +422,7 @@ jobbers_cleaner \
 All arguments are in **seconds** and are optional — omit any you don't need.
 
 | Argument | Description |
-|----------|-------------|
+| ---------- | ------------- |
 | `--stale-time <seconds>` | Mark tasks whose heartbeat is older than this as `stalled`. Use this to surface tasks that have silently frozen. |
 | `--completed-task-age <seconds>` | Delete stored state and heartbeat entries for tasks that reached a terminal status (`completed`, `failed`, `cancelled`) longer than this ago. Keeps Redis lean. |
 | `--dlq-age <seconds>` | Remove dead letter queue entries older than this. |
@@ -454,7 +454,7 @@ jobbers_scheduler
 ```
 
 | Environment variable | Default | Description |
-|----------------------|---------|-------------|
+| ---------------------- | --------- | ------------- |
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Seconds to sleep between polls when no tasks are due. |
 | `SCHEDULER_BATCH_SIZE` | `1` | Maximum tasks to dispatch per poll iteration. Increase if your workload produces many simultaneous retry delays. |
 | `SCHEDULER_ROLE` | `default` | Limits the scheduler to queues belonging to this role. |
