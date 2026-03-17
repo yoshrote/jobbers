@@ -62,7 +62,7 @@ class StateManager:
         self.submission_limiter = SubmissionRateLimiter(job_store, self.qca)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
-        self.task_scheduler = TaskScheduler(job_store, self.ta)
+        self.task_scheduler = TaskScheduler(job_store, self.ta, self.qca)
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
