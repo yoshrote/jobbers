@@ -34,7 +34,7 @@ jobbers/
 ## The Four Jobber Processes
 
 | Process | Entry Point | Role |
-|---------|-------------|------|
+| --------- | ------------- | ------ |
 | **Manager** | `runners/manager_proc.py` | FastAPI web server (port 8000): task submission, status, cancellation, DLQ, queue/role CRUD |
 | **Worker** | `runners/worker_proc.py` | Pulls tasks from Redis queues and executes them; handles retries, heartbeats, cancellation |
 | **Cleaner** | `runners/cleaner_proc.py` | Maintenance: prunes stale Redis state, rate-limit entries, DLQ entries, detects stalled tasks |
@@ -94,7 +94,7 @@ async def my_task(**kwargs):
 ## Key Environment Variables
 
 | Variable | Default | Used by |
-|----------|---------|---------|
+| ---------- | --------- | --------- |
 | `WORKER_ROLE` | `"default"` | Worker |
 | `WORKER_TTL` | `50` | Worker (max tasks before restart) |
 | `WORKER_CONCURRENT_TASKS` | `5` | Worker |
@@ -150,7 +150,6 @@ mypy jobbers
 
 mypy is configured with `strict = true` and runs only on the `jobbers/` package (tests are excluded).
 
-
 ### Test Architecture
 
 The test suite follows a layered approach designed for speed and systematic protocol coverage:
@@ -158,7 +157,7 @@ The test suite follows a layered approach designed for speed and systematic prot
 #### Three tiers of tests
 
 | Tier | Where | Fixture | Purpose |
-|------|-------|---------|---------|
+| ------ | ------- | --------- | --------- |
 | **Protocol contract** | `tests/adapters/test_task_adapter_common.py`, `test_dead_queue_common.py` | `task_adapter` / `dead_queue` (parametrized over all implementations) | Verify every implementation satisfies the protocol. Adding a new adapter means adding a fixture variant — all contract tests run automatically. |
 | **Implementation edge cases** | `tests/adapters/test_msgpack_adapter.py`, `test_json_adapter.py` | `msgpack_adapter` / `json_adapter` | Cover implementation-specific behaviour that is not a protocol requirement (e.g., sorting limitations, null JSON blobs). |
 | **Orchestration** | `test_state_manager.py`, `test_task_processor.py`, `test_task_routes.py`, `test_task_generator.py` | `DummyTaskAdapter` or `Mock(spec=StateManager)` | Test coordination logic without touching real adapters; fast, no Redis Stack required. |
