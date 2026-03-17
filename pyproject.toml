@@ -43,6 +43,7 @@ dependencies = [
     "python_on_whales",
     "msgpack",
     "aiosqlite",
+    "sqlalchemy[asyncio]",
     "python-ulid[pydantic]",
     "asyncio-taskpool",
     "msgpack-types",
@@ -73,6 +74,7 @@ jobbers_worker = 'jobbers.runners.worker_proc:run'
 jobbers_cleaner = 'jobbers.runners.cleaner_proc:run'
 jobbers_scheduler = 'jobbers.runners.scheduler_proc:run'
 jobbers_openapi = 'jobbers.runners.openapi_proc:run'
+jobbers_migrate = 'jobbers.migrations.runner:main'
 
 ## ruff settings ##
 [tool.ruff]

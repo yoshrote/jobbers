@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.models.queue_config import QueueConfigAdapter
     from jobbers.models.task import Task
 
 
@@ -48,9 +49,12 @@ class TaskScheduler:
         return results
     """
 
-    def __init__(self, data_store: Redis, task_adapter: TaskAdapterProtocol) -> None:
+    def __init__(
+        self, data_store: Redis, task_adapter: TaskAdapterProtocol, queue_config_adapter: QueueConfigAdapter
+    ) -> None:
         self.data_store = data_store
         self.ta = task_adapter
+        self.qca = queue_config_adapter
 
     def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
         """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
@@ -81,15 +85,12 @@ class TaskScheduler:
                 self.data_store.zrange(self.SCHEDULE_QUEUE(queue=queue), 0, -1),
             )
         else:
-            all_queue_bytes: set[bytes] = await cast(
-                "Awaitable[set[bytes]]",
-                self.data_store.smembers("all-queues"),
-            )
+            all_queues = await self.qca.get_all_queues()
             raw_ids = []
-            for q_bytes in all_queue_bytes:
+            for q in all_queues:
                 ids: list[bytes] = await cast(
                     "Awaitable[list[bytes]]",
-                    self.data_store.zrange(self.SCHEDULE_QUEUE(queue=q_bytes.decode()), 0, -1),
+                    self.data_store.zrange(self.SCHEDULE_QUEUE(queue=q), 0, -1),
                 )
                 raw_ids.extend(ids)
 
@@ -141,11 +142,7 @@ class TaskScheduler:
             return []
 
         if queues is None:
-            all_queue_bytes: set[bytes] = await cast(
-                "Awaitable[set[bytes]]",
-                self.data_store.smembers("all-queues"),
-            )
-            queues = [q.decode() for q in all_queue_bytes]
+            queues = await self.qca.get_all_queues()
             if not queues:
                 return []
 

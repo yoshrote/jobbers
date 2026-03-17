@@ -137,9 +137,6 @@ class TaskGenerator:
         # queues that meet configured limits so that we evaluate that aspect
         # between configuration refresh
 
-        # with self.ttl as needs_refresh:
-        #     if not needs_refresh:
-        #         return self.filter_by_worker_queue_capacity(self.task_queues)
         new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
         if new_refresh_tag != self.refresh_tag:
             self.refresh_tag = new_refresh_tag
@@ -164,7 +161,7 @@ class TaskGenerator:
                 task = await self.state_manager.get_next_task(task_queues)
             except asyncio.CancelledError:
                 if task:
-                    pipe = self.state_manager.data_store.pipeline()
+                    pipe = self.state_manager.job_store.pipeline()
                     self.state_manager.ta.stage_requeue(pipe, task)
                     await pipe.execute()
                 raise

@@ -4,8 +4,8 @@ from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, RatePer
 
 
 @pytest.fixture
-def queue_config_adapter(sqlite_conn):
-    return QueueConfigAdapter(sqlite_conn)
+def queue_config_adapter(session_factory):
+    return QueueConfigAdapter(session_factory)
 
 
 # ---------------------------------------------------------------------------

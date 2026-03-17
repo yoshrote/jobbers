@@ -5,6 +5,7 @@ import datetime as dt
 import pytest
 import pytest_asyncio
 
+from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task import Task
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
@@ -17,9 +18,14 @@ def make_task(task_id: str = "01JQC31AJP7TSA9X8AEP64XG08", queue: str = "default
     return Task(id=task_id, name="test_task", version=1, queue=queue, status=TaskStatus.SCHEDULED)
 
 
+@pytest.fixture
+def qca(session_factory):
+    return QueueConfigAdapter(session_factory)
+
+
 @pytest_asyncio.fixture
-async def scheduler(redis, dummy_task_adapter):
-    yield TaskScheduler(redis, dummy_task_adapter)
+async def scheduler(redis, dummy_task_adapter, qca):
+    yield TaskScheduler(redis, dummy_task_adapter, qca)
 
 
 async def schedule(s: TaskScheduler, task: Task, run_at: dt.datetime) -> None:
@@ -158,29 +164,29 @@ async def test_next_due_returns_earliest_run_at(scheduler, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_next_due_none_returns_due_task(scheduler, redis, dummy_task_adapter):
-    """next_due(None) matches any queue when all-queues set is populated."""
+async def test_next_due_none_returns_due_task(scheduler, qca, dummy_task_adapter):
+    """next_due(None) matches any queue when queues exist in the config."""
     task = make_task(queue="alpha")
     await dummy_task_adapter.save_task(task)
-    await redis.sadd("all-queues", "alpha")
+    await qca.save_queue_config(QueueConfig(name="alpha"))
     await schedule(scheduler, task, PAST)
     assert await scheduler.next_due(None) is not None
 
 
 @pytest.mark.asyncio
-async def test_next_due_none_skips_future_task(scheduler, redis):
+async def test_next_due_none_skips_future_task(scheduler, qca):
     """next_due(None) does not return a task whose run_at is in the future."""
-    await redis.sadd("all-queues", "default")
+    await qca.save_queue_config(QueueConfig(name="default"))
     await schedule(scheduler, make_task(), FUTURE)
     assert await scheduler.next_due(None) is None
 
 
 @pytest.mark.asyncio
-async def test_next_due_none_acquires_once(scheduler, redis, dummy_task_adapter):
+async def test_next_due_none_acquires_once(scheduler, qca, dummy_task_adapter):
     """next_due(None) will not return the same task twice."""
     task = make_task()
     await dummy_task_adapter.save_task(task)
-    await redis.sadd("all-queues", "default")
+    await qca.save_queue_config(QueueConfig(name="default"))
     await schedule(scheduler, task, PAST)
     assert await scheduler.next_due(None) is not None
     assert await scheduler.next_due(None) is None
@@ -299,23 +305,23 @@ async def test_get_by_filter_cursor_pagination(scheduler, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_queue_none_returns_from_all_queues(scheduler, redis, dummy_task_adapter):
-    """get_by_filter with queue=None fetches tasks from every queue in the all-queues set."""
+async def test_get_by_filter_queue_none_returns_from_all_queues(scheduler, qca, dummy_task_adapter):
+    """get_by_filter with queue=None fetches tasks from every configured queue."""
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", queue="q2")
     for t in (t1, t2):
         await dummy_task_adapter.save_task(t)
         await schedule(scheduler, t, PAST)
-    await redis.sadd("all-queues", b"q1", b"q2")
+    await qca.save_queue_config(QueueConfig(name="q1"))
+    await qca.save_queue_config(QueueConfig(name="q2"))
 
     results = await scheduler.get_by_filter(queue=None)
     assert {r.id for r in results} == {t1.id, t2.id}
 
 
 @pytest.mark.asyncio
-async def test_get_by_filter_queue_none_empty_all_queues_returns_empty(scheduler, redis, dummy_task_adapter):
-    """get_by_filter with queue=None and an empty all-queues set returns []."""
-    await redis.delete("all-queues")
+async def test_get_by_filter_queue_none_empty_all_queues_returns_empty(scheduler):
+    """get_by_filter with queue=None and no configured queues returns []."""
     results = await scheduler.get_by_filter(queue=None)
     assert results == []
 
@@ -357,8 +363,7 @@ async def test_get_by_filter_task_version_excludes_non_matching(scheduler, dummy
 
 
 @pytest.mark.asyncio
-async def test_next_due_bulk_queues_none_empty_redis_returns_empty(scheduler, redis):
-    """next_due_bulk with queues=None returns [] when all-queues set is empty."""
-    await redis.delete("all-queues")
+async def test_next_due_bulk_queues_none_empty_redis_returns_empty(scheduler):
+    """next_due_bulk with queues=None returns [] when no queues are configured."""
     result = await scheduler.next_due_bulk(1, queues=None)
     assert result == []

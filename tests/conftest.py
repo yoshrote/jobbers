@@ -1,13 +1,14 @@
-import aiosqlite
 import fakeredis
 import pytest
 import pytest_asyncio
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from ulid import ULID
 
 from jobbers.adapters.json_redis import JsonTaskAdapter
 from jobbers.adapters.raw_redis import MsgpackTaskAdapter
 from jobbers.adapters.task_adapter import _BaseTaskAdapter
-from jobbers.models.queue_config import create_schema
+from jobbers.migrations.runner import run_migrations
 from jobbers.models.task import Task
 from jobbers.state_manager import StateManager
 
@@ -27,15 +28,15 @@ def task_adapter(redis, request):
 
 
 @pytest_asyncio.fixture
-async def state_manager(redis, sqlite_conn, dummy_task_adapter):
+async def state_manager(redis, session_factory, dummy_task_adapter):
     """StateManager backed by DummyTaskAdapter: fast, single-run, for tests that don't exercise adapter internals."""
-    return StateManager(redis, sqlite_conn, task_adapter=dummy_task_adapter)
+    return StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
 
 
 @pytest_asyncio.fixture
-async def state_manager_real_ta(redis, sqlite_conn):
+async def state_manager_real_ta(redis, session_factory):
     """StateManager backed by MsgpackTaskAdapter for tests that exercise the full adapter call path."""
-    return StateManager(redis, sqlite_conn, task_adapter=MsgpackTaskAdapter(redis))
+    return StateManager(redis, session_factory, task_adapter=MsgpackTaskAdapter(redis))
 
 
 class DummyTaskAdapter:
@@ -86,7 +87,7 @@ class DummyTaskAdapter:
 
     def stage_requeue(self, pipe: object, task: Task) -> None:
         """Eagerly store the task and add a ZADD to the caller's Redis pipeline."""
-        assert task.submitted_at  # noqa: S101
+        assert task.submitted_at
         pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})  # type: ignore[union-attr]
         self._store[task.id] = task
 
@@ -111,9 +112,17 @@ def dummy_task_adapter() -> DummyTaskAdapter:
 
 
 @pytest_asyncio.fixture
-async def sqlite_conn():
-    """In-memory SQLite connection with schema applied."""
-    async with aiosqlite.connect(":memory:") as conn:
-        await conn.execute("PRAGMA foreign_keys = ON")
-        await create_schema(conn)
-        yield conn
+async def session_factory():
+    """In-memory SQLite async_sessionmaker with schema applied."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_conn: object, connection_record: object) -> None:
+        cursor = dbapi_conn.cursor()  # type: ignore[union-attr]
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    await run_migrations(engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield factory
+    await engine.dispose()

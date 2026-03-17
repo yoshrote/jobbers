@@ -259,7 +259,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         # final sort to ensure correct order after async fetches
         if pagination.order_by == PaginationOrder.SUBMITTED_AT:
             results.sort(key=lambda t: t.submitted_at or dt.datetime.min)
-        else: # default to sorting by ID (which is roughly creation time) if not sorting by submitted_at
+        else:  # default to sorting by ID (which is roughly creation time) if not sorting by submitted_at
             results.sort(key=lambda t: t.id)
         return results
 
@@ -404,9 +404,7 @@ class JsonDeadQueue:
             query_parts.append(f"@version:[{task_version} {task_version}]")
         query_str = " ".join(query_parts) if query_parts else "*"
 
-        q: SearchQuery = (
-            SearchQuery(query_str).no_content().sort_by("failed_at", asc=False).paging(0, limit)
-        )
+        q: SearchQuery = SearchQuery(query_str).no_content().sort_by("failed_at", asc=False).paging(0, limit)
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
         if not search_results.docs:
             return []

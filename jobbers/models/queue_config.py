@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
-import aiosqlite
 from pydantic import BaseModel
+from sqlalchemy import delete, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from ulid import ULID
+
+from jobbers.migrations.schema import queues, role_queues, roles
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 class RatePeriod(StrEnum):
@@ -46,7 +52,7 @@ class QueueConfig(BaseModel):
 
     @classmethod
     def from_row(cls, row: Any) -> Self:
-        """Construct from a sqlite3 row (name, max_concurrent, rate_numerator, rate_denominator, rate_period)."""
+        """Construct from a row (name, max_concurrent, rate_numerator, rate_denominator, rate_period)."""
         name, max_concurrent, rate_numerator, rate_denominator, rate_period = row
         return cls(
             name=name,
@@ -57,154 +63,135 @@ class QueueConfig(BaseModel):
         )
 
 
-async def create_schema(conn: aiosqlite.Connection) -> None:
-    """Create tables and indexes for queue/role configuration."""
-    await conn.executescript("""
-        CREATE TABLE IF NOT EXISTS roles (
-            name        TEXT PRIMARY KEY,
-            refresh_tag TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS queues (
-            name             TEXT PRIMARY KEY,
-            max_concurrent   INTEGER,
-            rate_numerator   INTEGER,
-            rate_denominator INTEGER,
-            rate_period      TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS role_queues (
-            role  TEXT NOT NULL REFERENCES roles(name)  ON DELETE CASCADE,
-            queue TEXT NOT NULL REFERENCES queues(name) ON DELETE CASCADE,
-            PRIMARY KEY (role, queue)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_roles_refresh_tag ON roles (refresh_tag);
-        CREATE INDEX IF NOT EXISTS idx_role_queues_role_queue ON role_queues (role, queue);
-    """)
-    await conn.commit()
-
-
 class QueueConfigAdapter:
     """
-    Manages queue configuration in a SQLite data store.
+    Manages queue configuration in a data store via SQLAlchemy async sessions.
 
     - `roles`: table of named roles, each with a refresh_tag for change detection.
     - `queues`: table of queue configurations (concurrency and rate limiting).
     - `role_queues`: many-to-many mapping of roles to queues.
     """
 
-    def __init__(self, conn: aiosqlite.Connection) -> None:
-        self.conn = conn
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.session_factory = session_factory
 
     async def get_queues(self, role: str) -> set[str]:
-        async with self.conn.execute("SELECT queue FROM role_queues WHERE role = ?", (role,)) as cursor:
-            return {row[0] for row in await cursor.fetchall()}
+        async with self.session_factory() as session:
+            result = await session.execute(select(role_queues.c.queue).where(role_queues.c.role == role))
+            return {row[0] for row in result.fetchall()}
 
-    async def save_role(self, role: str, queues: set[str]) -> None:
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
         new_tag = str(ULID())
-        async with self.conn.cursor() as cur:
-            try:
-                await cur.execute(
-                    "INSERT INTO roles (name, refresh_tag) VALUES (?, ?)"
-                    " ON CONFLICT(name) DO UPDATE SET refresh_tag = excluded.refresh_tag",
-                    (role, new_tag),
-                )
-                await cur.execute("DELETE FROM role_queues WHERE role = ?", (role,))
-                if queues:
-                    await cur.executemany(
-                        "INSERT INTO role_queues (role, queue) VALUES (?, ?)",
-                        [(role, q) for q in queues],
-                    )
-            except aiosqlite.IntegrityError:
-                await self.conn.rollback()
-                raise
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(select(roles.c.name).where(roles.c.name == role))
+            if existing.fetchone():
+                await session.execute(update(roles).where(roles.c.name == role).values(refresh_tag=new_tag))
             else:
-                await self.conn.commit()
+                await session.execute(insert(roles).values(name=role, refresh_tag=new_tag))
+            await session.execute(delete(role_queues).where(role_queues.c.role == role))
+            if queues_set:
+                await session.execute(
+                    insert(role_queues),
+                    [{"role": role, "queue": q} for q in queues_set],
+                )
 
     async def get_all_queues(self) -> list[str]:
-        async with self.conn.execute("SELECT name FROM queues ORDER BY name") as cursor:
-            return [row[0] for row in await cursor.fetchall()]
+        async with self.session_factory() as session:
+            result = await session.execute(select(queues.c.name).order_by(queues.c.name))
+            return [row[0] for row in result.fetchall()]
 
     async def get_all_roles(self) -> list[str]:
-        async with self.conn.execute("SELECT name FROM roles ORDER BY name") as cursor:
-            return [row[0] for row in await cursor.fetchall()]
+        async with self.session_factory() as session:
+            result = await session.execute(select(roles.c.name).order_by(roles.c.name))
+            return [row[0] for row in result.fetchall()]
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
-        async with self.conn.execute(
-            "SELECT name, max_concurrent, rate_numerator, rate_denominator, rate_period"
-            " FROM queues WHERE name = ?",
-            (queue,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    queues.c.name,
+                    queues.c.max_concurrent,
+                    queues.c.rate_numerator,
+                    queues.c.rate_denominator,
+                    queues.c.rate_period,
+                ).where(queues.c.name == queue)
+            )
+            row = result.fetchone()
         if row is None:
             return None
         return QueueConfig.from_row(row)
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
-        await self.conn.execute(
-            "INSERT INTO queues (name, max_concurrent, rate_numerator, rate_denominator, rate_period)"
-            " VALUES (?, ?, ?, ?, ?)"
-            " ON CONFLICT(name) DO UPDATE SET"
-            "   max_concurrent   = excluded.max_concurrent,"
-            "   rate_numerator   = excluded.rate_numerator,"
-            "   rate_denominator = excluded.rate_denominator,"
-            "   rate_period      = excluded.rate_period",
-            (
-                queue_config.name,
-                queue_config.max_concurrent,
-                queue_config.rate_numerator,
-                queue_config.rate_denominator,
-                queue_config.rate_period,
-            ),
-        )
-        await self.conn.commit()
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(select(queues.c.name).where(queues.c.name == queue_config.name))
+            if existing.fetchone():
+                await session.execute(
+                    update(queues)
+                    .where(queues.c.name == queue_config.name)
+                    .values(
+                        max_concurrent=queue_config.max_concurrent,
+                        rate_numerator=queue_config.rate_numerator,
+                        rate_denominator=queue_config.rate_denominator,
+                        rate_period=queue_config.rate_period,
+                    )
+                )
+            else:
+                await session.execute(
+                    insert(queues).values(
+                        name=queue_config.name,
+                        max_concurrent=queue_config.max_concurrent,
+                        rate_numerator=queue_config.rate_numerator,
+                        rate_denominator=queue_config.rate_denominator,
+                        rate_period=queue_config.rate_period,
+                    )
+                )
 
     async def delete_queue(self, queue_name: str) -> None:
         """Delete a queue and cascade to role_queues; bump refresh_tag for affected roles."""
         new_tag = str(ULID())
-        async with self.conn.cursor() as cur:
-            # Collect roles that reference this queue before deleting
-            await cur.execute("SELECT DISTINCT role FROM role_queues WHERE queue = ?", (queue_name,))
-            affected_roles = [row[0] for row in await cur.fetchall()]
-            await cur.execute("DELETE FROM queues WHERE name = ?", (queue_name,))
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(role_queues.c.role).where(role_queues.c.queue == queue_name).distinct()
+            )
+            affected_roles = [row[0] for row in result.fetchall()]
+            await session.execute(delete(queues).where(queues.c.name == queue_name))
             if affected_roles:
-                await cur.executemany(
-                    "UPDATE roles SET refresh_tag = ? WHERE name = ?",
-                    [(new_tag, r) for r in affected_roles],
+                await session.execute(
+                    update(roles).where(roles.c.name.in_(affected_roles)).values(refresh_tag=new_tag)
                 )
-        await self.conn.commit()
 
     async def delete_role(self, role: str) -> None:
         """Delete a role (cascades to role_queues). Queue configs are preserved."""
-        await self.conn.execute("DELETE FROM roles WHERE name = ?", (role,))
-        await self.conn.commit()
+        async with self.session_factory.begin() as session:
+            await session.execute(delete(roles).where(roles.c.name == role))
 
-    async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
-        if not queues:
+    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]:
+        if not queues_set:
             return {}
-        placeholders = ",".join("?" * len(queues))
-        async with self.conn.execute(
-            f"SELECT name, max_concurrent FROM queues WHERE name IN ({placeholders})",
-            list(queues),
-        ) as cursor:
-            found = {row[0]: row[1] for row in await cursor.fetchall()}
-        return {q: found.get(q) for q in queues}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(queues.c.name, queues.c.max_concurrent).where(queues.c.name.in_(list(queues_set)))
+            )
+            found = {row[0]: row[1] for row in result.fetchall()}
+        return {q: found.get(q) for q in queues_set}
 
     async def get_refresh_tag(self, role: str) -> ULID:
         """Return the current refresh tag for a role, creating one if needed."""
-        async with self.conn.execute("SELECT refresh_tag FROM roles WHERE name = ?", (role,)) as cursor:
-            row = await cursor.fetchone()
+        async with self.session_factory() as session:
+            result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
+            row = result.fetchone()
         if row is not None:
-            return ULID.from_str(row[0])
+            existing_tag: ULID = ULID.from_str(row[0])
+            return existing_tag
 
         init_tag = ULID()
-        await self.conn.execute(
-            "INSERT OR IGNORE INTO roles (name, refresh_tag) VALUES (?, ?)",
-            (role, str(init_tag)),
-        )
-        await self.conn.commit()
+        try:
+            async with self.session_factory.begin() as session:
+                await session.execute(insert(roles).values(name=role, refresh_tag=str(init_tag)))
+        except IntegrityError:
+            pass  # Another process inserted first
         # Re-read in case another process won the race
-        async with self.conn.execute("SELECT refresh_tag FROM roles WHERE name = ?", (role,)) as cursor:
-            row = await cursor.fetchone()
+        async with self.session_factory() as session:
+            result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
+            row = result.fetchone()
         return ULID.from_str(row[0]) if row else init_tag

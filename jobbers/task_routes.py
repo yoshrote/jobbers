@@ -131,7 +131,7 @@ async def get_task_list(filter_query: Annotated[TaskPagination, Query()]) -> dic
 async def get_queues(role: str) -> dict[str, Any]:
     """Retrieve the list of all queues for a given role."""
     logger.info("Getting all queues for role %s", role)
-    queues = await QueueConfigAdapter(db.get_sqlite_conn()).get_queues(
+    queues = await QueueConfigAdapter(db.get_session_factory()).get_queues(
         role
     )  # Ensure the queues are sorted for consistency
     return {"queues": sorted(queues)}
@@ -141,7 +141,7 @@ async def get_queues(role: str) -> dict[str, Any]:
 async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
     """Set the list of all queues for a given role."""
     logger.info("Setting all queues for role %s", role)
-    await QueueConfigAdapter(db.get_sqlite_conn()).save_role(role, set(queues))
+    await QueueConfigAdapter(db.get_session_factory()).save_role(role, set(queues))
     return {"message": "Queues set successfully"}
 
 
@@ -149,14 +149,14 @@ async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
 async def get_all_queues() -> dict[str, Any]:
     """Retrieve the list of all queues."""
     logger.info("Getting all queues")
-    queues = await QueueConfigAdapter(db.get_sqlite_conn()).get_all_queues()
+    queues = await QueueConfigAdapter(db.get_session_factory()).get_all_queues()
     return {"queues": queues}
 
 
 @app.post("/queues", status_code=201)
 async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
     """Create a new queue with its configuration. Returns 409 if the queue already exists."""
-    qca = QueueConfigAdapter(db.get_sqlite_conn())
+    qca = QueueConfigAdapter(db.get_session_factory())
     existing = await qca.get_queue_config(queue_config.name)
     if existing is not None:
         raise HTTPException(status_code=409, detail=f"Queue '{queue_config.name}' already exists.")
@@ -167,7 +167,7 @@ async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
 @app.get("/queues/{queue_name}/config")
 async def get_queue_config(queue_name: str) -> dict[str, Any]:
     """Retrieve the configuration for a specific queue."""
-    config = await QueueConfigAdapter(db.get_sqlite_conn()).get_queue_config(queue_name)
+    config = await QueueConfigAdapter(db.get_session_factory()).get_queue_config(queue_name)
     if config is None:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
     return {"queue": config.model_dump()}
@@ -177,14 +177,14 @@ async def get_queue_config(queue_name: str) -> dict[str, Any]:
 async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, Any]:
     """Create or update the configuration for a queue. The name in the body is ignored; the path name is used."""
     queue_config.name = queue_name
-    await QueueConfigAdapter(db.get_sqlite_conn()).save_queue_config(queue_config)
+    await QueueConfigAdapter(db.get_session_factory()).save_queue_config(queue_config)
     return {"message": "Queue updated successfully", "queue": queue_config.model_dump()}
 
 
 @app.delete("/queues/{queue_name}", status_code=200)
 async def delete_queue(queue_name: str) -> dict[str, Any]:
     """Delete a queue and remove it from all roles. Returns 404 if the queue does not exist."""
-    qca = QueueConfigAdapter(db.get_sqlite_conn())
+    qca = QueueConfigAdapter(db.get_session_factory())
     all_queues = await qca.get_all_queues()
     if queue_name not in all_queues:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
@@ -300,7 +300,7 @@ async def get_active_tasks(queue: str | None = None) -> dict[str, Any]:
     if queue:
         queues: set[str] = {queue}
     else:
-        queues = set(await QueueConfigAdapter(db.get_sqlite_conn()).get_all_queues())
+        queues = set(await QueueConfigAdapter(db.get_session_factory()).get_all_queues())
     tasks = await sm.get_active_tasks(queues)
     return {"tasks": [t.summarized() for t in tasks]}
 
@@ -323,7 +323,7 @@ async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) 
 async def get_all_roles() -> dict[str, Any]:
     """Retrieve the list of all roles."""
     logger.info("Getting all roles")
-    roles = await QueueConfigAdapter(db.get_sqlite_conn()).get_all_roles()
+    roles = await QueueConfigAdapter(db.get_session_factory()).get_all_roles()
     return {"roles": roles}
 
 
@@ -337,7 +337,7 @@ class RoleRequest(BaseModel):
 @app.post("/roles", status_code=201)
 async def create_role(role: RoleRequest) -> dict[str, Any]:
     """Create a new role with an initial set of queues. Returns 409 if the role already exists."""
-    qca = QueueConfigAdapter(db.get_sqlite_conn())
+    qca = QueueConfigAdapter(db.get_session_factory())
     existing = await qca.get_queues(role.name)
     if existing:
         raise HTTPException(status_code=409, detail=f"Role '{role.name}' already exists.")
@@ -348,7 +348,7 @@ async def create_role(role: RoleRequest) -> dict[str, Any]:
 @app.get("/roles/{role_name}")
 async def get_role(role_name: str) -> dict[str, Any]:
     """Retrieve the queues assigned to a specific role."""
-    qca = QueueConfigAdapter(db.get_sqlite_conn())
+    qca = QueueConfigAdapter(db.get_session_factory())
     all_roles = await qca.get_all_roles()
     if role_name not in all_roles:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
@@ -359,7 +359,7 @@ async def get_role(role_name: str) -> dict[str, Any]:
 @app.put("/roles/{role_name}")
 async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
     """Replace the queue list for a role. Returns 404 if the role does not exist."""
-    qca = QueueConfigAdapter(db.get_sqlite_conn())
+    qca = QueueConfigAdapter(db.get_session_factory())
     all_roles = await qca.get_all_roles()
     if role_name not in all_roles:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
@@ -370,7 +370,7 @@ async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
 @app.delete("/roles/{role_name}", status_code=200)
 async def delete_role(role_name: str) -> dict[str, Any]:
     """Delete a role. Queue configs are preserved. Returns 404 if the role does not exist."""
-    qca = QueueConfigAdapter(db.get_sqlite_conn())
+    qca = QueueConfigAdapter(db.get_session_factory())
     all_roles = await qca.get_all_roles()
     if role_name not in all_roles:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")

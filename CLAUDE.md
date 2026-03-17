@@ -11,13 +11,13 @@ jobbers/
 │   ├── adapters/              # Task storage backends (Redis JSON vs msgpack)
 │   ├── models/                # Pydantic models + enums
 │   ├── utils/                 # OpenTelemetry, serialization
-│   ├── state_manager.py       # Central Redis/SQLite state management
+│   ├── state_manager.py       # Central Redis/SQL state management
 │   ├── task_processor.py      # Single-task execution lifecycle
 │   ├── task_generator.py      # Async iterator: yields tasks from queues
 │   ├── task_routes.py         # FastAPI route definitions
 │   ├── registry.py            # @register_task() decorator + global task map
 │   ├── validation.py          # Task parameter validation
-│   └── db.py                  # Redis + SQLite connection singletons
+│   └── db.py                  # Redis + SQL connection singletons
 ├── frontend/                  # React 19 + Vite 7 admin UI
 │   └── src/
 │       ├── api/client.js      # All API calls (no direct fetch in components)
@@ -34,19 +34,19 @@ jobbers/
 ## The Four Jobber Processes
 
 | Process | Entry Point | Role |
-|---------|-------------|------|
+| --------- | ------------- | ------ |
 | **Manager** | `runners/manager_proc.py` | FastAPI web server (port 8000): task submission, status, cancellation, DLQ, queue/role CRUD |
 | **Worker** | `runners/worker_proc.py` | Pulls tasks from Redis queues and executes them; handles retries, heartbeats, cancellation |
 | **Cleaner** | `runners/cleaner_proc.py` | Maintenance: prunes stale Redis state, rate-limit entries, DLQ entries, detects stalled tasks |
-| **Scheduler** | `runners/scheduler_proc.py` | Polls SQLite for due scheduled tasks and promotes them back into Redis queues |
+| **Scheduler** | `runners/scheduler_proc.py` | Polls SQL for due scheduled tasks and promotes them back into Redis queues |
 
 All four run as separate processes (separate Docker containers in production).
 
 ## Tech Stack
 
-- **Python 3.11+**, FastAPI, asyncio, aiosqlite
+- **Python 3.11+**, FastAPI, asyncio, sqlalchemy[asyncio]
 - **Redis** — task queues, task scheduler, dead letter queue, task state
-- **SQLite** — queue/role config
+- **SQLAlchemy** — queue/role config
 - **Two interchangeable task adapters:** `JsonTaskAdapter` (Redis JSON + RediSearch) and `MsgpackTaskAdapter` (plain Redis + msgpack + sorted sets)
 - **Two interchangeable dead letter adapters:** `JsonDeadQueue` (Redis JSON + RediSearch) and `DeadQueue` (plain Redis + sorted sets)
 - **React 19 + Vite 7 + React Router 6** (no TypeScript, plain CSS)
@@ -87,21 +87,21 @@ async def my_task(**kwargs):
 
 ## Queue & Role System
 
-- **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Stored in SQLite `queues` table.
-- **Roles**: named sets of queues assigned to workers. Workers consume all queues in their role. Stored in SQLite `roles` table.
+- **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Stored in SQL `queues` table.
+- **Roles**: named sets of queues assigned to workers. Workers consume all queues in their role. Stored in SQL `roles` table.
 - Workers detect role/queue config changes via a refresh tag TTL in `TaskGenerator`.
 
 ## Key Environment Variables
 
 | Variable | Default | Used by |
-|----------|---------|---------|
+| ---------- | --------- | --------- |
 | `WORKER_ROLE` | `"default"` | Worker |
 | `WORKER_TTL` | `50` | Worker (max tasks before restart) |
 | `WORKER_CONCURRENT_TASKS` | `5` | Worker |
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Scheduler |
 | `SCHEDULER_BATCH_SIZE` | `1` | Scheduler |
 | `REDIS_URL` | `redis://localhost:6379` | All |
-| `SQLITE_PATH` | `jobbers.db` | All |
+| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All |
 
 ## Testing
 
@@ -150,7 +150,6 @@ mypy jobbers
 
 mypy is configured with `strict = true` and runs only on the `jobbers/` package (tests are excluded).
 
-
 ### Test Architecture
 
 The test suite follows a layered approach designed for speed and systematic protocol coverage:
@@ -158,7 +157,7 @@ The test suite follows a layered approach designed for speed and systematic prot
 #### Three tiers of tests
 
 | Tier | Where | Fixture | Purpose |
-|------|-------|---------|---------|
+| ------ | ------- | --------- | --------- |
 | **Protocol contract** | `tests/adapters/test_task_adapter_common.py`, `test_dead_queue_common.py` | `task_adapter` / `dead_queue` (parametrized over all implementations) | Verify every implementation satisfies the protocol. Adding a new adapter means adding a fixture variant — all contract tests run automatically. |
 | **Implementation edge cases** | `tests/adapters/test_msgpack_adapter.py`, `test_json_adapter.py` | `msgpack_adapter` / `json_adapter` | Cover implementation-specific behaviour that is not a protocol requirement (e.g., sorting limitations, null JSON blobs). |
 | **Orchestration** | `test_state_manager.py`, `test_task_processor.py`, `test_task_routes.py`, `test_task_generator.py` | `DummyTaskAdapter` or `Mock(spec=StateManager)` | Test coordination logic without touching real adapters; fast, no Redis Stack required. |
