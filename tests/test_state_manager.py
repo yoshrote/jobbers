@@ -20,13 +20,13 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
 
 async def schedule(sm: StateManager, task: Task, run_at: dt.datetime) -> None:
-    pipe = sm.data_store.pipeline(transaction=True)
+    pipe = sm.job_store.pipeline(transaction=True)
     sm.task_scheduler.stage_add(pipe, task, run_at)
     await pipe.execute()
 
 
 async def add_to_dlq(sm: StateManager, task: Task, failed_at: dt.datetime) -> None:
-    pipe = sm.data_store.pipeline(transaction=True)
+    pipe = sm.job_store.pipeline(transaction=True)
     sm.dead_queue.stage_add(pipe, task, failed_at)
     await pipe.execute()
 
@@ -428,7 +428,7 @@ async def test_cancel_submitted_task(redis, state_manager):
     task = Task(
         id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME
     )
-    pipe = state_manager.data_store.pipeline()
+    pipe = state_manager.job_store.pipeline()
     state_manager.ta.stage_requeue(pipe, task)
     await pipe.execute()
     await state_manager.ta.save_task(task)
@@ -586,7 +586,7 @@ async def test_update_task_heartbeat_sets_timestamp(state_manager_real_ta):
     await state_manager_real_ta.update_task_heartbeat(task)
 
     assert task.heartbeat_at is not None
-    score = await state_manager_real_ta.data_store.zscore(
+    score = await state_manager_real_ta.job_store.zscore(
         state_manager_real_ta.ta.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)
     )
     assert score is not None
@@ -601,7 +601,7 @@ async def test_remove_task_heartbeat_clears_entry(state_manager_real_ta):
 
     await state_manager_real_ta.remove_task_heartbeat(task)
 
-    score = await state_manager_real_ta.data_store.zscore(
+    score = await state_manager_real_ta.job_store.zscore(
         state_manager_real_ta.ta.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)
     )
     assert score is None
