@@ -49,7 +49,9 @@ class TaskScheduler:
         return results
     """
 
-    def __init__(self, data_store: Redis, task_adapter: TaskAdapterProtocol, queue_config_adapter: QueueConfigAdapter) -> None:
+    def __init__(
+        self, data_store: Redis, task_adapter: TaskAdapterProtocol, queue_config_adapter: QueueConfigAdapter
+    ) -> None:
         self.data_store = data_store
         self.ta = task_adapter
         self.qca = queue_config_adapter
