@@ -1,4 +1,5 @@
 """Central SQLAlchemy DDL definitions for the Jobbers schema."""
+
 from __future__ import annotations
 
 from sqlalchemy import Column, ForeignKey, Index, Integer, MetaData, String, Table

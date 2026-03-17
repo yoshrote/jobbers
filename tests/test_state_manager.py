@@ -425,8 +425,9 @@ async def test_request_task_cancellation_returns_none_for_missing_task(state_man
 @pytest.mark.asyncio
 async def test_cancel_submitted_task(redis, state_manager):
     """Cancelling a SUBMITTED task removes it from the queue and marks it CANCELLED."""
-    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED,
-                submitted_at=FROZEN_TIME)
+    task = Task(
+        id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME
+    )
     pipe = state_manager.data_store.pipeline()
     state_manager.ta.stage_requeue(pipe, task)
     await pipe.execute()
@@ -488,12 +489,14 @@ async def test_cancel_terminal_task_raises(state_manager):
 @pytest.mark.asyncio
 async def test_submit_task_rate_limited_branch(redis, state_manager_real_ta):
     """submit_task routes through submit_rate_limited_task when queue has rate config."""
-    await state_manager_real_ta.qca.save_queue_config(QueueConfig(
-        name="default",
-        rate_numerator=5,
-        rate_denominator=1,
-        rate_period=RatePeriod.MINUTE,
-    ))
+    await state_manager_real_ta.qca.save_queue_config(
+        QueueConfig(
+            name="default",
+            rate_numerator=5,
+            rate_denominator=1,
+            rate_period=RatePeriod.MINUTE,
+        )
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED)
 
     await state_manager_real_ta.submit_task(task)

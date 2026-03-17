@@ -435,4 +435,3 @@ async def test_clean_empty_queue_is_silent(dead_queue):
     """Clean on an empty DLQ should not raise."""
     dq, _ = dead_queue
     await dq.clean(dt.datetime(2025, 1, 1, tzinfo=dt.UTC))
-

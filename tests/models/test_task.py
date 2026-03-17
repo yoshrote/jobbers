@@ -157,7 +157,8 @@ def test_summarized_omits_last_error_when_no_errors():
 
 @pytest.mark.asyncio
 async def test_heartbeat_sets_heartbeat_at_and_calls_adapter():
-    """heartbeat() timestamps heartbeat_at and delegates to the task adapter.
+    """
+    heartbeat() timestamps heartbeat_at and delegates to the task adapter.
 
     Patches at the jobbers.db level so the real _ta property body (lines 105-107)
     executes, covering both the property and the heartbeat method.

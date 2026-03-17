@@ -171,7 +171,8 @@ async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
 
 @pytest.mark.asyncio
 async def test_clean_handles_missing_meta(raw_dead_queue):
-    """clean() removes the sorted-set entry even when the meta hash entry is absent.
+    """
+    clean() removes the sorted-set entry even when the meta hash entry is absent.
 
     DeadQueue stores DLQ membership in a sorted set (``dlq``) and queue/name metadata
     in a separate hash (``dlq-meta``).  If the meta entry is missing (e.g. written by

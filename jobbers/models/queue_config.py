@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from pydantic import BaseModel
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from ulid import ULID
 
 from jobbers.migrations.schema import queues, role_queues, roles
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 class RatePeriod(StrEnum):
@@ -75,9 +77,7 @@ class QueueConfigAdapter:
 
     async def get_queues(self, role: str) -> set[str]:
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(role_queues.c.queue).where(role_queues.c.role == role)
-            )
+            result = await session.execute(select(role_queues.c.queue).where(role_queues.c.role == role))
             return {row[0] for row in result.fetchall()}
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
@@ -126,7 +126,9 @@ class QueueConfigAdapter:
             existing = await session.execute(select(queues.c.name).where(queues.c.name == queue_config.name))
             if existing.fetchone():
                 await session.execute(
-                    update(queues).where(queues.c.name == queue_config.name).values(
+                    update(queues)
+                    .where(queues.c.name == queue_config.name)
+                    .values(
                         max_concurrent=queue_config.max_concurrent,
                         rate_numerator=queue_config.rate_numerator,
                         rate_denominator=queue_config.rate_denominator,
@@ -149,17 +151,13 @@ class QueueConfigAdapter:
         new_tag = str(ULID())
         async with self.session_factory.begin() as session:
             result = await session.execute(
-                select(role_queues.c.role)
-                .where(role_queues.c.queue == queue_name)
-                .distinct()
+                select(role_queues.c.role).where(role_queues.c.queue == queue_name).distinct()
             )
             affected_roles = [row[0] for row in result.fetchall()]
             await session.execute(delete(queues).where(queues.c.name == queue_name))
             if affected_roles:
                 await session.execute(
-                    update(roles)
-                    .where(roles.c.name.in_(affected_roles))
-                    .values(refresh_tag=new_tag)
+                    update(roles).where(roles.c.name.in_(affected_roles)).values(refresh_tag=new_tag)
                 )
 
     async def delete_role(self, role: str) -> None:
@@ -172,9 +170,7 @@ class QueueConfigAdapter:
             return {}
         async with self.session_factory() as session:
             result = await session.execute(
-                select(queues.c.name, queues.c.max_concurrent).where(
-                    queues.c.name.in_(list(queues_set))
-                )
+                select(queues.c.name, queues.c.max_concurrent).where(queues.c.name.in_(list(queues_set)))
             )
             found = {row[0]: row[1] for row in result.fetchall()}
         return {q: found.get(q) for q in queues_set}
@@ -182,12 +178,11 @@ class QueueConfigAdapter:
     async def get_refresh_tag(self, role: str) -> ULID:
         """Return the current refresh tag for a role, creating one if needed."""
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(roles.c.refresh_tag).where(roles.c.name == role)
-            )
+            result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
             row = result.fetchone()
         if row is not None:
-            return ULID.from_str(row[0])
+            existing_tag: ULID = ULID.from_str(row[0])
+            return existing_tag
 
         init_tag = ULID()
         try:
@@ -197,8 +192,6 @@ class QueueConfigAdapter:
             pass  # Another process inserted first
         # Re-read in case another process won the race
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(roles.c.refresh_tag).where(roles.c.name == role)
-            )
+            result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
             row = result.fetchone()
         return ULID.from_str(row[0]) if row else init_tag

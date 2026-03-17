@@ -1,4 +1,5 @@
 """Migration runner: applies the Jobbers schema to the SQLite database."""
+
 from __future__ import annotations
 
 import asyncio

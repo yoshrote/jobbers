@@ -90,9 +90,7 @@ async def test_get_all_tasks_filters_by_status(task_adapter):
     await task_adapter.submit_task(make_task(ULID2, status=TaskStatus.SUBMITTED))
     await task_adapter.save_task(make_task(ULID2, status=TaskStatus.COMPLETED))
 
-    results = await task_adapter.get_all_tasks(
-        TaskPagination(queue="default", status=TaskStatus.SUBMITTED)
-    )
+    results = await task_adapter.get_all_tasks(TaskPagination(queue="default", status=TaskStatus.SUBMITTED))
     assert len(results) == 1
     assert results[0].id == ULID1
 
@@ -113,9 +111,7 @@ async def test_get_all_tasks_filter_no_match_returns_empty(task_adapter):
     """A filter that matches no tasks returns an empty list."""
     await task_adapter.submit_task(make_task(ULID1, name="task_a"))
 
-    results = await task_adapter.get_all_tasks(
-        TaskPagination(queue="default", task_name="task_nonexistent")
-    )
+    results = await task_adapter.get_all_tasks(TaskPagination(queue="default", task_name="task_nonexistent"))
     assert results == []
 
 
@@ -126,9 +122,7 @@ async def test_get_all_tasks_filter_no_match_returns_empty(task_adapter):
 async def test_get_all_tasks_respects_limit(task_adapter):
     """`limit` caps the number of results returned."""
     for i, uid in enumerate((ULID1, ULID2, ULID3)):
-        await task_adapter.submit_task(
-            make_task(uid, submitted_at=FROZEN_TIME + dt.timedelta(seconds=i))
-        )
+        await task_adapter.submit_task(make_task(uid, submitted_at=FROZEN_TIME + dt.timedelta(seconds=i)))
 
     results = await task_adapter.get_all_tasks(TaskPagination(queue="default", limit=2))
     assert len(results) == 2
@@ -138,9 +132,7 @@ async def test_get_all_tasks_respects_limit(task_adapter):
 async def test_get_all_tasks_offset_skips_first_n(task_adapter):
     """`offset` skips the first N results so successive pages do not overlap."""
     for i, uid in enumerate((ULID1, ULID2, ULID3)):
-        await task_adapter.submit_task(
-            make_task(uid, submitted_at=FROZEN_TIME + dt.timedelta(seconds=i))
-        )
+        await task_adapter.submit_task(make_task(uid, submitted_at=FROZEN_TIME + dt.timedelta(seconds=i)))
 
     page1 = await task_adapter.get_all_tasks(
         TaskPagination(queue="default", limit=2, offset=0, order_by=PaginationOrder.SUBMITTED_AT)
@@ -159,9 +151,7 @@ async def test_get_all_tasks_offset_returns_empty_beyond_end(task_adapter):
     """An offset past the total count returns an empty list."""
     await task_adapter.submit_task(make_task(ULID1))
 
-    results = await task_adapter.get_all_tasks(
-        TaskPagination(queue="default", limit=10, offset=5)
-    )
+    results = await task_adapter.get_all_tasks(TaskPagination(queue="default", limit=10, offset=5))
     assert results == []
 
 
@@ -400,10 +390,16 @@ async def test_remove_task_heartbeat_removes_entry(task_adapter):
     task = make_task()
     task.heartbeat_at = FROZEN_TIME
     await task_adapter.update_task_heartbeat(task)
-    assert await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)) is not None
+    assert (
+        await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), bytes(ULID1))
+        is not None
+    )
 
     await task_adapter.remove_task_heartbeat(task)
-    assert await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)) is None
+    assert (
+        await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), bytes(ULID1))
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -486,9 +482,7 @@ async def test_get_next_task_skips_missing_data_and_returns_none(task_adapter):
             None,
         ]
     )
-    with patch.object(
-        task_adapter.data_store, "bzpopmin", new_callable=AsyncMock, side_effect=pop_results
-    ):
+    with patch.object(task_adapter.data_store, "bzpopmin", new_callable=AsyncMock, side_effect=pop_results):
         result = await task_adapter.get_next_task(queues={"default"}, pop_timeout=1)
     assert result is None
     assert await task_adapter.data_store.zscore(task_adapter.DLQ_MISSING_DATA, bytes(fake_id)) is not None
@@ -675,7 +669,8 @@ async def test_get_stale_tasks_handles_multiple_queues(task_adapter):
         await task_adapter.update_task_heartbeat(t)
 
     stale_tasks = [
-        task async for task in task_adapter.get_stale_tasks({"default", "high_priority"}, dt.timedelta(minutes=5))
+        task
+        async for task in task_adapter.get_stale_tasks({"default", "high_priority"}, dt.timedelta(minutes=5))
     ]
     assert len(stale_tasks) == 2
     assert {task.id for task in stale_tasks} == {t1.id, t2.id}
@@ -708,7 +703,10 @@ async def test_get_stale_tasks_filters_out_missing_blobs(task_adapter):
 async def test_clean_terminal_tasks_deletes_old_completed_blob(task_adapter):
     """A completed task blob older than max_age is deleted."""
     task = Task(
-        id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+        id=ULID1,
+        name="test_task",
+        queue="default",
+        status=TaskStatus.COMPLETED,
         completed_at=FROZEN_TIME - dt.timedelta(days=8),
     )
     await task_adapter.save_task(task)
@@ -720,7 +718,10 @@ async def test_clean_terminal_tasks_deletes_old_completed_blob(task_adapter):
 async def test_clean_terminal_tasks_removes_heartbeat_entry(task_adapter):
     """The heartbeat sorted-set entry is removed along with the task blob."""
     task = Task(
-        id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+        id=ULID1,
+        name="test_task",
+        queue="default",
+        status=TaskStatus.COMPLETED,
         completed_at=FROZEN_TIME - dt.timedelta(days=8),
     )
     await task_adapter.save_task(task)
@@ -729,14 +730,20 @@ async def test_clean_terminal_tasks_removes_heartbeat_entry(task_adapter):
         {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=8)).timestamp()},
     )
     await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    assert await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes) is None
+    assert (
+        await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes)
+        is None
+    )
 
 
 @pytest.mark.asyncio
 async def test_clean_terminal_tasks_removes_type_index_entry(task_adapter):
     """Orphaned task-type-idx entries are removed alongside the task blob."""
     task = Task(
-        id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+        id=ULID1,
+        name="test_task",
+        queue="default",
+        status=TaskStatus.COMPLETED,
         completed_at=FROZEN_TIME - dt.timedelta(days=8),
     )
     await task_adapter.save_task(task)
@@ -750,7 +757,10 @@ async def test_clean_terminal_tasks_removes_type_index_entry(task_adapter):
 async def test_clean_terminal_tasks_skips_active_task(task_adapter):
     """Tasks in active statuses are never deleted regardless of age."""
     task = Task(
-        id=ULID1, name="test_task", queue="default", status=TaskStatus.STARTED,
+        id=ULID1,
+        name="test_task",
+        queue="default",
+        status=TaskStatus.STARTED,
         started_at=FROZEN_TIME - dt.timedelta(days=100),
     )
     await task_adapter.save_task(task)
@@ -762,7 +772,10 @@ async def test_clean_terminal_tasks_skips_active_task(task_adapter):
 async def test_clean_terminal_tasks_skips_task_within_age(task_adapter):
     """A completed task whose completed_at is within max_age is not deleted."""
     task = Task(
-        id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+        id=ULID1,
+        name="test_task",
+        queue="default",
+        status=TaskStatus.COMPLETED,
         completed_at=FROZEN_TIME - dt.timedelta(hours=1),
     )
     await task_adapter.save_task(task)
@@ -793,7 +806,10 @@ async def test_clean_terminal_tasks_skips_task_without_completed_at(task_adapter
 async def test_clean_terminal_tasks_cleans_all_terminal_statuses(task_adapter, status):
     """All five terminal statuses are eligible for cleanup when old enough."""
     task = Task(
-        id=ULID1, name="test_task", queue="default", status=status,
+        id=ULID1,
+        name="test_task",
+        queue="default",
+        status=status,
         completed_at=FROZEN_TIME - dt.timedelta(days=8),
     )
     await task_adapter.save_task(task)
@@ -805,11 +821,17 @@ async def test_clean_terminal_tasks_cleans_all_terminal_statuses(task_adapter, s
 async def test_clean_terminal_tasks_leaves_other_tasks_untouched(task_adapter):
     """Only old terminal tasks are deleted; recent tasks remain."""
     old_task = Task(
-        id=ULID1, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+        id=ULID1,
+        name="test_task",
+        queue="default",
+        status=TaskStatus.COMPLETED,
         completed_at=FROZEN_TIME - dt.timedelta(days=8),
     )
     recent_task = Task(
-        id=ULID2, name="test_task", queue="default", status=TaskStatus.COMPLETED,
+        id=ULID2,
+        name="test_task",
+        queue="default",
+        status=TaskStatus.COMPLETED,
         completed_at=FROZEN_TIME - dt.timedelta(hours=1),
     )
     await task_adapter.save_task(old_task)
@@ -837,11 +859,15 @@ async def test_clean_terminal_tasks_skips_non_ulid_keys(task_adapter):
 
 
 def _make_rate_task(task_id: ULID, submitted_at: dt.datetime) -> Task:
-    return Task(id=task_id, name="test", queue="default", status=TaskStatus.SUBMITTED, submitted_at=submitted_at)
+    return Task(
+        id=task_id, name="test", queue="default", status=TaskStatus.SUBMITTED, submitted_at=submitted_at
+    )
 
 
 def _default_queue_config(rate_numerator: int = 2) -> QueueConfig:
-    return QueueConfig(name="default", rate_numerator=rate_numerator, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    return QueueConfig(
+        name="default", rate_numerator=rate_numerator, rate_denominator=1, rate_period=RatePeriod.MINUTE
+    )
 
 
 @pytest.mark.asyncio
@@ -853,8 +879,12 @@ async def test_submit_rate_limited_enqueues_when_empty(task_adapter, task_adapte
         mock_dt.timedelta = dt.timedelta
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
     assert result is True
-    assert bytes(ULID1) in await task_adapter.data_store.zrange(task_adapter.QUEUE_RATE_LIMITER(queue="default"), 0, -1)
-    assert bytes(ULID1) in await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
+    assert bytes(ULID1) in await task_adapter.data_store.zrange(
+        task_adapter.QUEUE_RATE_LIMITER(queue="default"), 0, -1
+    )
+    assert bytes(ULID1) in await task_adapter.data_store.zrange(
+        task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1
+    )
     assert await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
 
 
@@ -870,7 +900,9 @@ async def test_submit_rate_limited_enqueues_with_room(task_adapter, task_adapter
         mock_dt.timedelta = dt.timedelta
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
     assert result is True
-    assert bytes(ULID2) in await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
+    assert bytes(ULID2) in await task_adapter.data_store.zrange(
+        task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1
+    )
 
 
 @pytest.mark.asyncio
@@ -889,7 +921,9 @@ async def test_submit_rate_limited_prunes_expired_entries(task_adapter, task_ada
         mock_dt.timedelta = dt.timedelta
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
     assert result is True
-    assert new_id.bytes in await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
+    assert new_id.bytes in await task_adapter.data_store.zrange(
+        task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1
+    )
 
 
 @pytest.mark.asyncio
@@ -907,7 +941,9 @@ async def test_submit_rate_limited_rejects_when_full(task_adapter, task_adapter_
         mock_dt.timedelta = dt.timedelta
         result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
     assert result is False
-    assert ULID5.bytes not in await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
+    assert ULID5.bytes not in await task_adapter.data_store.zrange(
+        task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1
+    )
     assert not await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID5))
 
 

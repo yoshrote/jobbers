@@ -16,21 +16,21 @@ if TYPE_CHECKING:
 TASK_ADAPTER_BACKEND = "json"
 DEFAULT_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
-_client: redis.Redis | None = None  # type: ignore[type-arg]
+_client: redis.Redis | None = None
 _state_manager: StateManager | None = None
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _task_adapter: TaskAdapterProtocol | None = None
 
 
-def get_client() -> redis.Redis:  # type: ignore[type-arg]
+def get_client() -> redis.Redis:
     global _client
     if _client is None:
         _client = redis.from_url(DEFAULT_REDIS_URL)
     return _client
 
 
-def set_client(new_client: redis.Redis) -> redis.Redis:  # type: ignore[type-arg]
+def set_client(new_client: redis.Redis) -> redis.Redis:
     global _client
     if _client is not None:
         _client.close()
@@ -61,7 +61,7 @@ async def close_sqlite_conn() -> None:
         _session_factory = None
 
 
-def create_task_adapter(client: redis.Redis) -> TaskAdapterProtocol:  # type: ignore[type-arg]
+def create_task_adapter(client: redis.Redis) -> TaskAdapterProtocol:
     """Create a TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
     from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
 
@@ -81,14 +81,15 @@ async def init_state_manager() -> StateManager:
     global _state_manager, _engine, _session_factory, _task_adapter
     from jobbers.state_manager import StateManager
 
-    db_path = os.environ.get("SQLITE_PATH", "jobbers.db")
-    _engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
+    _engine = create_async_engine(db_path)
 
     @event.listens_for(_engine.sync_engine, "connect")
     def set_sqlite_pragma(dbapi_conn: object, connection_record: object) -> None:
-        cursor = dbapi_conn.cursor()  # type: ignore[union-attr]
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+        if db_path.startswith("sqlite"):
+            cursor = dbapi_conn.cursor()  # type: ignore[attr-defined]
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
 
     await run_migrations(_engine)
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
