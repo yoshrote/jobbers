@@ -1,4 +1,4 @@
-"""Migration runner: applies the Jobbers schema to the SQLite database."""
+"""Migration runner: applies the Jobbers schema to the SQL database."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ async def run_migrations(engine: AsyncEngine) -> None:
 async def run_cli() -> None:
     """CLI entry point: apply the schema to the configured database."""
     db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    engine = create_async_engine(db_path)
     try:
         await run_migrations(engine)
     finally:

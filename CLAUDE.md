@@ -11,13 +11,13 @@ jobbers/
 │   ├── adapters/              # Task storage backends (Redis JSON vs msgpack)
 │   ├── models/                # Pydantic models + enums
 │   ├── utils/                 # OpenTelemetry, serialization
-│   ├── state_manager.py       # Central Redis/SQLite state management
+│   ├── state_manager.py       # Central Redis/SQL state management
 │   ├── task_processor.py      # Single-task execution lifecycle
 │   ├── task_generator.py      # Async iterator: yields tasks from queues
 │   ├── task_routes.py         # FastAPI route definitions
 │   ├── registry.py            # @register_task() decorator + global task map
 │   ├── validation.py          # Task parameter validation
-│   └── db.py                  # Redis + SQLite connection singletons
+│   └── db.py                  # Redis + SQL connection singletons
 ├── frontend/                  # React 19 + Vite 7 admin UI
 │   └── src/
 │       ├── api/client.js      # All API calls (no direct fetch in components)
@@ -38,15 +38,15 @@ jobbers/
 | **Manager** | `runners/manager_proc.py` | FastAPI web server (port 8000): task submission, status, cancellation, DLQ, queue/role CRUD |
 | **Worker** | `runners/worker_proc.py` | Pulls tasks from Redis queues and executes them; handles retries, heartbeats, cancellation |
 | **Cleaner** | `runners/cleaner_proc.py` | Maintenance: prunes stale Redis state, rate-limit entries, DLQ entries, detects stalled tasks |
-| **Scheduler** | `runners/scheduler_proc.py` | Polls SQLite for due scheduled tasks and promotes them back into Redis queues |
+| **Scheduler** | `runners/scheduler_proc.py` | Polls SQL for due scheduled tasks and promotes them back into Redis queues |
 
 All four run as separate processes (separate Docker containers in production).
 
 ## Tech Stack
 
-- **Python 3.11+**, FastAPI, asyncio, aiosqlite
+- **Python 3.11+**, FastAPI, asyncio, sqlalchemy[asyncio]
 - **Redis** — task queues, task scheduler, dead letter queue, task state
-- **SQLite** — queue/role config
+- **SQLAlchemy** — queue/role config
 - **Two interchangeable task adapters:** `JsonTaskAdapter` (Redis JSON + RediSearch) and `MsgpackTaskAdapter` (plain Redis + msgpack + sorted sets)
 - **Two interchangeable dead letter adapters:** `JsonDeadQueue` (Redis JSON + RediSearch) and `DeadQueue` (plain Redis + sorted sets)
 - **React 19 + Vite 7 + React Router 6** (no TypeScript, plain CSS)
@@ -101,7 +101,7 @@ async def my_task(**kwargs):
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Scheduler |
 | `SCHEDULER_BATCH_SIZE` | `1` | Scheduler |
 | `REDIS_URL` | `redis://localhost:6379` | All |
-| `SQLITE_PATH` | `jobbers.db` | All |
+| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All |
 
 ## Testing
 

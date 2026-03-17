@@ -49,7 +49,7 @@ async def close_client() -> None:
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
     global _session_factory
     if _session_factory is None:
-        raise RuntimeError("SQLite not initialized. Call init_state_manager() first.")
+        raise RuntimeError("Session factory not initialized. Call init_state_manager() first.")
     return _session_factory
 
 

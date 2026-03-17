@@ -380,7 +380,7 @@ jobbers_manager myapp.tasks
 jobbers_manager /srv/myapp/tasks.py
 ```
 
-Run one or more manager instances. Because all state lives in Redis and SQLite, any number of managers can run concurrently behind a load balancer.
+Run one or more manager instances. Because all state lives in Redis and SQL, any number of managers can run concurrently behind a load balancer.
 
 ---
 
@@ -401,7 +401,7 @@ jobbers_worker myapp.tasks
 | `WORKER_CONCURRENT_TASKS` | `5` | Maximum number of tasks running concurrently within this process. |
 | `WORKER_TTL` | `50` | Worker exits after processing this many tasks and is expected to be restarted by a process supervisor (e.g. Docker, systemd). Protects against memory leaks in long-running task code. Set to `0` to run indefinitely. |
 
-Scale workers horizontally by running more instances. Each worker is fully independent — they share no state except through Redis and SQLite.
+Scale workers horizontally by running more instances. Each worker is fully independent — they share no state except through Redis and SQL.
 
 On `SIGTERM`, each in-flight task is handled according to its `on_shutdown` policy (`stop`, `resubmit`, or `continue`) before the process exits.
 

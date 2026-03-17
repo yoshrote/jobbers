@@ -65,7 +65,7 @@ class QueueConfig(BaseModel):
 
 class QueueConfigAdapter:
     """
-    Manages queue configuration in a SQLite data store via SQLAlchemy async sessions.
+    Manages queue configuration in a data store via SQLAlchemy async sessions.
 
     - `roles`: table of named roles, each with a refresh_tag for change detection.
     - `queues`: table of queue configurations (concurrency and rate limiting).
