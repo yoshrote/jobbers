@@ -40,9 +40,13 @@ UNSUBMITTED → SUBMITTED → STARTED → COMPLETED
                                    → DROPPED (unknown task type)
 ```
 
+See [docs/task-lifecycle.md](docs/task-lifecycle.md) for a full state diagram and details on how `TaskConfig` settings influence each transition.
+
 ---
 
 ## Quick Start
+
+For a complete reference on task registration options, enqueuing tasks, queue/role setup, and DLQ management, see [docs/developer-guide.md](docs/developer-guide.md).
 
 ### 1. Define a task
 
@@ -484,3 +488,5 @@ docker compose up
 ```
 
 This starts all four processes (manager, worker, cleaner, scheduler) along with Redis. The manager API is available at `http://localhost:8000`.
+
+For full installation instructions, environment variable reference, cron setup for the Cleaner, and monitoring guidance, see [docs/operations.md](docs/operations.md).
