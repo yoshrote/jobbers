@@ -87,8 +87,8 @@ async def my_task(**kwargs):
 
 ## Queue & Role System
 
-- **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Stored in SQLite `queues` table.
-- **Roles**: named sets of queues assigned to workers. Workers consume all queues in their role. Stored in SQLite `roles` table.
+- **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Stored in SQL `queues` table.
+- **Roles**: named sets of queues assigned to workers. Workers consume all queues in their role. Stored in SQL `roles` table.
 - Workers detect role/queue config changes via a refresh tag TTL in `TaskGenerator`.
 
 ## Key Environment Variables
