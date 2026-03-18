@@ -850,3 +850,83 @@ async def test_submit_task_raises_400_on_task_exception():
 
     assert response.status_code == 400
     assert "bad params" in response.json()["detail"]
+
+
+# ── schedule_task route ───────────────────────────────────────────────────────
+
+RUN_AT = dt.datetime(2026, 3, 18, 12, 0, 0, tzinfo=dt.UTC)
+
+
+@pytest.mark.asyncio
+async def test_schedule_task_valid(state_manager):
+    """POST /schedule-task schedules the task and returns 200 with task summary and run_at."""
+    from jobbers.models.task_config import TaskConfig
+
+    async def task_function(foo: int) -> None:  # pragma: no cover
+        pass
+
+    test_task_config = TaskConfig(name="Test Task", function=task_function)
+    task_data = Task(id=ULID1, name="Test Task", queue="default", parameters={"foo": 1})
+
+    with patch("jobbers.registry.get_task_config", return_value=test_task_config):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/schedule-task",
+                json={
+                    "task": task_data.model_dump(mode="json", exclude_unset=True),
+                    "run_at": RUN_AT.isoformat(),
+                },
+            )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["message"] == "Task scheduled successfully"
+    assert data["task"]["id"] == str(ULID1)
+    assert data["run_at"] == RUN_AT.isoformat()
+
+    scheduled = await state_manager.task_scheduler.get_by_filter(queue="default")
+    assert len(scheduled) == 1
+    assert scheduled[0].id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_schedule_task_invalid_params_returns_400():
+    """POST /schedule-task returns 400 when task parameters fail validation."""
+    from jobbers.models.task_config import TaskConfig
+
+    async def task_function(foo: int) -> None:  # pragma: no cover
+        pass
+
+    test_task_config = TaskConfig(name="Test Task", function=task_function)
+    task_data = Task(id=ULID1, name="Test Task", queue="default", parameters={"foo": "not_an_int"})
+
+    with patch("jobbers.registry.get_task_config", return_value=test_task_config):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/schedule-task",
+                json={
+                    "task": task_data.model_dump(mode="json", exclude_unset=True),
+                    "run_at": RUN_AT.isoformat(),
+                },
+            )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_schedule_task_unknown_task_returns_400():
+    """POST /schedule-task returns 400 when the task name is not registered."""
+    task_data = Task(id=ULID1, name="nonexistent_task", queue="default", parameters={})
+
+    with patch("jobbers.registry.get_task_config", return_value=None):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/schedule-task",
+                json={
+                    "task": task_data.model_dump(mode="json", exclude_unset=True),
+                    "run_at": RUN_AT.isoformat(),
+                },
+            )
+
+    assert response.status_code == 400
+    assert "nonexistent_task" in response.json()["detail"]

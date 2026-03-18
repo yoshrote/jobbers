@@ -1,4 +1,5 @@
 import asyncio
+import datetime as dt
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -62,6 +63,30 @@ async def submit_task(task: Task) -> dict[str, Any]:
     return {
         "message": "Task submitted successfully",
         "task": task.summarized(),
+    }
+
+
+class ScheduleTaskRequest(BaseModel):
+    """Request body for scheduling a task at a specific time."""
+
+    task: Task
+    run_at: dt.datetime = Field(description="UTC datetime when the task should be executed.")
+
+
+@app.post("/schedule-task")
+async def schedule_task(request: ScheduleTaskRequest) -> dict[str, Any]:
+    """Schedule a task to run at a specific UTC datetime."""
+    logger.info("Scheduling task %s to run at %s", request.task.name, request.run_at)
+    try:
+        await validate_task(request.task)
+    except ValidationError as ex:
+        raise HTTPException(status_code=400, detail=str(ex)) from ex
+    sm = db.get_state_manager()
+    await sm.schedule_new_task(request.task, request.run_at)
+    return {
+        "message": "Task scheduled successfully",
+        "task": request.task.summarized(),
+        "run_at": request.run_at.isoformat(),
     }
 
 

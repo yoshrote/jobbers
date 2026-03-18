@@ -556,6 +556,47 @@ async def test_monitor_task_cancellation_does_not_exit_without_message(state_man
         await monitor
 
 
+# ── schedule_new_task ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_schedule_new_task_sets_status_and_submitted_at(state_manager):
+    """schedule_new_task sets status=SCHEDULED and saves the task."""
+    task = Task(id=ULID1, name="t", version=1, queue="default")
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+
+    result = await state_manager.schedule_new_task(task, run_at)
+
+    assert result is task
+    assert task.status == TaskStatus.SCHEDULED
+    assert task.submitted_at is None
+
+
+@pytest.mark.asyncio
+async def test_schedule_new_task_appears_in_scheduler(state_manager):
+    """schedule_new_task registers the task in the scheduler sorted set."""
+    task = Task(id=ULID1, name="t", version=1, queue="default")
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+
+    await state_manager.schedule_new_task(task, run_at)
+
+    scheduled = await state_manager.task_scheduler.get_by_filter(queue="default")
+    assert len(scheduled) == 1
+    assert scheduled[0].id == ULID1
+    assert scheduled[0].status == TaskStatus.SCHEDULED
+
+
+@pytest.mark.asyncio
+async def test_schedule_new_task_does_not_increment_retry_attempt(state_manager):
+    """schedule_new_task leaves retry_attempt=0 for a fresh task."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", retry_attempt=0)
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+
+    await state_manager.schedule_new_task(task, run_at)
+
+    assert task.retry_attempt == 0
+
+
 # ── schedule_retry_task ───────────────────────────────────────────────────────
 
 
