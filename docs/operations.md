@@ -83,7 +83,7 @@ jobbers_manager myapp.tasks
 jobbers_manager /srv/myapp/tasks.py
 ```
 
-Run one or more Manager instances. Because all state lives in Redis and SQLite, any number can run concurrently behind a load balancer.
+Run one or more Manager instances. Because all state lives in Redis and SQL, any number can run concurrently behind a load balancer.
 
 **Environment variables:**
 
@@ -107,6 +107,8 @@ WORKER_TTL=50 \
 jobbers_worker <task_module>
 ```
 
+Starts a worker process that pulls tasks from Redis queues and executes them. Like the manager, it loads `<task module>` to registered task functions.
+
 **Environment variables:**
 
 | Variable | Default | Description |
@@ -118,7 +120,7 @@ jobbers_worker <task_module>
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL for queue/role config |
 | `OTEL_*` | _(same as Manager)_ | OpenTelemetry endpoints |
 
-Scale horizontally by running more worker processes. Workers are fully independent — they coordinate only through Redis and SQLite. Workers detect role and queue configuration changes automatically without restart.
+Scale horizontally by running more worker processes. Workers are fully independent — they coordinate only through Redis and SQL. Workers detect role and queue configuration changes automatically without restart.
 
 On `SIGTERM`, each in-flight task is handled according to its `on_shutdown` policy before the process exits.
 

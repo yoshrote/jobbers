@@ -100,7 +100,9 @@ Each `(name, version)` pair maps to exactly one function. When you make a breaki
 
 1. Register a new version: `@register_task(name="my_task", version=2, ...)`.
 2. Keep the old version registered until all in-flight and scheduled tasks of the old version have drained.
-3. Workers running the old code will `drop` tasks submitted with the new version number and vice versa.
+3. Workers running the old code will `drop` tasks submitted with the new version number if they receive newer tasks.
+
+Multiple versions of the same task can continue to co-exist for any length of time to support controlled rollouts, gradual migration, or compatibility with older clients.
 
 ---
 

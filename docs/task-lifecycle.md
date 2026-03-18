@@ -70,6 +70,14 @@ stateDiagram-v2
 - `expected_exceptions` — a tuple of exception types that trigger the retry logic. Any other exception causes an immediate transition to `failed` with no retry.
 - `timeout` — if the task exceeds this many seconds, it is treated like an expected exception and retried with backoff (if retries remain).
 
+#### Expected vs. unexpected exceptions
+
+Not every exception should trigger a retry. Jobbers distinguishes between the two via the `expected_exceptions` parameter:
+
+- **Expected exceptions** — transient failures you anticipate and want to retry (e.g. `httpx.TimeoutException`, `ConnectionError`). List them in `expected_exceptions`. When one of these is raised, Jobbers applies the backoff strategy and re-enqueues the task (up to `max_retries`).
+- **Unexpected exceptions** — bugs or unrecoverable errors not in `expected_exceptions`. These cause the task to move immediately to `FAILED` with no retry attempt, regardless of how many retries remain.
+- **Timeouts** — if a `timeout` is configured and the task exceeds it, it is treated like an expected exception and will retry with backoff.
+
 ### Dead Letter Queue
 
 ```python
