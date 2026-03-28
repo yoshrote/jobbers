@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 from opentelemetry import metrics
 
+from jobbers.context import _current_task as _current_task_cv
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
@@ -55,6 +56,7 @@ class TaskProcessor:
 
             with self.state_manager.task_in_registry(task):
                 await self.state_manager.update_task_heartbeat(task)
+_token = _current_task_cv.set(task)
                 self._current_promise = task.task_config.function(**task.parameters)
                 if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                     self._current_promise = asyncio.shield(self._current_promise)
@@ -82,6 +84,8 @@ class TaskProcessor:
                         await self.handle_unexpected_exception(task, exc)
                 else:
                     await self.handle_success(task)
+finally:
+                    _current_task_cv.reset(_token)
 
             await self.state_manager.remove_task_heartbeat(task)
 
