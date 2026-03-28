@@ -1,15 +1,15 @@
 """
 Protocols and shared base for task storage and dead-letter-queue adapters.
 
-``TaskAdapterProtocol``  – interface for task storage and querying.
-``DeadQueueProtocol``    – interface for dead letter queue operations.
-``_BaseTaskAdapter``     – shared key helpers and non-storage methods used by
-                           both concrete task-adapter implementations.
+- `TaskAdapterProtocol` — interface for task storage and querying.
+- `DeadQueueProtocol` — interface for dead letter queue operations.
+- `_BaseTaskAdapter` — shared key helpers and non-storage methods used by both
+  concrete task-adapter implementations.
 
 Concrete implementations live in the sibling modules:
 
-* ``jobbers.adapters.json_redis``  – Redis Stack (RedisJSON + RediSearch) backed classes.
-* ``jobbers.adapters.raw_redis``   – plain Redis (msgpack / sorted-set) backed classes.
+- `jobbers.adapters.json_redis` — Redis Stack (RedisJSON + RediSearch) backed classes.
+- `jobbers.adapters.raw_redis` — plain Redis (msgpack / sorted-set) backed classes.
 """
 
 from __future__ import annotations
