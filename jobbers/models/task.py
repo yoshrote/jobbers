@@ -5,16 +5,20 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Self
 
 from opentelemetry import metrics
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, TypeAdapter, field_serializer
 from ulid import ULID
 
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 
+from .dag import DAGCallback
 from .task_config import TaskConfig
 from .task_status import TaskStatus
 
 if TYPE_CHECKING:
     from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.models.dag import DynamicFanOut, TaskResult
+
+_dag_callback_adapter: TypeAdapter[list[DAGCallback]] = TypeAdapter(list[DAGCallback])
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -41,6 +45,10 @@ class Task(BaseModel):
     completed_at: dt.datetime | None = None
 
     task_config: TaskConfig | None = Field(default=None, exclude=True)
+    dag_callbacks: list[DAGCallback] = Field(default_factory=list)
+    # Immediate parent task IDs — empty for root tasks, one entry for simple-chain
+    # and dynamic fan-out children, many entries for fan-in collectors.
+    parent_ids: list[ULID] = Field(default_factory=list)
 
     @field_serializer("id", when_used="json")
     def serialize_id(self, value: ULID) -> str:
@@ -86,10 +94,72 @@ class Task(BaseModel):
         return self.task_config.retry_delay is not None
 
     def has_callbacks(self) -> bool:
-        return False
+        return bool(self.dag_callbacks)
 
-    def generate_callbacks(self) -> list[Self]:
-        return []
+    async def generate_callbacks(self) -> list[Self]:
+        """
+        Generate tasks to submit after this task completes.
+
+        For `SimpleCallback` entries the next task is created immediately with
+        `parent_ids=[self.id]`.  For `FanInCallback` entries the task's ID is
+        removed from the shared Redis set; the collector task is only returned
+        once the set is empty (all predecessors have completed), and its
+        `parent_ids` is populated from the permanent fan-in members set.
+        """
+        from jobbers.models.dag import FanInCallback, SimpleCallback
+
+        results: list[Self] = []
+        for cb in self.dag_callbacks:
+            spec = cb.task
+            match cb:
+                case SimpleCallback():
+                    results.append(
+                        self.__class__(
+                            id=spec.id,
+                            name=spec.name,
+                            queue=spec.queue,
+                            version=spec.version,
+                            parameters=spec.parameters,
+                            dag_callbacks=spec.dag_callbacks,
+                            parent_ids=[self.id],
+                        )
+                    )
+                case FanInCallback():
+                    remaining = await self._ta.fan_in_complete(cb.fan_in_key, self.id)
+                    if remaining == 0:
+                        member_ids = await self._ta.get_fan_in_members(cb.fan_in_key)
+                        results.append(
+                            self.__class__(
+                                id=spec.id,
+                                name=spec.name,
+                                queue=spec.queue,
+                                version=spec.version,
+                                parameters=spec.parameters,
+                                dag_callbacks=spec.dag_callbacks,
+                                parent_ids=member_ids,
+                            )
+                        )
+        return results
+
+    def make_result(
+        self,
+        results: "dict[Any, Any] | None" = None,
+        fanout: "DynamicFanOut | None" = None,
+    ) -> "TaskResult":
+        """
+        Create a `TaskResult` with `parent_ids` pre-populated from this task's known parents.
+
+        Use this instead of constructing `TaskResult` directly so that ancestry
+        is tracked without requiring task authors to manage it:
+
+        ```python
+        task = get_current_task()
+        return task.make_result(results={"count": n})
+        ```
+        """
+        from jobbers.models.dag import TaskResult
+
+        return TaskResult(results=results or {}, fanout=fanout, parent_ids=list(self.parent_ids))
 
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(
@@ -109,6 +179,19 @@ class Task(BaseModel):
     async def heartbeat(self) -> None:
         self.heartbeat_at = dt.datetime.now(dt.UTC)
         await self._ta.update_task_heartbeat(self)
+
+    async def parent_results(self) -> dict[Any, Any] | list[dict[Any, Any]]:
+        """
+        Fetch the results of this task's parent(s) using `parent_ids`.
+
+        Returns a single dict when there is one parent, a list of dicts when
+        there are multiple (fan-in collector), or `{}` for root tasks.
+        """
+        if not self.parent_ids:
+            return {}
+        tasks = await self._ta.get_tasks_bulk(self.parent_ids)
+        results_list = [t.results if t is not None else {} for t in tasks]
+        return results_list[0] if len(results_list) == 1 else results_list
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize task fields to a dict for RedisJSON storage."""
@@ -130,6 +213,8 @@ class Task(BaseModel):
             "started_at": _ts(self.started_at),
             "heartbeat_at": _ts(self.heartbeat_at),
             "completed_at": _ts(self.completed_at),
+            "dag_callbacks": [cb.model_dump() for cb in self.dag_callbacks],
+            "parent_ids": [str(pid) for pid in self.parent_ids],
         }
 
     @classmethod
@@ -154,6 +239,8 @@ class Task(BaseModel):
             started_at=_dt(raw.get("started_at")),
             heartbeat_at=_dt(raw.get("heartbeat_at")),
             completed_at=_dt(raw.get("completed_at")),
+            dag_callbacks=_dag_callback_adapter.validate_python(raw.get("dag_callbacks") or []),
+            parent_ids=[ULID.from_str(pid) for pid in raw.get("parent_ids") or []],
         )
 
     def set_status(self, status: TaskStatus) -> None:

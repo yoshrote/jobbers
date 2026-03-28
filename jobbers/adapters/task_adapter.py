@@ -73,6 +73,11 @@ class TaskAdapterProtocol(Protocol):
     async def update_task_heartbeat(self, task: Task) -> None: ...
     async def remove_task_heartbeat(self, task: Task) -> None: ...
 
+    # -- dag fan-in ----------------------------------------------------------
+    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
+    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int: ...
+    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
+
     # -- lifecycle -----------------------------------------------------------
     async def ensure_index(self) -> None: ...
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
@@ -211,6 +216,53 @@ class _BaseTaskAdapter:
         for task in fetched:
             if task is not None:
                 yield task
+
+    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
+        """
+        Pre-populate a fan-in tracking set in Redis.
+
+        Writes two keys:
+
+        - `fan_in_key` — decrementing tracking set; empty when all predecessors done.
+        - `{fan_in_key}:members` — permanent membership record; read by the collector
+          via `get_fan_in_members` to retrieve all parents' results even after the
+          tracking set has expired.
+
+        The *ttl* (seconds) guards against orphaned keys if the DAG is never fully
+        executed.  The members set uses `ttl * 2` so a slow collector can still read
+        it after the tracking set has expired.
+        """
+        members_key = f"{fan_in_key}:members"
+        encoded = [str(pid).encode() for pid in predecessor_ids]
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.sadd(fan_in_key, *encoded)
+        pipe.expire(fan_in_key, ttl)
+        pipe.sadd(members_key, *encoded)
+        pipe.expire(members_key, ttl * 2)
+        await pipe.execute()
+
+    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
+        """
+        Atomically remove *task_id* from the fan-in set and return the remaining count.
+
+        When the count reaches zero all predecessors have completed and the
+        caller should submit the collector task.
+        """
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.srem(fan_in_key, str(task_id).encode())
+        pipe.scard(fan_in_key)
+        results = await pipe.execute()
+        return int(results[1])
+
+    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]:
+        """
+        Return the permanent list of predecessor IDs for a fan-in collector.
+
+        Reads the `{fan_in_key}:members` set written by `init_fan_in`.
+        """
+        members_key = f"{fan_in_key}:members"
+        raw: set[bytes] = await self.data_store.smembers(members_key)
+        return [ULID.from_str(m.decode()) for m in raw]
 
     async def task_exists(self, task_id: ULID) -> bool:
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))

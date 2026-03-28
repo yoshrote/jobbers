@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from opentelemetry import metrics
 
 from jobbers.context import _current_task as _current_task_cv
+from jobbers.models.dag import DynamicFanOut, TaskResult
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
@@ -48,6 +49,7 @@ class TaskProcessor:
         task.task_config = get_task_config(task.name, task.version)
         ex: BaseException | None = None
 
+        dynamic_fanout: DynamicFanOut | None = None
         if task.task_config is None:
             await self.handle_dropped_task(task)
         else:
@@ -56,7 +58,7 @@ class TaskProcessor:
 
             with self.state_manager.task_in_registry(task):
                 await self.state_manager.update_task_heartbeat(task)
-_token = _current_task_cv.set(task)
+                _token = _current_task_cv.set(task)
                 self._current_promise = task.task_config.function(**task.parameters)
                 if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                     self._current_promise = asyncio.shield(self._current_promise)
@@ -64,7 +66,14 @@ _token = _current_task_cv.set(task)
                 # Run the task and handle exceptions
                 try:
                     async with asyncio.timeout(task.task_config.timeout):
-                        task.results = await self._current_promise
+                        raw_result = await self._current_promise
+                    if isinstance(raw_result, TaskResult):
+                        task.results = raw_result.results
+                        dynamic_fanout = raw_result.fanout
+                        if raw_result.parent_ids:
+                            task.parent_ids = raw_result.parent_ids
+                    else:
+                        task.results = {}
                 except TimeoutError:
                     task = await self.handle_timeout_exception(task)
                 except asyncio.CancelledError as exc:
@@ -84,7 +93,7 @@ _token = _current_task_cv.set(task)
                         await self.handle_unexpected_exception(task, exc)
                 else:
                     await self.handle_success(task)
-finally:
+                finally:
                     _current_task_cv.reset(_token)
 
             await self.state_manager.remove_task_heartbeat(task)
@@ -103,7 +112,7 @@ finally:
             )
 
         if task.status == TaskStatus.COMPLETED:
-            await self.post_process(task)
+            await self.post_process(task, dynamic_fanout)
         elif ex is not None:
             raise ex
 
@@ -120,14 +129,39 @@ finally:
     def mark_task_as_started(self, task: Task) -> None:
         task.set_status(TaskStatus.STARTED)
 
-    async def post_process(self, task: Task) -> None:
-        pass
-        # if not task.has_callbacks():
-        #     return
+    async def post_process(self, task: Task, dynamic_fanout: DynamicFanOut | None = None) -> None:
+        if dynamic_fanout is not None:
+            await self._handle_dynamic_fanout(task, dynamic_fanout)
+        if task.has_callbacks():
+            callbacks = await task.generate_callbacks()
+            await asyncio.gather(*(self.state_manager.submit_task(cb) for cb in callbacks))
 
-        # TODO: configure max concurrent callbacks
-        # Monitor for when fan-out becomes problematic
-        # callback_pool.map(self.state_manager.submit_task, task.generate_callbacks(), num_concurrent=5)
+    async def _handle_dynamic_fanout(self, parent: Task, fanout: DynamicFanOut) -> None:
+        """Wire and submit a runtime fan-out produced by a task function.
+
+        Calls `DAGNode.merge` to attach `FanInCallback`s to each child,
+        initialises the Redis tracking + members sets, pre-saves the collector
+        so it exists when the first child finishes, then submits all children.
+        """
+        from jobbers.models.dag import DAGNode
+
+        if not fanout.children:
+            # Degenerate case: no children — submit the collector immediately.
+            await self.state_manager.submit_task(fanout.collector.to_task())
+            return
+
+        fan_in_key = f"dag:fan-in:{fanout.collector.id}"
+        DAGNode.merge(*fanout.children, into=fanout.collector)
+
+        child_ids = {child.id for child in fanout.children}
+        child_tasks = [child.to_task(parent_id=parent.id) for child in fanout.children]
+        collector_task = fanout.collector.to_task()
+        collector_task.parent_ids = list(child_ids)
+
+        await self.state_manager.init_fan_in(fan_in_key, child_ids, ttl=fanout.fan_in_ttl)
+        # Pre-save the collector so it exists in Redis when the first child completes.
+        await self.state_manager.save_task(collector_task)
+        await asyncio.gather(*(self.state_manager.submit_task(ct) for ct in child_tasks))
 
     async def handle_dropped_task(self, task: Task) -> None:
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)

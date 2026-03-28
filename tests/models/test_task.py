@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from ulid import ULID
 
+from jobbers.models.dag import DAGTaskSpec, FanInCallback, SimpleCallback
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_config import TaskConfig
 from jobbers.models.task_status import TaskStatus
@@ -219,3 +220,307 @@ def test_serialize_start_with_none():
     pagination = TaskPagination(queue="default")
     result = pagination.model_dump(mode="json")
     assert result["start"] is None
+
+
+# ── to_dict / from_dict ───────────────────────────────────────────────────────
+
+
+def _make_full_task(**overrides) -> Task:
+    base = dict(
+        id=ULID1,
+        name="t",
+        version=1,
+        queue="default",
+        status=TaskStatus.SUBMITTED,
+        parameters={"x": 1},
+        results={"y": 2},
+        errors=["err"],
+        retry_attempt=2,
+    )
+    base.update(overrides)
+    return Task(**base)
+
+
+def test_to_dict_round_trip():
+    """from_dict(to_dict()) reproduces the original task."""
+    task = _make_full_task()
+    d = task.to_dict()
+    restored = Task.from_dict(task.id, d)
+    assert restored.id == task.id
+    assert restored.name == task.name
+    assert restored.parameters == task.parameters
+    assert restored.results == task.results
+    assert restored.errors == task.errors
+    assert restored.retry_attempt == task.retry_attempt
+
+
+def test_from_dict_missing_parent_ids_defaults_to_empty():
+    """from_dict handles a dict with no parent_ids gracefully."""
+    minimal = {"name": "t", "queue": "default", "version": 1, "status": "submitted"}
+    task = Task.from_dict(ULID1, minimal)
+    assert task.parent_ids == []
+
+
+def test_to_dict_preserves_dag_callbacks():
+    """dag_callbacks are round-tripped through to_dict/from_dict."""
+    child_spec = DAGTaskSpec(name="child")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.SUBMITTED,
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    d = task.to_dict()
+    restored = Task.from_dict(ULID1, d)
+    assert len(restored.dag_callbacks) == 1
+    assert isinstance(restored.dag_callbacks[0], SimpleCallback)
+    assert restored.dag_callbacks[0].task.name == "child"
+
+
+# ── generate_callbacks ────────────────────────────────────────────────────────
+
+
+def _patch_adapter(fan_in_complete_return=0, fan_in_members=None):
+    """Return a context-manager patch that installs a mock task adapter."""
+    mock_adapter = AsyncMock()
+    mock_adapter.fan_in_complete.return_value = fan_in_complete_return
+    mock_adapter.get_fan_in_members.return_value = fan_in_members or []
+
+    return patch.multiple(
+        "jobbers.db",
+        get_client=MagicMock(return_value=MagicMock()),
+        create_task_adapter=MagicMock(return_value=mock_adapter),
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_callbacks_simple_creates_child_with_correct_ids():
+    """SimpleCallback creates a child Task with parent_ids set to the parent's ID."""
+    child_spec = DAGTaskSpec(name="child_task")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.COMPLETED,
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    with _patch_adapter():
+        children = await task.generate_callbacks()
+
+    assert len(children) == 1
+    assert children[0].id == child_spec.id
+
+
+@pytest.mark.asyncio
+async def test_generate_callbacks_simple_child_has_parent_ids():
+    """Simple callback child has parent_ids=[parent.id]."""
+    child_spec = DAGTaskSpec(name="child_task")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.COMPLETED,
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    with _patch_adapter():
+        children = await task.generate_callbacks()
+
+    assert children[0].parent_ids == [ULID1]
+
+
+@pytest.mark.asyncio
+async def test_generate_callbacks_fan_in_collector_has_member_parent_ids():
+    """Fan-in collector gets parent_ids from the members set returned by the adapter."""
+    p1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+    p2 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG0A")
+    collector_spec = DAGTaskSpec(name="collector")
+    fan_in_key = f"dag:fan-in:{collector_spec.id}"
+    task = Task(
+        id=ULID1,
+        name="last_branch",
+        version=1,
+        queue="default",
+        status=TaskStatus.COMPLETED,
+        dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
+    )
+    with _patch_adapter(fan_in_complete_return=0, fan_in_members=[p1, p2]):
+        children = await task.generate_callbacks()
+
+    assert set(children[0].parent_ids) == {p1, p2}
+
+
+@pytest.mark.asyncio
+async def test_generate_callbacks_fan_in_not_last_returns_nothing():
+    """FanInCallback with remaining > 0 does not create a child task."""
+    collector_spec = DAGTaskSpec(name="collector")
+    fan_in_key = f"dag:fan-in:{collector_spec.id}"
+    task = Task(
+        id=ULID1,
+        name="branch",
+        version=1,
+        queue="default",
+        status=TaskStatus.COMPLETED,
+        dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
+    )
+    with _patch_adapter(fan_in_complete_return=1):
+        children = await task.generate_callbacks()
+
+    assert children == []
+
+
+@pytest.mark.asyncio
+async def test_generate_callbacks_fan_in_last_creates_collector():
+    """FanInCallback with remaining == 0 creates the collector task."""
+    collector_spec = DAGTaskSpec(name="collector")
+    fan_in_key = f"dag:fan-in:{collector_spec.id}"
+    task = Task(
+        id=ULID1,
+        name="last_branch",
+        version=1,
+        queue="default",
+        status=TaskStatus.COMPLETED,
+        dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
+    )
+    with _patch_adapter(fan_in_complete_return=0):
+        children = await task.generate_callbacks()
+
+    assert len(children) == 1
+    assert children[0].id == collector_spec.id
+
+
+# ── parent_results ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_parent_results_with_parent_ids_returns_parent_results():
+    """parent_results() fetches and returns the single parent's results dict via parent_ids."""
+    parent_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+    parent_task = Task(
+        id=parent_id, name="parent", version=1, queue="default",
+        status=TaskStatus.COMPLETED, results={"val": 42},
+    )
+    task = Task(
+        id=ULID1, name="child", version=1, queue="default",
+        status=TaskStatus.STARTED, parent_ids=[parent_id],
+    )
+    mock_adapter = AsyncMock()
+    mock_adapter.get_tasks_bulk.return_value = [parent_task]
+    with patch("jobbers.db.get_client", return_value=MagicMock()):
+        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
+            result = await task.parent_results()
+
+    assert result == {"val": 42}
+    mock_adapter.get_tasks_bulk.assert_awaited_once_with([parent_id])
+
+
+@pytest.mark.asyncio
+async def test_parent_results_parent_not_found_returns_empty():
+    """parent_results() returns {} when parent_ids is empty (root task)."""
+    task = Task(
+        id=ULID1, name="root", version=1, queue="default",
+        status=TaskStatus.STARTED,
+    )
+    mock_adapter = AsyncMock()
+    with patch("jobbers.db.get_client", return_value=MagicMock()):
+        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
+            result = await task.parent_results()
+
+    assert result == {}
+    mock_adapter.get_tasks_bulk.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_parent_results_fan_in_returns_list_of_results():
+    """parent_results() returns a list of results for fan-in collectors (via parent_ids)."""
+    p1_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+    p2_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG0A")
+    p1 = Task(id=p1_id, name="p1", version=1, queue="default",
+               status=TaskStatus.COMPLETED, results={"a": 1})
+    p2 = Task(id=p2_id, name="p2", version=1, queue="default",
+               status=TaskStatus.COMPLETED, results={"b": 2})
+
+    # collector has parent_ids set to both predecessors
+    collector = Task(id=ULID1, name="collector", version=1, queue="default",
+                     status=TaskStatus.STARTED, parent_ids=[p1_id, p2_id])
+
+    mock_adapter = AsyncMock()
+    mock_adapter.get_tasks_bulk.return_value = [p1, p2]
+
+    with patch("jobbers.db.get_client", return_value=MagicMock()):
+        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
+            result = await collector.parent_results()
+
+    assert isinstance(result, list)
+    assert {"a": 1} in result
+    assert {"b": 2} in result
+
+
+@pytest.mark.asyncio
+async def test_parent_results_no_parent_info_returns_empty():
+    """parent_results() returns {} when there is no parent information at all."""
+    task = Task(id=ULID1, name="root", version=1, queue="default",
+                status=TaskStatus.STARTED)
+    mock_adapter = AsyncMock()
+    mock_adapter.get_fan_in_members.return_value = []
+
+    with patch("jobbers.db.get_client", return_value=MagicMock()):
+        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
+            result = await task.parent_results()
+
+    assert result == {}
+
+
+# ── make_result ───────────────────────────────────────────────────────────────
+
+
+def test_make_result_populates_parent_ids():
+    """make_result() returns a TaskResult with parent_ids copied from the task."""
+    from jobbers.models.dag import TaskResult
+
+    parent_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+    task = Task(id=ULID1, name="child", version=1, queue="default",
+                status=TaskStatus.STARTED, parent_ids=[parent_id])
+    result = task.make_result(results={"x": 1})
+
+    assert isinstance(result, TaskResult)
+    assert result.results == {"x": 1}
+    assert result.parent_ids == [parent_id]
+    assert result.fanout is None
+
+
+def test_make_result_empty_parent_ids_for_root_task():
+    """make_result() returns TaskResult with empty parent_ids for root tasks."""
+    from jobbers.models.dag import TaskResult
+
+    task = Task(id=ULID1, name="root", version=1, queue="default", status=TaskStatus.STARTED)
+    result = task.make_result(results={"y": 2})
+
+    assert isinstance(result, TaskResult)
+    assert result.parent_ids == []
+
+
+def test_make_result_passes_fanout_through():
+    """make_result() includes a fanout when provided."""
+    from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
+
+    task = Task(id=ULID1, name="dispatcher", version=1, queue="default", status=TaskStatus.STARTED)
+    fanout = DynamicFanOut(children=[DAGNode("child")], collector=DAGNode("collect"))
+    result = task.make_result(results={}, fanout=fanout)
+
+    assert isinstance(result, TaskResult)
+    assert result.fanout is fanout
+
+
+def test_make_result_defaults_to_empty_results():
+    """make_result() with no arguments returns TaskResult with empty results."""
+    from jobbers.models.dag import TaskResult
+
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
+    result = task.make_result()
+
+    assert isinstance(result, TaskResult)
+    assert result.results == {}

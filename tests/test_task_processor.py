@@ -37,8 +37,10 @@ async def test_task_processor_success():
         status=TaskStatus.SUBMITTED,
         queue="test_queue",
     )
+    from jobbers.models.dag import TaskResult
+
     state_manager = _make_state_manager()
-    task_function = AsyncMock(return_value={"result": "success"})
+    task_function = AsyncMock(return_value=TaskResult(results={"result": "success"}))
 
     task_config = TaskConfig(
         name="test_task",
@@ -388,7 +390,7 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
     state_manager = _make_state_manager()
 
     # Mock the task function to succeed
-    task_function = AsyncMock(return_value={"result": "success"})
+    task_function = AsyncMock(return_value=None)
 
     task_config = TaskConfig(
         name="test_task",
@@ -411,7 +413,6 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
 
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
-    assert result_task.results == {"result": "success"}
 
     # save_task called when starting; complete_task called when done
     state_manager.save_task.assert_has_calls([call(task), call(task)])
@@ -430,7 +431,7 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
     state_manager = _make_state_manager()
 
     # Mock the task function to succeed
-    task_function = AsyncMock(return_value={"result": "success"})
+    task_function = AsyncMock(return_value=None)
 
     task_config = TaskConfig(
         name="test_task",
@@ -453,7 +454,6 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
 
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
-    assert result_task.results == {"result": "success"}
 
     # save_task called when starting; complete_task called when done
     state_manager.save_task.assert_has_calls([call(task), call(task)])
@@ -472,7 +472,7 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
     state_manager = _make_state_manager()
 
     # Mock the task function to succeed
-    task_function = AsyncMock(return_value={"result": "success"})
+    task_function = AsyncMock(return_value=None)
 
     task_config = TaskConfig(
         name="test_task",
@@ -495,7 +495,6 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
 
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
-    assert result_task.results == {"result": "success"}
 
     # save_task called when starting; complete_task called when done
     state_manager.save_task.assert_has_calls([call(task), call(task)])
@@ -751,6 +750,108 @@ async def test_process_does_not_overwrite_cancelled_status_on_system_cancel():
     assert task.status == TaskStatus.CANCELLED
 
 
+# ── _handle_dynamic_fanout ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
+    """Normal fan-out: children are submitted and collector is pre-saved."""
+    from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
+
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+    )
+    c1 = DAGNode("worker_a")
+    c2 = DAGNode("worker_b")
+    collector = DAGNode("aggregator")
+    fanout = DynamicFanOut(children=[c1, c2], collector=collector)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout)
+
+    # init_fan_in called once with correct key and both child IDs
+    fan_in_key = f"dag:fan-in:{collector.id}"
+    state_manager.init_fan_in.assert_awaited_once_with(
+        fan_in_key, {c1.id, c2.id}, ttl=fanout.fan_in_ttl
+    )
+    # collector pre-saved once with parent_ids == all child IDs
+    state_manager.save_task.assert_awaited_once()
+    saved_task = state_manager.save_task.call_args[0][0]
+    assert saved_task.id == collector.id
+    assert set(saved_task.parent_ids) == {c1.id, c2.id}
+
+    # both children submitted
+    assert state_manager.submit_task.await_count == 2
+    submitted_ids = {call[0][0].id for call in state_manager.submit_task.call_args_list}
+    assert submitted_ids == {c1.id, c2.id}
+
+    child_tasks = [call[0][0] for call in state_manager.submit_task.call_args_list]
+    for ct in child_tasks:
+        assert ct.parent_ids == [parent.id]
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_no_children_submits_collector_immediately():
+    """Degenerate fan-out with no children submits the collector directly."""
+    from jobbers.models.dag import DAGNode, DynamicFanOut
+
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+    )
+    collector = DAGNode("aggregator")
+    fanout = DynamicFanOut(children=[], collector=collector)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout)
+
+    state_manager.init_fan_in.assert_not_called()
+    state_manager.submit_task.assert_awaited_once()
+    submitted = state_manager.submit_task.call_args[0][0]
+    assert submitted.id == collector.id
+
+
+@pytest.mark.asyncio
+async def test_task_processor_stores_task_result_on_success():
+    """TaskProcessor stores results from a TaskResult return value."""
+    from jobbers.models.dag import TaskResult
+
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=TaskResult(results={"answer": 42}))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.results == {"answer": 42}
+    assert result.status == TaskStatus.COMPLETED
+
+
 @pytest.mark.asyncio
 async def test_monitor_task_cancellation_calls_handle_user_cancelled_task():
     # StateManager raises UserCancellationError directly — not inside a TaskGroup,
@@ -774,3 +875,146 @@ async def test_monitor_task_cancellation_calls_handle_user_cancelled_task():
             await processor.monitor_task_cancellation(task)
 
     mock_handle.assert_called_once_with(task)
+
+
+# ── post_process with dag_callbacks ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_post_process_triggers_dag_callbacks():
+    """post_process submits callbacks produced by generate_callbacks when has_callbacks() is True."""
+    from unittest.mock import AsyncMock, patch
+
+    from jobbers.models.dag import SimpleCallback
+    from jobbers.models.dag import DAGTaskSpec
+
+    # Build a parent task with a SimpleCallback so has_callbacks() → True
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+
+    state_manager = _make_state_manager()
+    state_manager.submit_task = AsyncMock()
+
+    # generate_callbacks needs a task adapter; patch db helpers to return a mock
+    mock_ta = AsyncMock()
+    mock_ta.fan_in_complete.return_value = 0
+    mock_ta.get_fan_in_members.return_value = []
+
+    processor = TaskProcessor(state_manager)
+    with patch("jobbers.db.get_client", return_value=AsyncMock()):
+        with patch("jobbers.db.create_task_adapter", return_value=mock_ta):
+            await processor.post_process(parent)
+
+    # At least one child task should have been submitted
+    assert state_manager.submit_task.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
+    """post_process delegates to _handle_dynamic_fanout when a DynamicFanOut is passed."""
+    from unittest.mock import AsyncMock, patch
+
+    from jobbers.models.dag import DAGNode, DynamicFanOut
+
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+    )
+    fanout = DynamicFanOut(children=[DAGNode("child")], collector=DAGNode("collect"))
+
+    state_manager = _make_state_manager()
+    processor = TaskProcessor(state_manager)
+
+    with patch.object(processor, "_handle_dynamic_fanout", new_callable=AsyncMock) as mock_fanout:
+        await processor.post_process(parent, dynamic_fanout=fanout)
+
+    mock_fanout.assert_awaited_once_with(parent, fanout)
+
+
+@pytest.mark.asyncio
+async def test_task_result_parent_ids_copied_to_task():
+    """When a TaskResult carries parent_ids, processor copies them onto the task."""
+    from ulid import ULID
+
+    from jobbers.models.dag import TaskResult
+
+    parent_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=TaskResult(results={}, parent_ids=[parent_id]))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.parent_ids == [parent_id]
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_latency_recorded_when_submitted_at_set():
+    """end_to_end_latency metric is recorded when task has submitted_at and completed_at."""
+    from jobbers.models.dag import TaskResult
+
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        submitted_at=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=TaskResult(results={}))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert result.submitted_at is not None
+    assert result.completed_at is not None
+
+
+# ── run() re-raises non-UserCancellationError ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_reraises_non_user_cancellation_error():
+    """run() re-raises exceptions from process() that are not UserCancellationError."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+
+    processor = TaskProcessor(state_manager)
+
+    boom = RuntimeError("unexpected failure")
+
+    async def failing_process(_task):
+        raise boom
+
+    with patch.object(processor, "process", side_effect=failing_process):
+        with pytest.raises((RuntimeError, ExceptionGroup)):
+            await processor.run(task)

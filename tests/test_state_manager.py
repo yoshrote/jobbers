@@ -675,3 +675,45 @@ async def test_queue_retry_task_requeues_immediately(redis, state_manager):
     assert result.status == TaskStatus.SUBMITTED
     members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in members
+# ── submit_dag ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_simple_chain(state_manager):
+    """submit_dag submits root tasks and returns Task objects."""
+    from jobbers.models.dag import DAGNode
+
+    root = DAGNode("fetch_data")
+    child = DAGNode("process_data")
+    root.then(child)
+
+    submitted = await state_manager.submit_dag(root)
+
+    assert len(submitted) == 1
+    assert submitted[0].id == root.id
+    assert submitted[0].status == TaskStatus.SUBMITTED
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
+    """submit_dag pre-populates Redis fan-in sets before submitting tasks."""
+    from jobbers.models.dag import DAGNode
+
+    branch_a = DAGNode("branch_a")
+    branch_b = DAGNode("branch_b")
+    collector = DAGNode("collect")
+    DAGNode.merge(branch_a, branch_b, into=collector)
+
+    state_manager.init_fan_in = AsyncMock()
+
+    submitted = await state_manager.submit_dag(branch_a, branch_b)
+
+    # init_fan_in must be called with the collector's fan-in key
+    fan_in_key = f"dag:fan-in:{collector.id}"
+    state_manager.init_fan_in.assert_awaited_once_with(
+        fan_in_key, {branch_a.id, branch_b.id}
+    )
+    assert len(submitted) == 2
+
+
+# ── dispatch_cron_dag ─────────────────────────────────────────────────────────

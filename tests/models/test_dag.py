@@ -1,9 +1,9 @@
-"""Tests for DAGTaskSpec.fresh_copy and collect_fan_in_keys."""
+"""Tests for DAGTaskSpec.fresh_copy, collect_fan_in_keys, DAGNode, and TaskResult."""
 
 import pytest
 from ulid import ULID
 
-from jobbers.models.dag import DAGTaskSpec, FanInCallback, SimpleCallback, collect_fan_in_keys
+from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, FanInCallback, SimpleCallback, TaskResult, collect_fan_in_keys
 
 
 def make_spec(name: str = "task", **kwargs) -> DAGTaskSpec:
@@ -186,3 +186,109 @@ def test_fresh_copy_then_collect_fan_in_keys_no_old_ids():
 
     assert old_predecessor_id not in next(iter(fan_ins.values()))
     assert new_predecessor_id in fan_ins[f"dag:fan-in:{new_collector_id}"]
+
+
+# ── TaskResult ────────────────────────────────────────────────────────────────
+
+
+def test_task_result_defaults():
+    """TaskResult defaults to empty results, no fanout."""
+    tr = TaskResult()
+    assert tr.results == {}
+    assert tr.fanout is None
+
+
+def test_task_result_with_results():
+    tr = TaskResult(results={"count": 5})
+    assert tr.results == {"count": 5}
+
+
+def test_task_result_with_fanout():
+    children = [DAGNode("child")]
+    collector = DAGNode("collect")
+    fanout = DynamicFanOut(children=children, collector=collector)
+    tr = TaskResult(results={}, fanout=fanout)
+    assert tr.fanout is fanout
+
+
+# ── DAGNode.to_task ───────────────────────────────────────────────────────────
+
+
+def test_dag_node_to_task_no_parent():
+    """to_task() with no parent creates a root task with empty parent_ids."""
+    node = DAGNode("fetch_data", queue="urgent", version=2, parameters={"k": "v"})
+    task = node.to_task()
+
+    assert task.id == node.id
+    assert task.name == "fetch_data"
+    assert task.queue == "urgent"
+    assert task.version == 2
+    assert task.parameters == {"k": "v"}
+    assert task.parent_ids == []
+    assert task.dag_callbacks == []
+
+
+def test_dag_node_to_task_with_parent():
+    """to_task(parent_id=...) sets parent_ids on the returned task."""
+    parent_id = ULID()
+    node = DAGNode("process")
+    task = node.to_task(parent_id=parent_id)
+
+    assert task.parent_ids == [parent_id]
+
+
+def test_dag_node_to_task_carries_callbacks():
+    """to_task() embeds the callback chain for downstream execution."""
+    child = DAGNode("child")
+    root = DAGNode("root")
+    root.then(child)
+
+    task = root.to_task()
+    assert len(task.dag_callbacks) == 1
+    assert isinstance(task.dag_callbacks[0], SimpleCallback)
+    assert task.dag_callbacks[0].task.id == child.id
+
+
+def test_dag_node_to_task_fan_in_callback_embedded():
+    """to_task() correctly embeds FanInCallback when merge() was used."""
+    collector = DAGNode("collector")
+    branch = DAGNode("branch")
+    DAGNode.merge(branch, into=collector)
+
+    task = branch.to_task()
+    assert len(task.dag_callbacks) == 1
+    assert isinstance(task.dag_callbacks[0], FanInCallback)
+    assert task.dag_callbacks[0].task.id == collector.id
+
+
+def test_dag_node_to_task_id_matches_node_id():
+    """The task's ULID must match the pre-assigned node ULID."""
+    node = DAGNode("task_a")
+    task = node.to_task()
+    assert task.id == node.id
+
+
+def test_dag_node_fan_in_predecessors_single():
+    """fan_in_predecessors() returns the collector key mapped to the branch's ID."""
+    collector = DAGNode("collector")
+    branch = DAGNode("branch")
+    DAGNode.merge(branch, into=collector)
+
+    preds = branch.fan_in_predecessors()
+    expected_key = f"dag:fan-in:{collector.id}"
+    assert expected_key in preds
+    assert branch.id in preds[expected_key]
+
+
+def test_dag_node_fan_in_predecessors_multiple():
+    """fan_in_predecessors() collects both branches for a two-predecessor merge."""
+    collector = DAGNode("collector")
+    b1 = DAGNode("branch1")
+    b2 = DAGNode("branch2")
+    root = DAGNode("root")
+    root.then(b1, b2)
+    DAGNode.merge(b1, b2, into=collector)
+
+    preds = root.fan_in_predecessors()
+    expected_key = f"dag:fan-in:{collector.id}"
+    assert preds[expected_key] == {b1.id, b2.id}

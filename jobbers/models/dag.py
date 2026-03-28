@@ -4,7 +4,7 @@ DAG node classes for describing task dependency graphs.
 - `DAGTaskSpec` — pre-configured task specification with a pre-assigned ULID.
 - `SimpleCallback` — submit a task immediately when the parent completes.
 - `FanInCallback` — submit a task only after *all* fan-in predecessors complete;
-                     uses a Redis set to track remaining predecessor IDs.
+  uses a Redis set to track remaining predecessor IDs.
 - `DAGCallback` — discriminated union of the two callback types.
 - `DAGNode` — fluent builder for constructing the DAG graph; call `to_task()` on
   root nodes to get `Task` objects ready for submission via `StateManager.submit_dag`.
@@ -14,23 +14,23 @@ DAG node classes for describing task dependency graphs.
 **Linear chain:**
 
 ```python
-    a = DAGNode("fetch_data")
-    b = DAGNode("process_data")
-    c = DAGNode("save_results")
-    a.then(b)
-    b.then(c)
+a = DAGNode("fetch_data")
+b = DAGNode("process_data")
+c = DAGNode("save_results")
+a.then(b)
+b.then(c)
 ```
 
 **Fan-out then fan-in (diamond):**
 
 ```python
-    root      = DAGNode("split_work")
-    branch_a  = DAGNode("process_chunk_a")
-    branch_b  = DAGNode("process_chunk_b")
-    collector = DAGNode("merge_results")
+root      = DAGNode("split_work")
+branch_a  = DAGNode("process_chunk_a")
+branch_b  = DAGNode("process_chunk_b")
+collector = DAGNode("merge_results")
 
-    root.then(branch_a, branch_b)
-    DAGNode.merge(branch_a, branch_b, into=collector)
+root.then(branch_a, branch_b)
+DAGNode.merge(branch_a, branch_b, into=collector)
 ```
 """
 
@@ -203,7 +203,7 @@ class DAGNode:
         Returns *self* for fluent chaining:
 
         ```python
-            a.then(b).then(c)   # same as a.then(b); b.then(c)
+        a.then(b).then(c)   # same as a.then(b); b.then(c)
         ```
         """
         for node in nodes:
@@ -220,7 +220,7 @@ class DAGNode:
         Returns `into` for further chaining:
 
         ```python
-            DAGNode.merge(branch_a, branch_b, into=collector).then(next_step)
+        DAGNode.merge(branch_a, branch_b, into=collector).then(next_step)
         ```
         """
         fan_in_key = f"dag:fan-in:{into._id}"
@@ -254,7 +254,7 @@ class DAGNode:
                 callbacks.append(FanInCallback(task=spec, fan_in_key=fan_in_key))
         return callbacks
 
-    def to_task(self, *, parent_task_id: ULID | None = None) -> Task:
+    def to_task(self, *, parent_id: ULID | None = None) -> Task:
         """Return a `Task` for this node ready for submission."""
         from jobbers.models.task import Task
 
@@ -265,8 +265,7 @@ class DAGNode:
             version=self._version,
             parameters=self._parameters,
             dag_callbacks=self._callbacks_recursive(),
-            parent_task_id=parent_task_id,
-            parent_ids=[parent_task_id] if parent_task_id is not None else [],
+            parent_ids=[parent_id] if parent_id is not None else [],
         )
 
     def fan_in_predecessors(self) -> dict[str, set[ULID]]:
@@ -323,31 +322,32 @@ class TaskResult:
     **Example — plain result (auto-populated parent_ids):**
 
     ```python
-        @register_task(name="fetch_data")
-        async def fetch_data(**kwargs):
+    @register_task(name="fetch_data")
+    async def fetch_data(**kwargs):
         task = get_current_task()
-            data = await load()
+        data = await load()
         return task.make_result(results={"rows": len(data)})
     ```
 
     **Example — dynamic fan-out:**
 
     ```python
-        @register_task(name="dispatch_records")
-        async def dispatch_records(**kwargs):
+    @register_task(name="dispatch_records")
+    async def dispatch_records(**kwargs):
         task = get_current_task()
-            records = await fetch_records()
-            children = [DAGNode("process_record", parameters={"id": r}) for r in records]
-            collector = DAGNode("aggregate_results")
+        records = await fetch_records()
+        children = [DAGNode("process_record", parameters={"id": r}) for r in records]
+        collector = DAGNode("aggregate_results")
         return task.make_result(
-                results={"count": len(records)},
-                fanout=DynamicFanOut(children=children, collector=collector),
-            )
+            results={"count": len(records)},
+            fanout=DynamicFanOut(children=children, collector=collector),
+        )
     ```
     """
 
     results: dict[str, Any] = field(default_factory=dict)
     fanout: DynamicFanOut | None = None
+    parent_ids: list[ULID] = field(default_factory=list)
 
 
 # Avoid circular import at module level – Task is only referenced inside methods.

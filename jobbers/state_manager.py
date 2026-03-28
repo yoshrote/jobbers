@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from ulid import ULID
 
     from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
+    from jobbers.models.dag import DAGNode
     from jobbers.models.task import Task
 
 logger = logging.getLogger(__name__)
@@ -285,6 +286,31 @@ class StateManager:
             await self.ta.submit_rate_limited_task(task=task, queue_config=queue_config)
         else:
             await self.ta.submit_task(task=task)
+
+    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
+        await self.ta.init_fan_in(fan_in_key, predecessor_ids, ttl)
+
+    async def submit_dag(self, *roots: DAGNode) -> list[Task]:
+        """
+        Initialise fan-in sets and submit all root tasks of a DAG.
+
+        All fan-in Redis sets are populated *before* any task is enqueued so
+        that a fast-completing predecessor cannot decrement a set that does not
+        yet exist.
+        """
+        all_fan_ins: dict[str, set[ULID]] = {}
+        for root in roots:
+            for key, ids in root.fan_in_predecessors().items():
+                all_fan_ins.setdefault(key, set()).update(ids)
+
+        await asyncio.gather(*(self.init_fan_in(k, ids) for k, ids in all_fan_ins.items()))
+
+        submitted: list[Task] = []
+        for root in roots:
+            task = root.to_task()
+            await self.submit_task(task)
+            submitted.append(task)
+        return submitted
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
