@@ -20,8 +20,8 @@ class TaskScheduler:
     Manages scheduled tasks in Redis, reusing task:<task_id> keys for task data.
 
     Keys:
-      ``schedule-queue:{queue}``  sorted set — member: task_id bytes, score: run_at Unix timestamp.
-      ``schedule-task-queue``     hash       — field: task_id bytes, value: queue name.
+    - `schedule-queue:{queue}` sorted set — member: task_id bytes, score: run_at Unix timestamp.
+    - `schedule-task-queue` hash — field: task_id bytes, value: queue name.
     """
 
     SCHEDULE_QUEUE = "schedule-queue:{queue}".format
@@ -77,7 +77,7 @@ class TaskScheduler:
         """
         Fetch scheduled entries matching the given filter criteria.
 
-        ``start_after`` is an exclusive ULID cursor for page-by-page iteration.
+        `start_after` is an exclusive ULID cursor for page-by-page iteration.
         """
         if queue is not None:
             raw_ids: list[bytes] = await cast(
@@ -121,9 +121,9 @@ class TaskScheduler:
         """
         Atomically acquire and return the earliest due task, or None.
 
-        - ``queues=None`` — match any queue
-        - ``queues=[]``   — return None immediately
-        - ``queues=[...]`` — only match tasks in the given queues
+        - `queues=None` — match any queue
+        - `queues=[]` — return None immediately
+        - `queues=[...]` — only match tasks in the given queues
         """
         results = await self.next_due_bulk(1, queues=queues)
         return results[0][0] if results else None
@@ -132,9 +132,9 @@ class TaskScheduler:
         """
         Atomically acquire and return up to n due tasks paired with their scheduled run_at.
 
-        - ``queues=None`` — match any queue
-        - ``queues=[]``   — return [] immediately
-        - ``queues=[...]`` — only match tasks in the given queues
+        - `queues=None` — match any queue
+        - `queues=[]` — return [] immediately
+        - `queues=[...]` — only match tasks in the given queues
         """
         import datetime as dt
 

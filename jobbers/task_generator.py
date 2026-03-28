@@ -23,12 +23,10 @@ class LocalTTL:
     """
     A context manager to manage time-to-live (TTL) for local operations.
 
-    Attributes
-    ----------
-    config_ttl : int
-        The TTL duration in seconds.
-    last_refreshed : datetime | None
-        The last time the TTL was refreshed.
+    **Attributes:**
+
+    - `config_ttl: int` — the TTL duration in seconds.
+    - `last_refreshed: datetime | None` — the last time the TTL was refreshed.
     """
 
     def __init__(self, config_ttl: int):
@@ -56,15 +54,13 @@ class MaxTaskCounter:
     """
     A counter to track the number of tasks processed, with a maximum limit.
 
-    Attributes
-    ----------
-    max_tasks : int
-        The maximum number of tasks allowed.
+    **Attributes:**
 
-    Methods
-    -------
-    limit_reached() -> bool
-        Check if the maximum task limit has been reached.
+    - `max_tasks: int` — the maximum number of tasks allowed.
+
+    **Methods:**
+
+    - `limit_reached() -> bool` — check if the maximum task limit has been reached.
     """
 
     def __init__(self, max_tasks: int = 0):

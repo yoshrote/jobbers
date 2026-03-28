@@ -1,9 +1,9 @@
 """
 Redis Stack (RedisJSON + RediSearch) backed implementations.
 
-``JsonTaskAdapter``  – stores tasks as RedisJSON documents, queries via RediSearch.
-``JsonDeadQueue``    – stores dead-letter entries as RedisJSON documents with a
-                       RediSearch index for server-side filtering and sorting.
+- `JsonTaskAdapter` — stores tasks as RedisJSON documents, queries via RediSearch.
+- `JsonDeadQueue` — stores dead-letter entries as RedisJSON documents with a
+  RediSearch index for server-side filtering and sorting.
 
 Both require a Redis Stack instance with the RedisJSON and RediSearch modules.
 """
@@ -301,21 +301,22 @@ class JsonTaskAdapter(_BaseTaskAdapter):
 
 
 class JsonDeadQueue:
-    r"""
+    """
     Dead letter queue using Redis JSON documents and RediSearch for filtering/sorting.
 
-    Each entry is stored as a JSON document at ``dlq:{task_id}`` with fields:
+    Each entry is stored as a JSON document at `dlq:{task_id}` with fields:
 
-    ``task_id``   string  — ULID of the failed task.
-    ``name``      string  — task name.
-    ``queue``     string  — originating queue name.
-    ``failed_at`` float   — Unix timestamp of failure.
+    | Field | Type | Description |
+    |-------|------|-------------|
+    | `task_id` | string | ULID of the failed task. |
+    | `name` | string | task name. |
+    | `queue` | string | originating queue name. |
+    | `failed_at` | float | Unix timestamp of failure. |
 
-    A RediSearch index (``dlq-json-idx``) on ``dlq:*`` keys enables server-side
-    filtering by ``name`` and ``queue`` (tag fields) and sorting by ``failed_at``
-    (numeric, sortable).
+    A RediSearch index (`dlq-json-idx`) on `dlq:*` keys enables server-side filtering
+    by `name` and `queue` (tag fields) and sorting by `failed_at` (numeric, sortable).
 
-    Full task data is loaded from the ``task_adapter`` when Task objects are needed.
+    Full task data is loaded from the `task_adapter` when Task objects are needed.
     """
 
     INDEX_NAME = "dlq-json-idx"

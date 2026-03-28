@@ -1,12 +1,10 @@
 """
 Plain Redis backed implementations (no Redis Stack modules required).
 
-``MsgpackTaskAdapter``  – stores tasks as msgpack-encoded binary strings, queries
-                          via sorted-set range commands.  Works with any standard
-                          Redis instance.
-``DeadQueue``           – dead letter queue backed by Redis sorted sets, sets, and
-                          a hash for secondary indexes.  Works with any standard
-                          Redis instance.
+- `MsgpackTaskAdapter` — stores tasks as msgpack-encoded binary strings, queries
+  via sorted-set range commands.  Works with any standard Redis instance.
+- `DeadQueue` — dead letter queue backed by Redis sorted sets, sets, and a hash
+  for secondary indexes.  Works with any standard Redis instance.
 """
 
 from __future__ import annotations
@@ -40,8 +38,8 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
     Stores tasks as msgpack-encoded binary strings; queries via sorted-set range commands.
 
     Works with any standard Redis instance (no Redis Stack required).
-    ``get_all_tasks`` applies ``task_name``, ``task_version``, and ``status`` filters
-    in Python after fetching candidate task IDs from the queue sorted set.
+    `get_all_tasks` applies `task_name`, `task_version`, and `status` filters in Python
+    after fetching candidate task IDs from the queue sorted set.
     """
 
     # Atomically enqueue a new task (no rate limiting).
@@ -271,14 +269,14 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
 
 
 class DeadQueue:
-    r"""
+    """
     Dead letter queue backed by Redis, reusing task:<task_id> keys for task data.
 
     Keys:
-      ``dlq``                sorted set — member: task_id bytes, score: failed_at Unix timestamp.
-      ``dlq-queue:{queue}``  set        — task_id bytes per queue name (queue filter index).
-      ``dlq-name:{name}``    set        — task_id bytes per task name (name filter index).
-      ``dlq-meta``           hash       — field: task_id bytes, value: b"{queue}\0{name}\0{version}".
+    - `dlq` sorted set — member: task_id bytes, score: failed_at Unix timestamp.
+    - `dlq-queue:{queue}` set — task_id bytes per queue name (queue filter index).
+    - `dlq-name:{name}` set — task_id bytes per task name (name filter index).
+    - `dlq-meta` hash — field: task_id bytes, value: `b"{queue}\0{name}\0{version}"`.
     """
 
     DLQ = "dlq"
