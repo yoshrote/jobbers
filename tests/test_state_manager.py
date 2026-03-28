@@ -675,6 +675,31 @@ async def test_queue_retry_task_requeues_immediately(redis, state_manager):
     assert result.status == TaskStatus.SUBMITTED
     members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in members
+
+
+# ── active_tasks_per_queue ────────────────────────────────────────────────────
+
+
+def test_active_tasks_per_queue_reflects_registry(state_manager):
+    """
+    active_tasks_per_queue mirrors the tasks currently tracked in task_in_registry.
+
+    this is only true while there is one task consumer
+    """
+    task1 = Task(id=ULID1, name="t1", version=1, queue="q1")
+    task2 = Task(id=ULID2, name="t2", version=1, queue="q1")
+
+    assert state_manager.active_tasks_per_queue == {}
+
+    with state_manager.task_in_registry(task1):
+        assert state_manager.active_tasks_per_queue == {"q1": 1}
+        with state_manager.task_in_registry(task2):
+            assert state_manager.active_tasks_per_queue == {"q1": 2}
+        assert state_manager.active_tasks_per_queue == {"q1": 1}
+
+    assert state_manager.active_tasks_per_queue == {"q1": 0}
+
+
 # ── submit_dag ────────────────────────────────────────────────────────────────
 
 

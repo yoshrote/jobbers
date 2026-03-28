@@ -367,3 +367,35 @@ async def test_next_due_bulk_queues_none_empty_redis_returns_empty(scheduler):
     """next_due_bulk with queues=None returns [] when no queues are configured."""
     result = await scheduler.next_due_bulk(1, queues=None)
     assert result == []
+
+
+# ── get_by_filter: limit and None-task edge cases ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_stops_at_limit(scheduler, dummy_task_adapter):
+    """get_by_filter returns at most ``limit`` tasks even when more are scheduled."""
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    t3 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03")
+    for t in (t1, t2, t3):
+        await dummy_task_adapter.save_task(t)
+        await schedule(scheduler, t, PAST)
+
+    results = await scheduler.get_by_filter(queue="default", limit=2)
+    assert len(results) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_skips_none_tasks(scheduler, dummy_task_adapter, redis):
+    """get_by_filter silently skips IDs whose task data is missing (get_tasks_bulk returns None)."""
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    # Save only t1's data; add t2 to the schedule without persisting its task data.
+    await dummy_task_adapter.save_task(t1)
+    await schedule(scheduler, t1, PAST)
+    await schedule(scheduler, t2, PAST)  # t2 has no task data → get_tasks_bulk returns None
+
+    results = await scheduler.get_by_filter(queue="default")
+    assert len(results) == 1
+    assert results[0].id == t1.id
