@@ -13,6 +13,7 @@ from redis.exceptions import WatchError
 from jobbers import registry
 from jobbers.adapters.json_redis import JsonTaskAdapter
 from jobbers.adapters.raw_redis import DeadQueue
+from jobbers.models.cron_dag_scheduler import CronDAGScheduler
 from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_scheduler import TaskScheduler
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from ulid import ULID
 
     from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
+    from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGNode
     from jobbers.models.task import Task
 
@@ -64,6 +66,7 @@ class StateManager:
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
         self.task_scheduler = TaskScheduler(job_store, self.ta, self.qca)
+        self.cron_dag_scheduler = CronDAGScheduler(job_store)
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -227,6 +230,68 @@ class StateManager:
                 return task
             except WatchError:
                 continue
+
+    async def dispatch_cron_dag(self, entry: CronDAGEntry, run_at: dt.datetime) -> None:
+        """
+        Fire a cron-scheduled DAG run and reschedule the entry for its next occurrence.
+
+        A fresh copy of the DAG spec (new ULIDs for every node) is generated on each call
+        so repeated runs never share Redis fan-in keys.  If the entry's concurrency policy
+        is SKIP_IF_RUNNING and the previous root task is still active, the run is skipped
+        but the entry is still rescheduled.
+        """
+        from croniter import croniter
+
+        from jobbers.models.cron_dag import ConcurrencyPolicy
+        from jobbers.models.dag import collect_fan_in_keys
+        from jobbers.models.task import Task
+
+        next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
+
+        if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
+            active_task_id_str = await self.cron_dag_scheduler.get_active_run(entry.id)
+            if active_task_id_str is not None:
+                from ulid import ULID as _ULID
+
+                active_task = await self.ta.get_task(_ULID.from_str(active_task_id_str))
+                if active_task is not None and active_task.status in {
+                    TaskStatus.SUBMITTED,
+                    TaskStatus.STARTED,
+                    TaskStatus.HEARTBEAT,
+                }:
+                    logger.info(
+                        "Cron entry %s skipped: previous run %s still active (%s).",
+                        entry.id,
+                        active_task_id_str,
+                        active_task.status,
+                    )
+                    pipe = self.job_store.pipeline(transaction=True)
+                    self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
+                    await pipe.execute()
+                    return
+
+        fresh_spec, _ = entry.dag_spec.fresh_copy()
+
+        fan_ins = collect_fan_in_keys(fresh_spec)
+        if fan_ins:
+            await asyncio.gather(*(self.init_fan_in(k, ids) for k, ids in fan_ins.items()))
+
+        task = Task(
+            id=fresh_spec.id,
+            name=fresh_spec.name,
+            queue=fresh_spec.queue,
+            version=fresh_spec.version,
+            parameters=fresh_spec.parameters,
+            dag_callbacks=fresh_spec.dag_callbacks,
+        )
+        await self.submit_task(task)
+        logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
+
+        pipe = self.job_store.pipeline(transaction=True)
+        if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
+            self.cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task.id)
+        self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
+        await pipe.execute()
 
     async def request_task_cancellation(self, task_id: ULID) -> Task | None:
         """

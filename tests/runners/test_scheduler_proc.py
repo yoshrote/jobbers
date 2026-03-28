@@ -22,6 +22,7 @@ def make_state_manager_with_tasks(tasks: list[Task]) -> MagicMock:
     entries = [(t, PAST) for t in tasks]
     state_manager = MagicMock()
     state_manager.task_scheduler.next_due_bulk = AsyncMock(side_effect=[entries, []])
+    state_manager.cron_dag_scheduler.next_due_bulk = AsyncMock(return_value=[])
     state_manager.qca.get_queues = AsyncMock(return_value={"default"})
     state_manager.dispatch_scheduled_task = AsyncMock(side_effect=lambda t: t)
     return state_manager

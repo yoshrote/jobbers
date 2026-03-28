@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import datetime as dt
 from collections import defaultdict
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from ulid import ULID
@@ -717,3 +717,125 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 
 
 # ── dispatch_cron_dag ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_submits_task_and_reschedules(state_manager):
+    """dispatch_cron_dag submits the root task and reschedules the entry."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="daily_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+    run_at = FROZEN_TIME
+
+    await state_manager.dispatch_cron_dag(entry, run_at)
+
+    # A task should now exist in the DummyTaskAdapter store
+    stored = state_manager.ta._store
+    assert len(stored) == 1
+    task = next(iter(stored.values()))
+    assert task.name == "my_job"
+    assert task.status == TaskStatus.SUBMITTED
+
+    # The entry should be rescheduled in the cron sorted set
+    members = await state_manager.job_store.zrange("cron-schedule", 0, -1)
+    assert bytes(entry.id) in members
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager):
+    """dispatch_cron_dag skips dispatch but reschedules when concurrency_policy=SKIP_IF_RUNNING and previous run is active."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="guarded_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.SKIP_IF_RUNNING,
+    )
+
+    # Plant an active task that the skip-guard will find
+    active_task = Task(id=ULID1, name="my_job", queue="default", status=TaskStatus.STARTED)
+    await state_manager.ta.save_task(active_task)
+    await state_manager.job_store.set(
+        f"cron-active:{entry.id}", str(ULID1)
+    )
+
+    run_at = FROZEN_TIME
+    await state_manager.dispatch_cron_dag(entry, run_at)
+
+    # No new tasks should have been submitted (only the pre-planted active one)
+    stored = state_manager.ta._store
+    assert len(stored) == 1
+    assert ULID1 in stored
+
+    # Entry must still be rescheduled
+    members = await state_manager.job_store.zrange("cron-schedule", 0, -1)
+    assert bytes(entry.id) in members
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_skipping(state_manager):
+    """dispatch_cron_dag records the new root task when concurrency_policy=SKIP_IF_RUNNING and no prior run is active."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="guarded_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.SKIP_IF_RUNNING,
+    )
+    # No active run planted — guard should not fire
+
+    run_at = FROZEN_TIME
+    await state_manager.dispatch_cron_dag(entry, run_at)
+
+    # The new root task should have been submitted
+    stored = state_manager.ta._store
+    assert len(stored) == 1
+
+    # The active-run key should now record the new task ID
+    active_key = f"cron-active:{entry.id}"
+    active_val = await state_manager.job_store.get(active_key)
+    assert active_val is not None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
+    """dispatch_cron_dag pre-populates fan-in sets when the DAG contains fan-in nodes."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGNode, DAGTaskSpec
+
+    # Build a diamond DAG: root → (a, b) → collector (fan-in)
+    root_node = DAGNode("root_job")
+    branch_a = DAGNode("branch_a")
+    branch_b = DAGNode("branch_b")
+    collector = DAGNode("collector")
+    root_node.then(branch_a, branch_b)
+    DAGNode.merge(branch_a, branch_b, into=collector)
+
+    root_spec = root_node._to_spec()
+    entry = CronDAGEntry(
+        name="fan_in_job",
+        cron_expr="0 0 * * *",
+        dag_spec=root_spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    state_manager.init_fan_in = AsyncMock()
+
+    run_at = FROZEN_TIME
+    await state_manager.dispatch_cron_dag(entry, run_at)
+
+    # init_fan_in must have been called for the collector's fan-in key
+    assert state_manager.init_fan_in.await_count >= 1
