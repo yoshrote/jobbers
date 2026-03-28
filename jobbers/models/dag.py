@@ -1,28 +1,29 @@
 """
 DAG node classes for describing task dependency graphs.
 
-``DAGTaskSpec``   – pre-configured task specification with a pre-assigned ULID.
-``SimpleCallback`` – submit a task immediately when the parent completes.
-``FanInCallback``  – submit a task only after *all* fan-in predecessors complete;
+- `DAGTaskSpec` — pre-configured task specification with a pre-assigned ULID.
+- `SimpleCallback` — submit a task immediately when the parent completes.
+- `FanInCallback` — submit a task only after *all* fan-in predecessors complete;
                      uses a Redis set to track remaining predecessor IDs.
-``DAGCallback``    – discriminated union of the two callback types.
-``DAGNode``        – fluent builder for constructing the DAG graph; call
-                     ``to_task()`` on root nodes to get ``Task`` objects ready
-                     for submission via ``StateManager.submit_dag``.
+- `DAGCallback` — discriminated union of the two callback types.
+- `DAGNode` — fluent builder for constructing the DAG graph; call `to_task()` on
+  root nodes to get `Task` objects ready for submission via `StateManager.submit_dag`.
 
-Usage
------
+## Usage
 
-Linear chain::
+**Linear chain:**
 
+```python
     a = DAGNode("fetch_data")
     b = DAGNode("process_data")
     c = DAGNode("save_results")
     a.then(b)
     b.then(c)
+```
 
-Fan-out then fan-in (diamond)::
+**Fan-out then fan-in (diamond):**
 
+```python
     root      = DAGNode("split_work")
     branch_a  = DAGNode("process_chunk_a")
     branch_b  = DAGNode("process_chunk_b")
@@ -30,6 +31,7 @@ Fan-out then fan-in (diamond)::
 
     root.then(branch_a, branch_b)
     DAGNode.merge(branch_a, branch_b, into=collector)
+```
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ class DAGTaskSpec(BaseModel):
     """
     Serialisable specification for a single task node.
 
-    The ``id`` is pre-assigned at DAG construction time so that fan-in sets can
+    The `id` is pre-assigned at DAG construction time so that fan-in sets can
     reference it before the task is ever submitted.
     """
 
@@ -68,10 +70,10 @@ class DAGTaskSpec(BaseModel):
         """
         Return a copy of this spec tree with brand-new ULIDs for every node.
 
-        Fan-in keys (``dag:fan-in:{old_id}``) are rewritten to reference the new
+        Fan-in keys (`dag:fan-in:{old_id}`) are rewritten to reference the new
         collector IDs so runs of the same cron entry never share Redis keys.
 
-        Returns ``(fresh_spec, id_map)`` where ``id_map`` maps old → new ULID.
+        Returns `(fresh_spec, id_map)` where `id_map` maps old → new ULID.
         """
         id_map: dict[ULID, ULID] = {}
         return self._remap(id_map), id_map
@@ -100,7 +102,7 @@ class DAGTaskSpec(BaseModel):
 
 
 class SimpleCallback(BaseModel):
-    """Submit ``task`` immediately when the parent task completes."""
+    """Submit `task` immediately when the parent task completes."""
 
     type: Literal["simple"] = "simple"
     task: DAGTaskSpec
@@ -108,10 +110,10 @@ class SimpleCallback(BaseModel):
 
 class FanInCallback(BaseModel):
     """
-    Submit ``task`` only once all fan-in predecessors have completed.
+    Submit `task` only once all fan-in predecessors have completed.
 
-    ``fan_in_key`` is a Redis key for a set of pending predecessor task IDs.
-    Each predecessor removes its own ID via ``TaskAdapterProtocol.fan_in_complete``;
+    `fan_in_key` is a Redis key for a set of pending predecessor task IDs.
+    Each predecessor removes its own ID via `TaskAdapterProtocol.fan_in_complete`;
     when the set becomes empty the collector task is submitted.
     """
 
@@ -146,7 +148,7 @@ def collect_fan_in_keys(spec: DAGTaskSpec) -> dict[str, set[ULID]]:
                 _walk(cb.task)
             else:
                 # SimpleCallback
-                _walk(cb.task)  # type: ignore[union-attr]
+                _walk(cb.task)
 
     _walk(spec)
     return result
@@ -161,11 +163,10 @@ class DAGNode:
     """
     Fluent builder for constructing a task DAG.
 
-    Each node is assigned a ``ULID`` at construction time.  Nodes are linked
-    via :meth:`then` (fan-out / chain) and :meth:`merge` (fan-in).  When the
-    graph is fully described, call :meth:`to_task` on each root node to obtain
-    a :class:`~jobbers.models.task.Task` ready for submission.  Pass all root
-    nodes to :meth:`~jobbers.state_manager.StateManager.submit_dag` so that
+    Each node is assigned a `ULID` at construction time.  Nodes are linked
+    via `then` (fan-out / chain) and `merge` (fan-in).  When the graph is fully
+    described, call `to_task` on each root node to obtain a `Task` ready for
+    submission.  Pass all root nodes to `StateManager.submit_dag` so that
     fan-in Redis sets are initialised before execution begins.
     """
 
@@ -199,9 +200,11 @@ class DAGNode:
         """
         Chain: each of *nodes* runs immediately after *this* node completes.
 
-        Returns *self* for fluent chaining::
+        Returns *self* for fluent chaining:
 
+        ```python
             a.then(b).then(c)   # same as a.then(b); b.then(c)
+        ```
         """
         for node in nodes:
             self._successors.append((node, None))
@@ -210,13 +213,15 @@ class DAGNode:
     @classmethod
     def merge(cls, *predecessors: DAGNode, into: DAGNode) -> DAGNode:
         """
-        Fan-in: ``into`` runs only after *all* ``predecessors`` have completed.
+        Fan-in: `into` runs only after *all* `predecessors` have completed.
 
-        A shared Redis set key derived from ``into``'s task ID is stored on
+        A shared Redis set key derived from `into`'s task ID is stored on
         each predecessor's callback so the worker knows which set to decrement.
-        Returns ``into`` for further chaining::
+        Returns `into` for further chaining:
 
+        ```python
             DAGNode.merge(branch_a, branch_b, into=collector).then(next_step)
+        ```
         """
         fan_in_key = f"dag:fan-in:{into._id}"
         for pred in predecessors:
@@ -228,7 +233,7 @@ class DAGNode:
     # ------------------------------------------------------------------
 
     def _to_spec(self) -> DAGTaskSpec:
-        """Recursively build a :class:`DAGTaskSpec` with embedded callbacks."""
+        """Recursively build a `DAGTaskSpec` with embedded callbacks."""
         return DAGTaskSpec(
             id=self._id,
             name=self._name,
@@ -239,7 +244,7 @@ class DAGNode:
         )
 
     def _callbacks_recursive(self) -> list[DAGCallback]:
-        """Return the list of :class:`DAGCallback` objects for this node's successors."""
+        """Return the list of `DAGCallback` objects for this node's successors."""
         callbacks: list[DAGCallback] = []
         for successor, fan_in_key in self._successors:
             spec = successor._to_spec()
@@ -250,7 +255,7 @@ class DAGNode:
         return callbacks
 
     def to_task(self, *, parent_task_id: ULID | None = None) -> Task:
-        """Return a :class:`~jobbers.models.task.Task` for this node ready for submission."""
+        """Return a `Task` for this node ready for submission."""
         from jobbers.models.task import Task
 
         return Task(
@@ -261,14 +266,14 @@ class DAGNode:
             parameters=self._parameters,
             dag_callbacks=self._callbacks_recursive(),
             parent_task_id=parent_task_id,
+            parent_ids=[parent_task_id] if parent_task_id is not None else [],
         )
 
     def fan_in_predecessors(self) -> dict[str, set[ULID]]:
         """
         Walk the full subgraph and return a mapping of fan-in key → predecessor IDs.
 
-        Used by :meth:`~jobbers.state_manager.StateManager.submit_dag` to
-        pre-populate Redis sets before any task runs.
+        Used by `StateManager.submit_dag` to pre-populate Redis sets before any task runs.
         """
         result: dict[str, set[ULID]] = {}
         visited: set[int] = set()
@@ -291,8 +296,8 @@ class DynamicFanOut:
     """
     Describes runtime fan-out: a dynamic set of children and a collector.
 
-    Do NOT call :meth:`DAGNode.merge` yourself — the processor does it.
-    Embed this in a :class:`TaskResult` to trigger fan-out processing.
+    Do NOT call `DAGNode.merge` yourself — the processor does it.
+    Embed this in a `TaskResult` to trigger fan-out processing.
     """
 
     children: list[DAGNode]
@@ -305,31 +310,40 @@ class TaskResult:
     """
     Return value for all jobber task functions.
 
-    ``results`` is stored on the task record and made available to downstream
-    tasks via :meth:`~jobbers.models.task.Task.parent_results`.
+    `results` is stored on the task record and made available to downstream
+    tasks via `Task.parent_results`.
 
-    Set ``fanout`` to trigger dynamic fan-out: the processor wires the
-    fan-in automatically, initialises the Redis tracking set, and submits
-    all children.
+    `parent_ids` records the immediate parent task ID(s) — one for simple
+    chains, many for fan-in collectors.  Use `Task.make_result` to have this
+    populated automatically from the running task's context.
 
-    Example — plain result::
+    Set `fanout` to trigger dynamic fan-out: the processor wires the fan-in
+    automatically, initialises the Redis tracking set, and submits all children.
 
+    **Example — plain result (auto-populated parent_ids):**
+
+    ```python
         @register_task(name="fetch_data")
         async def fetch_data(**kwargs):
+        task = get_current_task()
             data = await load()
-            return TaskResult(results={"rows": len(data)})
+        return task.make_result(results={"rows": len(data)})
+    ```
 
-    Example — dynamic fan-out::
+    **Example — dynamic fan-out:**
 
+    ```python
         @register_task(name="dispatch_records")
         async def dispatch_records(**kwargs):
+        task = get_current_task()
             records = await fetch_records()
             children = [DAGNode("process_record", parameters={"id": r}) for r in records]
             collector = DAGNode("aggregate_results")
-            return TaskResult(
+        return task.make_result(
                 results={"count": len(records)},
                 fanout=DynamicFanOut(children=children, collector=collector),
             )
+    ```
     """
 
     results: dict[str, Any] = field(default_factory=dict)
