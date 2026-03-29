@@ -756,7 +756,7 @@ async def test_process_does_not_overwrite_cancelled_status_on_system_cancel():
 @pytest.mark.asyncio
 async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     """Normal fan-out: children are submitted atomically via pipeline and collector is pre-saved."""
-    from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
+    from jobbers.models.dag import DAGNode, DynamicFanOut
 
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -893,10 +893,9 @@ async def test_monitor_task_cancellation_calls_handle_user_cancelled_task():
 @pytest.mark.asyncio
 async def test_post_process_triggers_dag_callbacks():
     """post_process submits callbacks produced by generate_callbacks when has_callbacks() is True."""
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import AsyncMock
 
-    from jobbers.models.dag import SimpleCallback
-    from jobbers.models.dag import DAGTaskSpec
+    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
 
     # Build a parent task with a SimpleCallback so has_callbacks() → True
     child_spec = DAGTaskSpec(name="child_task", queue="default")
@@ -987,7 +986,7 @@ async def test_end_to_end_latency_recorded_when_submitted_at_set():
         version=1,
         status=TaskStatus.SUBMITTED,
         queue="default",
-        submitted_at=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+        submitted_at=dt.datetime(2024, 1, 1, tzinfo=dt.UTC),
     )
     state_manager = _make_state_manager()
     task_function = AsyncMock(return_value=TaskResult(results={}))

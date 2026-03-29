@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import datetime as dt
-from enum import Enum
+from enum import StrEnum
+from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field
-from pydantic import field_serializer
+from pydantic import BaseModel, Field, field_serializer
 from ulid import ULID
 
-from jobbers.models.dag import DAGTaskSpec
+if TYPE_CHECKING:
+    from jobbers.models.dag import DAGTaskSpec
 
 
-class ConcurrencyPolicy(str, Enum):
+class ConcurrencyPolicy(StrEnum):
     """Controls what happens when a cron fires and the previous run is still active."""
 
     ALWAYS = "always"

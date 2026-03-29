@@ -1,6 +1,5 @@
 """Tests for DAGTaskSpec.fresh_copy, collect_fan_in_keys, DAGNode, and TaskResult."""
 
-import pytest
 from ulid import ULID
 
 from jobbers.models.dag import (

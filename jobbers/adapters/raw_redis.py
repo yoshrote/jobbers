@@ -269,7 +269,7 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
 
 
 class DeadQueue:
-    """
+    r"""
     Dead letter queue backed by Redis, reusing task:<task_id> keys for task data.
 
     Keys:
