@@ -47,6 +47,7 @@ dependencies = [
     "python-ulid[pydantic]",
     "asyncio-taskpool",
     "msgpack-types",
+    "croniter>=6.2.2",
 ]
 
 [project.optional-dependencies]
