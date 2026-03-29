@@ -24,9 +24,9 @@ b.then(c)
 **Fan-out then fan-in (diamond):**
 
 ```python
-root      = DAGNode("split_work")
-branch_a  = DAGNode("process_chunk_a")
-branch_b  = DAGNode("process_chunk_b")
+root = DAGNode("split_work")
+branch_a = DAGNode("process_chunk_a")
+branch_b = DAGNode("process_chunk_b")
 collector = DAGNode("merge_results")
 
 root.then(branch_a, branch_b)
@@ -203,7 +203,7 @@ class DAGNode:
         Returns *self* for fluent chaining:
 
         ```python
-        a.then(b).then(c)   # same as a.then(b); b.then(c)
+        a.then(b).then(c)  # same as a.then(b); b.then(c)
         ```
         """
         for node in nodes:

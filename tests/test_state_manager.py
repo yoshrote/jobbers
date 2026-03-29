@@ -735,9 +735,7 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 
     # init_fan_in must be called with the collector's fan-in key
     fan_in_key = f"dag:fan-in:{collector.id}"
-    state_manager.init_fan_in.assert_awaited_once_with(
-        fan_in_key, {branch_a.id, branch_b.id}
-    )
+    state_manager.init_fan_in.assert_awaited_once_with(fan_in_key, {branch_a.id, branch_b.id})
     assert len(submitted) == 2
 
 
@@ -790,9 +788,7 @@ async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager
     # Plant an active task that the skip-guard will find
     active_task = Task(id=ULID1, name="my_job", queue="default", status=TaskStatus.STARTED)
     await state_manager.ta.save_task(active_task)
-    await state_manager.job_store.set(
-        f"cron-active:{entry.id}", str(ULID1)
-    )
+    await state_manager.job_store.set(f"cron-active:{entry.id}", str(ULID1))
 
     run_at = FROZEN_TIME
     await state_manager.dispatch_cron_dag(entry, run_at)
@@ -839,7 +835,7 @@ async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_sk
 async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
     """dispatch_cron_dag pre-populates fan-in sets when the DAG contains fan-in nodes."""
     from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-    from jobbers.models.dag import DAGNode, DAGTaskSpec
+    from jobbers.models.dag import DAGNode
 
     # Build a diamond DAG: root → (a, b) → collector (fan-in)
     root_node = DAGNode("root_job")
@@ -857,10 +853,65 @@ async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
         concurrency_policy=ConcurrencyPolicy.ALWAYS,
     )
 
-    state_manager.init_fan_in = AsyncMock()
+    from unittest.mock import patch
 
     run_at = FROZEN_TIME
-    await state_manager.dispatch_cron_dag(entry, run_at)
+    with patch.object(state_manager.ta, "stage_init_fan_in") as mock_stage_init:
+        await state_manager.dispatch_cron_dag(entry, run_at)
 
-    # init_fan_in must have been called for the collector's fan-in key
-    assert state_manager.init_fan_in.await_count >= 1
+    # stage_init_fan_in must have been called for the collector's fan-in key
+    assert mock_stage_init.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_stages_submission_in_pipeline_for_non_rate_limited_queue(state_manager):
+    """For non-rate-limited queues, submission is staged in the same pipeline (no separate submit_task call)."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="daily_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    with (
+        patch.object(
+            state_manager.ta, "stage_submit_task", wraps=state_manager.ta.stage_submit_task
+        ) as mock_stage,
+        patch.object(state_manager, "submit_task", new_callable=AsyncMock) as mock_submit,
+    ):
+        await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    mock_stage.assert_called_once()
+    mock_submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queue(state_manager):
+    """For rate-limited queues, dispatch_cron_dag falls back to submit_task() to enforce the rate limit."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    await state_manager.qca.save_queue_config(
+        QueueConfig(name="default", rate_numerator=5, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    )
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="daily_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    with (
+        patch.object(state_manager.ta, "stage_submit_task") as mock_stage,
+        patch.object(state_manager, "submit_task", new_callable=AsyncMock) as mock_submit,
+    ):
+        await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    mock_stage.assert_not_called()
+    mock_submit.assert_called_once()

@@ -381,6 +381,59 @@ async def test_stage_requeue_does_not_duplicate_queue_entry(task_adapter):
     assert members.count(bytes(ULID1)) == 1
 
 
+# ── stage_submit_task ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stage_submit_task_adds_task_to_queue(task_adapter):
+    """stage_submit_task enqueues the task into its sorted-set queue."""
+    task = make_task()
+    pipe = task_adapter.data_store.pipeline(transaction=True)
+    task_adapter.stage_submit_task(pipe, task)
+    await pipe.execute()
+
+    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
+    assert bytes(ULID1) in members
+
+
+@pytest.mark.asyncio
+async def test_stage_submit_task_saves_task_data(task_adapter):
+    """stage_submit_task persists the task blob so it can be retrieved."""
+    task = make_task()
+    pipe = task_adapter.data_store.pipeline(transaction=True)
+    task_adapter.stage_submit_task(pipe, task)
+    await pipe.execute()
+
+    saved = await task_adapter.get_task(ULID1)
+    assert saved is not None
+    assert saved.id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_stage_submit_task_uses_submitted_at_as_score(task_adapter):
+    """The queue sorted-set score matches the task's submitted_at timestamp."""
+    task = make_task()
+    pipe = task_adapter.data_store.pipeline(transaction=True)
+    task_adapter.stage_submit_task(pipe, task)
+    await pipe.execute()
+
+    score = await task_adapter.data_store.zscore(task_adapter.TASKS_BY_QUEUE(queue="default"), bytes(ULID1))
+    assert score == pytest.approx(FROZEN_TIME.timestamp())
+
+
+@pytest.mark.asyncio
+async def test_stage_submit_task_does_not_duplicate_queue_entry(task_adapter):
+    """Staging the same task ID twice does not create a duplicate queue entry."""
+    task = make_task()
+    for _ in range(3):
+        pipe = task_adapter.data_store.pipeline(transaction=True)
+        task_adapter.stage_submit_task(pipe, task)
+        await pipe.execute()
+
+    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
+    assert members.count(bytes(ULID1)) == 1
+
+
 # ── remove_task_heartbeat ─────────────────────────────────────────────────────
 
 

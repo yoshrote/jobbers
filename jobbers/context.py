@@ -10,6 +10,7 @@ the running `Task` instance.
 ```python
 from jobbers.context import get_current_task
 
+
 @register_task(name="my_task")
 async def my_task(**kwargs):
     task = get_current_task()
@@ -30,7 +31,8 @@ _current_task: ContextVar[Task | None] = ContextVar("_current_task", default=Non
 
 
 def get_current_task() -> Task:
-    """Return the `Task` running in this worker coroutine.
+    """
+    Return the `Task` running in this worker coroutine.
 
     Raises `RuntimeError` if called outside a task function.
     """

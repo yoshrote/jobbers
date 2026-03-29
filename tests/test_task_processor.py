@@ -1,7 +1,7 @@
 import asyncio
 import contextlib
 import datetime as dt
-from unittest.mock import ANY, AsyncMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import fakeredis.aioredis as fakeredis
 import pytest
@@ -755,7 +755,7 @@ async def test_process_does_not_overwrite_cancelled_status_on_system_cancel():
 
 @pytest.mark.asyncio
 async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
-    """Normal fan-out: children are submitted and collector is pre-saved."""
+    """Normal fan-out: children are submitted atomically via pipeline and collector is pre-saved."""
     from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
 
     parent = Task(
@@ -775,28 +775,38 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     state_manager.save_task = AsyncMock()
     state_manager.submit_task = AsyncMock()
 
+    # Set up qca to report non-rate-limited queues
+    state_manager.qca = AsyncMock()
+    state_manager.qca.get_queue_config = AsyncMock(return_value=None)
+
+    # Set up pipeline: stage_submit_task is sync; execute() is awaitable
+    mock_pipe = AsyncMock()
+    state_manager.job_store = MagicMock()
+    state_manager.job_store.pipeline.return_value = mock_pipe
+
+    # Capture stage_submit_task calls
+    staged_tasks: list[Task] = []
+    state_manager.ta = MagicMock()
+    state_manager.ta.stage_submit_task.side_effect = lambda pipe, task: staged_tasks.append(task)
+
     processor = TaskProcessor(state_manager)
     await processor._handle_dynamic_fanout(parent, fanout)
 
     # init_fan_in called once with correct key and both child IDs
     fan_in_key = f"dag:fan-in:{collector.id}"
-    state_manager.init_fan_in.assert_awaited_once_with(
-        fan_in_key, {c1.id, c2.id}, ttl=fanout.fan_in_ttl
-    )
+    state_manager.init_fan_in.assert_awaited_once_with(fan_in_key, {c1.id, c2.id}, ttl=fanout.fan_in_ttl)
     # collector pre-saved once with parent_ids == all child IDs
     state_manager.save_task.assert_awaited_once()
     saved_task = state_manager.save_task.call_args[0][0]
     assert saved_task.id == collector.id
     assert set(saved_task.parent_ids) == {c1.id, c2.id}
 
-    # both children submitted
-    assert state_manager.submit_task.await_count == 2
-    submitted_ids = {call[0][0].id for call in state_manager.submit_task.call_args_list}
-    assert submitted_ids == {c1.id, c2.id}
-
-    child_tasks = [call[0][0] for call in state_manager.submit_task.call_args_list]
-    for ct in child_tasks:
+    # children submitted via pipeline, not submit_task
+    state_manager.submit_task.assert_not_awaited()
+    assert {ct.id for ct in staged_tasks} == {c1.id, c2.id}
+    for ct in staged_tasks:
         assert ct.parent_ids == [parent.id]
+        assert ct.status == TaskStatus.SUBMITTED
 
 
 @pytest.mark.asyncio
@@ -902,15 +912,14 @@ async def test_post_process_triggers_dag_callbacks():
     state_manager = _make_state_manager()
     state_manager.submit_task = AsyncMock()
 
-    # generate_callbacks needs a task adapter; patch db helpers to return a mock
+    # generate_callbacks now receives state_manager.ta directly
     mock_ta = AsyncMock()
     mock_ta.fan_in_complete.return_value = 0
     mock_ta.get_fan_in_members.return_value = []
+    state_manager.ta = mock_ta
 
     processor = TaskProcessor(state_manager)
-    with patch("jobbers.db.get_client", return_value=AsyncMock()):
-        with patch("jobbers.db.create_task_adapter", return_value=mock_ta):
-            await processor.post_process(parent)
+    await processor.post_process(parent)
 
     # At least one child task should have been submitted
     assert state_manager.submit_task.await_count >= 1

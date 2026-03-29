@@ -75,7 +75,9 @@ class TaskAdapterProtocol(Protocol):
     async def remove_task_heartbeat(self, task: Task) -> None: ...
 
     # -- dag fan-in ----------------------------------------------------------
-    def stage_init_fan_in(self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
+    def stage_init_fan_in(
+        self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+    ) -> None: ...
     async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
     async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int: ...
     async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
@@ -243,7 +245,9 @@ class _BaseTaskAdapter:
             if task is not None:
                 yield task
 
-    def stage_init_fan_in(self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
+    def stage_init_fan_in(
+        self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+    ) -> None:
         """
         Queue fan-in set initialisation commands onto *pipe* without executing.
 

@@ -60,7 +60,9 @@ async def main(poll_interval: float, role: str, batch_size: int) -> None:
             enabled = [(entry, run_at) for entry, run_at in cron_entries if entry.enabled]
             if enabled:
                 logger.info("Dispatching %d cron DAG(s)", len(enabled))
-                await asyncio.gather(*(state_manager.dispatch_cron_dag(entry, run_at) for entry, run_at in enabled))
+                await asyncio.gather(
+                    *(state_manager.dispatch_cron_dag(entry, run_at) for entry, run_at in enabled)
+                )
                 for entry, run_at in enabled:
                     dispatch_latency.record(
                         (now - run_at).total_seconds(),

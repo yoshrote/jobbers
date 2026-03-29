@@ -91,10 +91,21 @@ class DummyTaskAdapter:
         pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})  # type: ignore[union-attr]
         self._store[task.id] = task
 
+    def stage_submit_task(self, pipe: object, task: Task) -> None:
+        """Eagerly store the task and add a ZADD to the caller's Redis pipeline."""
+        assert task.submitted_at
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})  # type: ignore[union-attr]
+        self._store[task.id] = task
+
     def stage_remove_from_queue(self, pipe: object, task: Task) -> None:
         """Add ZREM + SREM commands to the caller's Redis pipeline."""
         pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))  # type: ignore[union-attr]
         pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))  # type: ignore[union-attr]
+
+    def stage_init_fan_in(
+        self, pipe: object, fan_in_key: str, predecessor_ids: object, ttl: int = 86400
+    ) -> None:
+        """No-op stub: fan-in sets are not needed for in-memory orchestration tests."""
 
     # ── convenience (not part of protocol) ───────────────────────────────────
 

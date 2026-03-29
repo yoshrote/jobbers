@@ -3,7 +3,15 @@
 import pytest
 from ulid import ULID
 
-from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, FanInCallback, SimpleCallback, TaskResult, collect_fan_in_keys
+from jobbers.models.dag import (
+    DAGNode,
+    DAGTaskSpec,
+    DynamicFanOut,
+    FanInCallback,
+    SimpleCallback,
+    TaskResult,
+    collect_fan_in_keys,
+)
 
 
 def make_spec(name: str = "task", **kwargs) -> DAGTaskSpec:
