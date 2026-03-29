@@ -165,7 +165,12 @@ Recommended cron setup:
 
 ### Scheduler
 
-A long-running process that polls for retry-delayed tasks and re-enqueues them when their scheduled time arrives. Run exactly **one** Scheduler per Redis instance.
+A long-running process that handles two scheduling concerns on each poll:
+
+1. **Retry delays** — re-enqueues tasks that are waiting out a backoff delay when their `run_at` arrives.
+2. **Cron DAGs** — fires recurring `CronDAGEntry` runs when their cron expression comes due; see [docs/cron-dags.md](cron-dags.md).
+
+Run exactly **one** Scheduler per Redis instance.
 
 ```bash
 SCHEDULER_POLL_INTERVAL=5.0 \

@@ -26,6 +26,7 @@ async def send_email(**kwargs: object) -> dict[str, object]:
 ```python
 import datetime as dt
 import httpx
+from jobbers.context import get_current_task
 from jobbers.registry import register_task
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy
 
@@ -56,6 +57,7 @@ from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy
     # on_shutdown=TaskShutdownPolicy.STOP,               # default; other options: RESUBMIT, CONTINUE
 )
 async def generate_report(**kwargs: object) -> dict[str, object]:
+    task = get_current_task()
     report_id = kwargs["report_id"]
 
     for section in get_sections(report_id):
@@ -87,8 +89,11 @@ async def generate_report(**kwargs: object) -> dict[str, object]:
 Call `await task.heartbeat()` periodically inside long-running tasks. This updates the `heartbeat_at` timestamp, which the Cleaner checks against `max_heartbeat_interval`.
 
 ```python
+from jobbers.context import get_current_task
+
 @register_task(name="bulk_import", version=1, max_heartbeat_interval=dt.timedelta(minutes=2))
 async def bulk_import(**kwargs: object) -> None:
+    task = get_current_task()
     for batch in get_batches(kwargs["file_id"]):
         await import_batch(batch)
         await task.heartbeat()   # must be called at least once every 2 minutes
