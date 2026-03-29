@@ -49,6 +49,8 @@ class Task(BaseModel):
     # Immediate parent task IDs — empty for root tasks, one entry for simple-chain
     # and dynamic fan-out children, many entries for fan-in collectors.
     parent_ids: list[ULID] = Field(default_factory=list)
+    # Set on cron-dispatched root tasks so the worker can clear the active-run key on completion.
+    cron_id: ULID | None = Field(default=None)
 
     @field_serializer("id", when_used="json")
     def serialize_id(self, value: ULID) -> str:
@@ -96,7 +98,7 @@ class Task(BaseModel):
     def has_callbacks(self) -> bool:
         return bool(self.dag_callbacks)
 
-    async def generate_callbacks(self) -> list[Self]:
+    async def generate_callbacks(self, ta: "TaskAdapterProtocol") -> list[Self]:
         """
         Generate tasks to submit after this task completes.
 
@@ -105,6 +107,9 @@ class Task(BaseModel):
         removed from the shared Redis set; the collector task is only returned
         once the set is empty (all predecessors have completed), and its
         `parent_ids` is populated from the permanent fan-in members set.
+
+        Returns -1 from `fan_in_complete` when the ID was not a member (already
+        processed or key expired); in that case the collector is not submitted.
         """
         from jobbers.models.dag import FanInCallback, SimpleCallback
 
@@ -125,9 +130,9 @@ class Task(BaseModel):
                         )
                     )
                 case FanInCallback():
-                    remaining = await self._ta.fan_in_complete(cb.fan_in_key, self.id)
+                    remaining = await ta.fan_in_complete(cb.fan_in_key, self.id)
                     if remaining == 0:
-                        member_ids = await self._ta.get_fan_in_members(cb.fan_in_key)
+                        member_ids = await ta.get_fan_in_members(cb.fan_in_key)
                         results.append(
                             self.__class__(
                                 id=spec.id,
@@ -138,6 +143,13 @@ class Task(BaseModel):
                                 dag_callbacks=spec.dag_callbacks,
                                 parent_ids=member_ids,
                             )
+                        )
+                    elif remaining == -1:
+                        logger.warning(
+                            "fan_in_complete returned -1 for key %s task %s — "
+                            "ID was not a member (already processed or key expired); skipping collector.",
+                            cb.fan_in_key,
+                            self.id,
                         )
         return results
 
@@ -215,6 +227,7 @@ class Task(BaseModel):
             "completed_at": _ts(self.completed_at),
             "dag_callbacks": [cb.model_dump() for cb in self.dag_callbacks],
             "parent_ids": [str(pid) for pid in self.parent_ids],
+            "cron_id": str(self.cron_id) if self.cron_id is not None else None,
         }
 
     @classmethod
@@ -241,6 +254,7 @@ class Task(BaseModel):
             completed_at=_dt(raw.get("completed_at")),
             dag_callbacks=_dag_callback_adapter.validate_python(raw.get("dag_callbacks") or []),
             parent_ids=[ULID.from_str(pid) for pid in raw.get("parent_ids") or []],
+            cron_id=ULID.from_str(raw["cron_id"]) if raw.get("cron_id") else None,
         )
 
     def set_status(self, status: TaskStatus) -> None:

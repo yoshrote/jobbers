@@ -57,6 +57,7 @@ class TaskAdapterProtocol(Protocol):
     async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool: ...
     def stage_save(self, pipe: Pipeline, task: Task) -> None: ...
     def stage_requeue(self, pipe: Pipeline, task: Task) -> None: ...
+    def stage_submit_task(self, pipe: Pipeline, task: Task) -> None: ...
 
     # -- read path -----------------------------------------------------------
     async def get_task(self, task_id: ULID) -> Task | None: ...
@@ -74,6 +75,7 @@ class TaskAdapterProtocol(Protocol):
     async def remove_task_heartbeat(self, task: Task) -> None: ...
 
     # -- dag fan-in ----------------------------------------------------------
+    def stage_init_fan_in(self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
     async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
     async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int: ...
     async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
@@ -124,11 +126,35 @@ class _BaseTaskAdapter:
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     DLQ_MISSING_DATA = "dlq-missing-data"
 
+    # Atomically remove task_id from fan-in set and return remaining count.
+    # Returns {removed=0, remaining=-1} if the ID was not a member (already
+    # processed or key expired), so callers can distinguish a real zero-remaining
+    # from a false zero caused by a missing/expired key.
+    _FAN_IN_SCRIPT = """
+        local removed = redis.call('SREM', KEYS[1], ARGV[1])
+        if removed == 0 then
+            return {0, -1}
+        end
+        return {removed, redis.call('SCARD', KEYS[1])}
+    """
+
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
+        self._fan_in_script = self.data_store.register_script(self._FAN_IN_SCRIPT)
 
     def stage_requeue(self, pipe: Pipeline, task: Task) -> None:
         """Queue ZADD task-queue + save-task commands onto pipe (no execute)."""
+        assert task.submitted_at  # noqa: S101
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        self.stage_save(pipe, task)
+
+    def stage_submit_task(self, pipe: Pipeline, task: Task) -> None:
+        """
+        Queue ZADD + save-task onto pipe for initial submission (no execute).
+
+        Identical Redis ops to stage_requeue; use for first-time submission where
+        the task ULID is guaranteed fresh and the Lua EXISTS guard is not needed.
+        """
         assert task.submitted_at  # noqa: S101
         pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
         self.stage_save(pipe, task)
@@ -217,9 +243,9 @@ class _BaseTaskAdapter:
             if task is not None:
                 yield task
 
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
+    def stage_init_fan_in(self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
         """
-        Pre-populate a fan-in tracking set in Redis.
+        Queue fan-in set initialisation commands onto *pipe* without executing.
 
         Writes two keys:
 
@@ -234,24 +260,27 @@ class _BaseTaskAdapter:
         """
         members_key = f"{fan_in_key}:members"
         encoded = [str(pid).encode() for pid in predecessor_ids]
-        pipe = self.data_store.pipeline(transaction=True)
         pipe.sadd(fan_in_key, *encoded)
         pipe.expire(fan_in_key, ttl)
         pipe.sadd(members_key, *encoded)
         pipe.expire(members_key, ttl * 2)
+
+    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
+        """Pre-populate a fan-in tracking set in Redis (see stage_init_fan_in for key details)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_init_fan_in(pipe, fan_in_key, predecessor_ids, ttl)
         await pipe.execute()
 
     async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
         """
         Atomically remove *task_id* from the fan-in set and return the remaining count.
 
-        When the count reaches zero all predecessors have completed and the
-        caller should submit the collector task.
+        Uses a Lua script so the SREM+SCARD pair is truly atomic across all workers.
+        Returns -1 if the task ID was not a member of the set (already processed or
+        key expired); callers must treat -1 as "do nothing" and not submit the
+        collector.  Returns 0 when this was the last predecessor.
         """
-        pipe = self.data_store.pipeline(transaction=True)
-        pipe.srem(fan_in_key, str(task_id).encode())
-        pipe.scard(fan_in_key)
-        results = await pipe.execute()
+        results: list[int] = await self._fan_in_script(keys=[fan_in_key], args=[str(task_id).encode()])
         return int(results[1])
 
     async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]:

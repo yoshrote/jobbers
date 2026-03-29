@@ -133,15 +133,24 @@ class TaskProcessor:
         if dynamic_fanout is not None:
             await self._handle_dynamic_fanout(task, dynamic_fanout)
         if task.has_callbacks():
-            callbacks = await task.generate_callbacks()
+            callbacks = await task.generate_callbacks(self.state_manager.ta)
             await asyncio.gather(*(self.state_manager.submit_task(cb) for cb in callbacks))
 
     async def _handle_dynamic_fanout(self, parent: Task, fanout: DynamicFanOut) -> None:
-        """Wire and submit a runtime fan-out produced by a task function.
+        """
+        Wire and submit a runtime fan-out produced by a task function.
 
         Calls `DAGNode.merge` to attach `FanInCallback`s to each child,
         initialises the Redis tracking + members sets, pre-saves the collector
-        so it exists when the first child finishes, then submits all children.
+        so it exists when the first child finishes, then submits all children
+        atomically in a single pipeline.
+
+        **Best practice:** assign child tasks to queues without rate limiting.
+        Once a DAG is executing there is no safe recourse if a child submission
+        is rejected — the fan-in would be initialised but never complete.
+        Rate limits on child queues are bypassed with a warning logged.
+        Capacity limits (max_concurrent) are not enforced at submission time
+        but a low limit may cause queue backpressure that delays fan-in completion.
         """
         from jobbers.models.dag import DAGNode
 
@@ -161,7 +170,28 @@ class TaskProcessor:
         await self.state_manager.init_fan_in(fan_in_key, child_ids, ttl=fanout.fan_in_ttl)
         # Pre-save the collector so it exists in Redis when the first child completes.
         await self.state_manager.save_task(collector_task)
-        await asyncio.gather(*(self.state_manager.submit_task(ct) for ct in child_tasks))
+
+        # Warn if any child queue has rate limiting — we bypass it below.
+        child_queues = list({ct.queue for ct in child_tasks})
+        configs = await asyncio.gather(
+            *(self.state_manager.qca.get_queue_config(queue=q) for q in child_queues)
+        )
+        for queue, config in zip(child_queues, configs):
+            if config and config.rate_numerator and config.rate_denominator and config.rate_period:
+                logger.warning(
+                    "Queue '%s' has rate limiting configured but DAG child task submission "
+                    "bypasses rate limits. Assign child tasks to queues without rate limiting.",
+                    queue,
+                )
+
+        # Submit all children atomically in a single pipeline. A transactional pipeline
+        # (MULTI/EXEC) is all-or-nothing: either every child is enqueued or none are,
+        # with no partial state possible on a crash — strictly safer than sequential submission.
+        pipe = self.state_manager.job_store.pipeline(transaction=True)
+        for ct in child_tasks:
+            ct.set_status(TaskStatus.SUBMITTED)
+            self.state_manager.ta.stage_submit_task(pipe, ct)
+        await pipe.execute()
 
     async def handle_dropped_task(self, task: Task) -> None:
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
@@ -226,4 +256,10 @@ class TaskProcessor:
     async def handle_success(self, task: Task) -> None:
         logger.info("Task %s completed.", task.id)
         task.set_status(TaskStatus.COMPLETED)
-        await self.state_manager.save_task(task)
+        if task.cron_id is not None:
+            pipe = self.state_manager.job_store.pipeline(transaction=True)
+            self.state_manager.ta.stage_save(pipe, task)
+            self.state_manager.cron_dag_scheduler.stage_clear_active_run(pipe, task.cron_id)
+            await pipe.execute()
+        else:
+            await self.state_manager.save_task(task)

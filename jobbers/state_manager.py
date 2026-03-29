@@ -4,7 +4,7 @@ import asyncio
 import datetime as dt
 import logging
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
@@ -20,15 +20,17 @@ from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncIterator, Iterator
 
-    from redis.asyncio.client import Redis
+    from redis.asyncio.client import Pipeline, Redis
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
     from ulid import ULID
 
     from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
     from jobbers.models.cron_dag import CronDAGEntry
+    from jobbers.models.cron_dag_scheduler import ConcurrencyStager
     from jobbers.models.dag import DAGNode
+    from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task
 
 logger = logging.getLogger(__name__)
@@ -231,22 +233,24 @@ class StateManager:
             except WatchError:
                 continue
 
-    async def dispatch_cron_dag(self, entry: CronDAGEntry, run_at: dt.datetime) -> None:
+    @asynccontextmanager
+    async def _concurrency_guard(
+        self,
+        entry: CronDAGEntry,
+        next_run_at: dt.datetime,
+    ) -> AsyncIterator[ConcurrencyStager]:
         """
-        Fire a cron-scheduled DAG run and reschedule the entry for its next occurrence.
+        Async context manager encapsulating all ConcurrencyPolicy logic for a cron dispatch.
 
-        A fresh copy of the DAG spec (new ULIDs for every node) is generated on each call
-        so repeated runs never share Redis fan-in keys.  If the entry's concurrency policy
-        is SKIP_IF_RUNNING and the previous root task is still active, the run is skipped
-        but the entry is still rescheduled.
+        Yields a ``ConcurrencyStager`` with:
+        - ``skipped=True`` if the previous run is still active (reschedule-only pipeline
+          already fired internally; caller should return immediately).
+        - ``skipped=False`` and a ``stage_active_run(pipe, task_id)`` callable otherwise.
+          Call it unconditionally during pipeline construction; it is a no-op for ALWAYS
+          policy and stages the NX guard for SKIP_IF_RUNNING.
         """
-        from croniter import croniter
-
         from jobbers.models.cron_dag import ConcurrencyPolicy
-        from jobbers.models.dag import collect_fan_in_keys
-        from jobbers.models.task import Task
-
-        next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
+        from jobbers.models.cron_dag_scheduler import ConcurrencyStager
 
         if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
             active_task_id_str = await self.cron_dag_scheduler.get_active_run(entry.id)
@@ -268,30 +272,78 @@ class StateManager:
                     pipe = self.job_store.pipeline(transaction=True)
                     self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
                     await pipe.execute()
+                    yield ConcurrencyStager(skipped=True, _stage_fn=lambda _p, _t: None)
                     return
 
-        fresh_spec, _ = entry.dag_spec.fresh_copy()
+            def _stage_skip(pipe: Pipeline, task_id: ULID) -> None:
+                self.cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task_id, nx=True)
 
-        fan_ins = collect_fan_in_keys(fresh_spec)
-        if fan_ins:
-            await asyncio.gather(*(self.init_fan_in(k, ids) for k, ids in fan_ins.items()))
+            yield ConcurrencyStager(skipped=False, _stage_fn=_stage_skip)
+        else:
+            yield ConcurrencyStager(skipped=False, _stage_fn=lambda _p, _t: None)
 
-        task = Task(
-            id=fresh_spec.id,
-            name=fresh_spec.name,
-            queue=fresh_spec.queue,
-            version=fresh_spec.version,
-            parameters=fresh_spec.parameters,
-            dag_callbacks=fresh_spec.dag_callbacks,
-        )
-        await self.submit_task(task)
-        logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
+    async def dispatch_cron_dag(self, entry: CronDAGEntry, run_at: dt.datetime) -> None:
+        """
+        Fire a cron-scheduled DAG run and reschedule the entry for its next occurrence.
 
-        pipe = self.job_store.pipeline(transaction=True)
-        if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
-            self.cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task.id)
-        self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
-        await pipe.execute()
+        A fresh copy of the DAG spec (new ULIDs for every node) is generated on each call
+        so repeated runs never share Redis fan-in keys.  If the entry's concurrency policy
+        is SKIP_IF_RUNNING and the previous root task is still active, the run is skipped
+        but the entry is still rescheduled.
+
+        Ordering guarantee: reschedule + fan-in init are written atomically in a single
+        pipeline *before* the root task is submitted.  A crash after the pipeline but
+        before submit means the entry fires again on the next poll (tolerable duplicate),
+        but the cron schedule is never permanently lost.
+        """
+        from croniter import croniter
+
+        from jobbers.models.dag import collect_fan_in_keys
+        from jobbers.models.task import Task
+
+        next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
+
+        async with self._concurrency_guard(entry, next_run_at) as stager:
+            if stager.skipped:
+                return
+
+            fresh_spec, _ = entry.dag_spec.fresh_copy()
+            fan_ins = collect_fan_in_keys(fresh_spec)
+            queue_config = await self.qca.get_queue_config(queue=fresh_spec.queue)
+
+            task = Task(
+                id=fresh_spec.id,
+                name=fresh_spec.name,
+                queue=fresh_spec.queue,
+                version=fresh_spec.version,
+                parameters=fresh_spec.parameters,
+                dag_callbacks=fresh_spec.dag_callbacks,
+                cron_id=entry.id,
+            )
+
+            is_rate_limited = bool(
+                queue_config
+                and queue_config.rate_numerator
+                and queue_config.rate_denominator
+                and queue_config.rate_period
+            )
+
+            # Write reschedule + fan-in sets atomically BEFORE submitting the root task.
+            # This ensures the cron entry is never permanently lost even if submit_task crashes.
+            # For SKIP_IF_RUNNING, SET NX is the authoritative guard against concurrent dispatches.
+            # For non-rate-limited queues, submission is included in the same pipeline.
+            pipe = self.job_store.pipeline(transaction=True)
+            self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
+            stager.stage_active_run(pipe, task.id)
+            for fan_in_key, predecessor_ids in fan_ins.items():
+                self.ta.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
+            if not is_rate_limited:
+                self.stage_submit_task(pipe, task, queue_config)
+            await pipe.execute()
+
+            if is_rate_limited:
+                await self.submit_task(task)
+            logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
 
     async def request_task_cancellation(self, task_id: ULID) -> Task | None:
         """
@@ -338,6 +390,26 @@ class StateManager:
     # Proxy methods
     async def get_refresh_tag(self, role: str) -> ULID:
         return await self.qca.get_refresh_tag(role)
+
+    def stage_submit_task(self, pipe: Pipeline, task: Task, queue_config: QueueConfig | None) -> None:
+        """
+        Set task status to SUBMITTED and stage ZADD + save onto pipe (no execute).
+
+        Raises ValueError if the queue has rate-limiting configured — callers must
+        use submit_task() for rate-limited queues, which enforces limits via Lua script.
+        The queue_config must be pre-fetched by the caller before building the pipeline.
+        """
+        if (
+            queue_config
+            and queue_config.rate_numerator
+            and queue_config.rate_denominator
+            and queue_config.rate_period
+        ):
+            raise ValueError(
+                f"Queue '{task.queue}' is rate-limited; use submit_task() instead of stage_submit_task()."
+            )
+        task.set_status(TaskStatus.SUBMITTED)
+        self.ta.stage_submit_task(pipe, task)
 
     async def submit_task(self, task: Task) -> None:
         queue_config = await self.qca.get_queue_config(queue=task.queue)
