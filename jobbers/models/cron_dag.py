@@ -1,16 +1,12 @@
 """Model for recurring cron-scheduled DAG entries."""
 
-from __future__ import annotations
-
 import datetime as dt
 from enum import StrEnum
-from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_serializer
 from ulid import ULID
 
-if TYPE_CHECKING:
-    from jobbers.models.dag import DAGTaskSpec
+from jobbers.models.dag import DAGTaskSpec
 
 
 class ConcurrencyPolicy(StrEnum):

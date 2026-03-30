@@ -113,8 +113,16 @@ class TaskProcessor:
 
         if task.status == TaskStatus.COMPLETED:
             await self.post_process(task, dynamic_fanout)
-        elif ex is not None:
-            raise ex
+        else:
+            if task.status in (
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.STALLED,
+                TaskStatus.DROPPED,
+            ):
+                await self.post_process_error(task)
+            if ex is not None:
+                raise ex
 
         return task
 
@@ -134,7 +142,19 @@ class TaskProcessor:
             await self._handle_dynamic_fanout(task, dynamic_fanout)
         if task.has_callbacks():
             callbacks = await task.generate_callbacks(self.state_manager.ta)
-            await asyncio.gather(*(self.state_manager.submit_task(cb) for cb in callbacks))
+            pipe = self.state_manager.job_store.pipeline(transaction=True)
+            for cb in callbacks:
+                self.state_manager.stage_submit_task(pipe, cb, queue_config=None)
+            await pipe.execute()
+
+    async def post_process_error(self, task: Task) -> None:
+        """Submit error callback tasks for a permanently-failed task."""
+        error_callbacks = task.generate_error_callbacks()
+        if error_callbacks:
+            pipe = self.state_manager.job_store.pipeline(transaction=True)
+            for cb in error_callbacks:
+                self.state_manager.stage_submit_task(pipe, cb, queue_config=None)
+            await pipe.execute()
 
     async def _handle_dynamic_fanout(self, parent: Task, fanout: DynamicFanOut) -> None:
         """

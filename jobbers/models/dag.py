@@ -32,6 +32,27 @@ collector = DAGNode("merge_results")
 root.then(branch_a, branch_b)
 DAGNode.merge(branch_a, branch_b, into=collector)
 ```
+
+**Error callbacks:**
+
+Pass `on_error` to `then()` or `merge()` to submit a task when a node fails
+permanently (status `FAILED`, `CANCELLED`, `STALLED`, or `DROPPED`). The error
+task receives `parent_ids=[failing_task.id]` so it can look up the failure
+details via `await get_current_task().parent_results()`.
+
+```python
+# Fire a notification task if "process_data" fails:
+err = DAGNode("notify_failure", parameters={"channel": "ops"})
+a.then(b, on_error=err)
+
+# Fire a shared error handler if any fan-in predecessor fails:
+err = DAGNode("handle_pipeline_error")
+DAGNode.merge(branch_a, branch_b, into=collector, on_error=err)
+```
+
+Error callbacks only fire on *permanent* failure — tasks that are being retried
+do not trigger them. The error node itself is a plain `DAGNode` and can have its
+own `then()` chain if further steps are needed on failure.
 """
 
 from __future__ import annotations
@@ -84,13 +105,17 @@ class DAGTaskSpec(BaseModel):
         new_callbacks: list[DAGCallback] = []
         for cb in self.dag_callbacks:
             if isinstance(cb, SimpleCallback):
-                new_callbacks.append(SimpleCallback(task=cb.task._remap(id_map)))
+                new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
+                new_callbacks.append(SimpleCallback(task=cb.task._remap(id_map), error_callback=new_err))
             else:
                 # FanInCallback — remap collector id inside fan_in_key
+                new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
                 new_child = cb.task._remap(id_map)
                 new_collector_id = id_map.setdefault(cb.task.id, new_child.id)
                 new_fan_in_key = f"dag:fan-in:{new_collector_id}"
-                new_callbacks.append(FanInCallback(task=new_child, fan_in_key=new_fan_in_key))
+                new_callbacks.append(
+                    FanInCallback(task=new_child, fan_in_key=new_fan_in_key, error_callback=new_err)
+                )
         return DAGTaskSpec(
             id=new_id,
             name=self.name,
@@ -106,6 +131,7 @@ class SimpleCallback(BaseModel):
 
     type: Literal["simple"] = "simple"
     task: DAGTaskSpec
+    error_callback: DAGTaskSpec | None = None  # Submit when the parent task fails permanently
 
 
 class FanInCallback(BaseModel):
@@ -120,6 +146,7 @@ class FanInCallback(BaseModel):
     type: Literal["fan_in"] = "fan_in"
     task: DAGTaskSpec
     fan_in_key: str  # Redis SSET key tracking remaining predecessors
+    error_callback: DAGTaskSpec | None = None  # Submit when this predecessor fails permanently
 
 
 # Pydantic discriminated union – serialises/deserialises by the ``type`` field.
@@ -184,8 +211,8 @@ class DAGNode:
         self._queue = queue
         self._version = version
         self._parameters: dict[str, Any] = parameters or {}
-        # (successor_node, fan_in_key or None)
-        self._successors: list[tuple[DAGNode, str | None]] = []
+        # (successor_node, fan_in_key or None, error_node or None)
+        self._successors: list[tuple[DAGNode, str | None, DAGNode | None]] = []
 
     @property
     def id(self) -> ULID:
@@ -196,9 +223,11 @@ class DAGNode:
     # Graph construction helpers
     # ------------------------------------------------------------------
 
-    def then(self, *nodes: DAGNode) -> DAGNode:
+    def then(self, *nodes: DAGNode, on_error: DAGNode | None = None) -> DAGNode:
         """
         Chain: each of *nodes* runs immediately after *this* node completes.
+
+        Pass `on_error` to also submit an error task when *this* node fails permanently.
 
         Returns *self* for fluent chaining:
 
@@ -207,13 +236,15 @@ class DAGNode:
         ```
         """
         for node in nodes:
-            self._successors.append((node, None))
+            self._successors.append((node, None, on_error))
         return self
 
     @classmethod
-    def merge(cls, *predecessors: DAGNode, into: DAGNode) -> DAGNode:
+    def merge(cls, *predecessors: DAGNode, into: DAGNode, on_error: DAGNode | None = None) -> DAGNode:
         """
         Fan-in: `into` runs only after *all* `predecessors` have completed.
+
+        Pass `on_error` to submit an error task when any predecessor fails permanently.
 
         A shared Redis set key derived from `into`'s task ID is stored on
         each predecessor's callback so the worker knows which set to decrement.
@@ -225,7 +256,7 @@ class DAGNode:
         """
         fan_in_key = f"dag:fan-in:{into._id}"
         for pred in predecessors:
-            pred._successors.append((into, fan_in_key))
+            pred._successors.append((into, fan_in_key, on_error))
         return into
 
     # ------------------------------------------------------------------
@@ -246,12 +277,13 @@ class DAGNode:
     def _callbacks_recursive(self) -> list[DAGCallback]:
         """Return the list of `DAGCallback` objects for this node's successors."""
         callbacks: list[DAGCallback] = []
-        for successor, fan_in_key in self._successors:
+        for successor, fan_in_key, error_node in self._successors:
             spec = successor._to_spec()
+            error_spec = error_node._to_spec() if error_node is not None else None
             if fan_in_key is None:
-                callbacks.append(SimpleCallback(task=spec))
+                callbacks.append(SimpleCallback(task=spec, error_callback=error_spec))
             else:
-                callbacks.append(FanInCallback(task=spec, fan_in_key=fan_in_key))
+                callbacks.append(FanInCallback(task=spec, fan_in_key=fan_in_key, error_callback=error_spec))
         return callbacks
 
     def to_task(self, *, parent_id: ULID | None = None) -> Task:
@@ -281,7 +313,7 @@ class DAGNode:
             if id(node) in visited:
                 return
             visited.add(id(node))
-            for successor, fan_in_key in node._successors:
+            for successor, fan_in_key, _error_node in node._successors:
                 if fan_in_key is not None:
                     result.setdefault(fan_in_key, set()).add(node._id)
                 _walk(successor)

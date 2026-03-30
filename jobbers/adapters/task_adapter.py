@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from opentelemetry import metrics
 from ulid import ULID
@@ -24,7 +24,7 @@ from ulid import ULID
 from jobbers.constants import TIME_ZERO
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Awaitable
 
     from redis.asyncio.client import Pipeline, Redis
 
@@ -294,7 +294,7 @@ class _BaseTaskAdapter:
         Reads the `{fan_in_key}:members` set written by `init_fan_in`.
         """
         members_key = f"{fan_in_key}:members"
-        raw: set[bytes] = await self.data_store.smembers(members_key)
+        raw: set[bytes] = await cast("Awaitable[set[bytes]]", self.data_store.smembers(members_key))
         return [ULID.from_str(m.decode()) for m in raw]
 
     async def task_exists(self, task_id: ULID) -> bool:

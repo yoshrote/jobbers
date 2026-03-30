@@ -382,6 +382,104 @@ async def test_generate_callbacks_fan_in_last_creates_collector():
     assert children[0].id == collector_spec.id
 
 
+# ── generate_error_callbacks ─────────────────────────────────────────────────
+
+
+def test_generate_error_callbacks_no_error_callbacks_returns_empty():
+    """generate_error_callbacks() returns [] when no callbacks have error_callback set."""
+    child_spec = DAGTaskSpec(name="child_task")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    assert task.generate_error_callbacks() == []
+
+
+def test_generate_error_callbacks_simple_callback_returns_error_task():
+    """generate_error_callbacks() returns the error task when SimpleCallback has error_callback."""
+    error_spec = DAGTaskSpec(name="error_handler")
+    child_spec = DAGTaskSpec(name="child_task")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
+    )
+    errors = task.generate_error_callbacks()
+
+    assert len(errors) == 1
+    assert errors[0].id == error_spec.id
+    assert errors[0].name == "error_handler"
+    assert errors[0].parent_ids == [ULID1]
+
+
+def test_generate_error_callbacks_fan_in_callback_returns_error_task():
+    """generate_error_callbacks() returns the error task when FanInCallback has error_callback."""
+    error_spec = DAGTaskSpec(name="fan_error")
+    collector_spec = DAGTaskSpec(name="collector")
+    fan_in_key = f"dag:fan-in:{collector_spec.id}"
+    task = Task(
+        id=ULID1,
+        name="branch",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key, error_callback=error_spec)],
+    )
+    errors = task.generate_error_callbacks()
+
+    assert len(errors) == 1
+    assert errors[0].id == error_spec.id
+    assert errors[0].parent_ids == [ULID1]
+
+
+def test_generate_error_callbacks_multiple_callbacks_only_those_with_error():
+    """Only callbacks that have error_callback set contribute an error task."""
+    error_spec = DAGTaskSpec(name="error_handler")
+    child_no_err = DAGTaskSpec(name="no_error")
+    child_with_err = DAGTaskSpec(name="with_error")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_callbacks=[
+            SimpleCallback(task=child_no_err),
+            SimpleCallback(task=child_with_err, error_callback=error_spec),
+        ],
+    )
+    errors = task.generate_error_callbacks()
+
+    assert len(errors) == 1
+    assert errors[0].id == error_spec.id
+
+
+def test_generate_error_callbacks_preserves_error_spec_dag_callbacks():
+    """The error task inherits dag_callbacks from the error spec (enabling chaining)."""
+    grandchild_spec = DAGTaskSpec(name="grandchild")
+    error_spec = DAGTaskSpec(name="error_handler", dag_callbacks=[SimpleCallback(task=grandchild_spec)])
+    child_spec = DAGTaskSpec(name="child")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
+    )
+    errors = task.generate_error_callbacks()
+
+    assert len(errors[0].dag_callbacks) == 1
+    assert errors[0].dag_callbacks[0].task.id == grandchild_spec.id
+
+
 # ── parent_results ────────────────────────────────────────────────────────────
 
 

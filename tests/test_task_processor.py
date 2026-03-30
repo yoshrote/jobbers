@@ -1026,3 +1026,133 @@ async def test_run_reraises_non_user_cancellation_error():
     with patch.object(processor, "process", side_effect=failing_process):
         with pytest.raises((RuntimeError, ExceptionGroup)):
             await processor.run(task)
+
+
+# ── post_process_error ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_post_process_error_submits_error_callbacks():
+    """post_process_error submits tasks returned by generate_error_callbacks."""
+    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
+
+    error_spec = DAGTaskSpec(name="error_handler")
+    child_spec = DAGTaskSpec(name="child")
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
+    )
+    state_manager = _make_state_manager()
+    state_manager.submit_task = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor.post_process_error(task)
+
+    state_manager.submit_task.assert_awaited_once()
+    submitted = state_manager.submit_task.call_args[0][0]
+    assert submitted.id == error_spec.id
+    assert submitted.parent_ids == [task.id]
+
+
+@pytest.mark.asyncio
+async def test_post_process_error_no_error_callbacks_does_nothing():
+    """post_process_error does not call submit_task when no error callbacks are set."""
+    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
+
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_callbacks=[SimpleCallback(task=DAGTaskSpec(name="child"))],
+    )
+    state_manager = _make_state_manager()
+    state_manager.submit_task = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor.post_process_error(task)
+
+    state_manager.submit_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_task_triggers_error_callback():
+    """When a task fails with an unexpected exception, error callbacks are submitted."""
+    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
+
+    error_spec = DAGTaskSpec(name="error_handler")
+    child_spec = DAGTaskSpec(name="child")
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
+    )
+    state_manager = _make_state_manager()
+    state_manager.submit_task = AsyncMock()
+
+    task_function = AsyncMock(side_effect=RuntimeError("boom"))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10, max_retries=0)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.FAILED
+    state_manager.submit_task.assert_awaited_once()
+    submitted = state_manager.submit_task.call_args[0][0]
+    assert submitted.id == error_spec.id
+
+
+@pytest.mark.asyncio
+async def test_retried_task_does_not_trigger_error_callback():
+    """A task being retried (SCHEDULED) does not fire error callbacks."""
+    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
+
+    error_spec = DAGTaskSpec(name="error_handler")
+    child_spec = DAGTaskSpec(name="child")
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
+    )
+    state_manager = _make_state_manager()
+    state_manager.submit_task = AsyncMock()
+
+    task_config = _retryable_config(max_retries=3)
+    task_config.function = AsyncMock(
+        side_effect=task_config.expected_exceptions[0]("retrying")
+        if task_config.expected_exceptions
+        else ValueError("retrying")
+    )
+
+    # Use an expected exception so retry logic kicks in
+    async def failing_fn(**_):
+        raise ValueError("retry me")
+
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=failing_fn,
+        timeout=10,
+        max_retries=3,
+        retry_delay=5,
+        expected_exceptions=(ValueError,),
+    )
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.SCHEDULED
+    state_manager.submit_task.assert_not_awaited()

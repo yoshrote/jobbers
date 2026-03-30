@@ -98,6 +98,30 @@ class Task(BaseModel):
     def has_callbacks(self) -> bool:
         return bool(self.dag_callbacks)
 
+    def generate_error_callbacks(self) -> list[Self]:
+        """
+        Return tasks to submit when this task fails permanently.
+
+        For each `dag_callback` that has an `error_callback` spec, a task is
+        created with `parent_ids=[self.id]`.  No Redis I/O is required.
+        """
+        results: list[Self] = []
+        for cb in self.dag_callbacks:
+            if cb.error_callback is not None:
+                spec = cb.error_callback
+                results.append(
+                    self.__class__(
+                        id=spec.id,
+                        name=spec.name,
+                        queue=spec.queue,
+                        version=spec.version,
+                        parameters=spec.parameters,
+                        dag_callbacks=spec.dag_callbacks,
+                        parent_ids=[self.id],
+                    )
+                )
+        return results
+
     async def generate_callbacks(self, ta: "TaskAdapterProtocol") -> list[Self]:
         """
         Generate tasks to submit after this task completes.

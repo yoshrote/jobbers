@@ -299,3 +299,123 @@ def test_dag_node_fan_in_predecessors_multiple():
     preds = root.fan_in_predecessors()
     expected_key = f"dag:fan-in:{collector.id}"
     assert preds[expected_key] == {b1.id, b2.id}
+
+
+# ── error callbacks ───────────────────────────────────────────────────────────
+
+
+def test_simple_callback_error_callback_defaults_none():
+    """SimpleCallback.error_callback is None by default."""
+    spec = make_spec("child")
+    cb = SimpleCallback(task=spec)
+    assert cb.error_callback is None
+
+
+def test_fan_in_callback_error_callback_defaults_none():
+    """FanInCallback.error_callback is None by default."""
+    collector = make_spec("collector")
+    cb = FanInCallback(task=collector, fan_in_key=f"dag:fan-in:{collector.id}")
+    assert cb.error_callback is None
+
+
+def test_dag_node_then_on_error_embeds_error_spec():
+    """then(on_error=...) stores the error callback spec in the SimpleCallback."""
+    child = DAGNode("child")
+    err = DAGNode("on_error")
+    root = DAGNode("root")
+    root.then(child, on_error=err)
+
+    task = root.to_task()
+    assert len(task.dag_callbacks) == 1
+    cb = task.dag_callbacks[0]
+    assert isinstance(cb, SimpleCallback)
+    assert cb.error_callback is not None
+    assert cb.error_callback.id == err.id
+    assert cb.error_callback.name == "on_error"
+
+
+def test_dag_node_then_without_on_error_has_no_error_callback():
+    """then() with no on_error leaves error_callback as None."""
+    child = DAGNode("child")
+    root = DAGNode("root")
+    root.then(child)
+
+    task = root.to_task()
+    assert task.dag_callbacks[0].error_callback is None
+
+
+def test_dag_node_merge_on_error_embeds_error_spec():
+    """merge(on_error=...) stores the error callback spec in each FanInCallback."""
+    collector = DAGNode("collector")
+    b1 = DAGNode("branch1")
+    b2 = DAGNode("branch2")
+    err = DAGNode("on_error")
+    DAGNode.merge(b1, b2, into=collector, on_error=err)
+
+    task_b1 = b1.to_task()
+    task_b2 = b2.to_task()
+
+    assert isinstance(task_b1.dag_callbacks[0], FanInCallback)
+    assert task_b1.dag_callbacks[0].error_callback is not None
+    assert task_b1.dag_callbacks[0].error_callback.id == err.id
+
+    assert isinstance(task_b2.dag_callbacks[0], FanInCallback)
+    assert task_b2.dag_callbacks[0].error_callback is not None
+    assert task_b2.dag_callbacks[0].error_callback.id == err.id
+
+
+def test_dag_node_merge_without_on_error_has_no_error_callback():
+    """merge() with no on_error leaves error_callback as None."""
+    collector = DAGNode("collector")
+    branch = DAGNode("branch")
+    DAGNode.merge(branch, into=collector)
+
+    task = branch.to_task()
+    assert task.dag_callbacks[0].error_callback is None
+
+
+def test_fresh_copy_remaps_error_callback_id():
+    """_remap remaps the error_callback ULID so cron runs never share keys."""
+    err_spec = make_spec("err_handler")
+    child_spec = make_spec("child")
+    root = DAGTaskSpec(
+        name="root",
+        dag_callbacks=[SimpleCallback(task=child_spec, error_callback=err_spec)],
+    )
+    fresh, id_map = root.fresh_copy()
+
+    cb = fresh.dag_callbacks[0]
+    assert isinstance(cb, SimpleCallback)
+    assert cb.error_callback is not None
+    assert cb.error_callback.id != err_spec.id
+    assert id_map[err_spec.id] == cb.error_callback.id
+
+
+def test_fresh_copy_fan_in_remaps_error_callback_id():
+    """_remap also remaps error_callback inside FanInCallback."""
+    err_spec = make_spec("err_handler")
+    collector = make_spec("collector")
+    fan_key = f"dag:fan-in:{collector.id}"
+    branch = DAGTaskSpec(
+        name="branch",
+        dag_callbacks=[FanInCallback(task=collector, fan_in_key=fan_key, error_callback=err_spec)],
+    )
+    root = DAGTaskSpec(name="root", dag_callbacks=[SimpleCallback(task=branch)])
+    fresh, id_map = root.fresh_copy()
+
+    fresh_branch = fresh.dag_callbacks[0].task  # type: ignore[union-attr]
+    fan_in_cb = fresh_branch.dag_callbacks[0]
+    assert isinstance(fan_in_cb, FanInCallback)
+    assert fan_in_cb.error_callback is not None
+    assert fan_in_cb.error_callback.id != err_spec.id
+    assert id_map[err_spec.id] == fan_in_cb.error_callback.id
+
+
+def test_fresh_copy_none_error_callback_stays_none():
+    """_remap leaves error_callback as None when not set."""
+    child_spec = make_spec("child")
+    root = DAGTaskSpec(name="root", dag_callbacks=[SimpleCallback(task=child_spec)])
+    fresh, _ = root.fresh_copy()
+
+    cb = fresh.dag_callbacks[0]
+    assert cb.error_callback is None

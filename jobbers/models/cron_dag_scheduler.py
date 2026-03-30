@@ -178,3 +178,24 @@ class CronDAGScheduler:
     def stage_clear_active_run(self, pipe: Pipeline, cron_id: ULID) -> None:
         """Queue DEL cron-active:{id} onto pipe (no execute)."""
         pipe.delete(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)))
+
+    async def list(
+        self, offset: int = 0, limit: int = 50
+    ) -> tuple[list[tuple[CronDAGEntry, dt.datetime]], int]:
+        """
+        Return a page of cron entries ordered by next_run_at ascending.
+
+        Returns (entry, next_run_at) pairs plus the total count of all entries in the schedule.
+        """
+        total: int = await self.data_store.zcard(self.CRON_SCHEDULE)
+        raw: list[tuple[bytes, float]] = await self.data_store.zrange(
+            self.CRON_SCHEDULE, offset, offset + limit - 1, withscores=True
+        )
+        results: list[tuple[CronDAGEntry, dt.datetime]] = []
+        for cron_id_bytes, score in raw:
+            cron_id = ULID.from_bytes(cron_id_bytes)
+            entry = await self.get(cron_id)
+            if entry is not None:
+                next_run_at = dt.datetime.fromtimestamp(score, dt.UTC)
+                results.append((entry, next_run_at))
+        return results, total
