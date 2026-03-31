@@ -1,9 +1,11 @@
 import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom'
 import ActiveTasks from './pages/ActiveTasks'
+import CronDags from './pages/CronDags'
 import Dashboard from './pages/Dashboard'
 import DeadLetterQueue from './pages/DeadLetterQueue'
 import Queues from './pages/Queues'
 import ScheduledTasks from './pages/ScheduledTasks'
+import SubmitDAG from './pages/SubmitDAG'
 import SubmitTask from './pages/SubmitTask'
 import TaskDetail from './pages/TaskDetail'
 import TaskList from './pages/TaskList'
@@ -15,7 +17,9 @@ const NAV_LINKS = [
   { to: '/scheduled', label: 'Scheduled Tasks' },
   { to: '/dlq', label: 'Dead Letter Queue' },
   { to: '/queues', label: 'Queue Configuration' },
+  { to: '/cron-dags', label: 'Cron DAGs' },
   { to: '/submit', label: 'Submit Task' },
+  { to: '/submit-dag', label: 'Submit DAG' },
 ]
 
 export default function App() {
@@ -47,7 +51,9 @@ export default function App() {
           <Route path="/scheduled" element={<ScheduledTasks />} />
           <Route path="/dlq" element={<DeadLetterQueue />} />
           <Route path="/queues" element={<Queues />} />
+          <Route path="/cron-dags" element={<CronDags />} />
           <Route path="/submit" element={<SubmitTask />} />
+          <Route path="/submit-dag" element={<SubmitDAG />} />
         </Routes>
       </main>
     </BrowserRouter>

@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
+from croniter import croniter
 from fastapi import FastAPI, HTTPException
 from fastapi.params import Query
 from opentelemetry import metrics
@@ -12,9 +13,12 @@ from pydantic import BaseModel, Field
 from ulid import ULID
 
 from jobbers import db, registry
+from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+from jobbers.models.dag import DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task import Task, TaskPagination
 from jobbers.state_manager import TaskException
+from jobbers.utils.mermaid_dag import MermaidParseError, dag_spec_to_mermaid, parse_mermaid_dag
 from jobbers.validation import ValidationError, validate_task
 
 
@@ -92,13 +96,30 @@ async def schedule_task(request: ScheduleTaskRequest) -> dict[str, Any]:
 
 @app.get("/task-status/{task_id}")
 async def get_task_status(task_id: str) -> dict[str, Any]:
-    """Retrieve the status of a specific task."""
+    """
+    Retrieve the status of a specific task.
+
+    If the task is the root of a DAG (has ``dag_callbacks``), the response
+    includes a ``dag_diagram`` field containing a mermaid flowchart of the
+    full DAG structure rooted at this task.
+    """
     logger.info("Getting task status for task ID %s", task_id)
     task_uid: ULID = ULID.from_str(task_id)
     task = await db.get_task_adapter().get_task(task_uid)
-    if task:
-        return task.summarized()
-    raise HTTPException(status_code=404, detail="Task not found")
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    summary = task.summarized()
+    if task.dag_callbacks:
+        spec = DAGTaskSpec(
+            id=task.id,
+            name=task.name,
+            queue=task.queue,
+            version=task.version,
+            parameters=task.parameters,
+            dag_callbacks=task.dag_callbacks,
+        )
+        summary["dag_diagram"] = dag_spec_to_mermaid(spec)
+    return summary
 
 
 @app.post("/task/{task_id}/cancel")
@@ -401,3 +422,166 @@ async def delete_role(role_name: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
     await qca.delete_role(role_name)
     return {"message": f"Role '{role_name}' deleted successfully."}
+
+
+# ── DAG submission ─────────────────────────────────────────────────────────────
+
+
+class SubmitDAGRequest(BaseModel):
+    """Request body for ad-hoc DAG submission from a mermaid diagram."""
+
+    diagram: str = Field(description="Mermaid flowchart text describing the DAG.")
+
+
+@app.post("/submit-dag")
+async def submit_dag(request: SubmitDAGRequest) -> dict[str, Any]:
+    """
+    Submit an ad-hoc DAG defined as a mermaid flowchart.
+
+    Parses the diagram, assigns ULIDs to each node, initialises fan-in Redis
+    sets, and enqueues all root tasks.  Returns the IDs of the submitted root
+    tasks.
+    """
+    try:
+        roots = parse_mermaid_dag(request.diagram)
+    except MermaidParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    for root in roots:
+        name = root._name
+        if not registry.get_task_config(name, 0):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown task name '{name}'. Register it with @register_task before submitting.",
+            )
+
+    sm = db.get_state_manager()
+    submitted = await sm.submit_dag(*roots)
+    return {"root_task_ids": [str(t.id) for t in submitted]}
+
+
+# ── Cron DAG CRUD ──────────────────────────────────────────────────────────────
+
+
+class CronDAGRequest(BaseModel):
+    """Request body for creating or updating a cron-scheduled DAG."""
+
+    name: str = Field(description="Human-readable name for the cron entry.")
+    cron_expr: str = Field(description="Standard 5-field cron expression (e.g. '0 6 * * *').")
+    diagram: str = Field(description="Mermaid flowchart text describing the DAG.")
+    enabled: bool = Field(default=True, description="Whether the entry fires on schedule.")
+    concurrency_policy: ConcurrencyPolicy = Field(
+        default=ConcurrencyPolicy.ALWAYS,
+        description="What to do when a new run fires while the previous one is still active.",
+    )
+
+
+def _cron_dag_to_dict(entry: CronDAGEntry, next_run_at: dt.datetime | None) -> dict[str, Any]:
+    return {
+        "id": str(entry.id),
+        "name": entry.name,
+        "cron_expr": entry.cron_expr,
+        "diagram": dag_spec_to_mermaid(entry.dag_spec),
+        "enabled": entry.enabled,
+        "concurrency_policy": entry.concurrency_policy.value,
+        "created_at": entry.created_at.isoformat(),
+        "next_run_at": next_run_at.isoformat() if next_run_at else None,
+    }
+
+
+@app.post("/cron-dags", status_code=201)
+async def create_cron_dag(request: CronDAGRequest) -> dict[str, Any]:
+    """Create a new cron-scheduled DAG entry."""
+    if not croniter.is_valid(request.cron_expr):
+        raise HTTPException(status_code=400, detail=f"Invalid cron expression: {request.cron_expr!r}")
+    try:
+        roots = parse_mermaid_dag(request.diagram)
+    except MermaidParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len(roots) != 1:
+        raise HTTPException(status_code=400, detail="Cron DAGs must have exactly one root node.")
+
+    dag_spec = roots[0]._to_spec()
+    entry = CronDAGEntry(
+        name=request.name,
+        cron_expr=request.cron_expr,
+        dag_spec=dag_spec,
+        enabled=request.enabled,
+        concurrency_policy=request.concurrency_policy,
+    )
+    sm = db.get_state_manager()
+    await sm.add_cron_dag(entry)
+    next_run_at = await sm.cron_dag_scheduler.get_next_run_at(entry.id)
+    return _cron_dag_to_dict(entry, next_run_at)
+
+
+@app.get("/cron-dags")
+async def list_cron_dags(offset: int = 0, limit: int = 50) -> dict[str, Any]:
+    """List all cron-scheduled DAG entries ordered by next run time."""
+    sm = db.get_state_manager()
+    entries, total = await sm.cron_dag_scheduler.list(offset=offset, limit=limit)
+    return {
+        "total": total,
+        "cron_dags": [_cron_dag_to_dict(entry, next_run_at) for entry, next_run_at in entries],
+    }
+
+
+@app.get("/cron-dags/{cron_id}")
+async def get_cron_dag(cron_id: str) -> dict[str, Any]:
+    """Retrieve a single cron-scheduled DAG entry by ID."""
+    uid = ULID.from_str(cron_id)
+    sm = db.get_state_manager()
+    entry = await sm.cron_dag_scheduler.get(uid)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Cron DAG '{cron_id}' not found.")
+    next_run_at = await sm.cron_dag_scheduler.get_next_run_at(uid)
+    return _cron_dag_to_dict(entry, next_run_at)
+
+
+@app.put("/cron-dags/{cron_id}")
+async def update_cron_dag(cron_id: str, request: CronDAGRequest) -> dict[str, Any]:
+    """
+    Replace the diagram and settings for a cron-scheduled DAG entry.
+
+    The entry ``id`` and ``created_at`` are preserved; the schedule is reset
+    to the next occurrence of the (possibly updated) cron expression.
+    """
+    uid = ULID.from_str(cron_id)
+    sm = db.get_state_manager()
+    existing = await sm.cron_dag_scheduler.get(uid)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"Cron DAG '{cron_id}' not found.")
+    if not croniter.is_valid(request.cron_expr):
+        raise HTTPException(status_code=400, detail=f"Invalid cron expression: {request.cron_expr!r}")
+    try:
+        roots = parse_mermaid_dag(request.diagram)
+    except MermaidParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len(roots) != 1:
+        raise HTTPException(status_code=400, detail="Cron DAGs must have exactly one root node.")
+
+    dag_spec = roots[0]._to_spec()
+    updated = CronDAGEntry(
+        id=existing.id,
+        name=request.name,
+        cron_expr=request.cron_expr,
+        dag_spec=dag_spec,
+        enabled=request.enabled,
+        concurrency_policy=request.concurrency_policy,
+        created_at=existing.created_at,
+    )
+    await sm.add_cron_dag(updated)
+    next_run_at = await sm.cron_dag_scheduler.get_next_run_at(uid)
+    return _cron_dag_to_dict(updated, next_run_at)
+
+
+@app.delete("/cron-dags/{cron_id}", status_code=200)
+async def delete_cron_dag(cron_id: str) -> dict[str, Any]:
+    """Delete a cron-scheduled DAG entry. Returns 404 if not found."""
+    uid = ULID.from_str(cron_id)
+    sm = db.get_state_manager()
+    entry = await sm.cron_dag_scheduler.get(uid)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Cron DAG '{cron_id}' not found.")
+    await sm.remove_cron_dag(uid)
+    return {"message": f"Cron DAG '{cron_id}' deleted successfully."}

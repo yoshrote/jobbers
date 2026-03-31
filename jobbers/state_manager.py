@@ -427,6 +427,30 @@ class StateManager:
     async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
         await self.ta.init_fan_in(fan_in_key, predecessor_ids, ttl)
 
+    async def add_cron_dag(self, entry: CronDAGEntry) -> None:
+        """
+        Register a new (or replace an existing) cron DAG entry and schedule its first run.
+
+        The first run is computed from ``entry.cron_expr`` relative to now.
+        If an entry with the same ``id`` already exists it is overwritten and
+        its schedule is reset.
+        """
+        from croniter import croniter
+
+        now = dt.datetime.now(dt.UTC)
+        first_run_at = croniter(entry.cron_expr, now).get_next(dt.datetime)
+        pipe = self.job_store.pipeline(transaction=True)
+        self.cron_dag_scheduler.stage_add(pipe, entry, first_run_at)
+        await pipe.execute()
+        logger.info("Cron DAG entry '%s' (%s) registered, first run at %s.", entry.name, entry.id, first_run_at)
+
+    async def remove_cron_dag(self, cron_id: ULID) -> None:
+        """Remove a cron DAG entry from the schedule."""
+        pipe = self.job_store.pipeline(transaction=True)
+        self.cron_dag_scheduler.stage_remove(pipe, cron_id)
+        await pipe.execute()
+        logger.info("Cron DAG entry %s removed.", cron_id)
+
     async def submit_dag(self, *roots: DAGNode) -> list[Task]:
         """
         Initialise fan-in sets and submit all root tasks of a DAG.

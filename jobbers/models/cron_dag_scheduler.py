@@ -179,6 +179,14 @@ class CronDAGScheduler:
         """Queue DEL cron-active:{id} onto pipe (no execute)."""
         pipe.delete(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)))
 
+    async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None:
+        """Return the next scheduled run time for a cron entry, or None if not scheduled."""
+        score: float | None = await cast(
+            "Awaitable[float | None]",
+            self.data_store.zscore(self.CRON_SCHEDULE, bytes(cron_id)),
+        )
+        return dt.datetime.fromtimestamp(score, dt.UTC) if score is not None else None
+
     async def list(
         self, offset: int = 0, limit: int = 50
     ) -> tuple[list[tuple[CronDAGEntry, dt.datetime]], int]:
