@@ -1,12 +1,67 @@
 import datetime as dt
 import logging
-from collections.abc import Callable, Iterator
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterator
+from typing import TYPE_CHECKING, Any
 
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
 
+if TYPE_CHECKING:
+    from jobbers.models.dag import DAGNode
+    from jobbers.models.task import Task
+
 logger = logging.getLogger(__name__)
 _task_function_map: dict[tuple[str, int], TaskConfig] = {}
+_router_function_map: dict[str, Callable[..., list[dict[str, Any]]]] = {}
+
+
+class TaskWrapper:
+    """
+    Wraps a registered task function with helpers for submission and DAG construction.
+
+    Instances are callable — calling them invokes the underlying async task function.
+    Three additional methods are provided:
+
+    - ``submit(queue, **params)`` — create and submit a task to a queue.
+    - ``schedule(run_at, queue, **params)`` — create and schedule a task for future execution.
+    - ``node(queue, **params)`` — return a :class:`~jobbers.models.dag.DAGNode` for
+      programmatic DAG construction.
+    """
+
+    def __init__(self, func: Callable[..., Awaitable[Any]], name: str, version: int) -> None:
+        self._func = func
+        self._name = name
+        self._version = version
+
+    def __call__(self, **kwargs: Any) -> Awaitable[Any]:
+        return self._func(**kwargs)
+
+    async def submit(self, queue: str = "default", **params: Any) -> "Task":
+        """Create a Task and submit it to *queue*."""
+        from ulid import ULID
+
+        from jobbers import db
+        from jobbers.models.task import Task
+
+        task = Task(id=ULID(), name=self._name, version=self._version, queue=queue, parameters=params)
+        await db.get_state_manager().submit_task(task)
+        return task
+
+    async def schedule(self, run_at: dt.datetime, queue: str = "default", **params: Any) -> "Task":
+        """Create a Task and schedule it to run at *run_at*."""
+        from ulid import ULID
+
+        from jobbers import db
+        from jobbers.models.task import Task
+
+        task = Task(id=ULID(), name=self._name, version=self._version, queue=queue, parameters=params)
+        await db.get_state_manager().schedule_new_task(task, run_at)
+        return task
+
+    def node(self, queue: str = "default", **params: Any) -> "DAGNode":
+        """Return a :class:`~jobbers.models.dag.DAGNode` for this task."""
+        from jobbers.models.dag import DAGNode
+
+        return DAGNode(self._name, queue=queue, version=self._version, parameters=params)
 
 
 def register_task(
@@ -23,13 +78,15 @@ def register_task(
 ) -> Callable[..., Any]:
     """Register a task function with the given name and version."""
 
-    def decorator(func: Callable[..., Any]) -> Any:
+    def decorator(func: Callable[..., Any]) -> TaskWrapper:
         """Decorate a task function and registers it for use with task instances."""
         if not callable(func):
             logger.exception("Task function must be callable")
             raise ValueError("Task function must be callable")
+        # Unwrap a TaskWrapper so double-decoration stores the raw function.
+        raw_func: Callable[..., Any] = func._func if isinstance(func, TaskWrapper) else func
         if (name, version) in _task_function_map:
-            if _task_function_map[(name, version)].function != func:
+            if _task_function_map[(name, version)].function != raw_func:
                 logger.exception(
                     "Task %s version %d is already registered to another function", name, version
                 )
@@ -40,7 +97,7 @@ def register_task(
         task_conf = TaskConfig(
             name=name,
             version=version,
-            function=func,
+            function=raw_func,
             max_concurrent=max_concurrent,
             timeout=timeout,
             max_retries=max_retries,
@@ -51,7 +108,7 @@ def register_task(
             dead_letter_policy=dead_letter_policy,
         )
         _task_function_map[(name, version)] = task_conf
-        return func
+        return TaskWrapper(raw_func, name, version)
 
     return decorator
 
@@ -65,6 +122,50 @@ def get_tasks() -> Iterator[tuple[str, int]]:
     return iter(_task_function_map.keys())
 
 
+def register_router(name: str) -> Callable[..., Any]:
+    """
+    Register a routing function for use in decision nodes.
+
+    A routing function receives the dispatcher task's results dict and any
+    params declared on the decision node, and returns a list of parameter
+    dicts — one per child instance to spawn::
+
+        @register_router("my_router")
+        def my_router(parent_results: dict, batch_size: int = 1) -> list[dict]:
+            return [{"item": item} for item in parent_results.get("items", [])]
+
+    Signature: ``(parent_results: dict[str, Any], **router_params) -> list[dict[str, Any]]``
+    """
+
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        _router_function_map[name] = fn
+        return fn
+
+    return decorator
+
+
+def get_router(name: str) -> Callable[..., list[dict[str, Any]]]:
+    """Retrieve a registered routing function by name. Raises KeyError if not found."""
+    if name not in _router_function_map:
+        raise KeyError(f"No router registered with name {name!r}")
+    return _router_function_map[name]
+
+
 def clear_registry() -> None:
     """Clear all registered tasks (for testing purposes)."""
     _task_function_map.clear()
+    _router_function_map.clear()
+
+
+# ── Built-in routers ───────────────────────────────────────────────────────────
+
+
+@register_router("fanout")
+def _fanout_router(parent_results: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
+    """
+    Default router: expects ``parent_results["items"]`` to be a list.
+
+    Returns one parameter dict per item, with the item stored under the key
+    ``"item"``.  Other conventions require a custom registered router.
+    """
+    return [{"item": item} for item in parent_results.get("items", [])]

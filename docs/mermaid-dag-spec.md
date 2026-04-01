@@ -13,12 +13,13 @@ Jobbers uses a subset of the [Mermaid](https://mermaid.js.org/) `flowchart TD` d
 Every node uses a **quoted rectangular-bracket label**:
 
 ```
-node_id["task_name[:queue][(param=val, ...)]"]
+node_id["task_name[@version][:queue][(param=val, ...)]"]
 ```
 
 | Section | Required | Meaning |
 |---|---|---|
 | `task_name` | yes | Registered task name — must match a `@register_task(name=...)` declaration |
+| `@version` | no | Integer task version; defaults to `0` when omitted |
 | `:queue` | no | Target queue; defaults to `"default"` |
 | `(key=val, …)` | no | Task parameters passed to the task function; values are type-coerced (see below) |
 | `{…}` | **reserved** | Output-only; appended by the generator for status / timestamps / metrics. **Stripped silently on parse** so UI-exported diagrams can be re-submitted without editing. |
@@ -29,6 +30,8 @@ Values inside `(...)` are coerced in this order:
 
 | Input | Result type |
 |---|---|
+| `~<base64>` | base64-decoded JSON — any JSON type (list, dict, `null`, etc.) |
+| `null` (case-insensitive) | `None` |
 | `true` / `false` (case-insensitive) | `bool` |
 | Integer literal (`42`, `-7`) | `int` |
 | Float literal (`3.14`) | `float` |
@@ -37,14 +40,21 @@ Values inside `(...)` are coerced in this order:
 
 Quoted values may contain commas and spaces: `msg="hello, world"`.
 
+The serializer emits human-readable `key=val` for all scalar types and `null`. For complex values (lists, dicts) it emits `key=~<base64-JSON>` — a Mermaid-safe encoding that keeps the key name readable while hiding the value in a compact blob:
+
+```text
+fetch_data(limit=100, ids=~WzEsMiwzXQ==, config=~eyJyZXRyaWVzIjozfQ==)
+```
+
 ---
 
 ## Edge semantics
 
 | Arrow | Meaning |
-|---|---|
+| ----- | ------- |
 | `-->` | **Success callback** — fires when the source task completes successfully. Automatically promoted to a `FanInCallback` when the destination has ≥ 2 incoming `-->` edges. |
-| `-.->` | **Error callback** — fires when the source fails *permanently* (`FAILED`, `CANCELLED`, `STALLED`, `DROPPED`). Tasks that are still retrying do **not** trigger this. Each source node may have **at most one** `-.->` target. |
+| `-.->` | **Error callback** — fires when the source fails *permanently* (`FAILED`, `CANCELLED`, `STALLED`, `DROPPED`). Tasks that are still retrying do **not** trigger this. Each source node may have **at most one** `-.->` target. Diagrams with more than one `-.->` from the same source are rejected with a parse error. |
+| `--o` | **Fan-in edge** — used exclusively inside dynamic fan-out branches to connect the last branch node to the collector. Only valid when the branch originates from a decision `{...}` node. |
 
 ---
 
@@ -68,6 +78,106 @@ flowchart TD
 ```
 
 `D` is the fan-in collector.  It runs only after both `B` and `C` finish.
+
+---
+
+## Decision nodes (dynamic fan-out)
+
+A diamond-shaped decision node declares a dynamic fan-out whose number of children is determined at runtime by a registered routing function:
+
+```
+D{"router_name[(key=val, ...)]"}
+```
+
+The routing function is called inline by the worker (not as a full task) with the dispatcher task's results and the optional router params. It returns a list of parameter dicts — one per child instance to spawn.
+
+### Syntax
+
+```mermaid
+flowchart TD
+    A["fetch_records"]
+    D{"fanout"}
+    B["process_record"]
+    C["aggregate_results"]
+
+    A --> D
+    D --> B
+    B --o C
+```
+
+What this describes:
+
+1. `A` completes and its results are passed to the `fanout` routing function.
+2. The router returns N parameter dicts; one instance of `B` is spawned per dict, with the dict merged into `B`'s parameters.
+3. All `B` instances fan in to `C` — `C` runs once all branches complete.
+
+**With a multi-step branch chain** (`B --> E` before collecting):
+
+```mermaid
+flowchart TD
+    A["fetch_records"]
+    D{"fanout"}
+    B["process_chunk"]
+    E["enrich_result"]
+    C["aggregate_results"]
+
+    A --> D
+    D --> B
+    B --> E
+    E --o C
+```
+
+Each branch runs `B → E`; all `E` instances fan into `C`.
+
+**With router params:**
+
+```mermaid
+flowchart TD
+    A["fetch_records"]
+    D{"split_by_type(batch_size=10)"}
+    B["process_chunk"]
+    C["aggregate"]
+
+    A --> D
+    D --> B
+    B --o C
+```
+
+### Router registry
+
+Routing functions are registered with `@register_router`:
+
+```python
+from jobbers.registry import register_router
+
+@register_router("split_by_type")
+def split_by_type(parent_results: dict, batch_size: int = 1) -> list[dict]:
+    items = parent_results.get("items", [])
+    return [{"item": item} for item in items]
+```
+
+**Signature:** `(parent_results: dict[str, Any], **router_params) -> list[dict[str, Any]]`
+
+- `parent_results` — the `results` dict stored on the completed dispatcher task.
+- `**router_params` — any params declared in the decision node label, type-coerced using the same rules as task parameters.
+- Return value — a list of parameter dicts; one child instance is spawned per entry, with the dict shallow-merged into the branch template's declared parameters.
+
+**Built-in routers:**
+
+| Name | Behaviour |
+| ---- | --------- |
+| `fanout` | Expects `parent_results["items"]` to be a list; returns `[{"item": x} for x in items]`. |
+
+### Edge contract
+
+| Edge | Meaning |
+| ---- | ------- |
+| `A --> D{...}` | `A` is the dispatcher; `D` is the routing node. |
+| `D --> B` | `B` is the first node in each per-branch chain. |
+| `B --> E` | Normal chain within the branch (zero or more intermediate steps). |
+| `E --o C` | `C` is the collector; `--o` marks the fan-in boundary. |
+
+`C` is a plain `["..."]` task node — no special shape needed.
 
 ---
 
@@ -184,6 +294,20 @@ If the task is the root of a DAG (`dag_callbacks` is non-empty), the response in
   "dag_diagram": "flowchart TD\n..."
 }
 ```
+
+---
+
+## Known limitations
+
+The mermaid format is a **static** representation of a DAG.  Some features of the Python `DAGNode` / `DAGTaskSpec` API cannot be expressed in a diagram:
+
+| Feature | Status |
+| ------- | ------ |
+| `DynamicFanOut` returned from a task function at runtime | **Not representable in mermaid.** `DynamicFanOut` is produced inside a task function during execution; the number of branches cannot be known at authoring time. Use the Python `DAGNode` API directly when this pattern is required. |
+| Multiple `-.->` error edges from the same source node | **Parse error.** The parser rejects diagrams with more than one error edge per source and raises `MermaidParseError`. This matches the underlying model constraint that each node has at most one error callback. |
+| Multiple diverging templates from one decision node (routing to different task types) | **Not yet supported.** Each decision node may have exactly one outgoing `-->` edge (one branch template). |
+| Per-child error callbacks inside a fan-out branch | **Not expressible.** Error callbacks on individual dynamically-spawned children cannot be declared in the diagram; apply error handling in the branch task itself or in the collector. |
+| Nested decision nodes (a branch that itself fans out) | **Not yet supported.** Decision nodes may not appear inside a branch template chain. |
 
 ---
 

@@ -139,9 +139,9 @@ class Task(BaseModel):
 
         results: list[Self] = []
         for cb in self.dag_callbacks:
-            spec = cb.task
             match cb:
                 case SimpleCallback():
+                    spec = cb.task
                     results.append(
                         self.__class__(
                             id=spec.id,
@@ -154,6 +154,7 @@ class Task(BaseModel):
                         )
                     )
                 case FanInCallback():
+                    spec = cb.task
                     remaining = await ta.fan_in_complete(cb.fan_in_key, self.id)
                     if remaining == 0:
                         member_ids = await ta.get_fan_in_members(cb.fan_in_key)
@@ -175,6 +176,9 @@ class Task(BaseModel):
                             cb.fan_in_key,
                             self.id,
                         )
+                case _:
+                    # DynamicFanOutCallback is handled by the processor directly; skip here.
+                    pass
         return results
 
     def make_result(

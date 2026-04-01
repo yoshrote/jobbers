@@ -107,14 +107,26 @@ class DAGTaskSpec(BaseModel):
             if isinstance(cb, SimpleCallback):
                 new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
                 new_callbacks.append(SimpleCallback(task=cb.task._remap(id_map), error_callback=new_err))
-            else:
-                # FanInCallback — remap collector id inside fan_in_key
+            elif isinstance(cb, FanInCallback):
                 new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
                 new_child = cb.task._remap(id_map)
                 new_collector_id = id_map.setdefault(cb.task.id, new_child.id)
                 new_fan_in_key = f"dag:fan-in:{new_collector_id}"
                 new_callbacks.append(
                     FanInCallback(task=new_child, fan_in_key=new_fan_in_key, error_callback=new_err)
+                )
+            else:
+                # DynamicFanOutCallback — remap child_template and collector; no fan_in_key to rewrite
+                dfo_cb = cb
+                new_err = dfo_cb.error_callback._remap(id_map) if dfo_cb.error_callback else None
+                new_callbacks.append(
+                    DynamicFanOutCallback(
+                        router_name=dfo_cb.router_name,
+                        router_params=dfo_cb.router_params,
+                        child_template=dfo_cb.child_template._remap(id_map),
+                        collector=dfo_cb.collector._remap(id_map),
+                        error_callback=new_err,
+                    )
                 )
         return DAGTaskSpec(
             id=new_id,
@@ -149,8 +161,30 @@ class FanInCallback(BaseModel):
     error_callback: DAGTaskSpec | None = None  # Submit when this predecessor fails permanently
 
 
+class DynamicFanOutCallback(BaseModel):
+    """
+    Declare a dynamic fan-out from this task.
+
+    At runtime the processor calls the registered routing function (*router_name*)
+    with the parent task's results and *router_params*, which returns a list of
+    parameter dicts — one per child instance to spawn from *child_template*.
+    The template chain (child_template and its own dag_callbacks) is cloned for
+    each child.  All children fan into *collector* once complete.
+
+    The routing function is called inline by the processor; it is not submitted
+    as a full task (no task lifecycle, no retries).
+    """
+
+    type: Literal["dynamic_fanout"] = "dynamic_fanout"
+    router_name: str
+    router_params: dict[str, Any] = {}
+    child_template: DAGTaskSpec  # root of the per-branch template chain
+    collector: DAGTaskSpec  # fan-in target (--o destination in mermaid)
+    error_callback: DAGTaskSpec | None = None
+
+
 # Pydantic discriminated union – serialises/deserialises by the ``type`` field.
-DAGCallback = Annotated[SimpleCallback | FanInCallback, Field(discriminator="type")]
+DAGCallback = Annotated[SimpleCallback | FanInCallback | DynamicFanOutCallback, Field(discriminator="type")]
 
 # Allow self-referential DAGTaskSpec.dag_callbacks.
 DAGTaskSpec.model_rebuild()
@@ -173,9 +207,13 @@ def collect_fan_in_keys(spec: DAGTaskSpec) -> dict[str, set[ULID]]:
             if isinstance(cb, FanInCallback):
                 result.setdefault(cb.fan_in_key, set()).add(s.id)
                 _walk(cb.task)
-            else:
-                # SimpleCallback
+            elif isinstance(cb, SimpleCallback):
                 _walk(cb.task)
+            else:
+                # DynamicFanOutCallback — no static fan-in keys; traverse template and collector
+                dfo = cb
+                _walk(dfo.child_template)
+                _walk(dfo.collector)
 
     _walk(spec)
     return result
@@ -213,6 +251,8 @@ class DAGNode:
         self._parameters: dict[str, Any] = parameters or {}
         # (successor_node, fan_in_key or None, error_node or None)
         self._successors: list[tuple[DAGNode, str | None, DAGNode | None]] = []
+        # (child_template, collector, router_name, router_params, error_node or None)
+        self._fanouts: list[tuple[DAGNode, DAGNode, str, dict[str, Any], DAGNode | None]] = []
 
     @property
     def id(self) -> ULID:
@@ -237,6 +277,27 @@ class DAGNode:
         """
         for node in nodes:
             self._successors.append((node, None, on_error))
+        return self
+
+    def fanout(
+        self,
+        child_template: DAGNode,
+        into: DAGNode,
+        *,
+        router: str = "fanout",
+        router_params: dict[str, Any] | None = None,
+        on_error: DAGNode | None = None,
+    ) -> DAGNode:
+        """
+        Declare a dynamic fan-out.
+
+        At runtime the processor calls the registered routing function (*router*)
+        with this node's results to spawn N instances of *child_template*, all
+        fanning into *into* (the collector).
+
+        Returns *self* for chaining.
+        """
+        self._fanouts.append((child_template, into, router, router_params or {}, on_error))
         return self
 
     @classmethod
@@ -284,6 +345,16 @@ class DAGNode:
                 callbacks.append(SimpleCallback(task=spec, error_callback=error_spec))
             else:
                 callbacks.append(FanInCallback(task=spec, fan_in_key=fan_in_key, error_callback=error_spec))
+        for child_template_node, collector_node, router_name, router_params, error_node in self._fanouts:
+            callbacks.append(
+                DynamicFanOutCallback(
+                    router_name=router_name,
+                    router_params=router_params,
+                    child_template=child_template_node._to_spec(),
+                    collector=collector_node._to_spec(),
+                    error_callback=error_node._to_spec() if error_node is not None else None,
+                )
+            )
         return callbacks
 
     def to_task(self, *, parent_id: ULID | None = None) -> Task:

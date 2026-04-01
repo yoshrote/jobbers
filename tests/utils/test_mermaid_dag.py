@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 from ulid import ULID
 
-from jobbers.models.dag import DAGTaskSpec, FanInCallback, SimpleCallback
+from jobbers.models.dag import DAGTaskSpec, DynamicFanOutCallback, FanInCallback, SimpleCallback
 from jobbers.models.task_status import TaskStatus
 from jobbers.utils.mermaid_dag import (
     MermaidParseError,
@@ -26,6 +29,8 @@ from jobbers.utils.mermaid_dag import (
         ("True", True),
         ("TRUE", True),
         ("false", False),
+        ("null", None),
+        ("NULL", None),
         ("42", 42),
         ("-7", -7),
         ("3.14", 3.14),
@@ -33,6 +38,10 @@ from jobbers.utils.mermaid_dag import (
         ("'single'", "single"),
         ("plain", "plain"),
         ("hello,world", "hello,world"),
+        # base64-encoded JSON values
+        ("~WzEsMiwzXQ==", [1, 2, 3]),
+        ('~eyJhIjoxfQ==', {"a": 1}),
+        ("~bnVsbA==", None),
     ],
 )
 def test_parse_param_value(raw: str, expected: object) -> None:
@@ -43,34 +52,61 @@ def test_parse_param_value(raw: str, expected: object) -> None:
 
 
 def test_parse_label_name_only() -> None:
-    name, queue, params = _parse_label("fetch_data")
+    name, version, queue, params = _parse_label("fetch_data")
     assert name == "fetch_data"
+    assert version == 0
     assert queue == "default"
     assert params == {}
 
 
 def test_parse_label_name_and_queue() -> None:
-    name, queue, params = _parse_label("fetch_data:heavy")
+    name, version, queue, params = _parse_label("fetch_data:heavy")
     assert name == "fetch_data"
+    assert version == 0
+    assert queue == "heavy"
+
+
+def test_parse_label_name_version_only() -> None:
+    name, version, queue, params = _parse_label("fetch_data@3")
+    assert name == "fetch_data"
+    assert version == 3
+    assert queue == "default"
+    assert params == {}
+
+
+def test_parse_label_name_version_queue() -> None:
+    name, version, queue, params = _parse_label("fetch_data@2:heavy")
+    assert name == "fetch_data"
+    assert version == 2
     assert queue == "heavy"
 
 
 def test_parse_label_name_queue_params() -> None:
-    name, queue, params = _parse_label("fetch_data:heavy(url=https://example.com,limit=100)")
+    name, version, queue, params = _parse_label("fetch_data:heavy(url=https://example.com,limit=100)")
     assert name == "fetch_data"
+    assert version == 0
     assert queue == "heavy"
     assert params == {"url": "https://example.com", "limit": 100}
 
 
-def test_parse_label_strips_status_suffix() -> None:
-    name, queue, params = _parse_label("fetch_data:default(limit=5){COMPLETED|2026-03-30}")
+def test_parse_label_version_queue_params() -> None:
+    name, version, queue, params = _parse_label("fetch_data@5:heavy(limit=100)")
     assert name == "fetch_data"
+    assert version == 5
+    assert queue == "heavy"
+    assert params == {"limit": 100}
+
+
+def test_parse_label_strips_status_suffix() -> None:
+    name, version, queue, params = _parse_label("fetch_data:default(limit=5){COMPLETED|2026-03-30}")
+    assert name == "fetch_data"
+    assert version == 0
     assert queue == "default"
     assert params == {"limit": 5}
 
 
 def test_parse_label_bool_params() -> None:
-    _, _, params = _parse_label("my_task(dry_run=true,verbose=false)")
+    _, _, _, params = _parse_label("my_task(dry_run=true,verbose=false)")
     assert params == {"dry_run": True, "verbose": False}
 
 
@@ -95,6 +131,30 @@ def test_serialize_params_basic() -> None:
 def test_serialize_params_quoted_string() -> None:
     result = _serialize_params({"msg": "hello, world"})
     assert '"hello, world"' in result
+
+
+def test_serialize_params_null() -> None:
+    assert _serialize_params({"x": None}) == "x=null"
+
+
+def test_serialize_params_list() -> None:
+    result = _serialize_params({"ids": [1, 2, 3]})
+    assert result.startswith("ids=~")
+    # Round-trip: the blob must decode back to the original list.
+    blob = result[len("ids=~"):]
+    assert json.loads(base64.b64decode(blob)) == [1, 2, 3]
+
+
+def test_serialize_params_dict() -> None:
+    result = _serialize_params({"cfg": {"retries": 3}})
+    assert result.startswith("cfg=~")
+
+
+def test_serialize_params_mixed() -> None:
+    result = _serialize_params({"limit": 10, "ids": [1, 2], "dry_run": True})
+    assert "limit=10" in result
+    assert "dry_run=true" in result
+    assert "ids=~" in result
 
 
 # ── parse_mermaid_dag — linear chain ─────────────────────────────────────────
@@ -262,6 +322,27 @@ def test_parse_default_queue() -> None:
     assert roots[0]._queue == "default"  # type: ignore[attr-defined]
 
 
+def test_parse_version() -> None:
+    text = 'flowchart TD\n    A["my_task@3"]'
+    roots = parse_mermaid_dag(text)
+    assert roots[0]._version == 3  # type: ignore[attr-defined]
+
+
+def test_parse_version_defaults_to_zero() -> None:
+    text = 'flowchart TD\n    A["my_task"]'
+    roots = parse_mermaid_dag(text)
+    assert roots[0]._version == 0  # type: ignore[attr-defined]
+
+
+def test_parse_version_with_queue_and_params() -> None:
+    text = 'flowchart TD\n    A["my_task@2:heavy(limit=10)"]'
+    roots = parse_mermaid_dag(text)
+    root = roots[0]
+    assert root._version == 2  # type: ignore[attr-defined]
+    assert root._queue == "heavy"  # type: ignore[attr-defined]
+    assert root._parameters == {"limit": 10}  # type: ignore[attr-defined]
+
+
 # ── parse_mermaid_dag — status suffix stripped ───────────────────────────────
 
 
@@ -318,6 +399,18 @@ def test_generator_queue_included_when_not_default() -> None:
     spec = _simple_spec("fetch_data", queue="heavy")
     diagram = dag_spec_to_mermaid(spec)
     assert ":heavy" in diagram
+
+
+def test_generator_version_omitted_when_zero() -> None:
+    spec = DAGTaskSpec(id=ULID(), name="my_task", version=0)
+    diagram = dag_spec_to_mermaid(spec)
+    assert "@" not in diagram
+
+
+def test_generator_version_included_when_nonzero() -> None:
+    spec = DAGTaskSpec(id=ULID(), name="my_task", version=3)
+    diagram = dag_spec_to_mermaid(spec)
+    assert "@3" in diagram
 
 
 def test_generator_linear_chain() -> None:
@@ -430,6 +523,18 @@ def test_round_trip_linear() -> None:
     assert root2._successors[0][0]._name == "process_data"  # type: ignore[attr-defined]
 
 
+def test_round_trip_complex_params() -> None:
+    """Complex param values survive a generate → parse cycle."""
+    spec = DAGTaskSpec(
+        id=ULID(),
+        name="my_task",
+        parameters={"limit": 10, "ids": [1, 2, 3], "cfg": {"retries": 3}, "flag": None},
+    )
+    diagram = dag_spec_to_mermaid(spec)
+    roots = parse_mermaid_dag(diagram)
+    assert roots[0]._parameters == {"limit": 10, "ids": [1, 2, 3], "cfg": {"retries": 3}, "flag": None}  # type: ignore[attr-defined]
+
+
 def test_round_trip_diamond() -> None:
     """Diamond DAG survives a generate → parse cycle with correct fan-in."""
     original = """
@@ -452,3 +557,300 @@ def test_round_trip_diamond() -> None:
     assert len(fan_in_map) == 1
     preds = next(iter(fan_in_map.values()))
     assert len(preds) == 2
+
+
+# ── parse_mermaid_dag — decision nodes (dynamic fan-out) ─────────────────────
+
+
+def test_parse_decision_node_simple() -> None:
+    """A --> D{"fanout"} --> B --o C wires a DynamicFanOutCallback on A."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        D{"fanout"}
+        B["process_record"]
+        C["aggregate_results"]
+
+        A --> D
+        D --> B
+        B --o C
+    """
+    roots = parse_mermaid_dag(text)
+    assert len(roots) == 1
+    root = roots[0]
+    assert root._name == "fetch_records"  # type: ignore[attr-defined]
+    # No regular successors — the fanout is stored in _fanouts.
+    assert root._successors == []  # type: ignore[attr-defined]
+    assert len(root._fanouts) == 1  # type: ignore[attr-defined]
+    child_template, collector, router_name, router_params, on_error = root._fanouts[0]  # type: ignore[attr-defined]
+    assert router_name == "fanout"
+    assert router_params == {}
+    assert child_template._name == "process_record"  # type: ignore[attr-defined]
+    assert collector._name == "aggregate_results"  # type: ignore[attr-defined]
+    assert on_error is None
+
+
+def test_parse_decision_node_with_router_params() -> None:
+    """Router params on the decision node label are parsed correctly."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        D{"split_by_type(batch_size=10)"}
+        B["process_chunk"]
+        C["aggregate"]
+
+        A --> D
+        D --> B
+        B --o C
+    """
+    roots = parse_mermaid_dag(text)
+    root = roots[0]
+    _, _, router_name, router_params, _ = root._fanouts[0]  # type: ignore[attr-defined]
+    assert router_name == "split_by_type"
+    assert router_params == {"batch_size": 10}
+
+
+def test_parse_decision_node_with_branch_chain() -> None:
+    """D --> B --> E --o C: the full chain B→E is the template; C is the collector."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        D{"fanout"}
+        B["process_chunk"]
+        E["enrich_result"]
+        C["aggregate_results"]
+
+        A --> D
+        D --> B
+        B --> E
+        E --o C
+    """
+    roots = parse_mermaid_dag(text)
+    root = roots[0]
+    assert len(root._fanouts) == 1  # type: ignore[attr-defined]
+    child_template, collector, router_name, _, _ = root._fanouts[0]  # type: ignore[attr-defined]
+    assert child_template._name == "process_chunk"  # type: ignore[attr-defined]
+    # The template chain should have process_chunk --> enrich_result.
+    spec = child_template._to_spec()  # type: ignore[attr-defined]
+    assert len(spec.dag_callbacks) == 1
+    assert spec.dag_callbacks[0].task.name == "enrich_result"
+    assert collector._name == "aggregate_results"  # type: ignore[attr-defined]
+
+
+def test_parse_decision_node_error_callback() -> None:
+    """Error callback on the dispatcher propagates to the DynamicFanOutCallback."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        D{"fanout"}
+        B["process_record"]
+        C["aggregate_results"]
+        err["handle_error"]
+
+        A --> D
+        D --> B
+        B --o C
+        A -.-> err
+    """
+    roots = parse_mermaid_dag(text)
+    root = roots[0]
+    _, _, _, _, on_error = root._fanouts[0]  # type: ignore[attr-defined]
+    assert on_error is not None
+    assert on_error._name == "handle_error"  # type: ignore[attr-defined]
+
+
+def test_parse_decision_node_excludes_branch_from_roots() -> None:
+    """Branch start and collector must not appear as roots."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        D{"fanout"}
+        B["process_record"]
+        C["aggregate_results"]
+
+        A --> D
+        D --> B
+        B --o C
+    """
+    roots = parse_mermaid_dag(text)
+    root_names = {r._name for r in roots}  # type: ignore[attr-defined]
+    assert root_names == {"fetch_records"}
+
+
+def test_parse_decision_node_no_dispatcher_raises() -> None:
+    """Decision node with no incoming --> edge raises MermaidParseError."""
+    text = """
+    flowchart TD
+        D{"fanout"}
+        B["process_record"]
+        C["aggregate"]
+
+        D --> B
+        B --o C
+    """
+    with pytest.raises(MermaidParseError, match="no incoming"):
+        parse_mermaid_dag(text)
+
+
+def test_parse_decision_node_no_branch_raises() -> None:
+    """Decision node with no outgoing --> edge raises MermaidParseError."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        D{"fanout"}
+
+        A --> D
+    """
+    with pytest.raises(MermaidParseError, match="no outgoing"):
+        parse_mermaid_dag(text)
+
+
+def test_parse_fanin_edge_without_decision_node_raises() -> None:
+    """--o edge not connected to any decision node raises MermaidParseError."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        B["process_record"]
+        C["aggregate"]
+
+        A --> B
+        B --o C
+    """
+    with pytest.raises(MermaidParseError, match="--o"):
+        parse_mermaid_dag(text)
+
+
+# ── dag_spec_to_mermaid — decision nodes ─────────────────────────────────────
+
+
+def test_generator_decision_node_simple() -> None:
+    """DynamicFanOutCallback generates a diamond node and --o edge."""
+    collector = DAGTaskSpec(id=ULID(), name="aggregate_results")
+    template = DAGTaskSpec(id=ULID(), name="process_record")
+    dispatcher = DAGTaskSpec(
+        id=ULID(),
+        name="fetch_records",
+        dag_callbacks=[
+            DynamicFanOutCallback(
+                router_name="fanout",
+                child_template=template,
+                collector=collector,
+            )
+        ],
+    )
+    diagram = dag_spec_to_mermaid(dispatcher)
+    assert '{"fanout"}' in diagram
+    assert f"{template.id} --o {collector.id}" in diagram
+    assert "fetch_records" in diagram
+    assert "process_record" in diagram
+    assert "aggregate_results" in diagram
+
+
+def test_generator_decision_node_with_router_params() -> None:
+    """Router params are included in the diamond node label."""
+    collector = DAGTaskSpec(id=ULID(), name="aggregate")
+    template = DAGTaskSpec(id=ULID(), name="process")
+    dispatcher = DAGTaskSpec(
+        id=ULID(),
+        name="dispatch",
+        dag_callbacks=[
+            DynamicFanOutCallback(
+                router_name="split_by_type",
+                router_params={"batch_size": 10},
+                child_template=template,
+                collector=collector,
+            )
+        ],
+    )
+    diagram = dag_spec_to_mermaid(dispatcher)
+    assert "split_by_type" in diagram
+    assert "batch_size=10" in diagram
+
+
+def test_generator_decision_node_branch_chain() -> None:
+    """Multi-node branch chain: last node emits --o, intermediate emits -->."""
+    collector = DAGTaskSpec(id=ULID(), name="aggregate")
+    enrich = DAGTaskSpec(id=ULID(), name="enrich_result")
+    process = DAGTaskSpec(
+        id=ULID(),
+        name="process_chunk",
+        dag_callbacks=[SimpleCallback(task=enrich)],
+    )
+    dispatcher = DAGTaskSpec(
+        id=ULID(),
+        name="dispatch",
+        dag_callbacks=[
+            DynamicFanOutCallback(
+                router_name="fanout",
+                child_template=process,
+                collector=collector,
+            )
+        ],
+    )
+    diagram = dag_spec_to_mermaid(dispatcher)
+    # Inner branch edge is -->
+    assert f"{process.id} --> {enrich.id}" in diagram
+    # Leaf → collector is --o
+    assert f"{enrich.id} --o {collector.id}" in diagram
+
+
+# ── Round-trip — decision node ────────────────────────────────────────────────
+
+
+def test_round_trip_decision_node_simple() -> None:
+    """Parse a decision-node DAG, generate, re-parse — same structure."""
+    original = """
+    flowchart TD
+        A["fetch_records"]
+        D{"fanout"}
+        B["process_record"]
+        C["aggregate_results"]
+
+        A --> D
+        D --> B
+        B --o C
+    """
+    roots = parse_mermaid_dag(original)
+    spec = roots[0]._to_spec()  # type: ignore[attr-defined]
+    diagram = dag_spec_to_mermaid(spec)
+    roots2 = parse_mermaid_dag(diagram)
+
+    assert len(roots2) == 1
+    root2 = roots2[0]
+    assert root2._name == "fetch_records"  # type: ignore[attr-defined]
+    assert len(root2._fanouts) == 1  # type: ignore[attr-defined]
+    child_template, collector, router_name, _, _ = root2._fanouts[0]  # type: ignore[attr-defined]
+    assert router_name == "fanout"
+    assert child_template._name == "process_record"  # type: ignore[attr-defined]
+    assert collector._name == "aggregate_results"  # type: ignore[attr-defined]
+
+
+def test_round_trip_decision_node_with_chain() -> None:
+    """Multi-node branch chain survives generate → parse."""
+    original = """
+    flowchart TD
+        A["fetch_records"]
+        D{"fanout"}
+        B["process_chunk"]
+        E["enrich_result"]
+        C["aggregate_results"]
+
+        A --> D
+        D --> B
+        B --> E
+        E --o C
+    """
+    roots = parse_mermaid_dag(original)
+    spec = roots[0]._to_spec()  # type: ignore[attr-defined]
+    diagram = dag_spec_to_mermaid(spec)
+    roots2 = parse_mermaid_dag(diagram)
+
+    root2 = roots2[0]
+    child_template, collector, router_name, _, _ = root2._fanouts[0]  # type: ignore[attr-defined]
+    assert router_name == "fanout"
+    assert child_template._name == "process_chunk"  # type: ignore[attr-defined]
+    assert collector._name == "aggregate_results"  # type: ignore[attr-defined]
+    # Template chain: process_chunk --> enrich_result
+    template_spec = child_template._to_spec()  # type: ignore[attr-defined]
+    assert len(template_spec.dag_callbacks) == 1
+    assert template_spec.dag_callbacks[0].task.name == "enrich_result"

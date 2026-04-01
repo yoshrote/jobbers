@@ -5,18 +5,59 @@ from typing import TYPE_CHECKING, Any
 from opentelemetry import metrics
 
 from jobbers.context import _current_task as _current_task_cv
-from jobbers.models.dag import DynamicFanOut, TaskResult
+from jobbers.models.dag import DynamicFanOut, DynamicFanOutCallback, TaskResult
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
-from jobbers.registry import get_task_config
+from jobbers.registry import get_router, get_task_config
 from jobbers.state_manager import StateManager, UserCancellationError
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
+    from jobbers.models.dag import DAGNode, DAGTaskSpec
+
 
 logger = logging.getLogger(__name__)
+
+
+def _spec_chain_to_dag_nodes(spec: "DAGTaskSpec") -> "tuple[DAGNode, DAGNode]":
+    """
+    Convert a linear ``DAGTaskSpec`` chain to ``(root_node, leaf_node)`` DAGNodes.
+
+    Used by ``_handle_diagram_fanout`` to reconstruct branch template chains so
+    that fan-in wiring can be applied at runtime after routing.  Only
+    ``SimpleCallback`` inner edges are expected inside a branch template; any
+    ``DynamicFanOutCallback`` entries are ignored (nested decision nodes are not
+    yet supported).
+    """
+    from jobbers.models.dag import DAGNode
+    from jobbers.models.dag import DynamicFanOutCallback as _DFO
+
+    root = DAGNode(
+        spec.name,
+        queue=spec.queue,
+        version=spec.version,
+        parameters=dict(spec.parameters),
+        task_id=spec.id,
+    )
+    if not spec.dag_callbacks:
+        return root, root
+
+    for cb in spec.dag_callbacks:
+        if isinstance(cb, _DFO):
+            continue  # nested decision nodes not supported; skip
+        child_root, child_leaf = _spec_chain_to_dag_nodes(cb.task)
+        error_node: DAGNode | None = None
+        if cb.error_callback is not None:
+            error_root, _ = _spec_chain_to_dag_nodes(cb.error_callback)
+            error_node = error_root
+        root.then(child_root, on_error=error_node)
+        return root, child_leaf
+
+    return root, root
+
+
 meter = metrics.get_meter(__name__)
 tasks_processed = meter.create_counter("tasks_processed", unit="1")
 tasks_retried = meter.create_counter("tasks_retried", unit="1")
@@ -140,11 +181,14 @@ class TaskProcessor:
     async def post_process(self, task: Task, dynamic_fanout: DynamicFanOut | None = None) -> None:
         if dynamic_fanout is not None:
             await self._handle_dynamic_fanout(task, dynamic_fanout)
+        for dag_cb in task.dag_callbacks:
+            if isinstance(dag_cb, DynamicFanOutCallback):
+                await self._handle_diagram_fanout(task, dag_cb)
         if task.has_callbacks():
             callbacks = await task.generate_callbacks(self.state_manager.ta)
             pipe = self.state_manager.job_store.pipeline(transaction=True)
-            for cb in callbacks:
-                self.state_manager.stage_submit_task(pipe, cb, queue_config=None)
+            for submitted_task in callbacks:
+                self.state_manager.stage_submit_task(pipe, submitted_task, queue_config=None)
             await pipe.execute()
 
     async def post_process_error(self, task: Task) -> None:
@@ -207,6 +251,101 @@ class TaskProcessor:
         # Submit all children atomically in a single pipeline. A transactional pipeline
         # (MULTI/EXEC) is all-or-nothing: either every child is enqueued or none are,
         # with no partial state possible on a crash — strictly safer than sequential submission.
+        pipe = self.state_manager.job_store.pipeline(transaction=True)
+        for ct in child_tasks:
+            ct.set_status(TaskStatus.SUBMITTED)
+            self.state_manager.ta.stage_submit_task(pipe, ct)
+        await pipe.execute()
+
+    async def _handle_diagram_fanout(self, parent: Task, cb: DynamicFanOutCallback) -> None:
+        """
+        Execute a ``DynamicFanOutCallback`` wired at DAG-authoring time.
+
+        Calls the registered routing function with *parent*'s results and the
+        router params stored on *cb*.  For each returned parameter dict a fresh
+        clone of the branch template is created (with remapped ULIDs); all
+        clones fan into a single fresh collector.  The routing function is
+        called inline (not as a separate task) so it has no task lifecycle
+        overhead.
+
+        On empty routing output the collector is submitted immediately.
+        If the router name is not registered the parent task is marked DROPPED.
+        """
+        from jobbers.models.dag import DAGNode
+
+        try:
+            router_fn = get_router(cb.router_name)
+        except KeyError:
+            logger.error(
+                "Unknown router %r for task %s id=%s — marking DROPPED.",
+                cb.router_name,
+                parent.name,
+                parent.id,
+            )
+            parent.set_status(TaskStatus.DROPPED)
+            await self.state_manager.save_task(parent)
+            return
+
+        child_param_list: list[dict[str, Any]] = router_fn(parent.results, **cb.router_params)
+
+        if not child_param_list:
+            # Degenerate: no children — submit collector immediately.
+            fresh_collector_spec, _ = cb.collector.fresh_copy()
+            fresh_collector_node = DAGNode(
+                fresh_collector_spec.name,
+                queue=fresh_collector_spec.queue,
+                version=fresh_collector_spec.version,
+                parameters=fresh_collector_spec.parameters,
+                task_id=fresh_collector_spec.id,
+            )
+            await self.state_manager.submit_task(fresh_collector_node.to_task())
+            return
+
+        # One shared collector node with a fresh ULID.
+        fresh_collector_spec, _ = cb.collector.fresh_copy()
+        collector_node = DAGNode(
+            fresh_collector_spec.name,
+            queue=fresh_collector_spec.queue,
+            version=fresh_collector_spec.version,
+            parameters=fresh_collector_spec.parameters,
+            task_id=fresh_collector_spec.id,
+        )
+
+        fan_in_key = f"dag:fan-in:{collector_node.id}"
+        branch_roots: list[DAGNode] = []
+        leaf_ids: set[Any] = set()
+
+        for child_params in child_param_list:
+            fresh_template, _ = cb.child_template.fresh_copy()
+            root_node, leaf_node = _spec_chain_to_dag_nodes(fresh_template)
+            # Merge per-child params into the root of this branch.
+            root_node._parameters = {**root_node._parameters, **child_params}
+            # Wire leaf → collector via FanInCallback (append directly to keep
+            # the leaf's other successors if any).
+            leaf_node._successors.append((collector_node, fan_in_key, None))
+            branch_roots.append(root_node)
+            leaf_ids.add(leaf_node.id)
+
+        child_tasks = [root.to_task(parent_id=parent.id) for root in branch_roots]
+        collector_task = collector_node.to_task()
+        collector_task.parent_ids = list(leaf_ids)
+
+        await self.state_manager.init_fan_in(fan_in_key, leaf_ids, ttl=86400)
+        # Pre-save the collector so it exists when the first leaf completes.
+        await self.state_manager.save_task(collector_task)
+
+        child_queues = list({ct.queue for ct in child_tasks})
+        configs = await asyncio.gather(
+            *(self.state_manager.qca.get_queue_config(queue=q) for q in child_queues)
+        )
+        for queue, config in zip(child_queues, configs):
+            if config and config.rate_numerator and config.rate_denominator and config.rate_period:
+                logger.warning(
+                    "Queue '%s' has rate limiting configured but DAG child task submission "
+                    "bypasses rate limits. Assign child tasks to queues without rate limiting.",
+                    queue,
+                )
+
         pipe = self.state_manager.job_store.pipeline(transaction=True)
         for ct in child_tasks:
             ct.set_status(TaskStatus.SUBMITTED)

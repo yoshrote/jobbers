@@ -201,6 +201,24 @@ Also available: `starmap`, `chunks`, nested workflows.
 
 **Jobbers** provides a DAG API for describing task dependency graphs. Two approaches can be freely mixed. For full details and examples see [docs/dags.md](dags.md).
 
+**Mermaid as the DAG format** — Jobbers uses standard [Mermaid](https://mermaid.js.org/) `flowchart TD` diagrams as the serialisation format for all DAGs. This means DAGs can be defined as plain text, submitted via the API, and rendered natively in GitHub, VS Code, Obsidian, and any Mermaid-compatible tool without additional tooling. The API accepts Mermaid text as input and returns it as output — including in task status responses.
+
+```mermaid
+flowchart TD
+  A["extract\nqueue=etl"]
+  B["transform\nqueue=etl"]
+  C["load\nqueue=etl"]
+  A --> B --> C
+```
+
+```bash
+# Submit an ad-hoc DAG directly via the API
+curl -X POST /dags -d '{"diagram": "flowchart TD\n  A[\"extract\"]\n  B[\"transform\"]\n  A --> B"}'
+
+# Retrieve a running DAG — response includes dag_diagram for immediate rendering
+GET /task-status/{id}  →  { ..., "dag_diagram": "flowchart TD\n  ..." }
+```
+
 **Static DAGs** — the full graph is described before submission using `DAGNode` and `StateManager.submit_dag`. All task IDs are pre-assigned at construction time.
 
 ```python
@@ -249,17 +267,33 @@ async def fetch_records(**kwargs):
 
 The framework wires the fan-in and submits all children automatically. Static and dynamic patterns can be nested arbitrarily.
 
+**Error callbacks** — pass `on_error` to `then()` or `merge()` to submit a task when a node fails permanently. The error task receives the failing task's ID as its parent so it can inspect results and errors:
+
+```python
+err = DAGNode("notify_failure", parameters={"channel": "ops"})
+
+# Chain error callback: fires if "transform" fails
+extract.then(transform, on_error=err)
+
+# Fan-in error callback: fires if any predecessor of "collector" fails
+DAGNode.merge(branch_a, branch_b, into=collector, on_error=err)
+```
+
+Error callbacks fire for any permanent failure status (`FAILED`, `CANCELLED`, `STALLED`, `DROPPED`) and are skipped while a task is still being retried.
+
 **Key differences from Celery canvas:**
 
 | Dimension | Celery | Jobbers |
 | --- | --- | --- |
-| Graph shape | Composed at call site from signatures | Described as a `DAGNode` graph before submission |
+| Graph shape | Composed at call site from signatures | Described as a `DAGNode` graph or Mermaid text before submission |
+| Graph format | Python API only | Mermaid text (portable, renderable, API-submittable) |
 | Result passing | Automatic argument injection (`self.s()`) | Explicit `await get_current_task().parent_results()` in task body |
 | Fan-in (chord) | `chord(group)(callback)` | `DAGNode.merge(..., into=collector)` or `DynamicFanOut` |
 | Runtime fan-out | `group(task.s(x) for x in items)` | `TaskResult(fanout=DynamicFanOut(...))` return value |
-| Error routing | `link_error` callbacks | Not supported in DAG context |
+| Error routing | `link_error` on any signature | `on_error=` on `then()` / `merge()` |
+| DAG introspection | No standard visual format | `dag_diagram` field in task status: render anywhere Mermaid is supported |
 
-**Verdict:** Comparable for the core patterns (chain, fan-out, fan-in, dynamic fan-out). Celery's canvas is more composable at the call site and supports error routing in workflows. Jobbers requires tasks to explicitly fetch parent results rather than receiving them as injected arguments, which is more verbose but makes data flow explicit.
+**Verdict:** Jobbers edges ahead for DAG-heavy workloads. The Mermaid format makes DAG authoring, sharing, and debugging significantly more ergonomic — a graph can be pasted into a GitHub comment or a wiki page and rendered immediately. Celery's canvas is more composable at the call site. Jobbers requires tasks to explicitly fetch parent results rather than receiving them as injected arguments, which is more verbose but makes data flow explicit.
 
 ---
 
@@ -348,11 +382,21 @@ entry = CronDAGEntry(
 )
 ```
 
-Cron entries are registered directly in Redis via `state_manager.cron_dag_scheduler.stage_add` — there is no HTTP API for CRUD. Celery Beat can store its schedule in a database backend and modify it at runtime without a code deploy; Jobbers does not have this yet.
+Cron entries are managed at runtime via a full REST API — no code deploy or Redis access required:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /cron-dags` | Create a new cron-scheduled DAG (validates cron expression and Mermaid diagram) |
+| `GET /cron-dags` | List all entries ordered by next run time (paginated) |
+| `GET /cron-dags/{id}` | Inspect a single entry |
+| `PUT /cron-dags/{id}` | Replace the diagram or cron expression; reschedules to next occurrence |
+| `DELETE /cron-dags/{id}` | Remove a cron entry |
+
+The DAG is specified as a Mermaid flowchart, so the same diagram that renders in a GitHub comment is the exact payload you `POST` to the API. Celery Beat stores schedules in Python config or a database backend; Jobbers stores them in Redis and exposes them through the same FastAPI server used for all other task management.
 
 The full pattern is described in [docs/cron-dags.md](cron-dags.md).
 
-**Verdict:** Comparable for cron-expression scheduling. Celery Beat has more configuration surface (interval schedules, `@periodic_task` decorator, database-backed dynamic schedules). Jobbers' cron scheduling integrates natively with its DAG composition model and `SKIP_IF_RUNNING` concurrency guard, but lacks a management API for cron entries.
+**Verdict:** Jobbers edges ahead for cron-scheduled DAG workloads. It matches Celery Beat for runtime-modifiable schedules and exceeds it by integrating scheduling directly with the DAG model, `SKIP_IF_RUNNING` concurrency control, and Mermaid-format definitions. Standard cron step syntax (`*/5 * * * *`) covers virtually all "every N minutes/hours" use cases. The only remaining gap is sub-minute intervals: Celery Beat's `schedule=30.0` has no cron equivalent.
 
 ---
 
@@ -402,12 +446,12 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 | **Retry policies** | Explicit (`self.retry()`) | Declarative (automatic) | Both support exponential backoff + jitter |
 | **Dead letter queue** | Not built-in | First-class | Jobbers: queryable API + bulk resubmit |
 | **Traffic management** | Restart required | Live, no restart | Jobbers: dynamic roles/queues, per-queue caps |
-| **Task composition** | Full canvas API | DAG API | Celery: canvas signatures. Jobbers: `DAGNode` + `DynamicFanOut`; no error routing in workflows |
+| **Task composition** | Full canvas API | DAG API + Mermaid | Celery: canvas signatures. Jobbers: `DAGNode` + `DynamicFanOut` + `on_error` callbacks; DAGs defined and returned as Mermaid |
 | **Graceful restart safety** | Good | Good | Both handle SIGTERM correctly |
 | **Hard crash recovery** | `acks_late` required | Heartbeat + Cleaner | Detection window can be several minutes in Jobbers |
 | **Broker durability** | RabbitMQ: strong | Redis only | Celery + RabbitMQ offers stronger durability |
 | **Broker flexibility** | Redis, AMQP, SQS, Kafka | Redis only | Celery wins significantly |
-| **Periodic/cron scheduling** | Celery Beat (full) | Cron DAGs + retry delays | Celery Beat has more config surface (intervals, DB-backed); Jobbers integrates with DAG model |
+| **Periodic/cron scheduling** | Celery Beat (full) | Cron DAGs + REST CRUD | Jobbers: full management API, `SKIP_IF_RUNNING`, Mermaid diagrams; Celery Beat: intervals + `@periodic_task` decorator |
 | **Task introspection** | Basic `AsyncResult` | Full lifecycle API | Jobbers: query by status/queue/name, cancel cooperatively |
 | **Security** | Broker-layer + optional signing | Proxy-layer only | Neither has strong built-in auth |
 
@@ -418,13 +462,13 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 - Operational visibility is a first-class concern and you want OTEL without additional instrumentation work.
 - You want a built-in, queryable DLQ with bulk resubmit.
 - You are already running Redis and do not need a second broker.
-- You need multi-step DAG workflows (chain, fan-out, fan-in, runtime-determined fan-out) and prefer explicit data flow over automatic argument injection.
-- You want recurring scheduled jobs that integrate natively with the DAG model and `SKIP_IF_RUNNING` concurrency control.
+- You need multi-step DAG workflows (chain, fan-out, fan-in, runtime-determined fan-out, error callbacks) and prefer explicit data flow over automatic argument injection.
+- You want recurring scheduled jobs that integrate natively with the DAG model and `SKIP_IF_RUNNING` concurrency control, manageable via REST API without code deploys.
+- You want DAG workflows defined in a standard, portable format (Mermaid) that renders natively in GitHub, VS Code, and documentation tools.
 
 ### When to choose Celery
 
-- You need workflow error routing (`link_error` callbacks in chains/chords).
-- You need interval-based scheduling, a `@periodic_task` decorator, or a database-backed cron schedule that can be modified at runtime without a code deploy.
+- You need **sub-minute** recurring tasks (Celery Beat supports `schedule=30.0`; cron expressions bottom out at 1-minute resolution, so `*/5 * * * *` covers "every 5 minutes" but not "every 30 seconds").
 - You require broker flexibility (RabbitMQ for durability, SQS for cloud-native deployments).
 - Your tasks are sync, or you have a large existing Celery codebase.
 - You need stronger message durability guarantees than Redis provides.
