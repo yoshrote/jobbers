@@ -473,3 +473,4 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 - Your tasks are sync, or you have a large existing Celery codebase.
 - You need stronger message durability guarantees than Redis provides.
 - You prefer composing workflows at the call site from task signatures rather than constructing a graph object upfront.
+- You prefer to have results injected as parameters rather than having to explicitly check for previous results.
