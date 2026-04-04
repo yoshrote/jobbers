@@ -11,7 +11,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _task_function_map: dict[tuple[str, int], TaskConfig] = {}
-_router_function_map: dict[str, Callable[..., list[dict[str, Any]]]] = {}
 
 
 class TaskWrapper:
@@ -122,50 +121,6 @@ def get_tasks() -> Iterator[tuple[str, int]]:
     return iter(_task_function_map.keys())
 
 
-def register_router(name: str) -> Callable[..., Any]:
-    """
-    Register a routing function for use in decision nodes.
-
-    A routing function receives the dispatcher task's results dict and any
-    params declared on the decision node, and returns a list of parameter
-    dicts — one per child instance to spawn::
-
-        @register_router("my_router")
-        def my_router(parent_results: dict, batch_size: int = 1) -> list[dict]:
-            return [{"item": item} for item in parent_results.get("items", [])]
-
-    Signature: ``(parent_results: dict[str, Any], **router_params) -> list[dict[str, Any]]``
-    """
-
-    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-        _router_function_map[name] = fn
-        return fn
-
-    return decorator
-
-
-def get_router(name: str) -> Callable[..., list[dict[str, Any]]]:
-    """Retrieve a registered routing function by name. Raises KeyError if not found."""
-    if name not in _router_function_map:
-        raise KeyError(f"No router registered with name {name!r}")
-    return _router_function_map[name]
-
-
 def clear_registry() -> None:
     """Clear all registered tasks (for testing purposes)."""
     _task_function_map.clear()
-    _router_function_map.clear()
-
-
-# ── Built-in routers ───────────────────────────────────────────────────────────
-
-
-@register_router("fanout")
-def _fanout_router(parent_results: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
-    """
-    Default router: expects ``parent_results["items"]`` to be a list.
-
-    Returns one parameter dict per item, with the item stored under the key
-    ``"item"``.  Other conventions require a custom registered router.
-    """
-    return [{"item": item} for item in parent_results.get("items", [])]
