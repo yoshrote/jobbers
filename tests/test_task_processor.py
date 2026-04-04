@@ -507,6 +507,7 @@ def _make_state_manager():
     """Return a mock StateManager whose retry_task mirrors the real SM behaviour."""
     state_manager = AsyncMock(spec=StateManager)
     state_manager.task_scheduler = AsyncMock(spec=TaskScheduler)
+    state_manager.job_store = fakeredis.FakeRedis()
 
     async def _schedule_retry_task(task: Task, run_at: dt.datetime) -> Task:
         return task
@@ -909,7 +910,7 @@ async def test_post_process_triggers_dag_callbacks():
     )
 
     state_manager = _make_state_manager()
-    state_manager.submit_task = AsyncMock()
+    state_manager.stage_submit_task = MagicMock()
 
     # generate_callbacks now receives state_manager.ta directly
     mock_ta = AsyncMock()
@@ -921,7 +922,7 @@ async def test_post_process_triggers_dag_callbacks():
     await processor.post_process(parent)
 
     # At least one child task should have been submitted
-    assert state_manager.submit_task.await_count >= 1
+    assert state_manager.stage_submit_task.call_count >= 1
 
 
 @pytest.mark.asyncio
@@ -1047,13 +1048,13 @@ async def test_post_process_error_submits_error_callbacks():
         dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
     )
     state_manager = _make_state_manager()
-    state_manager.submit_task = AsyncMock()
+    state_manager.stage_submit_task = MagicMock()
 
     processor = TaskProcessor(state_manager)
     await processor.post_process_error(task)
 
-    state_manager.submit_task.assert_awaited_once()
-    submitted = state_manager.submit_task.call_args[0][0]
+    state_manager.stage_submit_task.assert_called_once()
+    submitted = state_manager.stage_submit_task.call_args[0][1]
     assert submitted.id == error_spec.id
     assert submitted.parent_ids == [task.id]
 
@@ -1072,12 +1073,11 @@ async def test_post_process_error_no_error_callbacks_does_nothing():
         dag_callbacks=[SimpleCallback(task=DAGTaskSpec(name="child"))],
     )
     state_manager = _make_state_manager()
-    state_manager.submit_task = AsyncMock()
 
     processor = TaskProcessor(state_manager)
     await processor.post_process_error(task)
 
-    state_manager.submit_task.assert_not_awaited()
+    state_manager.stage_submit_task.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1096,7 +1096,7 @@ async def test_failed_task_triggers_error_callback():
         dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
     )
     state_manager = _make_state_manager()
-    state_manager.submit_task = AsyncMock()
+    state_manager.stage_submit_task = MagicMock()
 
     task_function = AsyncMock(side_effect=RuntimeError("boom"))
     task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10, max_retries=0)
@@ -1106,8 +1106,8 @@ async def test_failed_task_triggers_error_callback():
         result = await processor.process(task)
 
     assert result.status == TaskStatus.FAILED
-    state_manager.submit_task.assert_awaited_once()
-    submitted = state_manager.submit_task.call_args[0][0]
+    state_manager.stage_submit_task.assert_called_once()
+    submitted = state_manager.stage_submit_task.call_args[0][1]
     assert submitted.id == error_spec.id
 
 
