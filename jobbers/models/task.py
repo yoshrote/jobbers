@@ -49,6 +49,9 @@ class Task(BaseModel):
     # Immediate parent task IDs — empty for root tasks, one entry for simple-chain
     # and dynamic fan-out children, many entries for fan-in collectors.
     parent_ids: list[ULID] = Field(default_factory=list)
+    # When True, the worker fetches parent results via parent_ids and injects them
+    # as a `parent_results` kwarg before calling the task function.
+    inject_parent_results: bool = False
     # Set on cron-dispatched root tasks so the worker can clear the active-run key on completion.
     cron_id: ULID | None = Field(default=None)
 
@@ -64,7 +67,13 @@ class Task(BaseModel):
         signature = inspect.get_annotations(self.task_config.function)
         for param, psig in signature.items():
             # Skip the return type annotation
-            if param != "return" and not isinstance(self.parameters[param], psig):
+            if param == "return":
+                continue
+            # Skip parameters not present in the submitted payload — they may
+            # have defaults or be injected at execution time (e.g. parent_results).
+            if param not in self.parameters:
+                continue
+            if not isinstance(self.parameters[param], psig):
                 return False
         return True
 
@@ -151,6 +160,7 @@ class Task(BaseModel):
                             parameters=spec.parameters,
                             dag_callbacks=spec.dag_callbacks,
                             parent_ids=[self.id],
+                            inject_parent_results=cb.inject_parent_results,
                         )
                     )
                 case FanInCallback():
@@ -166,6 +176,7 @@ class Task(BaseModel):
                                 parameters=spec.parameters,
                                 dag_callbacks=spec.dag_callbacks,
                                 parent_ids=member_ids,
+                                inject_parent_results=cb.inject_parent_results,
                             )
                         )
                     elif remaining == -1:
@@ -251,6 +262,7 @@ class Task(BaseModel):
             "completed_at": _ts(self.completed_at),
             "dag_callbacks": [cb.model_dump() for cb in self.dag_callbacks],
             "parent_ids": [str(pid) for pid in self.parent_ids],
+            "inject_parent_results": self.inject_parent_results,
             "cron_id": str(self.cron_id) if self.cron_id is not None else None,
         }
 
@@ -278,6 +290,7 @@ class Task(BaseModel):
             completed_at=_dt(raw.get("completed_at")),
             dag_callbacks=_dag_callback_adapter.validate_python(raw.get("dag_callbacks") or []),
             parent_ids=[ULID.from_str(pid) for pid in raw.get("parent_ids") or []],
+            inject_parent_results=raw.get("inject_parent_results", False),
             cron_id=ULID.from_str(raw["cron_id"]) if raw.get("cron_id") else None,
         )
 

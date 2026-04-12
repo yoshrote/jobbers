@@ -1157,3 +1157,68 @@ async def test_retried_task_does_not_trigger_error_callback():
     assert result.status == TaskStatus.SCHEDULED
     state_manager.submit_task.assert_not_awaited()
 
+
+# ── inject_parent_results ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_inject_parent_results_passes_results_as_kwarg():
+    """When inject_parent_results=True and parent_ids is set, the task function receives parent_results."""
+    from unittest.mock import patch
+
+    from jobbers.models.dag import TaskResult
+    from ulid import ULID
+
+    parent_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        parent_ids=[parent_id],
+        inject_parent_results=True,
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=TaskResult(results={}))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        with patch.object(task.__class__, "parent_results", new_callable=AsyncMock, return_value={"val": 99}):
+            processor = TaskProcessor(state_manager)
+            result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    task_function.assert_awaited_once()
+    _, call_kwargs = task_function.call_args
+    assert call_kwargs.get("parent_results") == {"val": 99}
+
+
+@pytest.mark.asyncio
+async def test_no_injection_when_flag_is_false():
+    """When inject_parent_results=False, the task function is called with only task.parameters."""
+    from jobbers.models.dag import TaskResult
+    from ulid import ULID
+
+    parent_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        parameters={"x": 1},
+        parent_ids=[parent_id],
+        inject_parent_results=False,
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=TaskResult(results={}))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    task_function.assert_awaited_once_with(x=1)
+

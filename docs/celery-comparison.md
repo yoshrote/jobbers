@@ -228,7 +228,8 @@ from jobbers.models.dag import DAGNode
 extract   = DAGNode("extract",   version=1, parameters={"source_url": url})
 transform = DAGNode("transform", version=1)
 load      = DAGNode("load",      version=1)
-extract.then(transform).then(load)
+extract.then(transform)
+transform.then(load)
 await state_manager.submit_dag(extract)
 
 # Fan-out: one root triggers parallel branches
@@ -245,6 +246,17 @@ branch_b  = DAGNode("score_model", version=1, parameters={"model_id": "b"})
 collector = DAGNode("pick_best",   version=1)
 DAGNode.merge(branch_a, branch_b, into=collector)
 await state_manager.submit_dag(branch_a, branch_b)
+```
+
+When the registered task wrappers are in scope, nodes can be created inline using `.node()` — name and version are inferred from the wrapper, similar to Celery's `.s()` signatures:
+
+```python
+# Chain using wrapper style
+e = extract.node(source_url=url)
+t = transform.node()
+e.then(t)
+t.then(load.node())
+await state_manager.submit_dag(e)
 ```
 
 **Dynamic DAGs** — a task function returns a `TaskResult` with a `DynamicFanOut` when the number of children can only be determined at runtime (equivalent to Celery's `starmap`/`chunks`).
@@ -285,15 +297,15 @@ Error callbacks fire for any permanent failure status (`FAILED`, `CANCELLED`, `S
 
 | Dimension | Celery | Jobbers |
 | --- | --- | --- |
-| Graph shape | Composed at call site from signatures | Described as a `DAGNode` graph or Mermaid text before submission |
+| Graph shape | Single composable expression (define + submit inline) | `DAGNode` graph or Mermaid text submitted separately; `.node()` wrappers allow call-site construction |
 | Graph format | Python API only | Mermaid text (portable, renderable, API-submittable) |
-| Result passing | Automatic argument injection (`self.s()`) | Explicit `await get_current_task().parent_results()` in task body |
+| Result passing | Automatic argument injection (`self.s()`) | Manual `await get_current_task().parent_results()` **or** automatic injection via `inject_parent_results=True` on `then()`/`merge()` |
 | Fan-in (chord) | `chord(group)(callback)` | `DAGNode.merge(..., into=collector)` or `DynamicFanOut` |
 | Runtime fan-out | `group(task.s(x) for x in items)` | `TaskResult(fanout=DynamicFanOut(...))` return value |
 | Error routing | `link_error` on any signature | `on_error=` on `then()` / `merge()` |
 | DAG introspection | No standard visual format | `dag_diagram` field in task status: render anywhere Mermaid is supported |
 
-**Verdict:** Jobbers edges ahead for DAG-heavy workloads. The Mermaid format makes DAG authoring, sharing, and debugging significantly more ergonomic — a graph can be pasted into a GitHub comment or a wiki page and rendered immediately. Celery's canvas is more composable at the call site. Jobbers requires tasks to explicitly fetch parent results rather than receiving them as injected arguments, which is more verbose but makes data flow explicit.
+**Verdict:** Jobbers edges ahead for DAG-heavy workloads. The Mermaid format makes DAG authoring, sharing, and debugging significantly more ergonomic — a graph can be pasted into a GitHub comment or a wiki page and rendered immediately. Both frameworks support call-site node construction (Celery via `.s()`, Jobbers via `.node()`); the real difference is that Celery's canvas is a single composable expression that defines and submits in one call, while Jobbers separates graph construction from `submit_dag`. Jobbers supports both explicit result fetching (`await get_current_task().parent_results()`) and automatic injection (`inject_parent_results=True` on `then()`/`merge()`), so the data-flow style is a matter of preference.
 
 ---
 
@@ -362,6 +374,7 @@ app.conf.beat_schedule = {
     },
 }
 ```
+
 Full crontab expressions, interval scheduling, `@periodic_task` decorator. Beat schedules are defined in Python config or stored in a database backend.
 
 **Jobbers** handles two scheduling concerns in the same Scheduler process:
@@ -409,6 +422,7 @@ result = add.delay(2, 2)
 result.revoke()            # cancel if not yet started
 result.state               # PENDING / STARTED / SUCCESS / FAILURE
 ```
+
 `AsyncResult` gives basic status. Cancelling a running task requires `terminate=True` (sends SIGTERM to the worker process, which is coarse and may affect other tasks on the same worker).
 
 **Jobbers** provides a full task lifecycle API:
@@ -462,7 +476,7 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 - Operational visibility is a first-class concern and you want OTEL without additional instrumentation work.
 - You want a built-in, queryable DLQ with bulk resubmit.
 - You are already running Redis and do not need a second broker.
-- You need multi-step DAG workflows (chain, fan-out, fan-in, runtime-determined fan-out, error callbacks) and prefer explicit data flow over automatic argument injection.
+- You need multi-step DAG workflows (chain, fan-out, fan-in, runtime-determined fan-out, error callbacks) with either explicit result fetching or automatic parent result injection.
 - You want recurring scheduled jobs that integrate natively with the DAG model and `SKIP_IF_RUNNING` concurrency control, manageable via REST API without code deploys.
 - You want DAG workflows defined in a standard, portable format (Mermaid) that renders natively in GitHub, VS Code, and documentation tools.
 
@@ -472,5 +486,4 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 - You require broker flexibility (RabbitMQ for durability, SQS for cloud-native deployments).
 - Your tasks are sync, or you have a large existing Celery codebase.
 - You need stronger message durability guarantees than Redis provides.
-- You prefer composing workflows at the call site from task signatures rather than constructing a graph object upfront.
-- You prefer to have results injected as parameters rather than having to explicitly check for previous results.
+- You prefer defining and submitting a workflow as a single inline expression (`chain(a.s(), b.s())()`) rather than building a graph and calling `submit_dag` separately.

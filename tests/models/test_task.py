@@ -627,3 +627,103 @@ def test_make_result_defaults_to_empty_results():
 
     assert isinstance(result, TaskResult)
     assert result.results == {}
+
+
+# ── inject_parent_results propagation ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_generate_callbacks_simple_propagates_inject_flag():
+    """SimpleCallback with inject_parent_results=True produces a child Task with the flag set."""
+    child_spec = DAGTaskSpec(name="child_task")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.COMPLETED,
+        dag_callbacks=[SimpleCallback(task=child_spec, inject_parent_results=True)],
+    )
+    children = await task.generate_callbacks(_make_adapter())
+
+    assert len(children) == 1
+    assert children[0].inject_parent_results is True
+
+
+@pytest.mark.asyncio
+async def test_generate_callbacks_simple_no_injection_by_default():
+    """SimpleCallback without inject_parent_results produces a child with the flag False."""
+    child_spec = DAGTaskSpec(name="child_task")
+    task = Task(
+        id=ULID1,
+        name="root",
+        version=1,
+        queue="default",
+        status=TaskStatus.COMPLETED,
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    children = await task.generate_callbacks(_make_adapter())
+
+    assert children[0].inject_parent_results is False
+
+
+@pytest.mark.asyncio
+async def test_generate_callbacks_fan_in_propagates_inject_flag():
+    """FanInCallback with inject_parent_results=True produces a collector Task with the flag set."""
+    p1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+    collector_spec = DAGTaskSpec(name="collector")
+    fan_in_key = f"dag:fan-in:{collector_spec.id}"
+    task = Task(
+        id=ULID1,
+        name="last_branch",
+        version=1,
+        queue="default",
+        status=TaskStatus.COMPLETED,
+        dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key, inject_parent_results=True)],
+    )
+    children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=0, fan_in_members=[p1]))
+
+    assert len(children) == 1
+    assert children[0].inject_parent_results is True
+
+
+# ── valid_task_params: missing annotated parameters ───────────────────────────
+
+
+def test_valid_task_params_skips_annotated_missing_param():
+    """valid_task_params passes when an annotated parameter is absent from parameters (e.g. to-be-injected)."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+
+    def fn(parent_results: dict | None = None) -> None:  # pragma: no cover
+        pass
+
+    task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
+    task.parameters = {}  # parent_results not yet present
+    assert task.valid_task_params() is True
+
+
+def test_valid_task_params_still_checks_provided_params():
+    """valid_task_params still type-checks parameters that are present."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+
+    def fn(x: int) -> None:  # pragma: no cover
+        pass
+
+    task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
+    task.parameters = {"x": "not_an_int"}
+    assert task.valid_task_params() is False
+
+
+def test_to_dict_round_trip_preserves_inject_flag():
+    """inject_parent_results survives a to_dict/from_dict round-trip."""
+    task = _make_full_task(inject_parent_results=True)
+    d = task.to_dict()
+    restored = Task.from_dict(task.id, d)
+    assert restored.inject_parent_results is True
+
+
+def test_from_dict_missing_inject_flag_defaults_false():
+    """from_dict defaults inject_parent_results to False for records that predate the field."""
+    minimal = {"name": "t", "queue": "default", "version": 1, "status": "submitted"}
+    task = Task.from_dict(ULID1, minimal)
+    assert task.inject_parent_results is False

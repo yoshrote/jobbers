@@ -21,6 +21,32 @@ from jobbers.state_manager import StateManager
 
 ---
 
+## Node construction styles
+
+Two equivalent approaches exist for creating `DAGNode` objects:
+
+**Direct constructor** — explicit; useful when the task name is dynamic or the registered wrapper isn't in scope:
+
+```python
+from jobbers.models.dag import DAGNode
+
+a = DAGNode("extract",   version=1, parameters={"source_url": url})
+b = DAGNode("transform", version=1)
+c = DAGNode("load",      version=1)
+a.then(b).then(c)
+```
+
+**Wrapper `.node()`** — concise call-site style when the registered `TaskWrapper` is imported; name and version are inferred automatically:
+
+```python
+# extract, transform, load are the TaskWrapper objects returned by @register_task
+extract.node(source_url=url).then(transform.node()).then(load.node())
+```
+
+Both produce identical `DAGNode` objects. The wrapper style reads like Celery's `.s()` signatures and is convenient when building workflows inline. The constructor style is necessary when the task name is determined at runtime (e.g., in dynamic fan-out children).
+
+---
+
 ## 1. Static Chain
 
 Each task runs sequentially: `extract` → `transform` → `load`.
@@ -60,12 +86,55 @@ async def run_etl_pipeline(state_manager: StateManager, source_url: str) -> None
     transform = DAGNode("transform", version=1)
     load      = DAGNode("load",      version=1)
 
-    extract.then(transform).then(load)
+    extract.then(transform)
+    transform.then(load)
 
     await state_manager.submit_dag(extract)
 ```
 
-`then()` returns `self`, so the chain can be written in a single expression.
+Note: `then()` returns `self` (the node it was called on), not the child. Use separate calls to build a chain.
+
+Equivalently, using the registered task wrappers directly:
+
+```python
+async def run_etl_pipeline(state_manager: StateManager, source_url: str) -> None:
+    e = extract.node(source_url=source_url)
+    t = transform.node()
+    e.then(t)
+    t.then(load.node())
+    await state_manager.submit_dag(e)
+```
+
+### Alternative: automatic parent result injection
+
+Pass `inject_parent_results=True` to `then()` and declare a `parent_results` parameter on the task function instead of calling `parent_results()` manually:
+
+```python
+@register_task(name="transform", version=1)
+async def transform(parent_results: dict | None = None, **kwargs):
+    rows = parent_results["rows"]   # injected automatically by the worker
+    return TaskResult(results={"rows": [normalize(r) for r in rows]})
+
+
+@register_task(name="load", version=1)
+async def load(parent_results: dict | None = None, **kwargs):
+    await write_to_warehouse(parent_results["rows"])
+    return TaskResult(results={"written": len(parent_results["rows"])})
+```
+
+```python
+async def run_etl_pipeline(state_manager: StateManager, source_url: str) -> None:
+    extract   = DAGNode("extract",   version=1, parameters={"source_url": source_url})
+    transform = DAGNode("transform", version=1)
+    load      = DAGNode("load",      version=1)
+
+    extract.then(transform, inject_parent_results=True)
+    transform.then(load,    inject_parent_results=True)
+
+    await state_manager.submit_dag(extract)
+```
+
+The worker fetches the parent task's results from Redis via `parent_ids` and injects them as the `parent_results` kwarg just before calling the function. The injected value is always a `dict` for a single parent and a `list[dict]` for a fan-in collector (same semantics as `parent_results()`).
 
 ---
 
@@ -440,7 +509,31 @@ async def run_full_pipeline(state_manager: StateManager, source: str) -> None:
 
 ### Accessing parent results
 
-Every task uses the same call — `parent_results()` resolves to the right data automatically:
+Two approaches are available and can be freely mixed across nodes in the same DAG:
+
+**Manual** — call `parent_results()` inside the task body:
+
+```python
+upstream = await get_current_task().parent_results()
+```
+
+**Automatic injection** — pass `inject_parent_results=True` on `then()` or `merge()` and declare a `parent_results` parameter on the function:
+
+```python
+# Chain
+a.then(b, inject_parent_results=True)
+
+@register_task(name="b")
+async def b_fn(parent_results: dict | None = None, **kwargs): ...
+
+# Fan-in
+DAGNode.merge(branch_a, branch_b, into=collector, inject_parent_results=True)
+
+@register_task(name="collector")
+async def collector_fn(parent_results: list | None = None, **kwargs): ...
+```
+
+Either way the resolved type is:
 
 | Context | Return type |
 | --- | --- |

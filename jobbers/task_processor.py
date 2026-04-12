@@ -61,7 +61,10 @@ class TaskProcessor:
             with self.state_manager.task_in_registry(task):
                 await self.state_manager.update_task_heartbeat(task)
                 _token = _current_task_cv.set(task)
-                self._current_promise = task.task_config.function(**task.parameters)
+                kwargs = dict(task.parameters)
+                if task.inject_parent_results and task.parent_ids:
+                    kwargs["parent_results"] = await task.parent_results()
+                self._current_promise = task.task_config.function(**kwargs)
                 if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                     self._current_promise = asyncio.shield(self._current_promise)
 

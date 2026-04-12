@@ -106,14 +106,25 @@ class DAGTaskSpec(BaseModel):
         for cb in self.dag_callbacks:
             if isinstance(cb, SimpleCallback):
                 new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
-                new_callbacks.append(SimpleCallback(task=cb.task._remap(id_map), error_callback=new_err))
+                new_callbacks.append(
+                    SimpleCallback(
+                        task=cb.task._remap(id_map),
+                        error_callback=new_err,
+                        inject_parent_results=cb.inject_parent_results,
+                    )
+                )
             else:
                 new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
                 new_child = cb.task._remap(id_map)
                 new_collector_id = id_map.setdefault(cb.task.id, new_child.id)
                 new_fan_in_key = f"dag:fan-in:{new_collector_id}"
                 new_callbacks.append(
-                    FanInCallback(task=new_child, fan_in_key=new_fan_in_key, error_callback=new_err)
+                    FanInCallback(
+                        task=new_child,
+                        fan_in_key=new_fan_in_key,
+                        error_callback=new_err,
+                        inject_parent_results=cb.inject_parent_results,
+                    )
                 )
         return DAGTaskSpec(
             id=new_id,
@@ -131,6 +142,7 @@ class SimpleCallback(BaseModel):
     type: Literal["simple"] = "simple"
     task: DAGTaskSpec
     error_callback: DAGTaskSpec | None = None  # Submit when the parent task fails permanently
+    inject_parent_results: bool = False  # Inject parent results as `parent_results` kwarg
 
 
 class FanInCallback(BaseModel):
@@ -146,6 +158,7 @@ class FanInCallback(BaseModel):
     task: DAGTaskSpec
     fan_in_key: str  # Redis SSET key tracking remaining predecessors
     error_callback: DAGTaskSpec | None = None  # Submit when this predecessor fails permanently
+    inject_parent_results: bool = False  # Inject all predecessor results as `parent_results` kwarg
 
 
 # Pydantic discriminated union – serialises/deserialises by the ``type`` field.
@@ -207,8 +220,8 @@ class DAGNode:
         self._queue = queue
         self._version = version
         self._parameters: dict[str, Any] = parameters or {}
-        # (successor_node, fan_in_key or None, error_node or None)
-        self._successors: list[tuple[DAGNode, str | None, DAGNode | None]] = []
+        # (successor_node, fan_in_key or None, error_node or None, inject_parent_results)
+        self._successors: list[tuple[DAGNode, str | None, DAGNode | None, bool]] = []
 
     @property
     def id(self) -> ULID:
@@ -219,11 +232,18 @@ class DAGNode:
     # Graph construction helpers
     # ------------------------------------------------------------------
 
-    def then(self, *nodes: DAGNode, on_error: DAGNode | None = None) -> DAGNode:
+    def then(
+        self,
+        *nodes: DAGNode,
+        on_error: DAGNode | None = None,
+        inject_parent_results: bool = False,
+    ) -> DAGNode:
         """
         Chain: each of *nodes* runs immediately after *this* node completes.
 
         Pass `on_error` to also submit an error task when *this* node fails permanently.
+        Pass `inject_parent_results=True` to have the worker fetch this node's results
+        and inject them as a ``parent_results`` kwarg into each successor's task function.
 
         Returns *self* for fluent chaining:
 
@@ -232,15 +252,23 @@ class DAGNode:
         ```
         """
         for node in nodes:
-            self._successors.append((node, None, on_error))
+            self._successors.append((node, None, on_error, inject_parent_results))
         return self
 
     @classmethod
-    def merge(cls, *predecessors: DAGNode, into: DAGNode, on_error: DAGNode | None = None) -> DAGNode:
+    def merge(
+        cls,
+        *predecessors: DAGNode,
+        into: DAGNode,
+        on_error: DAGNode | None = None,
+        inject_parent_results: bool = False,
+    ) -> DAGNode:
         """
         Fan-in: `into` runs only after *all* `predecessors` have completed.
 
         Pass `on_error` to submit an error task when any predecessor fails permanently.
+        Pass `inject_parent_results=True` to have the worker fetch all predecessors'
+        results and inject them as a ``parent_results`` list kwarg into `into`'s function.
 
         A shared Redis set key derived from `into`'s task ID is stored on
         each predecessor's callback so the worker knows which set to decrement.
@@ -252,7 +280,7 @@ class DAGNode:
         """
         fan_in_key = f"dag:fan-in:{into._id}"
         for pred in predecessors:
-            pred._successors.append((into, fan_in_key, on_error))
+            pred._successors.append((into, fan_in_key, on_error, inject_parent_results))
         return into
 
     # ------------------------------------------------------------------
@@ -273,13 +301,26 @@ class DAGNode:
     def _callbacks_recursive(self) -> list[DAGCallback]:
         """Return the list of `DAGCallback` objects for this node's successors."""
         callbacks: list[DAGCallback] = []
-        for successor, fan_in_key, error_node in self._successors:
+        for successor, fan_in_key, error_node, inject_parent_results in self._successors:
             spec = successor._to_spec()
             error_spec = error_node._to_spec() if error_node is not None else None
             if fan_in_key is None:
-                callbacks.append(SimpleCallback(task=spec, error_callback=error_spec))
+                callbacks.append(
+                    SimpleCallback(
+                        task=spec,
+                        error_callback=error_spec,
+                        inject_parent_results=inject_parent_results,
+                    )
+                )
             else:
-                callbacks.append(FanInCallback(task=spec, fan_in_key=fan_in_key, error_callback=error_spec))
+                callbacks.append(
+                    FanInCallback(
+                        task=spec,
+                        fan_in_key=fan_in_key,
+                        error_callback=error_spec,
+                        inject_parent_results=inject_parent_results,
+                    )
+                )
         return callbacks
 
     def to_task(self, *, parent_id: ULID | None = None) -> Task:
@@ -309,7 +350,7 @@ class DAGNode:
             if id(node) in visited:
                 return
             visited.add(id(node))
-            for successor, fan_in_key, _error_node in node._successors:
+            for successor, fan_in_key, _error_node, _ipr in node._successors:
                 if fan_in_key is not None:
                     result.setdefault(fan_in_key, set()).add(node._id)
                 _walk(successor)

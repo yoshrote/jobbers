@@ -281,7 +281,7 @@ def test_parse_error_callback() -> None:
     assert root._name == "fetch_data"  # type: ignore[attr-defined]
     # The success edge should carry the on_error node.
     assert len(root._successors) == 1  # type: ignore[attr-defined]
-    _successor, _fan_in_key, on_error = root._successors[0]  # type: ignore[attr-defined]
+    _successor, _fan_in_key, on_error, _ipr = root._successors[0]  # type: ignore[attr-defined]
     assert on_error is not None
     assert on_error._name == "notify_failure"  # type: ignore[attr-defined]
     assert on_error._parameters == {"channel": "ops"}  # type: ignore[attr-defined]
