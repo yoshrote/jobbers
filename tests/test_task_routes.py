@@ -930,3 +930,79 @@ async def test_schedule_task_unknown_task_returns_400():
 
     assert response.status_code == 400
     assert "nonexistent_task" in response.json()["detail"]
+
+
+# ── DAG run listing and detail routes ─────────────────────────────────────────
+
+DAG_RUN_ID = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+SUBMITTED_AT = dt.datetime(2026, 4, 12, 10, 0, 0, tzinfo=dt.timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_list_dags_empty(state_manager):
+    """GET /dags returns an empty list when no DAG runs exist."""
+    state_manager.list_dag_runs = AsyncMock(return_value=([], 0))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/dags")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 0
+    assert data["dags"] == []
+
+
+@pytest.mark.asyncio
+async def test_list_dags_returns_runs(state_manager):
+    """GET /dags returns DAG runs with dag_run_id and submitted_at."""
+    state_manager.list_dag_runs = AsyncMock(return_value=([(DAG_RUN_ID, SUBMITTED_AT)], 1))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/dags")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert len(data["dags"]) == 1
+    assert data["dags"][0]["dag_run_id"] == str(DAG_RUN_ID)
+    assert data["dags"][0]["submitted_at"] == SUBMITTED_AT.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_list_dags_passes_pagination(state_manager):
+    """GET /dags forwards offset and limit query params as a DAGRunPagination object."""
+    from jobbers.models.dag import DAGRunPagination
+
+    state_manager.list_dag_runs = AsyncMock(return_value=([], 0))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/dags", params={"offset": 10, "limit": 25})
+
+    assert response.status_code == 200
+    state_manager.list_dag_runs.assert_called_once_with(DAGRunPagination(offset=10, limit=25))
+
+
+@pytest.mark.asyncio
+async def test_get_dag_found(state_manager):
+    """GET /dags/{dag_run_id} returns run details and task IDs."""
+    state_manager.get_dag_run = AsyncMock(return_value=(SUBMITTED_AT, [ULID1, ULID2]))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/dags/{DAG_RUN_ID}")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["dag_run_id"] == str(DAG_RUN_ID)
+    assert data["submitted_at"] == SUBMITTED_AT.isoformat()
+    assert data["task_ids"] == [str(ULID1), str(ULID2)]
+
+
+@pytest.mark.asyncio
+async def test_get_dag_not_found(state_manager):
+    """GET /dags/{dag_run_id} returns 404 when the run does not exist."""
+    state_manager.get_dag_run = AsyncMock(return_value=None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/dags/{DAG_RUN_ID}")
+
+    assert response.status_code == 404

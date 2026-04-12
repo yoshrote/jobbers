@@ -14,7 +14,7 @@ from ulid import ULID
 
 from jobbers import db, registry
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.dag import DAGTaskSpec
+from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task import Task, TaskPagination
 from jobbers.state_manager import TaskException
@@ -585,3 +585,36 @@ async def delete_cron_dag(cron_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Cron DAG '{cron_id}' not found.")
     await sm.remove_cron_dag(uid)
     return {"message": f"Cron DAG '{cron_id}' deleted successfully."}
+
+
+# ── DAG run inspection ─────────────────────────────────────────────────────────
+
+
+@app.get("/dags")
+async def list_dags(pagination: Annotated[DAGRunPagination, Query()]) -> dict[str, Any]:
+    """List all DAG runs ordered by submission time (oldest first)."""
+    sm = db.get_state_manager()
+    dag_runs, total = await sm.list_dag_runs(pagination)
+    return {
+        "total": total,
+        "dags": [
+            {"dag_run_id": str(rid), "submitted_at": ts.isoformat()}
+            for rid, ts in dag_runs
+        ],
+    }
+
+
+@app.get("/dags/{dag_run_id}")
+async def get_dag(dag_run_id: str) -> dict[str, Any]:
+    """Get details of a single DAG run including the IDs of all tasks within it."""
+    uid = ULID.from_str(dag_run_id)
+    sm = db.get_state_manager()
+    result = await sm.get_dag_run(uid)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"DAG run '{dag_run_id}' not found.")
+    submitted_at, task_ids = result
+    return {
+        "dag_run_id": dag_run_id,
+        "submitted_at": submitted_at.isoformat(),
+        "task_ids": [str(t) for t in task_ids],
+    }

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
+    from jobbers.models.dag import DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
 
@@ -51,6 +52,8 @@ class TaskAdapterProtocol(Protocol):
     TASK_BY_TYPE_IDX: Any
     QUEUE_RATE_LIMITER: Any
     DLQ_MISSING_DATA: str
+    DAG_RUNS: str
+    DAG_RUN_TASKS: Any
 
     # -- write path ----------------------------------------------------------
     async def submit_task(self, task: Task) -> bool: ...
@@ -81,6 +84,11 @@ class TaskAdapterProtocol(Protocol):
     async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
     async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int: ...
     async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
+
+    # -- dag run index -------------------------------------------------------
+    async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]: ...
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None: ...
+    async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
 
     # -- lifecycle -----------------------------------------------------------
     async def ensure_index(self) -> None: ...
@@ -127,6 +135,8 @@ class _BaseTaskAdapter:
     TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     DLQ_MISSING_DATA = "dlq-missing-data"
+    DAG_RUNS = "dag-runs"
+    DAG_RUN_TASKS = "dag-run:{dag_run_id}:tasks".format
 
     # Atomically remove task_id from fan-in set and return remaining count.
     # Returns {removed=0, remaining=-1} if the ID was not a member (already
@@ -160,6 +170,51 @@ class _BaseTaskAdapter:
         assert task.submitted_at  # noqa: S101
         pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
         self.stage_save(pipe, task)
+        self.stage_register_dag_run(pipe, task)
+
+    def stage_register_dag_run(self, pipe: Pipeline, task: Task) -> None:
+        """
+        Stage DAG run index updates onto pipe if the task belongs to a DAG run.
+
+        Base implementation registers the dag_run_id in the global ``dag-runs``
+        sorted set (score = submitted_at, NX so the score always reflects the
+        first root task).  Subclasses may override to stage additional keys.
+        """
+        if task.dag_run_id is None or task.submitted_at is None:
+            return
+        score = task.submitted_at.timestamp()
+        pipe.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): score}, nx=True)
+
+    async def get_dag_runs(
+        self, pagination: DAGRunPagination
+    ) -> tuple[list[tuple[ULID, dt.datetime]], int]:
+        """Return a paginated list of DAG runs ordered by submission time (oldest first)."""
+        total: int = await self.data_store.zcard(self.DAG_RUNS)
+        raw: list[tuple[bytes, float]] = await self.data_store.zrange(
+            self.DAG_RUNS, pagination.offset, pagination.offset + pagination.limit - 1, withscores=True
+        )
+        return [
+            (ULID.from_bytes(dag_id_bytes), dt.datetime.fromtimestamp(score, dt.UTC))
+            for dag_id_bytes, score in raw
+        ], total
+
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
+        """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
+        raise NotImplementedError
+
+    async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
+        """
+        Remove DAG run index entries older than ``max_age``.
+
+        Uses the same threshold as ``clean_terminal_tasks`` so that a DAG run's
+        listing entry is pruned at the same time its task blobs are deleted.
+        Subclasses should call ``super()`` and then delete any adapter-specific
+        per-run keys.
+        """
+        cutoff = (now - max_age).timestamp()
+        stale: list[bytes] = await self.data_store.zrangebyscore(self.DAG_RUNS, "-inf", cutoff)
+        if stale:
+            await self.data_store.zrem(self.DAG_RUNS, *stale)
 
     def stage_save(self, pipe: Pipeline, task: Task) -> None:
         raise NotImplementedError

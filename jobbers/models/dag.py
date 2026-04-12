@@ -420,6 +420,13 @@ class TaskResult:
     parent_ids: list[ULID] = field(default_factory=list)
 
 
+class DAGRunPagination(BaseModel):
+    "Pagination details for DAG run listings."
+
+    limit: int = Field(default=50, gt=0, le=100)
+    offset: int = Field(default=0, ge=0)
+
+
 # Avoid circular import at module level – Task is only referenced inside methods.
 if TYPE_CHECKING:
     from jobbers.models.task import Task

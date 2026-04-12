@@ -55,10 +55,12 @@ class JsonTaskAdapter(_BaseTaskAdapter):
     # KEYS[1] = task-queues:{queue}
     # KEYS[2] = task:{task_id}
     # KEYS[3] = task-type-idx:{name}
+    # KEYS[4] = dag-runs
     # ARGV[1] = submitted_at timestamp
     # ARGV[2] = task_id bytes
     # ARGV[3] = '1' to SADD type index, '0' to SREM
     # ARGV[4] = JSON-encoded task blob
+    # ARGV[5] = dag_run_id bytes (empty string if task is not part of a DAG run)
     SUBMIT_SCRIPT = """
         local exists = redis.call('EXISTS', KEYS[2])
         if exists == 0 then
@@ -70,6 +72,9 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         else
             redis.call('SREM', KEYS[3], ARGV[2])
         end
+        if ARGV[5] ~= '' then
+            redis.call('ZADD', KEYS[4], 'NX', ARGV[1], ARGV[5])
+        end
         return 1
     """
 
@@ -78,12 +83,14 @@ class JsonTaskAdapter(_BaseTaskAdapter):
     # KEYS[2] = task-queues:{queue}
     # KEYS[3] = task:{task_id}
     # KEYS[4] = task-type-idx:{name}
+    # KEYS[5] = dag-runs
     # ARGV[1] = earliest_time
     # ARGV[2] = rate_numerator
     # ARGV[3] = submitted_at timestamp
     # ARGV[4] = task_id bytes
     # ARGV[5] = '1'/'0' for type index
     # ARGV[6] = JSON-encoded task blob
+    # ARGV[7] = dag_run_id bytes (empty string if task is not part of a DAG run)
     # Returns: 1 if enqueued, 0 if rate-limited
     SUBMIT_RATE_LIMITED_SCRIPT = """
         local enqueued = 0
@@ -107,6 +114,9 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         else
             redis.call('SREM', KEYS[4], ARGV[4])
         end
+        if enqueued == 1 and ARGV[7] ~= '' then
+            redis.call('ZADD', KEYS[5], 'NX', ARGV[3], ARGV[7])
+        end
         return enqueued
     """
 
@@ -123,18 +133,21 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
         assert task.submitted_at  # noqa: S101
         is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
         result: int = await cast(
             "Awaitable[int]",
             self.data_store.eval(
                 self.SUBMIT_SCRIPT,
-                3,
+                4,
                 self.TASKS_BY_QUEUE(queue=task.queue),
                 self.TASK_DETAILS(task_id=task.id),
                 self.TASK_BY_TYPE_IDX(name=task.name),
+                self.DAG_RUNS,
                 task.submitted_at.timestamp(),
                 bytes(task.id),
                 is_active,
                 self.pack(task),
+                dag_run_id_bytes,
             ),
         )
         return result == 1
@@ -145,21 +158,24 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         now = dt.datetime.now(dt.UTC)
         earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
         is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
         result: int = await cast(
             "Awaitable[int]",
             self.data_store.eval(
                 self.SUBMIT_RATE_LIMITED_SCRIPT,
-                4,
+                5,
                 self.QUEUE_RATE_LIMITER(queue=task.queue),
                 self.TASKS_BY_QUEUE(queue=task.queue),
                 self.TASK_DETAILS(task_id=task.id),
                 self.TASK_BY_TYPE_IDX(name=task.name),
+                self.DAG_RUNS,
                 earliest_time.timestamp(),
                 queue_config.rate_numerator or 0,
                 task.submitted_at.timestamp(),
                 bytes(task.id),
                 is_active,
                 self.pack(task),
+                dag_run_id_bytes,
             ),
         )
         return result == 1
@@ -212,17 +228,20 @@ class JsonTaskAdapter(_BaseTaskAdapter):
             IndexType,
         )
 
+        fields = [
+            TagField("$.name", as_name="name"),
+            TagField("$.queue", as_name="queue"),
+            TagField("$.status", as_name="status"),
+            TagField("$.dag_run_id", as_name="dag_run_id"),
+            NumericField("$.version", as_name="version"),
+            NumericField("$.submitted_at", as_name="submitted_at", sortable=True),
+        ]
+
         try:
             await self.data_store.ft(self.INDEX_NAME).info()  # type: ignore[no-untyped-call]
         except ResponseError:
             await self.data_store.ft(self.INDEX_NAME).create_index(
-                fields=[
-                    TagField("$.name", as_name="name"),
-                    TagField("$.queue", as_name="queue"),
-                    TagField("$.status", as_name="status"),
-                    NumericField("$.version", as_name="version"),
-                    NumericField("$.submitted_at", as_name="submitted_at", sortable=True),
-                ],
+                fields=fields,
                 definition=IndexDefinition(prefix=["task:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
             )
 
@@ -262,6 +281,24 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         else:  # default to sorting by ID (which is roughly creation time) if not sorting by submitted_at
             results.sort(key=lambda t: t.id)
         return results
+
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
+        """Return (submitted_at, task_ids) for a DAG run using the RediSearch index."""
+        from redis.commands.search.query import Query as SearchQuery
+
+        score: float | None = await self.data_store.zscore(self.DAG_RUNS, bytes(dag_run_id))
+        if score is None:
+            return None
+        submitted_at = dt.datetime.fromtimestamp(score, dt.UTC)
+
+        escaped = _escape_tag(str(dag_run_id))
+        q = SearchQuery(f"@dag_run_id:{{{escaped}}}").no_content().paging(0, 10000)
+        search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
+        task_ids = [
+            ULID.from_str(doc.id.removeprefix("task:"))
+            for doc in (search_results.docs or [])
+        ]
+        return submitted_at, task_ids
 
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete blobs, heartbeat entries, and type-index members for old terminal tasks."""

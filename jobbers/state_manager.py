@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.cron_dag_scheduler import ConcurrencyStager
-    from jobbers.models.dag import DAGNode
+    from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task
 
@@ -110,6 +110,7 @@ class StateManager:
 
         if completed_task_age:
             clean_ops.append(self.ta.clean_terminal_tasks(now, completed_task_age))
+            clean_ops.append(self.ta.clean_dag_runs(now, completed_task_age))
 
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
@@ -474,6 +475,14 @@ class StateManager:
             await self.submit_task(task)
             submitted.append(task)
         return submitted
+
+    async def list_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
+        """Return a paginated list of DAG runs ordered by submission time."""
+        return await self.ta.get_dag_runs(pagination)
+
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
+        """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
+        return await self.ta.get_dag_run(dag_run_id)
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
