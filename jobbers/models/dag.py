@@ -323,7 +323,7 @@ class DAGNode:
                 )
         return callbacks
 
-    def to_task(self, *, parent_id: ULID | None = None) -> Task:
+    def to_task(self, *, parent_id: ULID | None = None, dag_run_id: ULID | None = None) -> Task:
         """Return a `Task` for this node ready for submission."""
         from jobbers.models.task import Task
 
@@ -335,6 +335,7 @@ class DAGNode:
             parameters=self._parameters,
             dag_callbacks=self._callbacks_recursive(),
             parent_ids=[parent_id] if parent_id is not None else [],
+            dag_run_id=dag_run_id,
         )
 
     def fan_in_predecessors(self) -> dict[str, set[ULID]]:

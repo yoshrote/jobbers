@@ -54,6 +54,10 @@ class Task(BaseModel):
     inject_parent_results: bool = False
     # Set on cron-dispatched root tasks so the worker can clear the active-run key on completion.
     cron_id: ULID | None = Field(default=None)
+    # Shared across every task in a DAG run; None for standalone tasks.
+    # Generated once at submission time (submit_dag / dispatch_cron_dag) and propagated to all
+    # descendants via generate_callbacks, generate_error_callbacks, and _handle_dynamic_fanout.
+    dag_run_id: ULID | None = Field(default=None)
 
     @field_serializer("id", when_used="json")
     def serialize_id(self, value: ULID) -> str:
@@ -127,6 +131,7 @@ class Task(BaseModel):
                         parameters=spec.parameters,
                         dag_callbacks=spec.dag_callbacks,
                         parent_ids=[self.id],
+                        dag_run_id=self.dag_run_id,
                     )
                 )
         return results
@@ -161,6 +166,7 @@ class Task(BaseModel):
                             dag_callbacks=spec.dag_callbacks,
                             parent_ids=[self.id],
                             inject_parent_results=cb.inject_parent_results,
+                            dag_run_id=self.dag_run_id,
                         )
                     )
                 case FanInCallback():
@@ -177,6 +183,7 @@ class Task(BaseModel):
                                 dag_callbacks=spec.dag_callbacks,
                                 parent_ids=member_ids,
                                 inject_parent_results=cb.inject_parent_results,
+                                dag_run_id=self.dag_run_id,
                             )
                         )
                     elif remaining == -1:
@@ -264,6 +271,7 @@ class Task(BaseModel):
             "parent_ids": [str(pid) for pid in self.parent_ids],
             "inject_parent_results": self.inject_parent_results,
             "cron_id": str(self.cron_id) if self.cron_id is not None else None,
+            "dag_run_id": str(self.dag_run_id) if self.dag_run_id is not None else None,
         }
 
     @classmethod
@@ -292,6 +300,7 @@ class Task(BaseModel):
             parent_ids=[ULID.from_str(pid) for pid in raw.get("parent_ids") or []],
             inject_parent_results=raw.get("inject_parent_results", False),
             cron_id=ULID.from_str(raw["cron_id"]) if raw.get("cron_id") else None,
+            dag_run_id=ULID.from_str(raw["dag_run_id"]) if raw.get("dag_run_id") else None,
         )
 
     def set_status(self, status: TaskStatus) -> None:

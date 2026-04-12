@@ -757,14 +757,18 @@ async def test_process_does_not_overwrite_cancelled_status_on_system_cancel():
 @pytest.mark.asyncio
 async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     """Normal fan-out: children are submitted atomically via pipeline and collector is pre-saved."""
+    from ulid import ULID
+
     from jobbers.models.dag import DAGNode, DynamicFanOut
 
+    dag_run_id = ULID()
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="dispatcher",
         version=1,
         status=TaskStatus.COMPLETED,
         queue="default",
+        dag_run_id=dag_run_id,
     )
     c1 = DAGNode("worker_a")
     c2 = DAGNode("worker_b")
@@ -808,19 +812,25 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     for ct in staged_tasks:
         assert ct.parent_ids == [parent.id]
         assert ct.status == TaskStatus.SUBMITTED
+        assert ct.dag_run_id == dag_run_id
+    assert saved_task.dag_run_id == dag_run_id
 
 
 @pytest.mark.asyncio
 async def test_handle_dynamic_fanout_no_children_submits_collector_immediately():
     """Degenerate fan-out with no children submits the collector directly."""
+    from ulid import ULID
+
     from jobbers.models.dag import DAGNode, DynamicFanOut
 
+    dag_run_id = ULID()
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="dispatcher",
         version=1,
         status=TaskStatus.COMPLETED,
         queue="default",
+        dag_run_id=dag_run_id,
     )
     collector = DAGNode("aggregator")
     fanout = DynamicFanOut(children=[], collector=collector)
@@ -837,6 +847,7 @@ async def test_handle_dynamic_fanout_no_children_submits_collector_immediately()
     state_manager.submit_task.assert_awaited_once()
     submitted = state_manager.submit_task.call_args[0][0]
     assert submitted.id == collector.id
+    assert submitted.dag_run_id == dag_run_id
 
 
 @pytest.mark.asyncio

@@ -181,15 +181,16 @@ class TaskProcessor:
 
         if not fanout.children:
             # Degenerate case: no children — submit the collector immediately.
-            await self.state_manager.submit_task(fanout.collector.to_task())
+            solo = fanout.collector.to_task(dag_run_id=parent.dag_run_id)
+            await self.state_manager.submit_task(solo)
             return
 
         fan_in_key = f"dag:fan-in:{fanout.collector.id}"
         DAGNode.merge(*fanout.children, into=fanout.collector)
 
         child_ids = {child.id for child in fanout.children}
-        child_tasks = [child.to_task(parent_id=parent.id) for child in fanout.children]
-        collector_task = fanout.collector.to_task()
+        child_tasks = [child.to_task(parent_id=parent.id, dag_run_id=parent.dag_run_id) for child in fanout.children]
+        collector_task = fanout.collector.to_task(dag_run_id=parent.dag_run_id)
         collector_task.parent_ids = list(child_ids)
 
         await self.state_manager.init_fan_in(fan_in_key, child_ids, ttl=fanout.fan_in_ttl)

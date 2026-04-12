@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
 from redis.exceptions import WatchError
+from ulid import ULID
 
 from jobbers import registry
 from jobbers.adapters.json_redis import JsonTaskAdapter
@@ -24,7 +25,6 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-    from ulid import ULID
 
     from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
     from jobbers.models.cron_dag import CronDAGEntry
@@ -319,6 +319,7 @@ class StateManager:
                 parameters=fresh_spec.parameters,
                 dag_callbacks=fresh_spec.dag_callbacks,
                 cron_id=entry.id,
+                dag_run_id=ULID(),
             )
 
             is_rate_limited = bool(
@@ -466,9 +467,10 @@ class StateManager:
 
         await asyncio.gather(*(self.init_fan_in(k, ids) for k, ids in all_fan_ins.items()))
 
+        dag_run_id = ULID()
         submitted: list[Task] = []
         for root in roots:
-            task = root.to_task()
+            task = root.to_task(dag_run_id=dag_run_id)
             await self.submit_task(task)
             submitted.append(task)
         return submitted

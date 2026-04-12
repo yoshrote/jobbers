@@ -717,6 +717,26 @@ async def test_submit_dag_simple_chain(state_manager):
     assert len(submitted) == 1
     assert submitted[0].id == root.id
     assert submitted[0].status == TaskStatus.SUBMITTED
+    assert submitted[0].dag_run_id is not None
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_multi_root_shares_dag_run_id(state_manager):
+    """All roots submitted in the same submit_dag call share a single dag_run_id."""
+    from jobbers.models.dag import DAGNode
+
+    branch_a = DAGNode("branch_a")
+    branch_b = DAGNode("branch_b")
+    collector = DAGNode("collect")
+    DAGNode.merge(branch_a, branch_b, into=collector)
+
+    state_manager.init_fan_in = AsyncMock()
+
+    submitted = await state_manager.submit_dag(branch_a, branch_b)
+
+    assert len(submitted) == 2
+    assert submitted[0].dag_run_id is not None
+    assert submitted[0].dag_run_id == submitted[1].dag_run_id
 
 
 @pytest.mark.asyncio
