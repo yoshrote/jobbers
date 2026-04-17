@@ -239,3 +239,19 @@ export const updateCronDag = (cronId, body) => put(`/cron-dags/${cronId}`, body)
  * @param {string} cronId
  */
 export const deleteCronDag = (cronId) => del(`/cron-dags/${cronId}`)
+
+// ── DAG run inspection ─────────────────────────────────────────────────────────
+
+/**
+ * GET /dags
+ * @param {{ limit?: number, offset?: number }} [params]
+ * @returns {{ total: number, dags: { dag_run_id: string, submitted_at: string }[] }}
+ */
+export const listDags = (params) => get('/dags', params)
+
+/**
+ * GET /dags/{dag_run_id}
+ * @param {string} dagRunId
+ * @returns {{ dag_run_id: string, submitted_at: string, task_ids: string[] }}
+ */
+export const getDag = (dagRunId) => get(`/dags/${dagRunId}`)
