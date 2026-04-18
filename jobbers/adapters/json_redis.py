@@ -221,14 +221,14 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         return self.unpack(task_id, raw_data)
 
     async def ensure_index(self) -> None:
-        """Create the RediSearch index on task JSON documents if it does not exist."""
+        """Create the RediSearch index, or add any missing fields to an existing one."""
         from redis.commands.search.field import NumericField, TagField
         from redis.commands.search.index_definition import (
             IndexDefinition,
             IndexType,
         )
 
-        fields = [
+        desired_fields = [
             TagField("$.name", as_name="name"),
             TagField("$.queue", as_name="queue"),
             TagField("$.status", as_name="status"),
@@ -236,14 +236,24 @@ class JsonTaskAdapter(_BaseTaskAdapter):
             NumericField("$.version", as_name="version"),
             NumericField("$.submitted_at", as_name="submitted_at", sortable=True),
         ]
-
         try:
             await self.data_store.ft(self.INDEX_NAME).info()  # type: ignore[no-untyped-call]
         except ResponseError:
+            # Index does not exist — create it fresh.
             await self.data_store.ft(self.INDEX_NAME).create_index(
-                fields=fields,
+                fields=desired_fields,
                 definition=IndexDefinition(prefix=["task:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
             )
+            return
+
+        # Index exists — add any fields the live schema is missing.
+        # Try each field individually; RediSearch returns ResponseError for duplicates.
+        for field in desired_fields:
+            try:
+                await self.data_store.ft(self.INDEX_NAME).alter_schema_add([field])  # type: ignore[no-untyped-call]
+            except ResponseError as e:
+                if "duplicate" not in str(e).lower():
+                    raise
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Query tasks via the RediSearch index with optional filters."""
