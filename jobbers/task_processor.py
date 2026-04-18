@@ -141,6 +141,7 @@ class TaskProcessor:
 
     def mark_task_as_started(self, task: Task) -> None:
         task.set_status(TaskStatus.STARTED)
+        logger.info("Task %s started (attempt %d).", task.id, task.retry_attempt + 1)
 
     async def post_process(self, task: Task, dynamic_fanout: DynamicFanOut | None = None) -> None:
         if dynamic_fanout is not None:

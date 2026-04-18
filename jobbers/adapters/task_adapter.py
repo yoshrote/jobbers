@@ -362,6 +362,7 @@ class _BaseTaskAdapter:
         task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
         pop_result = await self.data_store.bzpopmin(task_queues, timeout=pop_timeout)
         while pop_result:
+            logger.debug("Popped task %s from %s", pop_result[1], pop_result[0])
             task = await self.get_task(ULID.from_bytes(pop_result[1]))
             if task:
                 return task

@@ -230,6 +230,7 @@ class StateManager:
             self.task_scheduler.stage_remove(pipe, task.id, task.queue)
             try:
                 await pipe.execute()
+                logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
                 return task
             except WatchError:
                 continue
