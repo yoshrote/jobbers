@@ -1123,6 +1123,114 @@ async def test_failed_task_triggers_error_callback():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "retry_attempt, backoff, base, expected_delay_seconds",
+    [
+        # EXPONENTIAL: delay = base * 2^attempt (pre-increment)
+        # Bug produced base * 2^(attempt+1), doubling the intended delay.
+        (0, BackoffStrategy.EXPONENTIAL, 60, 60.0),   # bug gave 120s
+        (1, BackoffStrategy.EXPONENTIAL, 60, 120.0),  # bug gave 240s
+        # LINEAR: delay = base * attempt (pre-increment)
+        # Bug produced base * (attempt+1), adding one extra step.
+        (1, BackoffStrategy.LINEAR, 30, 30.0),         # bug gave 60s
+        (2, BackoffStrategy.LINEAR, 30, 60.0),         # bug gave 90s
+    ],
+)
+async def test_scheduled_retry_delay_uses_pre_increment_attempt(
+    retry_attempt: int,
+    backoff: BackoffStrategy,
+    base: int,
+    expected_delay_seconds: float,
+) -> None:
+    """
+    schedule_retry_task must receive a run_at derived from compute_retry_at(retry_attempt)
+    — the value *before* set_status(SCHEDULED) increments it.
+
+    Regression: set_status(SCHEDULED) used to run before compute_retry_at, so the
+    first retry would use attempt=1 instead of attempt=0, making every delay one
+    step higher on the backoff curve than configured.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=retry_attempt,
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        max_retries=retry_attempt + 2,  # always has retries remaining
+        retry_delay=base,
+        backoff_strategy=backoff,
+        expected_exceptions=(ValueError,),
+    )
+
+    before = dt.datetime.now(dt.UTC)
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        await TaskProcessor(state_manager).process(task)
+
+    state_manager.schedule_retry_task.assert_called_once()
+    _, run_at = state_manager.schedule_retry_task.call_args[0]
+    actual_delay = (run_at - before).total_seconds()
+    assert abs(actual_delay - expected_delay_seconds) < 1.0, (
+        f"Expected delay ≈ {expected_delay_seconds}s, got {actual_delay:.1f}s. "
+        "compute_retry_at may have been called with the post-increment retry_attempt."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "retry_attempt, backoff, base, expected_delay_seconds",
+    [
+        (0, BackoffStrategy.EXPONENTIAL, 60, 60.0),
+        (1, BackoffStrategy.EXPONENTIAL, 60, 120.0),
+    ],
+)
+async def test_timeout_retry_delay_uses_pre_increment_attempt(
+    retry_attempt: int,
+    backoff: BackoffStrategy,
+    base: int,
+    expected_delay_seconds: float,
+) -> None:
+    """Same regression check for the timeout path in handle_timeout_exception."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=retry_attempt,
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(side_effect=asyncio.TimeoutError)
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=1,
+        max_retries=retry_attempt + 2,
+        retry_delay=base,
+        backoff_strategy=backoff,
+    )
+
+    before = dt.datetime.now(dt.UTC)
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        await TaskProcessor(state_manager).process(task)
+
+    state_manager.schedule_retry_task.assert_called_once()
+    _, run_at = state_manager.schedule_retry_task.call_args[0]
+    actual_delay = (run_at - before).total_seconds()
+    assert abs(actual_delay - expected_delay_seconds) < 1.0, (
+        f"Expected delay ≈ {expected_delay_seconds}s, got {actual_delay:.1f}s. "
+        "compute_retry_at may have been called with the post-increment retry_attempt."
+    )
+
+
+@pytest.mark.asyncio
 async def test_retried_task_does_not_trigger_error_callback():
     """A task being retried (SCHEDULED) does not fire error callbacks."""
     from jobbers.models.dag import DAGTaskSpec, SimpleCallback

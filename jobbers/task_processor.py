@@ -251,8 +251,8 @@ class TaskProcessor:
 
         tasks_retried.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         if task.should_schedule():
-            task.set_status(TaskStatus.SCHEDULED)
             run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
+            task.set_status(TaskStatus.SCHEDULED)
             return await self.state_manager.schedule_retry_task(task, run_at)
         else:
             task.set_status(TaskStatus.UNSUBMITTED)
@@ -273,8 +273,8 @@ class TaskProcessor:
 
         tasks_retried.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         if task.should_schedule():
-            task.set_status(TaskStatus.SCHEDULED)
             run_at = task.task_config.compute_retry_at(task.retry_attempt)  # type: ignore[union-attr]
+            task.set_status(TaskStatus.SCHEDULED)
             return await self.state_manager.schedule_retry_task(task, run_at)
         else:
             task.set_status(TaskStatus.UNSUBMITTED)
