@@ -267,7 +267,7 @@ class Task(BaseModel):
             "started_at": _ts(self.started_at),
             "heartbeat_at": _ts(self.heartbeat_at),
             "completed_at": _ts(self.completed_at),
-            "dag_callbacks": [cb.model_dump() for cb in self.dag_callbacks],
+            "dag_callbacks": [cb.model_dump(mode="json") for cb in self.dag_callbacks],
             "parent_ids": [str(pid) for pid in self.parent_ids],
             "inject_parent_results": self.inject_parent_results,
             "cron_id": str(self.cron_id) if self.cron_id is not None else None,

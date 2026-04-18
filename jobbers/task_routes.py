@@ -447,13 +447,23 @@ async def submit_dag(request: SubmitDAGRequest) -> dict[str, Any]:
     except MermaidParseError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    for root in roots:
-        name = root._name
-        if not registry.get_task_config(name, 0):
+    # Walk all reachable nodes (not just roots) and validate each against the registry.
+    visited: set[int] = set()
+    worklist: list[Any] = list(roots)
+    while worklist:
+        node = worklist.pop()
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        if not registry.get_task_config(node._name, node._version):
             raise HTTPException(
                 status_code=400,
-                detail=f"Unknown task name '{name}'. Register it with @register_task before submitting.",
+                detail=f"Unknown task '{node._name}@{node._version}'. Register it with @register_task before submitting.",
             )
+        for successor, _, error_node, _ in node._successors:
+            worklist.append(successor)
+            if error_node is not None:
+                worklist.append(error_node)
 
     sm = db.get_state_manager()
     submitted = await sm.submit_dag(*roots)
