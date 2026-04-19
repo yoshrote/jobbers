@@ -32,17 +32,21 @@ dispatch_latency = meter.create_histogram(
 )
 
 
-async def main(poll_interval: float, role: str, batch_size: int) -> None:
+async def main(poll_interval: float, config_interval: dt.timedelta, role: str, batch_size: int) -> None:
     state_manager: StateManager = await db.init_state_manager()
-    queues: list[str] = list(await state_manager.qca.get_queues(role))
     logger.info("Scheduler starting; poll_interval=%.1fs batch_size=%d", poll_interval, batch_size)
+    queues: list[str] = []
+    queues_fetched_at: dt.datetime = dt.datetime.min.replace(tzinfo=dt.UTC)
     while True:
+        now = dt.datetime.now(dt.UTC)
+        if now - queues_fetched_at >= config_interval:
+            queues = list(await state_manager.qca.get_queues(role))
+            queues_fetched_at = now
         task_entries, cron_entries = await asyncio.gather(
-            state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues),
+            state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues if queues else None),
             state_manager.cron_dag_scheduler.next_due_bulk(batch_size),
         )
 
-        now = dt.datetime.now(dt.UTC)
         work_done = False
 
         if task_entries:
@@ -94,5 +98,6 @@ def run() -> None:
     poll_interval = float(os.environ.get("SCHEDULER_POLL_INTERVAL", "5.0"))
     batch_size = int(os.environ.get("SCHEDULER_BATCH_SIZE", "1"))
     role = os.environ.get("SCHEDULER_ROLE", "default")
+    config_interval = dt.timedelta(minutes=int(os.environ.get("SCHEDULFER_CONFIG_REFRESH_INTERVAL", "3")))
 
-    asyncio.run(main(poll_interval, role, batch_size))
+    asyncio.run(main(poll_interval, config_interval, role, batch_size))
