@@ -459,19 +459,6 @@ async def test_cancel_started_task_publishes_message(state_manager):
         await asyncio.wait_for(monitor, timeout=1.0)
 
 
-@pytest.mark.asyncio
-async def test_cancel_heartbeat_task_publishes_message(state_manager):
-    """Cancelling a HEARTBEAT task also publishes a cancel message."""
-    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.HEARTBEAT)
-    await state_manager.ta.save_task(task)
-
-    monitor = asyncio.create_task(state_manager.monitor_task_cancellation(ULID1))
-    await asyncio.sleep(0.05)
-    await state_manager.request_task_cancellation(ULID1)
-
-    with pytest.raises(UserCancellationError):
-        await asyncio.wait_for(monitor, timeout=1.0)
-
 
 @pytest.mark.asyncio
 async def test_cancel_terminal_task_raises(state_manager):

@@ -115,7 +115,7 @@ class StateManager:
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
             async for task in self.ta.get_stale_tasks({q.decode() for q in queues}, stale_time):
-                if task.status not in {TaskStatus.STARTED, TaskStatus.HEARTBEAT}:
+                if task.status != TaskStatus.STARTED:
                     continue
                 stale_tasks_by_type[(task.name, task.version)].append(task)
 
@@ -263,7 +263,6 @@ class StateManager:
                 if active_task is not None and active_task.status in {
                     TaskStatus.SUBMITTED,
                     TaskStatus.STARTED,
-                    TaskStatus.HEARTBEAT,
                 }:
                     logger.info(
                         "Cron entry %s skipped: previous run %s still active (%s).",
@@ -373,7 +372,7 @@ class StateManager:
                 self.ta.stage_remove_from_queue(pipe, task)
                 self.ta.stage_save(pipe, task)
                 await pipe.execute()
-            case TaskStatus.STARTED | TaskStatus.HEARTBEAT:
+            case TaskStatus.STARTED:
                 await self.job_store.publish(f"task_cancel_{task_id}", "cancel")
             case _:
                 raise TaskException(f"Task has status '{task.status}' and cannot be cancelled.")

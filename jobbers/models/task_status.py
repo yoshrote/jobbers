@@ -7,7 +7,6 @@ class TaskStatus(StrEnum):
     UNSUBMITTED = "unsubmitted"
     SUBMITTED = "submitted"
     STARTED = "started"
-    HEARTBEAT = "heartbeat"
     COMPLETED = "completed"
     CANCELLED = "cancelled"  # cancelled by the user
     STALLED = "stalled"  # cancelled by the system
@@ -26,4 +25,4 @@ class TaskStatus(StrEnum):
 
     @classmethod
     def active_statuses(cls) -> set["TaskStatus"]:
-        return {cls.SUBMITTED, cls.STARTED, cls.HEARTBEAT, cls.SCHEDULED}
+        return {cls.SUBMITTED, cls.STARTED, cls.SCHEDULED}

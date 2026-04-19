@@ -8,7 +8,6 @@ def test_all_values() -> None:
         TaskStatus.UNSUBMITTED,
         TaskStatus.SUBMITTED,
         TaskStatus.STARTED,
-        TaskStatus.HEARTBEAT,
         TaskStatus.COMPLETED,
         TaskStatus.CANCELLED,
         TaskStatus.STALLED,

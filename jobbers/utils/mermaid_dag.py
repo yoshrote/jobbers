@@ -173,7 +173,6 @@ _STATUS_CLASS: dict[TaskStatus, str] = {
     TaskStatus.SUBMITTED: "pending",
     TaskStatus.SCHEDULED: "pending",
     TaskStatus.STARTED: "running",
-    TaskStatus.HEARTBEAT: "running",
     TaskStatus.COMPLETED: "completed",
     TaskStatus.FAILED: "failed",
     TaskStatus.DROPPED: "failed",
