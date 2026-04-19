@@ -119,12 +119,11 @@ class TaskProcessor:
         if task.status == TaskStatus.COMPLETED:
             await self.post_process(task, dynamic_fanout)
         else:
-            if task.status in (
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-                TaskStatus.STALLED,
-                TaskStatus.DROPPED,
-            ):
+            # Only FAILED triggers error callbacks. CANCELLED means the user
+            # deliberately stopped the task; STALLED and DROPPED are system-level
+            # outcomes where the task function never ran to completion — firing an
+            # error callback would be surprising and is intentionally not supported.
+            if task.status == TaskStatus.FAILED:
                 await self.post_process_error(task)
             if ex is not None:
                 raise ex

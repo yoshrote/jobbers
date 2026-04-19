@@ -1123,6 +1123,70 @@ async def test_failed_task_triggers_error_callback():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trigger_status", ["stalled", "cancelled", "dropped"])
+async def test_non_failed_terminal_statuses_do_not_trigger_error_callback(trigger_status):
+    """
+    STALLED, CANCELLED, and DROPPED tasks must not fire error callbacks.
+
+    Only FAILED represents a task that ran and produced an actionable error.
+    The other terminal statuses are control-flow outcomes (user stopped it,
+    system stopped it, or it was never registered) where firing an error
+    callback would be surprising and is explicitly not supported.
+    """
+    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
+
+    error_spec = DAGTaskSpec(name="error_handler")
+    child_spec = DAGTaskSpec(name="child")
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
+    )
+    state_manager = _make_state_manager()
+    state_manager.stage_submit_task = MagicMock()
+
+    if trigger_status == "stalled":
+        # CancelledError from the system with STOP policy → STALLED
+        task_function = AsyncMock(side_effect=asyncio.CancelledError)
+        task_config = TaskConfig(
+            name="test_task",
+            version=1,
+            function=task_function,
+            timeout=10,
+            on_shutdown=TaskShutdownPolicy.STOP,
+        )
+        with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+            processor = TaskProcessor(state_manager)
+            with contextlib.suppress(asyncio.CancelledError):
+                await processor.process(task)
+        assert task.status == TaskStatus.STALLED
+    elif trigger_status == "cancelled":
+        # Simulate user cancellation: the cancellation monitor sets status to
+        # CANCELLED before CancelledError reaches the process() handler.
+        async def user_cancelled_fn(**_):
+            task.set_status(TaskStatus.CANCELLED)
+            raise asyncio.CancelledError
+
+        task_config = TaskConfig(name="test_task", version=1, function=user_cancelled_fn, timeout=10)
+        with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+            processor = TaskProcessor(state_manager)
+            with contextlib.suppress(asyncio.CancelledError):
+                await processor.process(task)
+        assert task.status == TaskStatus.CANCELLED
+    else:
+        # Unknown task type → DROPPED
+        with patch("jobbers.task_processor.get_task_config", return_value=None):
+            processor = TaskProcessor(state_manager)
+            await processor.process(task)
+        assert task.status == TaskStatus.DROPPED
+
+    state_manager.stage_submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "retry_attempt, backoff, base, expected_delay_seconds",
     [
