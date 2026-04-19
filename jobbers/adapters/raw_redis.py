@@ -405,31 +405,33 @@ class DeadQueue:
         limit: int = 100,
     ) -> list[Task]:
         """Fetch DLQ entries matching the given filter criteria."""
-        if queue is not None and task_name is not None:
-            raw_ids: set[bytes] = await cast(
-                "Awaitable[set[bytes]]",
-                self.data_store.sinter([self.DLQ_QUEUE(queue=queue), self.DLQ_NAME(name=task_name)]),
-            )
-        elif queue is not None:
-            raw_ids = await cast(
-                "Awaitable[set[bytes]]",
-                self.data_store.smembers(self.DLQ_QUEUE(queue=queue)),
-            )
-        elif task_name is not None:
-            raw_ids = await cast(
-                "Awaitable[set[bytes]]",
-                self.data_store.smembers(self.DLQ_NAME(name=task_name)),
+        if queue is None and task_name is None:
+            # No filter: use zrevrange so results are ordered newest-first.
+            id_bytes: list[bytes] = await cast(
+                "Awaitable[list[bytes]]",
+                self.data_store.zrevrange(self.DLQ, 0, -1),
             )
         else:
-            raw_ids = set(
-                await cast(
-                    "Awaitable[list[bytes]]",
-                    self.data_store.zrange(self.DLQ, 0, -1),
+            raw_ids: set[bytes]
+            if queue is not None and task_name is not None:
+                raw_ids = await cast(
+                    "Awaitable[set[bytes]]",
+                    self.data_store.sinter([self.DLQ_QUEUE(queue=queue), self.DLQ_NAME(name=task_name)]),
                 )
-            )
-        if not raw_ids:
+            elif queue is not None:
+                raw_ids = await cast(
+                    "Awaitable[set[bytes]]",
+                    self.data_store.smembers(self.DLQ_QUEUE(queue=queue)),
+                )
+            else:
+                raw_ids = await cast(
+                    "Awaitable[set[bytes]]",
+                    self.data_store.smembers(self.DLQ_NAME(name=task_name)),
+                )
+            id_bytes = list(raw_ids)
+        if not id_bytes:
             return []
-        ulid_list = [ULID.from_bytes(b) for b in raw_ids]
+        ulid_list = [ULID.from_bytes(b) for b in id_bytes]
         fetched: list[Task | None] = await self.ta.get_tasks_bulk(ulid_list)
         results: list[Task] = []
         for task in fetched:

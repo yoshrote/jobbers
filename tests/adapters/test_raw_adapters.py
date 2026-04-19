@@ -189,25 +189,3 @@ async def test_clean_handles_missing_meta(raw_dead_queue):
     score = await raw_dead_queue.data_store.zscore(raw_dead_queue.DLQ, bytes(task.id))
     assert score is None
 
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DeadQueue uses zrange (ascending score) with no server-side sort option; "
-        "results are returned earliest-first, not most-recent-first. "
-        "Remove this xfail if DeadQueue gains sorted get_by_filter support."
-    ),
-)
-@pytest.mark.asyncio
-async def test_get_by_filter_sorted_by_failed_at_desc(raw_dead_queue, dummy_task_adapter):
-    """Tripwire: DeadQueue does not sort get_by_filter results by failed_at descending."""
-    t1 = make_task(task_id=ULID1, status=TaskStatus.FAILED)
-    t2 = make_task(task_id=ULID2, status=TaskStatus.FAILED)
-    await dummy_task_adapter.save_task(t1)
-    await dummy_task_adapter.save_task(t2)
-    await add_to_dlq(raw_dead_queue, t1, EARLIER)
-    await add_to_dlq(raw_dead_queue, t2, LATER)
-
-    results = await raw_dead_queue.get_by_filter()
-    assert len(results) == 2
-    assert results[0].id == t2.id  # LATER first — correct protocol behaviour, not what DeadQueue returns
