@@ -53,7 +53,7 @@ fetch_data(limit=100, ids=~WzEsMiwzXQ==, config=~eyJyZXRyaWVzIjozfQ==)
 | Arrow | Meaning |
 | ----- | ------- |
 | `-->` | **Success callback** — fires when the source task completes successfully. Automatically promoted to a `FanInCallback` when the destination has ≥ 2 incoming `-->` edges. |
-| `-.->` | **Error callback** — fires when the source fails *permanently* (`FAILED`, `CANCELLED`, `STALLED`, `DROPPED`). Tasks that are still retrying do **not** trigger this. Each source node may have **at most one** `-.->` target. Diagrams with more than one `-.->` from the same source are rejected with a parse error. |
+| `-.->` | **Error callback** — fires only when the source reaches `FAILED` status (retries exhausted or unexpected exception). `CANCELLED`, `STALLED`, and `DROPPED` outcomes do **not** trigger this, nor do tasks that are still retrying. Each source node may have **at most one** `-.->` target. Diagrams with more than one `-.->` from the same source are rejected with a parse error. |
 
 ---
 

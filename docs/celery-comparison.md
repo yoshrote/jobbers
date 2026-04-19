@@ -291,7 +291,7 @@ extract.then(transform, on_error=err)
 DAGNode.merge(branch_a, branch_b, into=collector, on_error=err)
 ```
 
-Error callbacks fire for any permanent failure status (`FAILED`, `CANCELLED`, `STALLED`, `DROPPED`) and are skipped while a task is still being retried.
+Error callbacks fire only when a task reaches `FAILED` status (retries exhausted or an unexpected exception). Tasks that end in `CANCELLED`, `STALLED`, or `DROPPED` do **not** trigger error callbacks, and neither do tasks that are still being retried.
 
 **Key differences from Celery canvas:**
 
