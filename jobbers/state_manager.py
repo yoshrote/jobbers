@@ -444,7 +444,9 @@ class StateManager:
         pipe = self.job_store.pipeline(transaction=True)
         self.cron_dag_scheduler.stage_add(pipe, entry, first_run_at)
         await pipe.execute()
-        logger.info("Cron DAG entry '%s' (%s) registered, first run at %s.", entry.name, entry.id, first_run_at)
+        logger.info(
+            "Cron DAG entry '%s' (%s) registered, first run at %s.", entry.name, entry.id, first_run_at
+        )
 
     async def remove_cron_dag(self, cron_id: ULID) -> None:
         """Remove a cron DAG entry from the schedule."""
@@ -528,7 +530,7 @@ class SubmissionRateLimiter:
         queues_to_use = set()
         queues = list(task_queues)
         configs = await asyncio.gather(*(self.qca.get_queue_config(queue=q) for q in queues))
-        for queue, config in zip(queues, configs):
+        for queue, config in zip(queues, configs, strict=True):
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
                     queues_to_use.add(queue)

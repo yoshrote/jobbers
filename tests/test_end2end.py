@@ -117,9 +117,12 @@ async def test_linear_chain(sm: StateManager) -> None:
     task_b = await sm.ta.get_task(b_node.id)
     task_c = await sm.ta.get_task(c_node.id)
 
-    assert task_a is not None and task_a.status == TaskStatus.COMPLETED
-    assert task_b is not None and task_b.status == TaskStatus.COMPLETED
-    assert task_c is not None and task_c.status == TaskStatus.COMPLETED
+    assert task_a is not None
+    assert task_a.status == TaskStatus.COMPLETED
+    assert task_b is not None
+    assert task_b.status == TaskStatus.COMPLETED
+    assert task_c is not None
+    assert task_c.status == TaskStatus.COMPLETED
 
     assert task_a.results == {"value": "a"}
     assert task_b.results == {"value": "b"}
@@ -156,10 +159,14 @@ async def test_diamond_fan_out_fan_in(sm: StateManager) -> None:
     task_c = await sm.ta.get_task(c_node.id)
     task_d = await sm.ta.get_task(d_node.id)
 
-    assert task_a is not None and task_a.status == TaskStatus.COMPLETED
-    assert task_b is not None and task_b.status == TaskStatus.COMPLETED
-    assert task_c is not None and task_c.status == TaskStatus.COMPLETED
-    assert task_d is not None and task_d.status == TaskStatus.COMPLETED
+    assert task_a is not None
+    assert task_a.status == TaskStatus.COMPLETED
+    assert task_b is not None
+    assert task_b.status == TaskStatus.COMPLETED
+    assert task_c is not None
+    assert task_c.status == TaskStatus.COMPLETED
+    assert task_d is not None
+    assert task_d.status == TaskStatus.COMPLETED
 
     assert task_a.results == {"value": "a"}
     assert task_b.results == {"value": "b"}
@@ -225,7 +232,8 @@ async def test_downstream_not_submitted_on_parent_failure(sm: StateManager) -> N
     task_a = await sm.ta.get_task(a_node.id)
     task_b = await sm.ta.get_task(b_node.id)
 
-    assert task_a is not None and task_a.status == TaskStatus.FAILED
+    assert task_a is not None
+    assert task_a.status == TaskStatus.FAILED
     assert task_b is None  # B was never submitted
 
 
@@ -249,8 +257,10 @@ async def test_multi_root_dag(sm: StateManager) -> None:
     task_a = await sm.ta.get_task(a_root.id)
     task_b = await sm.ta.get_task(b_root.id)
 
-    assert task_a is not None and task_a.status == TaskStatus.COMPLETED
-    assert task_b is not None and task_b.status == TaskStatus.COMPLETED
+    assert task_a is not None
+    assert task_a.status == TaskStatus.COMPLETED
+    assert task_b is not None
+    assert task_b.status == TaskStatus.COMPLETED
     assert task_a.results == {"value": "a"}
     assert task_b.results == {"value": "b"}
     assert task_a.dag_run_id == task_b.dag_run_id

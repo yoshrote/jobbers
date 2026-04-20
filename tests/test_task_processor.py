@@ -1188,16 +1188,16 @@ async def test_non_failed_terminal_statuses_do_not_trigger_error_callback(trigge
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "retry_attempt, backoff, base, expected_delay_seconds",
+    ("retry_attempt", "backoff", "base", "expected_delay_seconds"),
     [
         # EXPONENTIAL: delay = base * 2^attempt (pre-increment)
         # Bug produced base * 2^(attempt+1), doubling the intended delay.
-        (0, BackoffStrategy.EXPONENTIAL, 60, 60.0),   # bug gave 120s
+        (0, BackoffStrategy.EXPONENTIAL, 60, 60.0),  # bug gave 120s
         (1, BackoffStrategy.EXPONENTIAL, 60, 120.0),  # bug gave 240s
         # LINEAR: delay = base * attempt (pre-increment)
         # Bug produced base * (attempt+1), adding one extra step.
-        (1, BackoffStrategy.LINEAR, 30, 30.0),         # bug gave 60s
-        (2, BackoffStrategy.LINEAR, 30, 60.0),         # bug gave 90s
+        (1, BackoffStrategy.LINEAR, 30, 30.0),  # bug gave 60s
+        (2, BackoffStrategy.LINEAR, 30, 60.0),  # bug gave 90s
     ],
 )
 async def test_scheduled_retry_delay_uses_pre_increment_attempt(
@@ -1207,8 +1207,7 @@ async def test_scheduled_retry_delay_uses_pre_increment_attempt(
     expected_delay_seconds: float,
 ) -> None:
     """
-    schedule_retry_task must receive a run_at derived from compute_retry_at(retry_attempt)
-    — the value *before* set_status(SCHEDULED) increments it.
+    schedule_retry_task must receive a run_at derived from compute_retry_at(retry_attempt).
 
     Regression: set_status(SCHEDULED) used to run before compute_retry_at, so the
     first retry would use attempt=1 instead of attempt=0, making every delay one
@@ -1249,7 +1248,7 @@ async def test_scheduled_retry_delay_uses_pre_increment_attempt(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "retry_attempt, backoff, base, expected_delay_seconds",
+    ("retry_attempt", "backoff", "base", "expected_delay_seconds"),
     [
         (0, BackoffStrategy.EXPONENTIAL, 60, 60.0),
         (1, BackoffStrategy.EXPONENTIAL, 60, 120.0),
@@ -1349,8 +1348,9 @@ async def test_inject_parent_results_passes_results_as_kwarg():
     """When inject_parent_results=True and parent_ids is set, the task function receives parent_results."""
     from unittest.mock import patch
 
-    from jobbers.models.dag import TaskResult
     from ulid import ULID
+
+    from jobbers.models.dag import TaskResult
 
     parent_id = ULID()
     task = Task(
@@ -1380,8 +1380,9 @@ async def test_inject_parent_results_passes_results_as_kwarg():
 @pytest.mark.asyncio
 async def test_no_injection_when_flag_is_false():
     """When inject_parent_results=False, the task function is called with only task.parameters."""
-    from jobbers.models.dag import TaskResult
     from ulid import ULID
+
+    from jobbers.models.dag import TaskResult
 
     parent_id = ULID()
     task = Task(
@@ -1404,4 +1405,3 @@ async def test_no_injection_when_flag_is_false():
 
     assert result.status == TaskStatus.COMPLETED
     task_function.assert_awaited_once_with(x=1)
-

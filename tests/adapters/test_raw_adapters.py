@@ -188,4 +188,3 @@ async def test_clean_handles_missing_meta(raw_dead_queue):
 
     score = await raw_dead_queue.data_store.zscore(raw_dead_queue.DLQ, bytes(task.id))
     assert score is None
-

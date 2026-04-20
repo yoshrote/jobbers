@@ -368,11 +368,7 @@ async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) 
         limit=filter_query.limit,
         start_after=str(filter_query.start) if filter_query.start else None,
     )
-    summaries = []
-    for t, run_at in pairs:
-        s = t.summarized()
-        s["scheduled_at"] = run_at.isoformat()
-        summaries.append(s)
+    summaries = [{**t.summarized(), "scheduled_at": run_at.isoformat()} for t, run_at in pairs]
     return {"tasks": summaries}
 
 
@@ -618,10 +614,7 @@ async def list_dags(pagination: Annotated[DAGRunPagination, Query()]) -> dict[st
     dag_runs, total = await sm.list_dag_runs(pagination)
     return {
         "total": total,
-        "dags": [
-            {"dag_run_id": str(rid), "submitted_at": ts.isoformat()}
-            for rid, ts in dag_runs
-        ],
+        "dags": [{"dag_run_id": str(rid), "submitted_at": ts.isoformat()} for rid, ts in dag_runs],
     }
 
 

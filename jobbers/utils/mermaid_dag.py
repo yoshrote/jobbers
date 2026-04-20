@@ -277,8 +277,7 @@ def _parse_label(label: str) -> tuple[str, int, str, dict[str, Any]]:
     m = _LABEL_RE.match(label)
     if not m:
         raise MermaidParseError(
-            f"Invalid node label {label!r}. "
-            "Expected: task_name[@version][:queue][(key=val, ...)]"
+            f"Invalid node label {label!r}. Expected: task_name[@version][:queue][(key=val, ...)]"
         )
     name = m.group("name")
     version = int(m.group("version")) if m.group("version") is not None else 0
@@ -443,15 +442,11 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
     error_map: dict[str, str] = {}
     for src, dst in error_edges:
         if src in error_map and error_map[src] != dst:
-            raise MermaidParseError(
-                f"Node '{src}' has multiple '-.->'' error edges; at most one is allowed."
-            )
+            raise MermaidParseError(f"Node '{src}' has multiple '-.->'' error edges; at most one is allowed.")
         error_map[src] = dst
 
     # Fan-in collectors: destinations with ≥ 2 incoming success edges.
-    fan_in_collectors: set[str] = {
-        dst for dst, srcs in predecessors.items() if len(srcs) >= 2
-    }
+    fan_in_collectors: set[str] = {dst for dst, srcs in predecessors.items() if len(srcs) >= 2}
 
     # Wire edges.  Each (src, dst) success edge is processed exactly once.
     for src, dst in success_edges:
@@ -465,11 +460,7 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
 
     # Roots: nodes with no incoming success edges that are not error targets.
     error_targets: set[str] = set(error_map.values())
-    roots = [
-        dag_nodes[nid]
-        for nid in all_ids
-        if not predecessors[nid] and nid not in error_targets
-    ]
+    roots = [dag_nodes[nid] for nid in all_ids if not predecessors[nid] and nid not in error_targets]
 
     if not roots:
         raise MermaidParseError(

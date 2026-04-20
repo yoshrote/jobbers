@@ -459,7 +459,6 @@ async def test_cancel_started_task_publishes_message(state_manager):
         await asyncio.wait_for(monitor, timeout=1.0)
 
 
-
 @pytest.mark.asyncio
 async def test_cancel_terminal_task_raises(state_manager):
     """Cancelling a task in a terminal status raises TaskException."""

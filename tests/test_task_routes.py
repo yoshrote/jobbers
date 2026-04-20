@@ -938,7 +938,7 @@ async def test_schedule_task_unknown_task_returns_400():
 # ── DAG run listing and detail routes ─────────────────────────────────────────
 
 DAG_RUN_ID = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
-SUBMITTED_AT = dt.datetime(2026, 4, 12, 10, 0, 0, tzinfo=dt.timezone.utc)
+SUBMITTED_AT = dt.datetime(2026, 4, 12, 10, 0, 0, tzinfo=dt.UTC)
 
 
 @pytest.mark.asyncio

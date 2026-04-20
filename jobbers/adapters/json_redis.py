@@ -250,7 +250,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         # Try each field individually; RediSearch returns ResponseError for duplicates.
         for field in desired_fields:
             try:
-                await self.data_store.ft(self.INDEX_NAME).alter_schema_add([field])  # type: ignore[no-untyped-call]
+                await self.data_store.ft(self.INDEX_NAME).alter_schema_add([field])
             except ResponseError as e:
                 if "duplicate" not in str(e).lower():
                     raise
@@ -304,10 +304,7 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         escaped = _escape_tag(str(dag_run_id))
         q = SearchQuery(f"@dag_run_id:{{{escaped}}}").no_content().paging(0, 10000)
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
-        task_ids = [
-            ULID.from_str(doc.id.removeprefix("task:"))
-            for doc in (search_results.docs or [])
-        ]
+        task_ids = [ULID.from_str(doc.id.removeprefix("task:")) for doc in (search_results.docs or [])]
         return submitted_at, task_ids
 
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:

@@ -86,7 +86,9 @@ class TaskAdapterProtocol(Protocol):
     async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
 
     # -- dag run index -------------------------------------------------------
-    async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]: ...
+    async def get_dag_runs(
+        self, pagination: DAGRunPagination
+    ) -> tuple[list[tuple[ULID, dt.datetime]], int]: ...
     async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None: ...
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
 
@@ -185,9 +187,7 @@ class _BaseTaskAdapter:
         score = task.submitted_at.timestamp()
         pipe.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): score}, nx=True)
 
-    async def get_dag_runs(
-        self, pagination: DAGRunPagination
-    ) -> tuple[list[tuple[ULID, dt.datetime]], int]:
+    async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
         """Return a paginated list of DAG runs ordered by submission time (oldest first)."""
         total: int = await self.data_store.zcard(self.DAG_RUNS)
         raw: list[tuple[bytes, float]] = await self.data_store.zrange(
@@ -249,7 +249,7 @@ class _BaseTaskAdapter:
         raws = await self._fetch_task_data_bulk(task_ids)
         tasks: list[Task | None] = []
         valid: list[tuple[int, Task]] = []
-        for i, (task_id, raw) in enumerate(zip(task_ids, raws)):
+        for i, (task_id, raw) in enumerate(zip(task_ids, raws, strict=True)):
             if raw is None:
                 tasks.append(None)
             else:
@@ -263,7 +263,7 @@ class _BaseTaskAdapter:
         for _, task in valid:
             pipe.zscore(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
         scores = await pipe.execute()
-        for (_, task), score in zip(valid, scores):
+        for (_, task), score in zip(valid, scores, strict=True):
             if score is not None:
                 task.heartbeat_at = dt.datetime.fromtimestamp(score, dt.UTC)
         return tasks
@@ -360,21 +360,20 @@ class _BaseTaskAdapter:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""
         # TODO: Shuffle/rotate the order of queues to avoid starving any of them
         task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
-        pop_result = await self.data_store.bzpopmin(task_queues, timeout=pop_timeout)
-        while pop_result:
-            logger.debug("Popped task %s from %s", pop_result[1], pop_result[0])
-            task = await self.get_task(ULID.from_bytes(pop_result[1]))
+        while pop_result := await self.data_store.bzpopmin(task_queues, timeout=pop_timeout):
+            queue_name, task_id_bytes, _ = pop_result
+            logger.debug("Popped task %s from %s", task_id_bytes, queue_name)
+            task = await self.get_task(ULID.from_bytes(task_id_bytes))
             if task:
                 return task
             logger.error(
                 "Task %s popped from queue but data not found; adding to %s",
-                pop_result[1],
+                task_id_bytes,
                 self.DLQ_MISSING_DATA,
             )
             tasks_missing_data.add(1)
             now = dt.datetime.now(dt.UTC)
-            await self.data_store.zadd(self.DLQ_MISSING_DATA, {pop_result[1]: now.timestamp()})
-            pop_result = await self.data_store.bzpopmin(task_queues, timeout=pop_timeout)
+            await self.data_store.zadd(self.DLQ_MISSING_DATA, {task_id_bytes: now.timestamp()})
         logger.info("task query timed out")
         return None
 

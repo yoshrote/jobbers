@@ -45,7 +45,9 @@ async def test_scheduler_dispatches_due_task():
         patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep),
     ):
         try:
-            await main(poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1)
+            await main(
+                poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1
+            )
         except asyncio.CancelledError:
             pass
 
@@ -70,7 +72,9 @@ async def test_scheduler_sleeps_when_no_task():
         patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep),
     ):
         try:
-            await main(poll_interval=7.5, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1)
+            await main(
+                poll_interval=7.5, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1
+            )
         except asyncio.CancelledError:
             pass
 
@@ -94,7 +98,9 @@ async def test_scheduler_runs_multiple_iterations():
         patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep),
     ):
         try:
-            await main(poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1)
+            await main(
+                poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1
+            )
         except asyncio.CancelledError:
             pass
 
@@ -122,7 +128,12 @@ async def test_scheduler_uses_env_var_poll_interval(monkeypatch):
     ):
         try:
             poll_interval = float(os.environ.get("SCHEDULER_POLL_INTERVAL", "5.0"))
-            await main(poll_interval=poll_interval, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1)
+            await main(
+                poll_interval=poll_interval,
+                config_interval=dt.timedelta(minutes=5),
+                role="default",
+                batch_size=1,
+            )
         except asyncio.CancelledError:
             pass
 

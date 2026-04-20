@@ -40,7 +40,7 @@ from jobbers.utils.mermaid_dag import (
         ("hello,world", "hello,world"),
         # base64-encoded JSON values
         ("~WzEsMiwzXQ==", [1, 2, 3]),
-        ('~eyJhIjoxfQ==', {"a": 1}),
+        ("~eyJhIjoxfQ==", {"a": 1}),
         ("~bnVsbA==", None),
     ],
 )
@@ -141,7 +141,7 @@ def test_serialize_params_list() -> None:
     result = _serialize_params({"ids": [1, 2, 3]})
     assert result.startswith("ids=~")
     # Round-trip: the blob must decode back to the original list.
-    blob = result[len("ids=~"):]
+    blob = result[len("ids=~") :]
     assert json.loads(base64.b64decode(blob)) == [1, 2, 3]
 
 
@@ -557,4 +557,3 @@ def test_round_trip_diamond() -> None:
     assert len(fan_in_map) == 1
     preds = next(iter(fan_in_map.values()))
     assert len(preds) == 2
-

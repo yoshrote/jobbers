@@ -179,9 +179,9 @@ class QueueConfigAdapter:
         """Return the current refresh tag for a role, creating one if needed."""
         async with self.session_factory() as session:
             result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
-            row = result.fetchone()
-        if row is not None:
-            existing_tag: ULID = ULID.from_str(row[0])
+        tag_str: str | None = result.scalar()
+        if tag_str:
+            existing_tag: ULID = ULID.from_str(tag_str)
             return existing_tag
 
         init_tag = ULID()
@@ -193,5 +193,5 @@ class QueueConfigAdapter:
         # Re-read in case another process won the race
         async with self.session_factory() as session:
             result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
-            row = result.fetchone()
-        return ULID.from_str(row[0]) if row else init_tag
+        tag_str = result.scalar()
+        return ULID.from_str(tag_str) if tag_str else init_tag

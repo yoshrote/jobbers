@@ -189,7 +189,9 @@ class TaskProcessor:
         DAGNode.merge(*fanout.children, into=fanout.collector)
 
         child_ids = {child.id for child in fanout.children}
-        child_tasks = [child.to_task(parent_id=parent.id, dag_run_id=parent.dag_run_id) for child in fanout.children]
+        child_tasks = [
+            child.to_task(parent_id=parent.id, dag_run_id=parent.dag_run_id) for child in fanout.children
+        ]
         collector_task = fanout.collector.to_task(dag_run_id=parent.dag_run_id)
         collector_task.parent_ids = list(child_ids)
 

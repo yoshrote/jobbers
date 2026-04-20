@@ -276,9 +276,7 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         if score is None:
             return None
         submitted_at = dt.datetime.fromtimestamp(score, dt.UTC)
-        raw_ids: list[bytes] = await self.data_store.zrange(
-            self.DAG_RUN_TASKS(dag_run_id=dag_run_id), 0, -1
-        )
+        raw_ids: list[bytes] = await self.data_store.zrange(self.DAG_RUN_TASKS(dag_run_id=dag_run_id), 0, -1)
         task_ids = [ULID.from_bytes(b) for b in raw_ids]
         return submitted_at, task_ids
 
