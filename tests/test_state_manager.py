@@ -663,6 +663,56 @@ async def test_queue_retry_task_requeues_immediately(redis, state_manager):
     assert bytes(ULID1) in members
 
 
+@pytest.mark.asyncio
+async def test_queue_retry_task_bypasses_rate_limit(redis, state_manager_real_ta):
+    """
+    queue_retry_task succeeds and does not touch the rate-limiter bucket even when the queue is at capacity.
+
+    Retries must never be gated by rate limits: blocking them would require manual
+    intervention (e.g. moving to the DLQ) rather than allowing automatic recovery.
+    """
+    await state_manager_real_ta.qca.save_queue_config(
+        QueueConfig(name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    )
+    rate_key = state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default")
+    await redis.zadd(rate_key, {ULID2.bytes: FROZEN_TIME.timestamp()})
+
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+    result = await state_manager_real_ta.queue_retry_task(task)
+
+    assert result.status == TaskStatus.SUBMITTED
+    members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) in members
+    count = await redis.zcard(rate_key)
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_task_bypasses_rate_limit(redis, state_manager_real_ta):
+    """
+    schedule_retry_task succeeds and does not touch the rate-limiter bucket even when the queue is at capacity.
+
+    Retries must never be gated by rate limits: blocking them would require manual
+    intervention (e.g. moving to the DLQ) rather than allowing automatic recovery.
+    """
+    await state_manager_real_ta.qca.save_queue_config(
+        QueueConfig(name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    )
+    rate_key = state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default")
+    await redis.zadd(rate_key, {ULID2.bytes: FROZEN_TIME.timestamp()})
+
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SCHEDULED)
+    run_at = FROZEN_TIME + dt.timedelta(minutes=5)
+    result = await state_manager_real_ta.schedule_retry_task(task, run_at)
+
+    assert result is task
+    due = await state_manager_real_ta.task_scheduler.next_due(["default"])
+    assert due is not None
+    assert due.id == ULID1
+    count = await redis.zcard(rate_key)
+    assert count == 1
+
+
 # ── active_tasks_per_queue ────────────────────────────────────────────────────
 
 

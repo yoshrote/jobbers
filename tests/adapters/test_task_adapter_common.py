@@ -871,6 +871,38 @@ async def test_clean_terminal_tasks_cleans_all_terminal_statuses(task_adapter, s
     assert not await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.STALLED,
+        TaskStatus.DROPPED,
+    ],
+)
+@pytest.mark.asyncio
+async def test_clean_terminal_tasks_removes_heartbeat_for_all_terminal_statuses(task_adapter, status):
+    """Heartbeat entries are removed for every terminal status, not just COMPLETED."""
+    task = Task(
+        id=ULID1,
+        name="test_task",
+        queue="default",
+        status=status,
+        completed_at=FROZEN_TIME - dt.timedelta(days=8),
+    )
+    await task_adapter.save_task(task)
+    await task_adapter.data_store.zadd(
+        task_adapter.HEARTBEAT_SCORES(queue="default"),
+        {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=8)).timestamp()},
+    )
+    await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
+    assert (
+        await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes)
+        is None
+    )
+
+
 @pytest.mark.asyncio
 async def test_clean_terminal_tasks_leaves_other_tasks_untouched(task_adapter):
     """Only old terminal tasks are deleted; recent tasks remain."""
