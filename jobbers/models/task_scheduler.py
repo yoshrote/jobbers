@@ -70,13 +70,13 @@ class TaskScheduler:
         """Return the scheduled run_at for a single task, or None if not found."""
         import datetime as dt
 
-        queue_raw: str | None = await cast(
-            "Awaitable[str | None]", self.data_store.hget(self.SCHEDULE_TASK_QUEUE, str(task_id))
+        queue_raw: bytes | None = await cast(
+            "Awaitable[bytes | None]", self.data_store.hget(self.SCHEDULE_TASK_QUEUE, str(task_id))
         )
         if queue_raw is None:
             return None
         score: float | None = await self.data_store.zscore(
-            self.SCHEDULE_QUEUE(queue=queue_raw), bytes(task_id)
+            self.SCHEDULE_QUEUE(queue=queue_raw.decode()), bytes(task_id)
         )
         return dt.datetime.fromtimestamp(score, dt.UTC) if score is not None else None
 
