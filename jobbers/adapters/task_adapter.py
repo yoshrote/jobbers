@@ -42,7 +42,7 @@ tasks_missing_data = metrics.get_meter(__name__).create_counter("tasks_missing_d
 
 
 @runtime_checkable
-class TaskAdapterProtocol(Protocol):
+class TaskAdapterProtocol(Protocol):  # pragma: no cover
     """Interface for task storage and querying."""
 
     # -- key helpers (both implementations use the same Redis key names) ----
@@ -104,7 +104,7 @@ class TaskAdapterProtocol(Protocol):
     ) -> None: ...
 
 
-class DeadQueueProtocol(Protocol):
+class DeadQueueProtocol(Protocol):  # pragma: no cover
     """Interface for dead letter queue operations."""
 
     async def ensure_index(self) -> None: ...

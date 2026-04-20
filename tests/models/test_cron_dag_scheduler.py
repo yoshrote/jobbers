@@ -7,7 +7,7 @@ import pytest_asyncio
 from ulid import ULID
 
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.cron_dag_scheduler import CronDAGScheduler
+from jobbers.models.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
 from jobbers.models.dag import DAGTaskSpec
 
 PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
@@ -32,6 +32,19 @@ async def add_entry(s: CronDAGScheduler, entry: CronDAGEntry, next_run_at: dt.da
     pipe = s.data_store.pipeline(transaction=True)
     s.stage_add(pipe, entry, next_run_at)
     await pipe.execute()
+
+
+# ── ConcurrencyStager ─────────────────────────────────────────────────────────
+
+
+def test_concurrency_stager_calls_stage_fn():
+    """stage_active_run delegates to the injected _stage_fn."""
+    calls: list[tuple] = []
+    pipe_sentinel = object()
+    task_id = ULID()
+    stager = ConcurrencyStager(skipped=False, _stage_fn=lambda p, t: calls.append((p, t)))
+    stager.stage_active_run(pipe_sentinel, task_id)
+    assert calls == [(pipe_sentinel, task_id)]
 
 
 # ── stage_add / get ────────────────────────────────────────────────────────────
@@ -227,3 +240,100 @@ async def test_clear_active_run(scheduler):
     await pipe.execute()
 
     assert await scheduler.get_active_run(cron_id) is None
+
+
+# ── get_next_run_at ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_next_run_at_returns_none_when_not_scheduled(scheduler):
+    """Returns None for a cron_id not present in the schedule."""
+    assert await scheduler.get_next_run_at(ULID()) is None
+
+
+@pytest.mark.asyncio
+async def test_get_next_run_at_returns_scheduled_time(scheduler):
+    """Returns the next_run_at timestamp for a scheduled entry."""
+    entry = make_entry()
+    await add_entry(scheduler, entry, FUTURE)
+    result = await scheduler.get_next_run_at(entry.id)
+    assert result is not None
+    assert abs((result - FUTURE).total_seconds()) < 0.001
+
+
+# ── list ───────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_empty(scheduler):
+    """list() returns empty results and total=0 when no entries exist."""
+    entries, total = await scheduler.list()
+    assert entries == []
+    assert total == 0
+
+
+@pytest.mark.asyncio
+async def test_list_returns_entry_with_next_run_at(scheduler):
+    """list() returns (entry, next_run_at) pairs for scheduled entries."""
+    entry = make_entry()
+    await add_entry(scheduler, entry, FUTURE)
+    entries, total = await scheduler.list()
+    assert total == 1
+    assert len(entries) == 1
+    fetched, next_run_at = entries[0]
+    assert fetched.id == entry.id
+    assert abs((next_run_at - FUTURE).total_seconds()) < 0.001
+
+
+@pytest.mark.asyncio
+async def test_list_pagination_limit(scheduler):
+    """list() respects the limit parameter."""
+    for i in range(3):
+        await add_entry(scheduler, make_entry(name=f"cron_{i}"), FUTURE)
+    entries, total = await scheduler.list(offset=0, limit=2)
+    assert total == 3
+    assert len(entries) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_pagination_offset(scheduler):
+    """list() respects the offset parameter for successive pages."""
+    cron_entries = [make_entry(name=f"cron_{i}") for i in range(3)]
+    for e in cron_entries:
+        await add_entry(scheduler, e, FUTURE)
+    page1, _ = await scheduler.list(offset=0, limit=2)
+    page2, _ = await scheduler.list(offset=2, limit=2)
+    assert len(page1) == 2
+    assert len(page2) == 1
+    ids_p1 = {e.id for e, _ in page1}
+    ids_p2 = {e.id for e, _ in page2}
+    assert ids_p1.isdisjoint(ids_p2)
+
+
+@pytest.mark.asyncio
+async def test_list_skips_entry_with_missing_hash(scheduler):
+    """list() silently skips schedule entries whose hash has been deleted."""
+    cron_id = ULID()
+    await scheduler.data_store.zadd(scheduler.CRON_SCHEDULE, {bytes(cron_id): FUTURE.timestamp()})
+    # Hash deliberately not written — simulates a race with concurrent deletion.
+    entries, total = await scheduler.list()
+    assert total == 1
+    assert entries == []
+
+
+# ── next_due_bulk: missing hash ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_next_due_bulk_missing_hash_is_skipped_and_rescheduled(scheduler):
+    """Entry acquired from schedule but with no hash is skipped and re-added with retry delay."""
+    cron_id = ULID()
+    await scheduler.data_store.zadd(scheduler.CRON_SCHEDULE, {bytes(cron_id): PAST.timestamp()})
+    # Hash deliberately not written.
+
+    results = await scheduler.next_due_bulk(10)
+    assert results == []
+
+    # Entry should have been re-added to the schedule with a ~60s retry delay.
+    score = await scheduler.data_store.zscore(scheduler.CRON_SCHEDULE, bytes(cron_id))
+    assert score is not None

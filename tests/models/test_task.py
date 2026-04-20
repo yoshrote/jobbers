@@ -98,7 +98,7 @@ def test_shutdown_resubmit_policy_sets_status_unsubmitted():
 
 
 def test_should_retry_true_when_retries_remain():
-    async def noop() -> None: ...
+    async def noop() -> None: ... # pragma: no cover
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
@@ -107,7 +107,7 @@ def test_should_retry_true_when_retries_remain():
 
 
 def test_should_retry_false_when_exhausted():
-    async def noop() -> None: ...
+    async def noop() -> None: ... # pragma: no cover
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
@@ -116,7 +116,7 @@ def test_should_retry_false_when_exhausted():
 
 
 def test_should_schedule_true_when_retry_delay_set():
-    async def noop() -> None: ...
+    async def noop() -> None: ... # pragma: no cover
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, retry_delay=10)
@@ -124,7 +124,7 @@ def test_should_schedule_true_when_retry_delay_set():
 
 
 def test_should_schedule_false_when_no_retry_delay():
-    async def noop() -> None: ...
+    async def noop() -> None: ... # pragma: no cover
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, retry_delay=None)

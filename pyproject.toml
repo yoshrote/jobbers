@@ -221,7 +221,7 @@ exclude_also = [
     "@(abc\\.)?abstractmethod",
     "@(typing(_extensions)?\\.)?overload",
     "if (typing(_extensions)?\\.)?TYPE_CHECKING:",
-    "def run\\(\\):",
+    "def run\\(\\)",
 ]
 
 [tool.mypy]

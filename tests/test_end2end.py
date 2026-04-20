@@ -34,10 +34,9 @@ async def sm(redis, session_factory):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-async def drain(sm: StateManager, queues: set[str] | None = None) -> int:
+async def drain(sm: StateManager) -> int:
     """Pop and process tasks until all queues are empty. Returns count processed."""
-    if queues is None:
-        queues = {"default"}
+    queues = {"default"}
     ta = sm.ta
     count = 0
     while True:
