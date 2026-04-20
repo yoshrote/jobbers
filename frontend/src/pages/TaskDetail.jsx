@@ -57,6 +57,12 @@ export default function TaskDetail() {
               <th>Submitted at</th>
               <td>{task.submitted_at ? new Date(task.submitted_at).toLocaleString() : '—'}</td>
             </tr>
+            {task.scheduled_at && (
+              <tr>
+                <th>Scheduled for</th>
+                <td>{new Date(task.scheduled_at).toLocaleString()}</td>
+              </tr>
+            )}
             {task.last_error && (
               <tr><th>Last error</th><td style={{ color: '#dc3545' }}>{task.last_error}</td></tr>
             )}

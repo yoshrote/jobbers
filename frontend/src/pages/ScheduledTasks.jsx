@@ -71,7 +71,7 @@ export default function ScheduledTasks() {
                 <th>Name</th>
                 <th>Status</th>
                 <th>Retry</th>
-                <th>Submitted at</th>
+                <th>Scheduled for</th>
               </tr>
             </thead>
             <tbody>
@@ -86,7 +86,7 @@ export default function ScheduledTasks() {
                   <td>{t.name}</td>
                   <td><StatusBadge status={t.status} /></td>
                   <td>{t.retry_attempt}</td>
-                  <td>{t.submitted_at ? new Date(t.submitted_at).toLocaleString() : '—'}</td>
+                  <td>{t.scheduled_at ? new Date(t.scheduled_at).toLocaleString() : '—'}</td>
                 </tr>
               ))}
             </tbody>

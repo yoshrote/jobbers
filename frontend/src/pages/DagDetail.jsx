@@ -6,6 +6,40 @@ import StatusBadge from '../components/StatusBadge'
 
 mermaid.initialize({ startOnLoad: false, theme: 'default' })
 
+const STATUS_CLASS = {
+  failed:    'status_error',
+  dropped:   'status_error',
+  stalled:   'status_error',
+  completed: 'status_done',
+  scheduled: 'status_scheduled',
+  submitted: 'status_scheduled',
+  cancelled: 'status_cancelled',
+}
+
+const CLASS_DEFS = [
+  '    classDef status_error     fill:#f8d7da,stroke:#dc3545,color:#000',
+  '    classDef status_done      fill:#d4edda,stroke:#28a745,color:#000',
+  '    classDef status_scheduled fill:#fff3cd,stroke:#ffc107,color:#000',
+  '    classDef status_cancelled fill:#e2e3e5,stroke:#6c757d,color:#000',
+  '    classDef status_active    fill:#cce5ff,stroke:#0d6efd,color:#000',
+].join('\n')
+
+function applyStatusColors(diagram, tasks) {
+  if (!diagram || !tasks.length) return diagram
+
+  // Remove backend-generated classDef lines and any existing :::class suffixes
+  let result = diagram
+    .replace(/:::[\w]+/g, '')
+    .replace(/^\s+classDef .+\n?/gm, '')
+
+  // Append our classDef block and per-node class assignments
+  const classLines = tasks
+    .filter((t) => t.id && t.status)
+    .map((t) => `    class ${t.id} ${STATUS_CLASS[t.status] ?? 'status_active'}`)
+
+  return result.trimEnd() + '\n' + CLASS_DEFS + '\n' + classLines.join('\n')
+}
+
 function MermaidDiagram({ diagram }) {
   const [svg, setSvg] = useState('')
   const [err, setErr] = useState(null)
@@ -51,7 +85,7 @@ export default function DagDetail() {
       setTasks(taskResults)
 
       const root = taskResults.find((t) => t.dag_diagram)
-      if (root) setDiagram(root.dag_diagram)
+      if (root) setDiagram(applyStatusColors(root.dag_diagram, taskResults))
     } catch (e) {
       setError(e.message)
     } finally {
@@ -102,6 +136,7 @@ export default function DagDetail() {
                 <th>Status</th>
                 <th>Retry</th>
                 <th>Submitted at</th>
+                <th>Scheduled for</th>
                 <th>Last error</th>
               </tr>
             </thead>
@@ -117,6 +152,7 @@ export default function DagDetail() {
                   <td>{task.status ? <StatusBadge status={task.status} /> : '—'}</td>
                   <td style={{ textAlign: 'center' }}>{task.retry_attempt ?? '—'}</td>
                   <td style={{ whiteSpace: 'nowrap' }}>{formatTs(task.submitted_at)}</td>
+                  <td style={{ whiteSpace: 'nowrap' }}>{formatTs(task.scheduled_at)}</td>
                   <td style={{ color: '#dc3545', maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {task.last_error ?? ''}
                   </td>
