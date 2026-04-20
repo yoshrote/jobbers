@@ -265,7 +265,7 @@ async def test_get_by_filter_returns_scheduled_tasks(scheduler, dummy_task_adapt
     await schedule(scheduler, task, PAST)
     results = await scheduler.get_by_filter(queue="default")
     assert len(results) == 1
-    assert results[0].id == task.id
+    assert results[0][0].id == task.id
 
 
 @pytest.mark.asyncio
@@ -298,7 +298,7 @@ async def test_get_by_filter_cursor_pagination(scheduler, dummy_task_adapter):
         await schedule(scheduler, t, PAST)
     results = await scheduler.get_by_filter(queue="default", start_after=str(t1.id))
     assert len(results) == 1
-    assert results[0].id == t2.id
+    assert results[0][0].id == t2.id
 
 
 # ── get_by_filter: queue=None (all-queues path) ───────────────────────────────
@@ -316,7 +316,7 @@ async def test_get_by_filter_queue_none_returns_from_all_queues(scheduler, qca, 
     await qca.save_queue_config(QueueConfig(name="q2"))
 
     results = await scheduler.get_by_filter(queue=None)
-    assert {r.id for r in results} == {t1.id, t2.id}
+    assert {r[0].id for r in results} == {t1.id, t2.id}
 
 
 @pytest.mark.asyncio
@@ -341,7 +341,7 @@ async def test_get_by_filter_task_name_excludes_non_matching(scheduler, dummy_ta
 
     results = await scheduler.get_by_filter(queue="default", task_name="test_task")
     assert len(results) == 1
-    assert results[0].id == t1.id
+    assert results[0][0].id == t1.id
 
 
 @pytest.mark.asyncio
@@ -356,7 +356,7 @@ async def test_get_by_filter_task_version_excludes_non_matching(scheduler, dummy
 
     results = await scheduler.get_by_filter(queue="default", task_version=1)
     assert len(results) == 1
-    assert results[0].id == t1.id
+    assert results[0][0].id == t1.id
 
 
 # ── next_due_bulk: queues=None with empty all-queues set ──────────────────────
@@ -398,4 +398,4 @@ async def test_get_by_filter_skips_none_tasks(scheduler, dummy_task_adapter, red
 
     results = await scheduler.get_by_filter(queue="default")
     assert len(results) == 1
-    assert results[0].id == t1.id
+    assert results[0][0].id == t1.id

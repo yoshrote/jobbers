@@ -17,6 +17,7 @@ from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task import Task, TaskPagination
+from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import TaskException
 from jobbers.utils.mermaid_dag import MermaidParseError, dag_spec_to_mermaid, parse_mermaid_dag
 from jobbers.validation import ValidationError, validate_task
@@ -109,6 +110,11 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     summary = task.summarized()
+    if task.status == TaskStatus.SCHEDULED:
+        sm = db.get_state_manager()
+        run_at = await sm.task_scheduler.get_run_at(task_uid)
+        if run_at:
+            summary["scheduled_at"] = run_at.isoformat()
     if task.dag_callbacks:
         spec = DAGTaskSpec(
             id=task.id,
@@ -355,14 +361,19 @@ async def get_active_tasks(queue: str | None = None) -> dict[str, Any]:
 async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) -> dict[str, Any]:
     """Retrieve scheduled tasks filtered by queue, and optionally by task name or version."""
     sm = db.get_state_manager()
-    tasks = await sm.task_scheduler.get_by_filter(
+    pairs = await sm.task_scheduler.get_by_filter(
         queue=filter_query.queue,
         task_name=filter_query.task_name,
         task_version=filter_query.task_version,
         limit=filter_query.limit,
         start_after=str(filter_query.start) if filter_query.start else None,
     )
-    return {"tasks": [t.summarized() for t in tasks]}
+    summaries = []
+    for t, run_at in pairs:
+        s = t.summarized()
+        s["scheduled_at"] = run_at.isoformat()
+        summaries.append(s)
+    return {"tasks": summaries}
 
 
 @app.get("/roles")

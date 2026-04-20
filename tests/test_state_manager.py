@@ -569,8 +569,8 @@ async def test_schedule_new_task_appears_in_scheduler(state_manager):
 
     scheduled = await state_manager.task_scheduler.get_by_filter(queue="default")
     assert len(scheduled) == 1
-    assert scheduled[0].id == ULID1
-    assert scheduled[0].status == TaskStatus.SCHEDULED
+    assert scheduled[0][0].id == ULID1
+    assert scheduled[0][0].status == TaskStatus.SCHEDULED
 
 
 @pytest.mark.asyncio

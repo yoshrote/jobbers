@@ -66,6 +66,18 @@ class TaskScheduler:
         pipe.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
         pipe.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
 
+    async def get_run_at(self, task_id: ULID) -> "dt.datetime | None":
+        """Return the scheduled run_at for a single task, or None if not found."""
+        import datetime as dt
+
+        queue_raw: bytes | None = await self.data_store.hget(self.SCHEDULE_TASK_QUEUE, str(task_id))
+        if queue_raw is None:
+            return None
+        score: float | None = await self.data_store.zscore(
+            self.SCHEDULE_QUEUE(queue=queue_raw.decode()), bytes(task_id)
+        )
+        return dt.datetime.fromtimestamp(score, dt.UTC) if score is not None else None
+
     async def get_by_filter(
         self,
         queue: str | None = None,
@@ -73,29 +85,35 @@ class TaskScheduler:
         task_version: int | None = None,
         limit: int = 100,
         start_after: str | None = None,
-    ) -> list[Task]:
+    ) -> "list[tuple[Task, dt.datetime]]":
         """
         Fetch scheduled entries matching the given filter criteria.
 
         `start_after` is an exclusive ULID cursor for page-by-page iteration.
+        Returns each task paired with its scheduled run_at timestamp.
         """
+        import datetime as dt
+
+        score_map: dict[bytes, float] = {}
+
         if queue is not None:
-            raw_ids: list[bytes] = await cast(
-                "Awaitable[list[bytes]]",
-                self.data_store.zrange(self.SCHEDULE_QUEUE(queue=queue), 0, -1),
+            pairs: list[tuple[bytes, float]] = await cast(
+                "Awaitable[list[tuple[bytes, float]]]",
+                self.data_store.zrange(self.SCHEDULE_QUEUE(queue=queue), 0, -1, withscores=True),
             )
+            for id_bytes, score in pairs:
+                score_map[id_bytes] = score
         else:
             all_queues = await self.qca.get_all_queues()
-            raw_ids = []
             for q in all_queues:
-                ids: list[bytes] = await cast(
-                    "Awaitable[list[bytes]]",
-                    self.data_store.zrange(self.SCHEDULE_QUEUE(queue=q), 0, -1),
+                pairs = await cast(
+                    "Awaitable[list[tuple[bytes, float]]]",
+                    self.data_store.zrange(self.SCHEDULE_QUEUE(queue=q), 0, -1, withscores=True),
                 )
-                raw_ids.extend(ids)
+                for id_bytes, score in pairs:
+                    score_map[id_bytes] = score
 
-        # ULID bytes are time-ordered, so sorting by bytes matches task_id ascending.
-        raw_ids.sort()
+        raw_ids = sorted(score_map.keys())
 
         if start_after is not None:
             cursor = bytes(ULID.from_str(start_after))
@@ -103,8 +121,8 @@ class TaskScheduler:
 
         ulid_list = [ULID.from_bytes(r) for r in raw_ids]
         fetched: list[Task | None] = await self.ta.get_tasks_bulk(ulid_list)
-        results: list[Task] = []
-        for task in fetched:
+        results: list[tuple[Task, dt.datetime]] = []
+        for task, id_bytes in zip(fetched, raw_ids):
             if len(results) >= limit:
                 break
             if task is None:
@@ -113,7 +131,8 @@ class TaskScheduler:
                 continue
             if task_version is not None and task.version != task_version:
                 continue
-            results.append(task)
+            run_at = dt.datetime.fromtimestamp(score_map[id_bytes], dt.UTC)
+            results.append((task, run_at))
 
         return results
 

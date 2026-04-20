@@ -246,9 +246,10 @@ async def test_get_scheduled_tasks_no_optional_filters():
     """Test fetching scheduled tasks with only queue uses all-None optional filters."""
     task1 = Task(id=ULID1, name="Task 1", status="submitted", parameters={})
     task2 = Task(id=ULID2, name="Task 2", status="submitted", parameters={})
+    run_at = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
 
     mock_sm = MagicMock()
-    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[task1, task2])
+    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[(task1, run_at), (task2, run_at)])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -269,9 +270,10 @@ async def test_get_scheduled_tasks_no_optional_filters():
 async def test_get_scheduled_tasks_by_filter():
     """Test fetching scheduled tasks with queue, task_name, task_version, and limit filters."""
     task = Task(id=ULID1, name="My Task", status="submitted", parameters={})
+    run_at = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
 
     mock_sm = MagicMock()
-    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[task])
+    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[(task, run_at)])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -309,9 +311,10 @@ async def test_get_scheduled_tasks_empty():
 async def test_get_scheduled_tasks_with_start_cursor():
     """Test that the start ULID is forwarded as start_after for cursor pagination."""
     task = Task(id=ULID2, name="Task 2", status="submitted", parameters={})
+    run_at = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
 
     mock_sm = MagicMock()
-    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[task])
+    mock_sm.task_scheduler.get_by_filter = AsyncMock(return_value=[(task, run_at)])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -886,7 +889,7 @@ async def test_schedule_task_valid(state_manager):
 
     scheduled = await state_manager.task_scheduler.get_by_filter(queue="default")
     assert len(scheduled) == 1
-    assert scheduled[0].id == ULID1
+    assert scheduled[0][0].id == ULID1
 
 
 @pytest.mark.asyncio
