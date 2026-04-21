@@ -102,7 +102,7 @@ def register_task(
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
-            max_retry_delay=max_retry_delay,
+            max_retry_delay=max_retry_delay or 3600,
             expected_exceptions=expected_exceptions,
             max_heartbeat_interval=max_heartbeat_interval,
             backoff_strategy=backoff_strategy,
