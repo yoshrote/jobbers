@@ -473,8 +473,8 @@ async def submit_dag(request: SubmitDAGRequest) -> dict[str, Any]:
                 worklist.append(error_node)
 
     sm = db.get_state_manager()
-    submitted = await sm.submit_dag(*roots)
-    return {"root_task_ids": [str(t.id) for t in submitted]}
+    dag_run_id, submitted = await sm.submit_dag(*roots)
+    return {"dag_run_id": str(dag_run_id), "root_task_ids": [str(t.id) for t in submitted]}
 
 
 # ── Cron DAG CRUD ──────────────────────────────────────────────────────────────

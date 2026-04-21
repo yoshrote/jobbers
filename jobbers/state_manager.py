@@ -455,7 +455,7 @@ class StateManager:
         await pipe.execute()
         logger.info("Cron DAG entry %s removed.", cron_id)
 
-    async def submit_dag(self, *roots: DAGNode) -> list[Task]:
+    async def submit_dag(self, *roots: DAGNode) -> tuple[ULID, list[Task]]:
         """
         Initialise fan-in sets and submit all root tasks of a DAG.
 
@@ -476,7 +476,7 @@ class StateManager:
             task = root.to_task(dag_run_id=dag_run_id)
             await self.submit_task(task)
             submitted.append(task)
-        return submitted
+        return dag_run_id, submitted
 
     async def list_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
         """Return a paginated list of DAG runs ordered by submission time."""

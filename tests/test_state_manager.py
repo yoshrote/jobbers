@@ -748,8 +748,9 @@ async def test_submit_dag_simple_chain(state_manager):
     child = DAGNode("process_data")
     root.then(child)
 
-    submitted = await state_manager.submit_dag(root)
+    dag_run_id, submitted = await state_manager.submit_dag(root)
 
+    assert dag_run_id is not None
     assert len(submitted) == 1
     assert submitted[0].id == root.id
     assert submitted[0].status == TaskStatus.SUBMITTED
@@ -768,11 +769,13 @@ async def test_submit_dag_multi_root_shares_dag_run_id(state_manager):
 
     state_manager.init_fan_in = AsyncMock()
 
-    submitted = await state_manager.submit_dag(branch_a, branch_b)
+    dag_run_id, submitted = await state_manager.submit_dag(branch_a, branch_b)
 
+    assert dag_run_id is not None
     assert len(submitted) == 2
     assert submitted[0].dag_run_id is not None
     assert submitted[0].dag_run_id == submitted[1].dag_run_id
+    assert submitted[0].dag_run_id == dag_run_id
 
 
 @pytest.mark.asyncio
@@ -787,7 +790,7 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 
     state_manager.init_fan_in = AsyncMock()
 
-    submitted = await state_manager.submit_dag(branch_a, branch_b)
+    _, submitted = await state_manager.submit_dag(branch_a, branch_b)
 
     # init_fan_in must be called with the collector's fan-in key
     fan_in_key = f"dag:fan-in:{collector.id}"

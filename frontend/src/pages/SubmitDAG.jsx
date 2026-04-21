@@ -106,6 +106,7 @@ export default function SubmitDAG() {
       {result && (
         <div className="card">
           <h2 style={{ color: 'green', marginTop: 0 }}>Submitted</h2>
+          <p>DAG run: <Link to={`/dags/${result.dag_run_id}`} className="monospace">{result.dag_run_id}</Link></p>
           <p>Root task{result.root_task_ids.length > 1 ? 's' : ''}:</p>
           <ul>
             {result.root_task_ids.map((id) => (

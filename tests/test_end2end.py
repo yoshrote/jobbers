@@ -81,7 +81,7 @@ async def test_single_node_happy_path(sm: StateManager) -> None:
       A["echo_task@1(value=a)"]
     """
     roots = parse_mermaid_dag(diagram)
-    submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots)
     await run_until_done(sm)
 
     assert len(submitted) == 1
@@ -275,7 +275,7 @@ async def test_retry_exhaustion_dlq(sm: StateManager) -> None:
       A["always_fail_task@1"]
     """
     roots = parse_mermaid_dag(diagram)
-    submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots)
     await run_until_done(sm)
 
     task = await sm.ta.get_task(submitted[0].id)
@@ -298,7 +298,7 @@ async def test_scheduled_retry_path(sm: StateManager) -> None:
       A["scheduled_fail_task@1"]
     """
     roots = parse_mermaid_dag(diagram)
-    submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots)
     task_id = submitted[0].id
 
     await run_until_done(sm)
@@ -323,7 +323,7 @@ async def test_parameters_passed_and_results(sm: StateManager) -> None:
       A["echo_task@1(value=hello)"]
     """
     roots = parse_mermaid_dag(diagram)
-    submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots)
     await run_until_done(sm)
 
     task = await sm.ta.get_task(submitted[0].id)
