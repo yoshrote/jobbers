@@ -8,7 +8,7 @@ Jobbers provides four complementary mechanisms for controlling how computing res
 
 The coarsest knob. Each worker process has a fixed pool of **task slots** controlled by a single asyncio semaphore.
 
-```
+```bash
 WORKER_CONCURRENT_TASKS=5   # default
 ```
 
@@ -153,7 +153,7 @@ Roles are named sets of queues. A worker consumes exactly the queues belonging t
 
 Each role has a `refresh_tag` (a ULID) stored in SQL. `TaskGenerator` caches the tag it last saw. On each task fetch cycle it re-reads the tag (at most once per `config_ttl` seconds, default 60 s). If the tag has changed the generator re-queries its queue list and rate/concurrency limits before the next fetch.
 
-```
+```text
 PUT /roles/gpu-workers  { "queues": ["ml-inference", "image-resize"] }
   → generates new ULID refresh_tag in SQL
 
@@ -220,7 +220,7 @@ PUT /queues/payment-gateway  {
 
 The controls form a layered pipeline. A task must clear every layer to run:
 
-```
+```text
 Submission time
   └─ Queue rate limit (Redis Lua, atomic)
         └─ Task enqueued (SUBMITTED)

@@ -51,7 +51,7 @@ Both produce identical `DAGNode` objects. The wrapper style reads like Celery's 
 
 Each task runs sequentially: `extract` → `transform` → `load`.
 
-```
+```text
 [extract] → [transform] → [load]
 ```
 
@@ -142,7 +142,7 @@ The worker fetches the parent task's results from Redis via `parent_ids` and inj
 
 One root task triggers multiple independent branches that run in parallel.
 
-```
+```text
            ┌→ [process_region_a]
 [split] ───┼→ [process_region_b]
            └→ [process_region_c]
@@ -187,7 +187,7 @@ async def run_regional_analysis_pipeline(
 
 Multiple branches converge into a single collector that runs only after all predecessors complete.
 
-```
+```text
 [branch_a] ─┐
 [branch_b] ─┼→ [aggregate]
 [branch_c] ─┘
@@ -233,7 +233,7 @@ async def run_model_selection(
 
 The canonical pattern: one root fans out to parallel branches which then reconverge.
 
-```
+```text
               ┌→ [branch_a] ─┐
 [dispatch] ───┤               ├→ [summarize]
               └→ [branch_b] ─┘
@@ -285,7 +285,7 @@ A task decides at runtime which single follow-up task to run, based on its outpu
 
 The simplest dynamic chain is a task that chooses the next task name or parameters based on its result. Because `dag_callbacks` are embedded at submission time, truly dynamic routing (where the *name* of the next task is unknown upfront) requires a `DynamicFanOut` with one child.
 
-```
+```text
 [classify] → [<chosen handler>]
 ```
 
@@ -499,7 +499,7 @@ async def run_full_pipeline(state_manager: StateManager, source: str) -> None:
 ## Quick Reference
 
 | Pattern | Construction | Submission |
-|---|---|---|
+| --- | --- | --- |
 | Static chain | `a.then(b).then(c)` | `submit_dag(a)` |
 | Static fan-out | `root.then(b, c, d)` | `submit_dag(root)` |
 | Static fan-in | `DAGNode.merge(b, c, d, into=collector)` | `submit_dag(b, c, d)` |

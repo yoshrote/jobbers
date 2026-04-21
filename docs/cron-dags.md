@@ -42,9 +42,120 @@ Controls what happens when the Scheduler fires a cron entry but a previous run's
 
 ---
 
-## Registering a Cron Entry
+## Managing Cron Entries via the HTTP API
 
-There is no HTTP API for managing cron entries. Register them directly via `StateManager` during application startup or migration:
+Cron entries are managed through the Manager's REST API. For interactive exploration, see the Swagger UI at `http://localhost:8000/docs`.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/cron-dags` | Create a new cron entry |
+| `GET` | `/cron-dags` | List all entries ordered by next run time |
+| `GET` | `/cron-dags/{cron_id}` | Get a single entry |
+| `PUT` | `/cron-dags/{cron_id}` | Replace an entry (resets schedule if cron expression changed) |
+| `DELETE` | `/cron-dags/{cron_id}` | Delete an entry |
+
+### Request body (`CronDAGRequest`)
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | — | Human-readable label |
+| `cron_expr` | string | yes | — | Standard 5-field cron expression |
+| `diagram` | string | yes | — | Mermaid flowchart defining the DAG (see [mermaid-dag-spec.md](mermaid-dag-spec.md)). Must have exactly one root node. |
+| `enabled` | boolean | no | `true` | When `false`, entry is rescheduled but not dispatched |
+| `concurrency_policy` | string | no | `"always"` | `"always"` or `"skip_if_running"` |
+
+### Response shape
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | string (ULID) | Entry identifier |
+| `name` | string | Label |
+| `cron_expr` | string | Stored cron expression |
+| `diagram` | string | Mermaid diagram regenerated from stored spec (node IDs are ULIDs) |
+| `enabled` | boolean | Current enabled state |
+| `concurrency_policy` | string | `"always"` or `"skip_if_running"` |
+| `created_at` | ISO 8601 datetime | Creation timestamp |
+| `next_run_at` | ISO 8601 datetime or null | Next scheduled firing |
+
+### Create
+
+```bash
+curl -X POST http://localhost:8000/cron-dags \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "daily_report",
+    "cron_expr": "0 6 * * *",
+    "diagram": "flowchart TD\n    A[\"generate_daily_report:reports(report_type=daily)\"]",
+    "concurrency_policy": "skip_if_running"
+  }'
+```
+
+For a multi-step DAG, use the mermaid chain syntax:
+
+```bash
+curl -X POST http://localhost:8000/cron-dags \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "nightly_etl",
+    "cron_expr": "0 2 * * *",
+    "diagram": "flowchart TD\n    A[\"extract_data:heavy\"] --> B[\"transform_data\"] --> C[\"load_results\"]",
+    "concurrency_policy": "skip_if_running"
+  }'
+```
+
+Returns 201 with the created entry. Returns 400 if the cron expression is invalid, the diagram fails to parse, or the diagram has multiple disconnected root nodes.
+
+### List
+
+```bash
+curl "http://localhost:8000/cron-dags?offset=0&limit=50"
+```
+
+Returns `{"total": N, "cron_dags": [...]}` ordered by `next_run_at` ascending.
+
+### Get
+
+```bash
+curl http://localhost:8000/cron-dags/01JXXX...
+```
+
+Returns 404 if not found.
+
+### Update
+
+Replace an entry with new values. The `id` and `created_at` are preserved. If `cron_expr` changes, `next_run_at` is recalculated.
+
+```bash
+curl -X PUT http://localhost:8000/cron-dags/01JXXX... \
+  -H "Content-Type: application/json" \
+  -d '{"name": "daily_report", "cron_expr": "0 7 * * *", "diagram": "..."}'
+```
+
+### Pause (disable without deleting)
+
+```bash
+curl -X PUT http://localhost:8000/cron-dags/01JXXX... \
+  -H "Content-Type: application/json" \
+  -d '{"name": "daily_report", "cron_expr": "0 6 * * *", "diagram": "...", "enabled": false}'
+```
+
+Disabled entries are still rescheduled on each poll but not dispatched, so the schedule is never lost.
+
+### Delete
+
+```bash
+curl -X DELETE http://localhost:8000/cron-dags/01JXXX...
+```
+
+Returns 200 with `{"message": "Cron DAG '...' deleted successfully."}`. Returns 404 if not found.
+
+---
+
+## Registering a Cron Entry via Python (Low-Level)
+
+> This low-level approach is useful for startup scripts or migrations running without a Manager process. For most use cases, the HTTP API above is simpler.
+
+Register cron entries directly via `StateManager`:
 
 ```python
 import datetime as dt
@@ -107,9 +218,11 @@ Each cron fire generates a **fresh copy** of the DAG spec with brand-new ULIDs f
 
 ---
 
-## Disabling and Deleting Entries
+## Disabling and Deleting Entries via Python (Low-Level)
 
-### Disable (pause without deleting)
+> For the HTTP API equivalents, see [Managing Cron Entries via the HTTP API](#managing-cron-entries-via-the-http-api) above.
+
+### Disable via Python (pause without deleting)
 
 ```python
 # Fetch the entry, set enabled=False, re-register under the same ID
@@ -120,7 +233,7 @@ await pipe.execute()
 
 Disabled entries are still picked up by the Scheduler on schedule — they are rescheduled for their next occurrence but not dispatched. This means the schedule is never permanently lost.
 
-### Delete
+### Delete via Python
 
 ```python
 pipe = state_manager.job_store.pipeline(transaction=True)
@@ -134,7 +247,7 @@ await pipe.execute()
 
 The Scheduler polls both retry-delayed tasks and cron entries on every iteration:
 
-```
+```python
 while True:
     task_entries, cron_entries = await asyncio.gather(
         task_scheduler.next_due_bulk(batch_size, queues=queues),

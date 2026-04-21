@@ -64,7 +64,7 @@ This starts:
 | `collector` | 4317 / 4318 | OpenTelemetry Collector |
 | `openobserve` | 5080 | Metrics and logs UI |
 
-The `cleaner` and `scheduler` are not included in the default compose file; run them as cron jobs or add them as additional services.
+The `cleaner` is not included in the default compose file; run it as a cron job or add it as an additional service.
 
 ---
 
@@ -138,7 +138,7 @@ jobbers_cleaner \
   --rate-limit-age 604800
 ```
 
-All time arguments are in **seconds** and are optional.
+Duration arguments (`--stale-time`, `--completed-task-age`, `--dlq-age`, `--rate-limit-age`) are in seconds. Range arguments (`--min-queue-age`, `--max-queue-age`) take Unix epoch timestamps in seconds. All arguments are optional.
 
 | Argument | Description |
 | --- | --- |
@@ -219,6 +219,10 @@ The frontend (port 3000 in dev, or the build served behind your web server) prov
 - **Roles** — assign queues to roles; workers refresh automatically when roles change.
 
 All data is pulled from the Manager API at `http://localhost:8000`.
+
+### API Reference
+
+The Manager serves a full interactive API reference at `http://localhost:8000/docs` (Swagger UI). The machine-readable OpenAPI spec is available at `http://localhost:8000/openapi.json` and is also checked into the repo as `openapi.json` (source of truth for the frontend).
 
 ### API Endpoints for Monitoring
 

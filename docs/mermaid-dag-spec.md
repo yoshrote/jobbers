@@ -12,12 +12,12 @@ Jobbers uses a subset of the [Mermaid](https://mermaid.js.org/) `flowchart TD` d
 
 Every node uses a **quoted rectangular-bracket label**:
 
-```
+```text
 node_id["task_name[@version][:queue][(param=val, ...)]"]
 ```
 
 | Section | Required | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `task_name` | yes | Registered task name — must match a `@register_task(name=...)` declaration |
 | `@version` | no | Integer task version; defaults to `0` when omitted |
 | `:queue` | no | Target queue; defaults to `"default"` |
@@ -29,7 +29,7 @@ node_id["task_name[@version][:queue][(param=val, ...)]"]
 Values inside `(...)` are coerced in this order:
 
 | Input | Result type |
-|---|---|
+| --- | --- |
 | `~<base64>` | base64-decoded JSON — any JSON type (list, dict, `null`, etc.) |
 | `null` (case-insensitive) | `None` |
 | `true` / `false` (case-insensitive) | `bool` |
@@ -145,7 +145,7 @@ What this describes:
 
 ### Submit an ad-hoc DAG
 
-```
+```http
 POST /submit-dag
 Content-Type: application/json
 
@@ -162,7 +162,7 @@ Response:
 
 ### Create a cron-scheduled DAG
 
-```
+```http
 POST /cron-dags
 Content-Type: application/json
 
@@ -179,7 +179,7 @@ The `diagram` field is regenerated from the stored `DAGTaskSpec` on every `GET` 
 
 ### View task DAG
 
-```
+```http
 GET /task-status/01JXXX...
 ```
 
@@ -202,7 +202,7 @@ The mermaid format is a **static** representation of a DAG.  Some features of th
 
 | Feature | Status |
 | ------- | ------ |
-| `DynamicFanOut` returned from a task function at runtime | **Not representable in mermaid.** `DynamicFanOut` is produced inside a task function during execution; the number of branches cannot be known at authoring time. Use the Python `DAGNode` API directly when this pattern is required. |
+| `DynamicFanOut` returned from a task function at runtime | **Not representable in mermaid.** `DynamicFanOut` is produced inside a task function during execution; the number of branches cannot be known at authoring time. Use the Python `DAGNode` API directly when this pattern is required. *(A Mermaid decision-node syntax is proposed but not yet implemented — see "Proposed changes" below.)* |
 | Multiple `-.->` error edges from the same source node | **Parse error.** The parser rejects diagrams with more than one error edge per source and raises `MermaidParseError`. This matches the underlying model constraint that each node has at most one error callback. |
 
 ---
@@ -217,11 +217,13 @@ The mermaid format is a **static** representation of a DAG.  Some features of th
 
 ## Proposed changes
 
+> **NOT YET IMPLEMENTED.** The decision-node syntax, `@register_router`, `--o` fan-in edges from decision nodes, and diamond `D{...}` shapes described in this section do not exist in the current parser. Submitting a diagram containing `D{...}` nodes will produce a parse error. For runtime fan-out today, use the `TaskResult` + `DynamicFanOut` Python API described in [DAG Patterns](dags.md).
+
 ### Decision nodes (dynamic fan-out)
 
 A diamond-shaped decision node would declare a dynamic fan-out whose number of children is determined at runtime by a registered routing function:
 
-```
+```text
 D{"router_name[(key=val, ...)]"}
 ```
 
