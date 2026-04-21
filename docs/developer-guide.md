@@ -76,13 +76,13 @@ async def generate_report(**kwargs: object) -> dict[str, object]:
 | `max_retries` | `int` | `3` | Maximum retry attempts after the first failure. |
 | `retry_delay` | `int \| None` | `None` | Base delay in seconds before a retry. `None` = re-queue immediately. |
 | `backoff_strategy` | `BackoffStrategy` | `EXPONENTIAL` | How the delay grows per attempt. |
-| `max_retry_delay` | `int` | `3600` | Upper bound on computed delay, in seconds. |
+| `max_retry_delay` | `int` | `3600` | Upper bound on computed delay, in seconds. *(Exists in `TaskConfig` but not yet exposed via `@register_task`.)* |
 | `expected_exceptions` | `tuple[type[Exception]]` | `None` | Exception types that trigger the retry/backoff path. All others go straight to `failed`. |
 | `timeout` | `int \| None` | `None` | Task timeout in seconds. Treated like an expected exception when exceeded. |
 | `dead_letter_policy` | `DeadLetterPolicy` | `NONE` | `SAVE` copies permanently failed tasks to the DLQ. |
 | `max_heartbeat_interval` | `timedelta \| None` | `None` | If set, the Cleaner marks the task `stalled` when this interval passes without a heartbeat. |
 | `max_concurrent` | `int \| None` | `1` | Max simultaneous executions of this task per worker. `None` = unlimited. |
-| `on_shutdown` | `TaskShutdownPolicy` | `STOP` | What happens to the task when the worker receives SIGTERM. |
+| `on_shutdown` | `TaskShutdownPolicy` | `STOP` | What happens to the task when the worker receives SIGTERM. *(Exists in `TaskConfig` but not yet exposed via `@register_task`; see "Shutdown Policies" below.)* |
 
 ### Heartbeats
 
@@ -98,6 +98,82 @@ async def bulk_import(**kwargs: object) -> None:
         await import_batch(batch)
         await task.heartbeat()   # must be called at least once every 2 minutes
 ```
+
+### Shutdown Policies
+
+When the worker receives `SIGTERM`, each in-flight task is handled according to its `on_shutdown` policy:
+
+| Policy | Behaviour |
+| --- | --- |
+| `STOP` (default) | The task coroutine is cancelled and the task is marked `stalled`. The Cleaner detects stalled tasks on the next run. |
+| `RESUBMIT` | The task is re-queued without incrementing `retry_attempt`. Useful for idempotent tasks during rolling deploys. |
+| `CONTINUE` | The task coroutine is wrapped in `asyncio.shield()` so the worker waits for it to finish naturally before exiting. Appropriate only for tasks with very short remaining work. |
+
+`on_shutdown` is stored on `TaskConfig` but is not yet a parameter of `@register_task`. To use a non-default policy, set it directly on the `TaskConfig` after registration or patch the registry at startup.
+
+### Returning Results and Propagating to Downstream Tasks
+
+Task functions can return a plain `dict` or a `TaskResult`:
+
+- A **plain `dict`** is stored in `task.results` and works fine for standalone tasks.
+- A **`TaskResult`** (from `jobbers.models.dag`) additionally tracks `parent_ids` for correct DAG ancestry. Use `task.make_result()` to construct one — it auto-populates `parent_ids` from the running task.
+
+```python
+from jobbers.context import get_current_task
+from jobbers.models.dag import TaskResult
+
+@register_task(name="fetch_data", version=1)
+async def fetch_data(**kwargs: object) -> TaskResult:
+    task = get_current_task()
+    data = await load_data(kwargs["source"])
+    return task.make_result(results={"rows": len(data), "path": data.path})
+```
+
+Downstream tasks that set `inject_parent_results=True` will receive these results as a `parent_results` kwarg (see below).
+
+### Passing Parent Results to Downstream Tasks
+
+When building DAGs, pass `inject_parent_results=True` to `DAGNode.then()` or `DAGNode.merge()` to have the worker automatically inject parent output into the child task's kwargs:
+
+```python
+fetch = fetch_data.node(queue="etl", source="warehouse")
+process = process_data.node(queue="etl")
+fetch.then(process, inject_parent_results=True)
+```
+
+Inside `process_data`:
+
+```python
+@register_task(name="process_data", version=1)
+async def process_data(**kwargs: object) -> dict[str, object]:
+    parent = kwargs["parent_results"]   # dict from fetch_data's TaskResult.results
+    rows = parent["rows"]
+    ...
+```
+
+For fan-in nodes (multiple parents), `parent_results` is a list of dicts — one per predecessor, in the order they completed. See [DAG Patterns](dags.md) for full examples.
+
+### Using the Task Wrapper
+
+`@register_task` returns a `TaskWrapper`. In addition to being callable as a plain async function, it exposes three convenience methods:
+
+```python
+# Submit immediately (requires StateManager to be initialized)
+task = await my_task.submit(queue="reports", report_id=42)
+
+# Schedule for a future time
+import datetime as dt
+task = await my_task.schedule(
+    dt.datetime(2026, 5, 1, 9, 0, tzinfo=dt.UTC),
+    queue="reports",
+    report_id=42,
+)
+
+# Create a DAGNode for graph construction (no I/O — returns immediately)
+node = my_task.node(queue="reports", report_id=42)
+```
+
+`.submit()` and `.schedule()` are thin wrappers around `StateManager` and require it to be initialized. Inside a worker or manager process this happens automatically at startup. See [DAG Patterns](dags.md) for `node()` usage.
 
 ### Versioning
 
