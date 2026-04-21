@@ -6,19 +6,17 @@ import { submitDag } from '../api/client'
 mermaid.initialize({ startOnLoad: false, theme: 'default' })
 
 const PLACEHOLDER = `flowchart TD
-    A["fetch_data:heavy(limit=100)"]
-    B["process_chunk_a"]
-    C["process_chunk_b"]
-    D["merge_results"]
-    E["notify_slack(channel=ops)"]
-    err["notify_failure"]
+    A["echo_task(value=hello)"]
+    B["always_fail_task"]
+    C["scheduled_fail_task"]
+    D["echo_task(value=done)"]
+    err["echo_task(value=error)"]
 
     A --> B
     A --> C
     B --> D
     C --> D
-    D --> E
-    A -.-> err`
+    B -.-> err`
 
 export default function SubmitDAG() {
   const [diagram, setDiagram]     = useState(PLACEHOLDER)
