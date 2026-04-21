@@ -98,6 +98,6 @@ def run() -> None:
     poll_interval = float(os.environ.get("SCHEDULER_POLL_INTERVAL", "5.0"))
     batch_size = int(os.environ.get("SCHEDULER_BATCH_SIZE", "1"))
     role = os.environ.get("SCHEDULER_ROLE", "default")
-    config_interval = dt.timedelta(minutes=int(os.environ.get("SCHEDULFER_CONFIG_REFRESH_INTERVAL", "3")))
+    config_interval = dt.timedelta(minutes=int(os.environ.get("SCHEDULER_CONFIG_REFRESH_INTERVAL", "3")))
 
     asyncio.run(main(poll_interval, config_interval, role, batch_size))

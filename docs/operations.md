@@ -184,6 +184,7 @@ jobbers_scheduler
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Seconds between polls when no tasks are due. |
 | `SCHEDULER_BATCH_SIZE` | `1` | Max tasks dispatched per poll iteration. |
 | `SCHEDULER_ROLE` | `default` | Limits the scheduler to queues in this role. |
+| `SCHEDULER_CONFIG_REFRESH_INTERVAL` | `3` | Minutes between queue configuration refreshes. |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL |
 
