@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 
 import pytest
@@ -49,7 +50,7 @@ async def drain(sm: StateManager) -> int:
                 break
         if task is None:
             break
-        await TaskProcessor(sm).process(task)
+        await TaskProcessor(sm).run(task)
         count += 1
     return count
 
@@ -331,3 +332,69 @@ async def test_parameters_passed_and_results(sm: StateManager) -> None:
     assert task.status == TaskStatus.COMPLETED
     assert task.results == {"value": "hello"}
     assert task.parameters == {"value": "hello"}
+
+
+# ── Scenario 10: Cancellation ─────────────────────────────────────────────────
+
+
+async def _wait_for_started(sm: StateManager, task_id: ULID, *, max_wait: float = 2.0) -> None:
+    """Poll until the task reaches STARTED status or the deadline expires."""
+    deadline = asyncio.get_event_loop().time() + max_wait
+    while asyncio.get_event_loop().time() < deadline:
+        t = await sm.ta.get_task(task_id)
+        if t is not None and t.status == TaskStatus.STARTED:
+            return
+        await asyncio.sleep(0.01)
+    raise TimeoutError(f"Task {task_id} did not reach STARTED within {max_wait}s")
+
+
+@pytest.mark.asyncio
+async def test_cancel_running_task(sm: StateManager) -> None:
+    """A STARTED task transitions to CANCELLED when a cancellation is requested."""
+    diagram = """
+    flowchart TD
+      A["slow_task@1"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    _, submitted = await sm.submit_dag(*roots)
+    task_id = submitted[0].id
+
+    drain_bg = asyncio.create_task(drain(sm))
+    await _wait_for_started(sm, task_id)
+    # Give the monitor coroutine one poll cycle to reach get_message()
+    await asyncio.sleep(0.05)
+
+    await sm.request_task_cancellation(task_id)
+    await drain_bg
+
+    result = await sm.ta.get_task(task_id)
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancel_dag_root_leaves_downstream_unsubmitted(sm: StateManager) -> None:
+    """When the root of a DAG chain is cancelled, successor tasks are never submitted."""
+    diagram = """
+    flowchart TD
+      A["slow_task@1"] --> B["echo_task@1(value=b)"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    await sm.submit_dag(*roots)
+
+    a_node = roots[0]
+    b_node = a_node._successors[0][0]  # type: ignore[attr-defined]
+
+    drain_bg = asyncio.create_task(drain(sm))
+    await _wait_for_started(sm, a_node.id)
+    await asyncio.sleep(0.05)
+
+    await sm.request_task_cancellation(a_node.id)
+    await drain_bg
+
+    task_a = await sm.ta.get_task(a_node.id)
+    task_b = await sm.ta.get_task(b_node.id)
+
+    assert task_a is not None
+    assert task_a.status == TaskStatus.CANCELLED
+    assert task_b is None  # successor was never submitted

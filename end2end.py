@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from jobbers.models.dag import TaskResult
@@ -46,3 +47,14 @@ async def always_fail_task() -> dict[Any, Any]:
 )
 async def scheduled_fail_task() -> dict[Any, Any]:
     raise CustomException("scheduled fail")
+
+
+@register_task(
+    name="slow_task",
+    version=1,
+    max_concurrent=None,
+    max_retries=0,
+)
+async def slow_task() -> dict[Any, Any]:
+    await asyncio.sleep(30)
+    return {}

@@ -647,6 +647,75 @@ async def test_timeout_max_retries_fails_even_with_scheduler():
     state_manager.schedule_retry_task.assert_not_called()
 
 
+# ── TaskGroup cleanup (monitor cancelled when process finishes) ───────────────
+
+
+@pytest.mark.asyncio
+async def test_run_cancels_monitor_when_process_succeeds():
+    """When process() returns normally, the monitor task is cancelled and awaited."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    monitor_cancelled = asyncio.Event()
+
+    async def slow_monitor(_task_id: str) -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            monitor_cancelled.set()
+            raise
+
+    state_manager.monitor_task_cancellation.side_effect = slow_monitor
+
+    task_function = AsyncMock(return_value=None)
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.run(task)
+
+    assert monitor_cancelled.is_set(), "Monitor should be cancelled when process completes successfully"
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_run_cancels_monitor_when_process_fails():
+    """When the task function raises (process() returns with FAILED status), the monitor is cancelled."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    monitor_cancelled = asyncio.Event()
+
+    async def slow_monitor(_task_id: str) -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            monitor_cancelled.set()
+            raise
+
+    state_manager.monitor_task_cancellation.side_effect = slow_monitor
+
+    task_function = AsyncMock(side_effect=RuntimeError("boom"))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10, max_retries=0)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.run(task)
+
+    assert monitor_cancelled.is_set(), "Monitor should be cancelled when process completes with a failure"
+    assert task.status == TaskStatus.FAILED
+
+
 # ── pubsub cancellation ───────────────────────────────────────────────────────
 
 
@@ -932,8 +1001,10 @@ async def test_post_process_triggers_dag_callbacks():
     processor = TaskProcessor(state_manager)
     await processor.post_process(parent)
 
-    # At least one child task should have been submitted
-    assert state_manager.stage_submit_task.call_count >= 1
+    # Exactly one child task should have been submitted (one SimpleCallback)
+    state_manager.stage_submit_task.assert_called_once()
+    submitted = state_manager.stage_submit_task.call_args[0][1]
+    assert submitted.name == child_spec.name
 
 
 @pytest.mark.asyncio
@@ -1184,6 +1255,60 @@ async def test_non_failed_terminal_statuses_do_not_trigger_error_callback(trigge
         assert task.status == TaskStatus.DROPPED
 
     state_manager.stage_submit_task.assert_not_called()
+
+
+# ── handle_success cron_id branch ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_success_without_cron_id_calls_save_task():
+    """handle_success saves the task directly when cron_id is None."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.STARTED,
+        queue="default",
+        cron_id=None,
+    )
+    state_manager = _make_state_manager()
+    processor = TaskProcessor(state_manager)
+    await processor.handle_success(task)
+
+    state_manager.save_task.assert_awaited_once_with(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_handle_success_with_cron_id_uses_pipeline_not_save_task():
+    """handle_success uses a transactional pipeline (stage_save + stage_clear_active_run) when cron_id is set."""
+    from ulid import ULID
+
+    cron_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.STARTED,
+        queue="default",
+        cron_id=cron_id,
+    )
+    state_manager = _make_state_manager()
+    mock_pipe = AsyncMock()
+    state_manager.job_store = MagicMock()
+    state_manager.job_store.pipeline.return_value = mock_pipe
+    state_manager.ta = MagicMock()
+    state_manager.cron_dag_scheduler = MagicMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor.handle_success(task)
+
+    state_manager.save_task.assert_not_awaited()
+    state_manager.job_store.pipeline.assert_called_once_with(transaction=True)
+    state_manager.ta.stage_save.assert_called_once_with(mock_pipe, task)
+    state_manager.cron_dag_scheduler.stage_clear_active_run.assert_called_once_with(mock_pipe, cron_id)
+    mock_pipe.execute.assert_awaited_once()
+    assert task.status == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
