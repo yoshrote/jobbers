@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import random
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from opentelemetry import metrics
 from redis.exceptions import WatchError
@@ -17,11 +18,13 @@ from jobbers.adapters.raw_redis import DeadQueue
 from jobbers.models.cron_dag_scheduler import CronDAGScheduler
 from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task_config import DeadLetterPolicy
+from jobbers.models.task_routing import RoutingStrategy, TaskRoutingConfigAdapter
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
+from jobbers.utils.lazy_ttl import LazyTTL
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
     from redis.asyncio.client import Pipeline, Redis
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -32,6 +35,7 @@ if TYPE_CHECKING:
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task
+    from jobbers.models.task_routing import RoutingConfig
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -58,16 +62,20 @@ class StateManager:
         job_store: Redis,
         session_factory: async_sessionmaker[AsyncSession],
         task_adapter: TaskAdapterProtocol | None = None,
+        config_cache_ttl: int = 30,
     ) -> None:
         self.job_store: Redis = job_store
         self.qca = QueueConfigAdapter(session_factory)
+        self.rca = TaskRoutingConfigAdapter(session_factory)
         self.ta: TaskAdapterProtocol = (
             task_adapter if task_adapter is not None else JsonTaskAdapter(job_store)
         )
-        self.submission_limiter = SubmissionRateLimiter(job_store, self.qca)
+        self._queue_config_cache: LazyTTL = LazyTTL(config_cache_ttl)
+        self._routing_config_cache: LazyTTL = LazyTTL(config_cache_ttl)
+        self.submission_limiter = SubmissionRateLimiter(job_store, self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
-        self.task_scheduler = TaskScheduler(job_store, self.ta, self.qca)
+        self.task_scheduler = TaskScheduler(job_store, self.ta, self.get_all_queues)
         self.cron_dag_scheduler = CronDAGScheduler(job_store)
 
     @property
@@ -96,7 +104,7 @@ class StateManager:
     ) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.UTC)
-        queues = {q.encode() for q in await self.qca.get_all_queues()}
+        queues = {q.encode() for q in await self.get_all_queues()}
 
         clean_ops = []
         if rate_limit_age:
@@ -177,6 +185,7 @@ class StateManager:
 
     async def schedule_new_task(self, task: Task, run_at: dt.datetime) -> Task:
         """Save a brand-new task directly into the scheduler in a single atomic transaction."""
+        task.queue = await self.resolve_queue(task)
         task.status = TaskStatus.SCHEDULED
         pipe = self.job_store.pipeline(transaction=True)
         self.task_scheduler.stage_add(pipe, task, run_at)
@@ -310,7 +319,7 @@ class StateManager:
 
             fresh_spec, _ = entry.dag_spec.fresh_copy()
             fan_ins = collect_fan_in_keys(fresh_spec)
-            queue_config = await self.qca.get_queue_config(queue=fresh_spec.queue)
+            queue_config = await self.get_queue_config(fresh_spec.queue)
 
             task = Task(
                 id=fresh_spec.id,
@@ -413,8 +422,46 @@ class StateManager:
         task.set_status(TaskStatus.SUBMITTED)
         self.ta.stage_submit_task(pipe, task)
 
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
+        """Return queue config, reading from cache or SQL on miss."""
+        if queue not in self._queue_config_cache:
+            self._queue_config_cache.set(queue, await self.qca.get_queue_config(queue))
+        return cast("QueueConfig | None", self._queue_config_cache.get(queue))
+
+    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
+        """Return routing config, reading from cache or SQL on miss."""
+        key = (task_name, task_version)
+        if key not in self._routing_config_cache:
+            self._routing_config_cache.set(key, await self.rca.get_routing_config(task_name, task_version))
+        return cast("RoutingConfig | None", self._routing_config_cache.get(key))
+
+    async def get_queues(self, role: str) -> set[str]:
+        """Return the set of queues assigned to a role."""
+        return await self.qca.get_queues(role)
+
+    async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
+        """Return per-queue max_concurrent limits, reusing the queue-config cache."""
+        results = await asyncio.gather(*(self.get_queue_config(q) for q in queues))
+        return {q: (cfg.max_concurrent if cfg else None) for q, cfg in zip(queues, results)}
+
+    async def get_all_queues(self) -> list[str]:
+        """Return the list of all configured queue names."""
+        return await self.qca.get_all_queues()
+
+    async def resolve_queue(self, task: Task) -> str:
+        """Return the queue name to use for *task*, applying routing config if one is set."""
+        routing = await self.get_routing_config(task.name, task.version)
+        if routing is None:
+            return task.queue
+        match routing.strategy:
+            case RoutingStrategy.SINGLE:
+                return routing.queues[0]
+            case RoutingStrategy.WEIGHTED:
+                return random.choices(routing.queues, weights=routing.weights, k=1)[0]
+
     async def submit_task(self, task: Task) -> None:
-        queue_config = await self.qca.get_queue_config(queue=task.queue)
+        task.queue = await self.resolve_queue(task)
+        queue_config = await self.get_queue_config(task.queue)
         task.set_status(TaskStatus.SUBMITTED)
         if (
             queue_config
@@ -519,9 +566,11 @@ class SubmissionRateLimiter:
 
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
 
-    def __init__(self, job_store: Redis, queue_config_adapter: QueueConfigAdapter):
+    def __init__(
+        self, job_store: Redis, get_queue_config: Callable[[str], Awaitable[QueueConfig | None]]
+    ) -> None:
         self.job_store = job_store
-        self.qca = queue_config_adapter
+        self._get_queue_config = get_queue_config
 
     async def concurrency_limits(
         self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]
@@ -529,7 +578,7 @@ class SubmissionRateLimiter:
         """Limit the number of concurrent tasks in each queue."""
         queues_to_use = set()
         queues = list(task_queues)
-        configs = await asyncio.gather(*(self.qca.get_queue_config(queue=q) for q in queues))
+        configs = await asyncio.gather(*(self._get_queue_config(q) for q in queues))
         for queue, config in zip(queues, configs, strict=True):
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:

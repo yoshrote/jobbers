@@ -849,9 +849,8 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     state_manager.save_task = AsyncMock()
     state_manager.submit_task = AsyncMock()
 
-    # Set up qca to report non-rate-limited queues
-    state_manager.qca = AsyncMock()
-    state_manager.qca.get_queue_config = AsyncMock(return_value=None)
+    # Set up get_queue_config to report non-rate-limited queues
+    state_manager.get_queue_config = AsyncMock(return_value=None)
 
     # Set up pipeline: stage_submit_task is sync; execute() is awaitable
     mock_pipe = AsyncMock()

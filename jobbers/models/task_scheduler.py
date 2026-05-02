@@ -6,12 +6,11 @@ from ulid import ULID
 
 if TYPE_CHECKING:
     import datetime as dt
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Callable
 
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.adapters.task_adapter import TaskAdapterProtocol
-    from jobbers.models.queue_config import QueueConfigAdapter
     from jobbers.models.task import Task
 
 
@@ -50,11 +49,14 @@ class TaskScheduler:
     """
 
     def __init__(
-        self, data_store: Redis, task_adapter: TaskAdapterProtocol, queue_config_adapter: QueueConfigAdapter
+        self,
+        data_store: Redis,
+        task_adapter: TaskAdapterProtocol,
+        get_all_queues: Callable[[], Awaitable[list[str]]],
     ) -> None:
         self.data_store = data_store
         self.ta = task_adapter
-        self.qca = queue_config_adapter
+        self._get_all_queues = get_all_queues
 
     def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
         """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
@@ -104,7 +106,7 @@ class TaskScheduler:
             score_map: dict[bytes, float] = dict(pairs)
         else:
             score_map = {}
-            all_queues = await self.qca.get_all_queues()
+            all_queues = await self._get_all_queues()
             for q in all_queues:
                 pairs = await cast(
                     "Awaitable[list[tuple[bytes, float]]]",
@@ -160,7 +162,7 @@ class TaskScheduler:
             return []
 
         if queues is None:
-            queues = await self.qca.get_all_queues()
+            queues = await self._get_all_queues()
             if not queues:
                 return []
 

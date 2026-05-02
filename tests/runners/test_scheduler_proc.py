@@ -39,7 +39,7 @@ def make_state_manager_with_tasks(
         state_manager.cron_dag_scheduler.next_due_bulk = AsyncMock(side_effect=[cron_entries, []])
     else:
         state_manager.cron_dag_scheduler.next_due_bulk = AsyncMock(return_value=[])
-    state_manager.qca.get_queues = AsyncMock(return_value={"default"})
+    state_manager.get_queues = AsyncMock(return_value={"default"})
     state_manager.dispatch_scheduled_task = AsyncMock(side_effect=lambda t: t)
     state_manager.dispatch_cron_dag = AsyncMock()
     return state_manager

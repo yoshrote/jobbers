@@ -32,7 +32,7 @@ async def main() -> None:
     role = os.environ.get("WORKER_ROLE", "default")
     worker_ttl = int(os.environ.get("WORKER_TTL", 50))  # if 0, will run indefinitely
     state_manager = await db.init_state_manager()
-    task_generator = TaskGenerator(state_manager, state_manager.qca, role, max_tasks=worker_ttl)
+    task_generator = TaskGenerator(state_manager, role, max_tasks=worker_ttl)
     await task_generator.queues()  # warm up the refresh tag once
 
     semaphore = asyncio.Semaphore(num_concurrent)

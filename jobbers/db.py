@@ -95,7 +95,8 @@ async def init_state_manager() -> StateManager:
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
     client = get_client()
     _task_adapter = create_task_adapter(client)
-    _state_manager = StateManager(client, _session_factory, task_adapter=_task_adapter)
+    _config_cache_ttl = int(os.environ.get("CONFIG_CACHE_TTL", "30"))
+    _state_manager = StateManager(client, _session_factory, task_adapter=_task_adapter, config_cache_ttl=_config_cache_ttl)
     await _task_adapter.ensure_index()
     await _state_manager.dead_queue.ensure_index()
     return _state_manager

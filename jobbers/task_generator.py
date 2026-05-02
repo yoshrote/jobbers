@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
 
-from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task
 from jobbers.state_manager import StateManager
 
@@ -93,14 +92,12 @@ class TaskGenerator:
     def __init__(
         self,
         state_manager: StateManager,
-        query_config_adapter: QueueConfigAdapter,
         role: str = "default",
         max_tasks: int = 100,
         config_ttl: int = 60,
     ) -> None:
         self.role: str = role
         self.state_manager: StateManager = state_manager
-        self.query_config_adapter = query_config_adapter
         self.ttl = LocalTTL(config_ttl)
         self.max_task_check = MaxTaskCounter(max_tasks)
         self.task_queues: set[str] = set()
@@ -111,7 +108,7 @@ class TaskGenerator:
         """Find all queues we should listen to via Redis."""
         if self.role == "default":
             return self.DEFAULT_QUEUES
-        queues = await self.query_config_adapter.get_queues(self.role)
+        queues = await self.state_manager.get_queues(self.role)
         return queues or set()
 
     async def filter_by_worker_queue_capacity(self, queues: set[str]) -> set[str]:
@@ -119,7 +116,7 @@ class TaskGenerator:
             return queues
 
         active_tasks = self.state_manager.active_tasks_per_queue
-        queue_worker_limits = await self.query_config_adapter.get_queue_limits(queues)
+        queue_worker_limits = await self.state_manager.get_queue_limits(queues)
         logger.debug("Queues: %s; Active: %s; Limits: %s", queues, active_tasks, queue_worker_limits)
         # TODO: write tests to make sure this filters correctly
         return {

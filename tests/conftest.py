@@ -30,13 +30,23 @@ def task_adapter(redis, request):
 @pytest_asyncio.fixture
 async def state_manager(redis, session_factory, dummy_task_adapter):
     """StateManager backed by DummyTaskAdapter: fast, single-run, for tests that don't exercise adapter internals."""
-    return StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    sm.get_queue_config = sm.qca.get_queue_config
+    sm.get_routing_config = sm.rca.get_routing_config
+    sm.get_queues = sm.qca.get_queues
+    sm.get_all_queues = sm.qca.get_all_queues
+    return sm
 
 
 @pytest_asyncio.fixture
 async def state_manager_real_ta(redis, session_factory):
     """StateManager backed by MsgpackTaskAdapter for tests that exercise the full adapter call path."""
-    return StateManager(redis, session_factory, task_adapter=MsgpackTaskAdapter(redis))
+    sm = StateManager(redis, session_factory, task_adapter=MsgpackTaskAdapter(redis))
+    sm.get_queue_config = sm.qca.get_queue_config
+    sm.get_routing_config = sm.rca.get_routing_config
+    sm.get_queues = sm.qca.get_queues
+    sm.get_all_queues = sm.qca.get_all_queues
+    return sm
 
 
 class DummyTaskAdapter:

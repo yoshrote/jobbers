@@ -53,8 +53,6 @@ def test_load_task_module_invalid_path_raises():
 
 def _make_state_manager() -> MagicMock:
     sm = MagicMock()
-    sm.qca = MagicMock()
-    sm.qca.get_queues = AsyncMock(return_value={"default"})
     return sm
 
 
@@ -117,7 +115,7 @@ async def test_main_respects_worker_ttl_env_var(monkeypatch):
         await main()
 
     _, kwargs = MockGen.call_args
-    assert kwargs.get("max_tasks") == 7 or MockGen.call_args[0][3] == 7
+    assert kwargs.get("max_tasks") == 7 or MockGen.call_args[0][2] == 7
 
 
 @pytest.mark.asyncio

@@ -152,6 +152,7 @@ class TaskProcessor:
             callbacks = await task.generate_callbacks(self.state_manager.ta)
             pipe = self.state_manager.job_store.pipeline(transaction=True)
             for submitted_task in callbacks:
+                submitted_task.queue = await self.state_manager.resolve_queue(submitted_task)
                 self.state_manager.stage_submit_task(pipe, submitted_task, queue_config=None)
             await pipe.execute()
 
@@ -161,6 +162,7 @@ class TaskProcessor:
         if error_callbacks:
             pipe = self.state_manager.job_store.pipeline(transaction=True)
             for cb in error_callbacks:
+                cb.queue = await self.state_manager.resolve_queue(cb)
                 self.state_manager.stage_submit_task(pipe, cb, queue_config=None)
             await pipe.execute()
 
@@ -205,7 +207,7 @@ class TaskProcessor:
         # Warn if any child queue has rate limiting — we bypass it below.
         child_queues = list({ct.queue for ct in child_tasks})
         configs = await asyncio.gather(
-            *(self.state_manager.qca.get_queue_config(queue=q) for q in child_queues)
+            *(self.state_manager.get_queue_config(q) for q in child_queues)
         )
         for queue, config in zip(child_queues, configs):
             if config and config.rate_numerator and config.rate_denominator and config.rate_period:

@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from ulid import ULID
@@ -9,6 +9,19 @@ from jobbers.models.task_config import TaskConfig
 from jobbers.validation import ValidationError, validate_task
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
+
+
+def _mock_sm(routing=None, queue_config=None):
+    sm = AsyncMock()
+    sm.get_routing_config = AsyncMock(return_value=routing)
+    sm.get_queue_config = AsyncMock(return_value=queue_config)
+    return sm
+
+
+_no_routing = patch(
+    "jobbers.validation.db.get_state_manager",
+    return_value=_mock_sm(routing=None, queue_config=QueueConfig(name="default")),
+)
 
 
 @pytest.mark.asyncio
@@ -42,14 +55,11 @@ async def test_validate_task_valid_sets_task_config():
         pass
 
     task_config = TaskConfig(name="Test Task", function=task_function)
-    queue_config = QueueConfig(name="default")
     task = Task(id=ULID1, name="Test Task", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with patch("jobbers.validation.db.get_session_factory", return_value=MagicMock()):
-            with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
-                MockAdapter.return_value.get_queue_config = AsyncMock(return_value=queue_config)
-                await validate_task(task)
+        with _no_routing:
+            await validate_task(task)
 
     assert task.task_config is task_config
 
@@ -65,8 +75,9 @@ async def test_validate_task_missing_queue_config():
     task = Task(id=ULID1, name="Test Task", queue="unknown-queue", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with patch("jobbers.validation.db.get_session_factory", return_value=MagicMock()):
-            with patch("jobbers.validation.QueueConfigAdapter") as MockAdapter:
-                MockAdapter.return_value.get_queue_config = AsyncMock(return_value=None)
-                with pytest.raises(ValidationError, match="Unknown queue unknown-queue"):
-                    await validate_task(task)
+        with patch(
+            "jobbers.validation.db.get_state_manager",
+            return_value=_mock_sm(routing=None, queue_config=None),
+        ):
+            with pytest.raises(ValidationError, match="Unknown queue unknown-queue"):
+                await validate_task(task)

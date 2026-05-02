@@ -974,3 +974,91 @@ async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queu
 
     mock_stage.assert_not_called()
     mock_submit.assert_called_once()
+
+
+# ── resolve_queue ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def testresolve_queue_no_routing_returns_task_queue(state_manager):
+    """When no routing config exists, resolve_queue returns the task's own queue."""
+    task = Task(id=ULID1, name="my_task", version=1, queue="original")
+    result = await state_manager.resolve_queue(task)
+    assert result == "original"
+
+
+@pytest.mark.asyncio
+async def testresolve_queue_single_strategy(state_manager):
+    """SINGLE routing always returns the configured queue."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    config = RoutingConfig(task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["target"])
+    await state_manager.rca.save_routing_config(config)
+
+    task = Task(id=ULID1, name="my_task", version=1, queue="ignored")
+    result = await state_manager.resolve_queue(task)
+    assert result == "target"
+
+
+@pytest.mark.asyncio
+async def testresolve_queue_weighted_strategy_returns_one_of_configured_queues(state_manager):
+    """WEIGHTED routing returns one of the configured queues."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    config = RoutingConfig(
+        task_name="my_task", task_version=1, strategy=RoutingStrategy.WEIGHTED, queues=["fast", "slow"], weights=[1.0, 1.0]
+    )
+    await state_manager.rca.save_routing_config(config)
+
+    task = Task(id=ULID1, name="my_task", version=1, queue="ignored")
+    results = {await state_manager.resolve_queue(task) for _ in range(20)}
+    assert results <= {"fast", "slow"}
+    assert len(results) > 0
+
+
+@pytest.mark.asyncio
+async def testresolve_queue_routing_is_version_specific(state_manager):
+    """Routing config is looked up by (name, version); a different version falls through."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    config = RoutingConfig(task_name="my_task", task_version=2, strategy=RoutingStrategy.SINGLE, queues=["routed"])
+    await state_manager.rca.save_routing_config(config)
+
+    task_v1 = Task(id=ULID1, name="my_task", version=1, queue="original")
+    assert await state_manager.resolve_queue(task_v1) == "original"
+
+    task_v2 = Task(id=ULID2, name="my_task", version=2, queue="original")
+    assert await state_manager.resolve_queue(task_v2) == "routed"
+
+
+# ── cache behaviour ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_queue_config_caches_result(redis, session_factory, dummy_task_adapter):
+    """get_queue_config returns a cached value on the second call."""
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    await sm.qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
+    r1 = await sm.get_queue_config("q1")
+    assert r1 is not None and r1.max_concurrent == 5
+    # Replace the adapter method so any second SQL call would return a different value
+    sm.qca.get_queue_config = AsyncMock(return_value=QueueConfig(name="q1", max_concurrent=99))
+    r2 = await sm.get_queue_config("q1")
+    assert r2 is not None and r2.max_concurrent == 5, "cache should serve the original value"
+
+
+@pytest.mark.asyncio
+async def test_get_routing_config_caches_result(redis, session_factory, dummy_task_adapter):
+    """get_routing_config returns a cached value on the second call."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["routed"])
+    await sm.rca.save_routing_config(config)
+    r1 = await sm.get_routing_config("t", 1)
+    assert r1 is not None and r1.queues == ["routed"]
+    sm.rca.get_routing_config = AsyncMock(return_value=RoutingConfig(
+        task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["other"]
+    ))
+    r2 = await sm.get_routing_config("t", 1)
+    assert r2 is not None and r2.queues == ["routed"], "cache should serve the original value"

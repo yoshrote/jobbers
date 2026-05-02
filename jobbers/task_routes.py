@@ -17,6 +17,7 @@ from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task import Task, TaskPagination
+from jobbers.models.task_routing import RoutingConfig, TaskRoutingConfigAdapter
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import TaskException
 from jobbers.utils.mermaid_dag import MermaidParseError, dag_spec_to_mermaid, parse_mermaid_dag
@@ -429,6 +430,36 @@ async def delete_role(role_name: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
     await qca.delete_role(role_name)
     return {"message": f"Role '{role_name}' deleted successfully."}
+
+
+# ── Task routing ───────────────────────────────────────────────────────────────
+
+
+@app.get("/task-routing/{task_name}/{task_version}")
+async def get_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
+    """Retrieve the routing configuration for a specific task type."""
+    config = await TaskRoutingConfigAdapter(db.get_session_factory()).get_routing_config(task_name, task_version)
+    if config is None:
+        raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
+    return {"routing": config.model_dump()}
+
+
+@app.put("/task-routing/{task_name}/{task_version}")
+async def update_task_routing(task_name: str, task_version: int, routing_config: RoutingConfig) -> dict[str, Any]:
+    """Create or update the routing configuration for a task type. Path parameters override body values."""
+    routing_config.task_name = task_name
+    routing_config.task_version = task_version
+    await TaskRoutingConfigAdapter(db.get_session_factory()).save_routing_config(routing_config)
+    return {"message": "Task routing updated successfully", "routing": routing_config.model_dump()}
+
+
+@app.delete("/task-routing/{task_name}/{task_version}", status_code=200)
+async def delete_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
+    """Remove the routing configuration for a task type. Returns 404 if it does not exist."""
+    deleted = await TaskRoutingConfigAdapter(db.get_session_factory()).delete_routing_config(task_name, task_version)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
+    return {"message": f"Routing config for '{task_name}' v{task_version} deleted successfully."}
 
 
 # ── DAG submission ─────────────────────────────────────────────────────────────

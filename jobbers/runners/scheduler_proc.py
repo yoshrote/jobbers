@@ -40,7 +40,7 @@ async def main(poll_interval: float, config_interval: dt.timedelta, role: str, b
     while True:
         now = dt.datetime.now(dt.UTC)
         if now - queues_fetched_at >= config_interval:
-            queues = list(await state_manager.qca.get_queues(role))
+            queues = list(await state_manager.get_queues(role))
             queues_fetched_at = now
         task_entries, cron_entries = await asyncio.gather(
             state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues if queues else None),

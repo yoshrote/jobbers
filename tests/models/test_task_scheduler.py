@@ -18,14 +18,15 @@ def make_task(task_id: str = "01JQC31AJP7TSA9X8AEP64XG08", queue: str = "default
     return Task(id=task_id, name="test_task", version=1, queue=queue, status=TaskStatus.SCHEDULED)
 
 
-@pytest.fixture
-def qca(session_factory):
-    return QueueConfigAdapter(session_factory)
+@pytest_asyncio.fixture
+async def qca(session_factory):
+    yield QueueConfigAdapter(session_factory)
 
 
 @pytest_asyncio.fixture
-async def scheduler(redis, dummy_task_adapter, qca):
-    yield TaskScheduler(redis, dummy_task_adapter, qca)
+async def scheduler(redis, dummy_task_adapter, session_factory):
+    qca = QueueConfigAdapter(session_factory)
+    yield TaskScheduler(redis, dummy_task_adapter, qca.get_all_queues)
 
 
 async def schedule(s: TaskScheduler, task: Task, run_at: dt.datetime) -> None:

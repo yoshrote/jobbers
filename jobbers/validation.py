@@ -1,5 +1,4 @@
 from jobbers import db, registry
-from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task
 
 
@@ -20,6 +19,9 @@ async def validate_task(task: Task) -> None:
     if not task.valid_task_params():
         raise ValidationError(f"Invalid parameters for {task.name} v{task.version}")
 
-    queue_config = await QueueConfigAdapter(db.get_session_factory()).get_queue_config(task.queue)
-    if queue_config is None:
-        raise ValidationError(f"Unknown queue {task.queue}")
+    sm = db.get_state_manager()
+    routing = await sm.get_routing_config(task.name, task.version)
+    if routing is None:
+        queue_config = await sm.get_queue_config(task.queue)
+        if queue_config is None:
+            raise ValidationError(f"Unknown queue {task.queue}")

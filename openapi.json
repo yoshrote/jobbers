@@ -279,11 +279,11 @@
                   "type": "string",
                   "minLength": 26,
                   "maxLength": 26,
-                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                  "pattern": "[A-Z0-9]{26}"
                 },
                 {
                   "type": "string",
-                  "contentMediaType": "application/octet-stream",
+                  "format": "binary",
                   "minLength": 16,
                   "maxLength": 16
                 },
@@ -988,11 +988,11 @@
                   "type": "string",
                   "minLength": 26,
                   "maxLength": 26,
-                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                  "pattern": "[A-Z0-9]{26}"
                 },
                 {
                   "type": "string",
-                  "contentMediaType": "application/octet-stream",
+                  "format": "binary",
                   "minLength": 16,
                   "maxLength": 16
                 },
@@ -1266,6 +1266,165 @@
                   "type": "object",
                   "additionalProperties": true,
                   "title": "Response Delete Role Roles  Role Name  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/task-routing/{task_name}/{task_version}": {
+      "get": {
+        "summary": "Get Task Routing",
+        "description": "Retrieve the routing configuration for a specific task type.",
+        "operationId": "get_task_routing_task_routing__task_name___task_version__get",
+        "parameters": [
+          {
+            "name": "task_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Name"
+            }
+          },
+          {
+            "name": "task_version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Task Routing Task Routing  Task Name   Task Version  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update Task Routing",
+        "description": "Create or update the routing configuration for a task type. Path parameters override body values.",
+        "operationId": "update_task_routing_task_routing__task_name___task_version__put",
+        "parameters": [
+          {
+            "name": "task_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Name"
+            }
+          },
+          {
+            "name": "task_version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Version"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoutingConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Update Task Routing Task Routing  Task Name   Task Version  Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Task Routing",
+        "description": "Remove the routing configuration for a task type. Returns 404 if it does not exist.",
+        "operationId": "delete_task_routing_task_routing__task_name___task_version__delete",
+        "parameters": [
+          {
+            "name": "task_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Name"
+            }
+          },
+          {
+            "name": "task_version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Task Routing Task Routing  Task Name   Task Version  Delete"
                 }
               }
             }
@@ -1733,13 +1892,13 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                "pattern": "[A-Z0-9]{26}"
               },
               {
                 "type": "string",
                 "maxLength": 16,
                 "minLength": 16,
-                "contentMediaType": "application/octet-stream"
+                "format": "binary"
               }
             ],
             "title": "Id"
@@ -2081,6 +2240,60 @@
         "title": "RootResponse",
         "description": "Response model for the root endpoint."
       },
+      "RoutingConfig": {
+        "properties": {
+          "task_name": {
+            "type": "string",
+            "title": "Task Name",
+            "default": ""
+          },
+          "task_version": {
+            "type": "integer",
+            "title": "Task Version",
+            "default": 0
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/RoutingStrategy"
+          },
+          "queues": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Queues"
+          },
+          "weights": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weights"
+          }
+        },
+        "type": "object",
+        "required": [
+          "strategy",
+          "queues"
+        ],
+        "title": "RoutingConfig",
+        "description": "Queue routing configuration for a task type."
+      },
+      "RoutingStrategy": {
+        "type": "string",
+        "enum": [
+          "single",
+          "weighted"
+        ],
+        "title": "RoutingStrategy",
+        "description": "Queue routing strategy for a task type."
+      },
       "ScheduleTaskRequest": {
         "properties": {
           "task": {
@@ -2158,13 +2371,13 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                "pattern": "[A-Z0-9]{26}"
               },
               {
                 "type": "string",
                 "maxLength": 16,
                 "minLength": 16,
-                "contentMediaType": "application/octet-stream"
+                "format": "binary"
               }
             ],
             "title": "Id"
@@ -2310,13 +2523,13 @@
                   "type": "string",
                   "maxLength": 26,
                   "minLength": 26,
-                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                  "pattern": "[A-Z0-9]{26}"
                 },
                 {
                   "type": "string",
                   "maxLength": 16,
                   "minLength": 16,
-                  "contentMediaType": "application/octet-stream"
+                  "format": "binary"
                 }
               ]
             },
@@ -2334,13 +2547,13 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                "pattern": "[A-Z0-9]{26}"
               },
               {
                 "type": "string",
                 "maxLength": 16,
                 "minLength": 16,
-                "contentMediaType": "application/octet-stream"
+                "format": "binary"
               },
               {
                 "type": "null"
@@ -2354,13 +2567,13 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+                "pattern": "[A-Z0-9]{26}"
               },
               {
                 "type": "string",
                 "maxLength": 16,
                 "minLength": 16,
-                "contentMediaType": "application/octet-stream"
+                "format": "binary"
               },
               {
                 "type": "null"
@@ -2502,7 +2715,6 @@
           "unsubmitted",
           "submitted",
           "started",
-          "heartbeat",
           "completed",
           "cancelled",
           "stalled",
@@ -2536,13 +2748,6 @@
           "type": {
             "type": "string",
             "title": "Error Type"
-          },
-          "input": {
-            "title": "Input"
-          },
-          "ctx": {
-            "type": "object",
-            "title": "Context"
           }
         },
         "type": "object",
