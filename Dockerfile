@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.18-slim
 WORKDIR /usr/src/app
 RUN apt-get update && apt-get install -y curl netcat-openbsd
 ENV VIRTUAL_ENV=/opt/venv
