@@ -187,6 +187,131 @@ Multiple versions of the same task can continue to co-exist for any length of ti
 
 ---
 
+## Dependency Injection
+
+Task functions can declare shared resources — database sessions, HTTP clients, config objects — as parameters annotated with `Depends()`. The worker resolves each dependency before calling the task and tears down generator providers afterwards, regardless of whether the task succeeded or raised.
+
+### Basic usage
+
+```python
+from typing import Annotated, AsyncGenerator
+from sqlalchemy.ext.asyncio import AsyncSession
+from jobbers.di import Depends
+from jobbers.registry import register_task
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with session_factory() as session:
+        try:
+            yield session
+        finally:
+            pass  # teardown always runs — commit, close, release pool connection, etc.
+
+@register_task(name="process_record", version=1)
+async def process_record(
+    record_id: int,                                   # from task.parameters — submitted by the caller
+    db: Annotated[AsyncSession, Depends(get_db)],     # injected by the worker; never in task.parameters
+) -> dict:
+    row = await db.get(MyModel, record_id)
+    ...
+    return {"status": "ok"}
+```
+
+`record_id` is submitted by the caller when they enqueue the task. `db` is never part of the submitted payload — the worker opens a session, injects it, and then closes it.
+
+### Provider types
+
+All four provider shapes are supported:
+
+| Provider | When to use |
+| --- | --- |
+| `async def` generator (`yield`) | Resources that need teardown — DB sessions, HTTP clients, locks |
+| `def` generator (`yield`) | Same, but synchronous (e.g. temp files, context managers) |
+| `async def` (no `yield`) | Async factories that need no teardown — config loaded from Redis, etc. |
+| `def` (no `yield`) | Plain synchronous factories — in-process config, constants |
+
+### Cleanup guarantee
+
+Generator providers must put teardown code in a `try/finally` block. The worker calls `aclose()` / `close()` on each open generator after the task exits, regardless of whether the task succeeded, raised, timed out, or was cancelled.
+
+```python
+async def get_http_client() -> AsyncGenerator[httpx.AsyncClient, None]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            yield client
+        finally:
+            pass  # AsyncClient.__aexit__ already handles cleanup; the finally is here for clarity
+```
+
+### Nested dependencies
+
+Providers can themselves declare `Depends()` parameters. The framework builds the full graph at decoration time and resolves it in topological order (leaves first) at execution time.
+
+```python
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with session_factory() as session:
+        try:
+            yield session
+        finally:
+            pass
+
+async def get_user_repo(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> UserRepository:
+    return UserRepository(db)
+
+@register_task(name="update_user", version=1)
+async def update_user(
+    user_id: int,
+    repo: Annotated[UserRepository, Depends(get_user_repo)],
+) -> dict:
+    ...
+```
+
+`get_db` is called once. The session is shared between `get_user_repo` and any other provider in the same task execution that also depends on `get_db`.
+
+### Shared dependencies
+
+If two parameters depend on the same provider, the provider is called once and the result shared:
+
+```python
+async def get_db() -> AsyncGenerator[AsyncSession, None]: ...
+
+async def get_user_repo(db: Annotated[AsyncSession, Depends(get_db)]) -> UserRepository: ...
+async def get_audit_log(db: Annotated[AsyncSession, Depends(get_db)]) -> AuditLog: ...
+
+@register_task(name="audit_update", version=1)
+async def audit_update(
+    user_id: int,
+    repo: Annotated[UserRepository, Depends(get_user_repo)],
+    audit: Annotated[AuditLog, Depends(get_audit_log)],
+    # Both repo and audit share the same db session — get_db is called once.
+) -> dict: ...
+```
+
+### Cycle detection
+
+The dependency graph is validated at `@register_task` decoration time (i.e. at import). A circular dependency raises `ValueError` immediately, before any task is ever submitted or executed.
+
+### Testing with dependency overrides
+
+Use `dependency_overrides` to replace providers for the duration of a test:
+
+```python
+from jobbers.di import dependency_overrides
+
+async def fake_db() -> AsyncGenerator[AsyncSession, None]:
+    yield FakeSession()
+
+def test_process_record():
+    with dependency_overrides({get_db: fake_db}):
+        # Any task that depends on get_db now receives FakeSession instead
+        await process_record.submit(queue="default", record_id=1)
+```
+
+The original provider is restored automatically when the context exits, even if the test raises.
+
+---
+
 ## Submitting Tasks
 
 ### Via the HTTP API
