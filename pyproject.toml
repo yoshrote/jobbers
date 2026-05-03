@@ -3,7 +3,7 @@ requires = [
     "hatchling", 
     "packaging",
     "tomli>=1.2.1; python_version<'3.11'",
-    "trove-classifiers==2026.1.14.14",
+    "trove-classifiers==2026.4.28.13",
 ]
 build-backend = "hatchling.build"
 
@@ -60,6 +60,7 @@ test = [
     "pytest_unordered",
     "ruff",
     "mypy",
+    "typing_extensions>=4.6.0",
 ]
 
 [tool.hatch.version]
@@ -178,7 +179,6 @@ addopts = [
     # Disable warnings summary, because we use our warning summary.
     "--disable-warnings",
     "--asyncio-mode=strict",
-    "--redis-port=6379",
 ]
 
 norecursedirs = [
