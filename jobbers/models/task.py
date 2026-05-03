@@ -68,6 +68,7 @@ class Task(BaseModel):
             # Safer to fail here than chance something funky downstream
             return True
         from jobbers.di import get_injected_param_names  # local import avoids circular dep
+
         injected = get_injected_param_names(self.task_config.function)
         try:
             hints = get_type_hints(self.task_config.function, include_extras=True)

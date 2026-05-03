@@ -29,9 +29,7 @@ def make_cron_entry(*, enabled: bool = True, cron_expr: str = "0 * * * *") -> Cr
     )
 
 
-def make_state_manager_with_tasks(
-    tasks: list[Task], cron_entries: list | None = None
-) -> MagicMock:
+def make_state_manager_with_tasks(tasks: list[Task], cron_entries: list | None = None) -> MagicMock:
     task_side_effect = [(t, PAST) for t in tasks]
     state_manager = MagicMock()
     state_manager.task_scheduler.next_due_bulk = AsyncMock(side_effect=[task_side_effect, []])
@@ -174,7 +172,9 @@ async def test_scheduler_dispatches_enabled_cron_entry():
         patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep),
     ):
         try:
-            await main(poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1)
+            await main(
+                poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1
+            )
         except asyncio.CancelledError:
             pass
 
@@ -197,7 +197,9 @@ async def test_scheduler_reschedules_disabled_cron_entry():
         patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep),
     ):
         try:
-            await main(poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1)
+            await main(
+                poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1
+            )
         except asyncio.CancelledError:
             pass
 
@@ -225,7 +227,9 @@ async def test_scheduler_handles_mixed_enabled_and_disabled_cron_entries():
         patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep),
     ):
         try:
-            await main(poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1)
+            await main(
+                poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="default", batch_size=1
+            )
         except asyncio.CancelledError:
             pass
 

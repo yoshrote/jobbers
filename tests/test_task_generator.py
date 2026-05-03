@@ -203,13 +203,15 @@ async def test_filter_by_worker_queue_capacity_mixed_scenarios():
         "queue3": 15,  # Over limit (12)
         "queue4": 2,  # No active tasks recorded, should default to 0
     }
-    state_manager.get_queue_limits = AsyncMock(return_value={
-        "queue1": 5,
-        "queue2": 10,
-        "queue3": 12,
-        "queue4": 5,
-        "queue5": 0,
-    })
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={
+            "queue1": 5,
+            "queue2": 10,
+            "queue3": 12,
+            "queue4": 5,
+            "queue5": 0,
+        }
+    )
     task_generator = TaskGenerator(state_manager)
 
     queues = {"queue1", "queue2", "queue3", "queue4", "queue5"}

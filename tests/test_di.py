@@ -21,8 +21,10 @@ from jobbers.registry import clear_registry, register_task
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_task_config(func, **kwargs) -> TaskConfig:
     from jobbers.di import inspect_task_dependencies
+
     return TaskConfig(
         name="test",
         version=1,
@@ -35,6 +37,7 @@ def _make_task_config(func, **kwargs) -> TaskConfig:
 # ---------------------------------------------------------------------------
 # Depends marker
 # ---------------------------------------------------------------------------
+
 
 def test_depends_rejects_non_callable():
     with pytest.raises(TypeError):
@@ -52,6 +55,7 @@ def test_depends_repr():
 # ---------------------------------------------------------------------------
 # inspect_task_dependencies — graph building
 # ---------------------------------------------------------------------------
+
 
 def test_inspect_returns_empty_for_no_deps():
     async def plain(x: int) -> int:
@@ -106,6 +110,7 @@ def test_inspect_detects_cycle():
     # For simplicity, verify ValueError is raised by creating two mutually-annotated functions.
     # We do this by manually calling _build_graph with a pre-seeded `visiting` set.
     from jobbers.di import _build_graph
+
     visited: dict = {}
     visiting = {a}  # pretend `a` is already in the DFS stack
     # `a` depends on `a` itself (via visiting set already containing `a`)
@@ -138,6 +143,7 @@ def test_inspect_shared_dep_appears_once():
 # get_injected_param_names
 # ---------------------------------------------------------------------------
 
+
 def test_get_injected_param_names():
     async def get_db() -> str:
         return "db"
@@ -157,6 +163,7 @@ def test_get_injected_param_names_empty():
 # ---------------------------------------------------------------------------
 # DependencyResolver
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_resolver_plain_async_dep():
@@ -344,6 +351,7 @@ async def test_resolver_error_in_provider_still_cleans_up_earlier_gens():
 # dependency_overrides context manager
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_dependency_overrides_replaces_provider():
     async def real_db() -> str:
@@ -387,6 +395,7 @@ async def test_dependency_overrides_restores_after_context():
 # ---------------------------------------------------------------------------
 # valid_task_params integration
 # ---------------------------------------------------------------------------
+
 
 def test_valid_task_params_skips_di_params(tmp_path):
     """DI params absent from task.parameters should not fail validation."""
@@ -434,15 +443,18 @@ def test_valid_task_params_still_rejects_wrong_type():
 # @register_task integration — dependency_graph populated at decoration time
 # ---------------------------------------------------------------------------
 
+
 def test_register_task_populates_dependency_graph():
     async def get_val() -> int:
         return 1
 
     try:
+
         @register_task(name="di_test_task", version=1)
         async def task_func(v: Annotated[int, Depends(get_val)]) -> None: ...
 
         from jobbers.registry import get_task_config
+
         cfg = get_task_config("di_test_task", 1)
         assert cfg is not None
         assert len(cfg.dependency_graph) == 1

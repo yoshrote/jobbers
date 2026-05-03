@@ -77,7 +77,7 @@ def test_from_row_single():
 
 
 def test_from_row_weighted():
-    row = ("my_task", 2, "weighted", '["fast", "slow"]', '[0.8, 0.2]')
+    row = ("my_task", 2, "weighted", '["fast", "slow"]', "[0.8, 0.2]")
     config = RoutingConfig.from_row(row)
     assert config.strategy == RoutingStrategy.WEIGHTED
     assert config.queues == ["fast", "slow"]
@@ -109,7 +109,11 @@ async def test_save_and_get_single(adapter):
 @pytest.mark.asyncio
 async def test_save_and_get_weighted(adapter):
     config = RoutingConfig(
-        task_name="echo", task_version=1, strategy=RoutingStrategy.WEIGHTED, queues=["fast", "slow"], weights=[2.0, 1.0]
+        task_name="echo",
+        task_version=1,
+        strategy=RoutingStrategy.WEIGHTED,
+        queues=["fast", "slow"],
+        weights=[2.0, 1.0],
     )
     await adapter.save_routing_config(config)
     result = await adapter.get_routing_config("echo", 1)
@@ -121,11 +125,17 @@ async def test_save_and_get_weighted(adapter):
 
 @pytest.mark.asyncio
 async def test_save_upserts_existing(adapter):
-    config1 = RoutingConfig(task_name="echo", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"])
+    config1 = RoutingConfig(
+        task_name="echo", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"]
+    )
     await adapter.save_routing_config(config1)
 
     config2 = RoutingConfig(
-        task_name="echo", task_version=1, strategy=RoutingStrategy.WEIGHTED, queues=["fast", "slow"], weights=[1.0, 1.0]
+        task_name="echo",
+        task_version=1,
+        strategy=RoutingStrategy.WEIGHTED,
+        queues=["fast", "slow"],
+        weights=[1.0, 1.0],
     )
     await adapter.save_routing_config(config2)
 
@@ -138,7 +148,11 @@ async def test_save_upserts_existing(adapter):
 async def test_configs_are_isolated_by_version(adapter):
     v1 = RoutingConfig(task_name="echo", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"])
     v2 = RoutingConfig(
-        task_name="echo", task_version=2, strategy=RoutingStrategy.WEIGHTED, queues=["fast", "slow"], weights=[1.0, 1.0]
+        task_name="echo",
+        task_version=2,
+        strategy=RoutingStrategy.WEIGHTED,
+        queues=["fast", "slow"],
+        weights=[1.0, 1.0],
     )
     await adapter.save_routing_config(v1)
     await adapter.save_routing_config(v2)

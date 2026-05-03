@@ -49,7 +49,6 @@ class TaskProcessor:
                 if not isinstance(exc, UserCancellationError):
                     raise  # Re-raise to exit the TaskGroup in run()
 
-
     async def process(self, task: Task) -> Task:
         """Process the task and return the result."""
         logger.debug("Task %s details: %s", task.id, task)
@@ -225,9 +224,7 @@ class TaskProcessor:
 
         # Warn if any child queue has rate limiting — we bypass it below.
         child_queues = list({ct.queue for ct in child_tasks})
-        configs = await asyncio.gather(
-            *(self.state_manager.get_queue_config(q) for q in child_queues)
-        )
+        configs = await asyncio.gather(*(self.state_manager.get_queue_config(q) for q in child_queues))
         for queue, config in zip(child_queues, configs):
             if config and config.rate_numerator and config.rate_denominator and config.rate_period:
                 logger.warning(

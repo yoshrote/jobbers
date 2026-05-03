@@ -438,7 +438,9 @@ async def delete_role(role_name: str) -> dict[str, Any]:
 @app.get("/task-routing/{task_name}/{task_version}")
 async def get_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
     """Retrieve the routing configuration for a specific task type."""
-    config = await TaskRoutingConfigAdapter(db.get_session_factory()).get_routing_config(task_name, task_version)
+    config = await TaskRoutingConfigAdapter(db.get_session_factory()).get_routing_config(
+        task_name, task_version
+    )
     if config is None:
         raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
     return {"routing": config.model_dump()}

@@ -22,6 +22,7 @@ class Depends:
             async with session_factory() as session:
                 yield session
 
+
         @register_task(name="my_task", version=1)
         async def my_task(
             record_id: int,
@@ -55,9 +56,11 @@ class DependencyNode:
 # Graph inspection — called once at @register_task decoration time
 # ---------------------------------------------------------------------------
 
+
 def _extract_depends(hint: Any) -> Depends | None:
     """Return the Depends marker from an Annotated hint, or None."""
     import typing
+
     if get_origin(hint) is not typing.Annotated:
         return None
     for meta in get_args(hint)[1:]:
@@ -148,9 +151,7 @@ def get_injected_param_names(func: Callable[..., Any]) -> frozenset[str]:
     except Exception:
         return frozenset()
     return frozenset(
-        name
-        for name, hint in hints.items()
-        if name != "return" and _extract_depends(hint) is not None
+        name for name, hint in hints.items() if name != "return" and _extract_depends(hint) is not None
     )
 
 
@@ -173,6 +174,7 @@ def dependency_overrides(
         async def fake_db() -> AsyncSession:
             return FakeSession()
 
+
         with dependency_overrides({get_db: fake_db}):
             await process_payment.submit(...)
     """
@@ -187,6 +189,7 @@ def dependency_overrides(
 # ---------------------------------------------------------------------------
 # Per-execution resolver
 # ---------------------------------------------------------------------------
+
 
 class DependencyResolver:
     """
