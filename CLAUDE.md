@@ -103,6 +103,7 @@ async def my_task(**kwargs):
 | `WORKER_CONCURRENT_TASKS` | `5` | Worker |
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Scheduler |
 | `SCHEDULER_BATCH_SIZE` | `1` | Scheduler |
+| `TASK_ADAPTER` | `"json"` | All (`"json"` or `"msgpack"`) |
 | `REDIS_URL` | `redis://localhost:6379` | All |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All |
 | `CONFIG_CACHE_TTL` | `30` | All (queue/routing config cache TTL in seconds) |

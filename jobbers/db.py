@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from jobbers.adapters.task_adapter import TaskAdapterProtocol
     from jobbers.state_manager import StateManager
 
-TASK_ADAPTER_BACKEND = "json"
+TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")
 DEFAULT_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 _client: redis.Redis | None = None
