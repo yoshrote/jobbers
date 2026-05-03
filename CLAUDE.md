@@ -11,6 +11,7 @@ jobbers/
 │   ├── adapters/              # Task storage backends (Redis JSON vs msgpack)
 │   ├── models/                # Pydantic models + enums
 │   ├── utils/                 # OpenTelemetry, serialization
+│   ├── di.py                  # FastAPI-styled dependency injection resolver
 │   ├── state_manager.py       # Central Redis/SQL state management
 │   ├── task_processor.py      # Single-task execution lifecycle
 │   ├── task_generator.py      # Async iterator: yields tasks from queues
@@ -55,15 +56,17 @@ All four run as separate processes (separate Docker containers in production).
 ## Task Lifecycle
 
 ```
-UNSUBMITTED → SUBMITTED → STARTED → COMPLETED
+UNSUBMITTED → SUBMITTED → STARTED → COMPLETED → [DAG callbacks / fan-out children]
+           → SCHEDULED (task.schedule() / POST /schedule-task) → re-queued by scheduler → SUBMITTED
                                   → FAILED (no retries left) → [DLQ if policy=SAVE]
-                                  → SCHEDULED (retry delay) → re-queued by scheduler
+                                  → SCHEDULED (retry delay set) → re-queued by scheduler → SUBMITTED
+                                  → UNSUBMITTED (immediate retry, no retry_delay) → SUBMITTED
                                   → CANCELLED (user request)
                                   → STALLED (heartbeat timeout or SIGTERM + STOP policy)
                                   → DROPPED (unknown task type)
 ```
 
-Workers apply the `on_shutdown` policy on SIGTERM: `STOP` (cancel → STALLED), `RESUBMIT` (re-enqueue), `CONTINUE` (shield to completion).
+Workers apply the `on_shutdown` policy on SIGTERM: `STOP` (→ STALLED), `RESUBMIT` (→ UNSUBMITTED, re-enqueued), `CONTINUE` (shield to completion).
 
 ## Task Registration
 
@@ -102,6 +105,7 @@ async def my_task(**kwargs):
 | `SCHEDULER_BATCH_SIZE` | `1` | Scheduler |
 | `REDIS_URL` | `redis://localhost:6379` | All |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All |
+| `CONFIG_CACHE_TTL` | `30` | All (queue/routing config cache TTL in seconds) |
 
 ## Testing
 
@@ -176,9 +180,11 @@ The test suite follows a layered approach designed for speed and systematic prot
 
 #### Known hard-to-cover paths (concurrency guards)
 
-The following lines are defensive race-condition guards that require a key to be deleted between a `scan_iter` and a subsequent `GET`/`JSON.GET`. They cannot be covered reliably without concurrent test execution or low-level patching:
+The following lines cannot be covered reliably without concurrent execution, low-level patching, or specially broken inputs:
 
-- `jobbers/adapters/raw_redis.py` line 249 — `if task_data is None: continue` in `MsgpackTaskAdapter.clean_terminal_tasks`
-- `jobbers/task_generator.py` lines 167–169 — the `if task:` requeue branch in `TaskGenerator.__anext__`'s `CancelledError` handler (task is always `None` when `get_next_task` raises, making this branch unreachable in practice)
+- `jobbers/adapters/raw_redis.py` line 312 — `if task_data is None: continue` in `MsgpackTaskAdapter.clean_terminal_tasks` (key deleted between `scan_iter` and `GET`)
+- `jobbers/task_generator.py` line 156 — the `if task:` requeue branch in `TaskGenerator.__anext__`'s `CancelledError` handler (task is always `None` when `get_next_task` raises, making this branch unreachable in practice)
+- `jobbers/di.py` lines 227, 232 — exception handlers in `DependencyResolver.__aexit__` that catch errors thrown by generator cleanup; requires an async/sync generator that raises during `.aclose()` / `.close()`
+- `jobbers/task_processor.py` line 80 — `hints = {}` fallback when `get_type_hints()` raises; only reachable with unresolvable forward references in task annotations
 
 These should be addressed with integration tests or by restructuring the code so the guard is testable.
