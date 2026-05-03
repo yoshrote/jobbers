@@ -1,10 +1,12 @@
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type_hints
 
 from opentelemetry import metrics
 
 from jobbers.context import _current_task as _current_task_cv
+from jobbers.di import DependencyResolver
+from jobbers.di import Depends as _Depends
 from jobbers.models.dag import DynamicFanOut, TaskResult
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
@@ -67,42 +69,59 @@ class TaskProcessor:
                 kwargs = dict(task.parameters)
                 if task.inject_parent_results and task.parent_ids:
                     kwargs["parent_results"] = await task.parent_results()
-                self._current_promise = task.task_config.function(**kwargs)
-                if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
-                    self._current_promise = asyncio.shield(self._current_promise)
 
-                # Run the task and handle exceptions
-                try:
-                    async with asyncio.timeout(task.task_config.timeout):
-                        raw_result = await self._current_promise
-                    if isinstance(raw_result, TaskResult):
-                        task.results = raw_result.results
-                        dynamic_fanout = raw_result.fanout
-                        if raw_result.parent_ids:
-                            task.parent_ids = raw_result.parent_ids
+                resolver = DependencyResolver(task.task_config.dependency_graph)
+                async with resolver:
+                    # Resolve DI deps and map them to their kwarg names
+                    dep_cache = await resolver.resolve_all()
+                    try:
+                        hints = get_type_hints(task.task_config.function, include_extras=True)
+                    except Exception:
+                        hints = {}
+                    for param_name, hint in hints.items():
+                        if param_name == "return":
+                            continue
+                        if get_origin(hint) is Annotated:
+                            for meta in get_args(hint)[1:]:
+                                if isinstance(meta, _Depends) and meta.dependency in dep_cache:
+                                    kwargs[param_name] = dep_cache[meta.dependency]
+
+                    self._current_promise = task.task_config.function(**kwargs)
+                    if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
+                        self._current_promise = asyncio.shield(self._current_promise)
+
+                    # Run the task and handle exceptions
+                    try:
+                        async with asyncio.timeout(task.task_config.timeout):
+                            raw_result = await self._current_promise
+                        if isinstance(raw_result, TaskResult):
+                            task.results = raw_result.results
+                            dynamic_fanout = raw_result.fanout
+                            if raw_result.parent_ids:
+                                task.parent_ids = raw_result.parent_ids
+                        else:
+                            task.results = {}
+                    except TimeoutError:
+                        task = await self.handle_timeout_exception(task)
+                    except asyncio.CancelledError as exc:
+                        if task.status == TaskStatus.CANCELLED:
+                            pass  # user cancellation already handled; keep CANCELLED status
+                        else:
+                            ex = exc
+                            await self.handle_system_cancelled_task(task)
+                    except Exception as exc:
+                        if (
+                            task.task_config
+                            and task.task_config.expected_exceptions
+                            and isinstance(exc, task.task_config.expected_exceptions)
+                        ):
+                            task = await self.handle_expected_exception(task, exc)
+                        else:
+                            await self.handle_unexpected_exception(task, exc)
                     else:
-                        task.results = {}
-                except TimeoutError:
-                    task = await self.handle_timeout_exception(task)
-                except asyncio.CancelledError as exc:
-                    if task.status == TaskStatus.CANCELLED:
-                        pass  # user cancellation already handled; keep CANCELLED status
-                    else:
-                        ex = exc
-                        await self.handle_system_cancelled_task(task)
-                except Exception as exc:
-                    if (
-                        task.task_config
-                        and task.task_config.expected_exceptions
-                        and isinstance(exc, task.task_config.expected_exceptions)
-                    ):
-                        task = await self.handle_expected_exception(task, exc)
-                    else:
-                        await self.handle_unexpected_exception(task, exc)
-                else:
-                    await self.handle_success(task)
-                finally:
-                    _current_task_cv.reset(_token)
+                        await self.handle_success(task)
+                    finally:
+                        _current_task_cv.reset(_token)
 
             await self.state_manager.remove_task_heartbeat(task)
 

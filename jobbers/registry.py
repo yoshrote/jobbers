@@ -3,6 +3,7 @@ import logging
 from collections.abc import Awaitable, Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
+from jobbers.di import inspect_task_dependencies
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
 
 if TYPE_CHECKING:
@@ -85,6 +86,7 @@ def register_task(
             raise ValueError("Task function must be callable")
         # Unwrap a TaskWrapper so double-decoration stores the raw function.
         raw_func: Callable[..., Any] = func._func if isinstance(func, TaskWrapper) else func
+        dep_graph = inspect_task_dependencies(raw_func)
         if (name, version) in _task_function_map:
             if _task_function_map[(name, version)].function != raw_func:
                 logger.exception(
@@ -98,6 +100,7 @@ def register_task(
             name=name,
             version=version,
             function=raw_func,
+            dependency_graph=dep_graph,
             max_concurrent=max_concurrent,
             timeout=timeout,
             max_retries=max_retries,

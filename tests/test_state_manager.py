@@ -1040,11 +1040,13 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
     sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
     await sm.qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
     r1 = await sm.get_queue_config("q1")
-    assert r1 is not None and r1.max_concurrent == 5
+    assert r1 is not None
+    assert r1.max_concurrent == 5
     # Replace the adapter method so any second SQL call would return a different value
     sm.qca.get_queue_config = AsyncMock(return_value=QueueConfig(name="q1", max_concurrent=99))
     r2 = await sm.get_queue_config("q1")
-    assert r2 is not None and r2.max_concurrent == 5, "cache should serve the original value"
+    assert r2 is not None
+    assert r2.max_concurrent == 5, "cache should serve the original value"
 
 
 @pytest.mark.asyncio
@@ -1056,9 +1058,12 @@ async def test_get_routing_config_caches_result(redis, session_factory, dummy_ta
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["routed"])
     await sm.rca.save_routing_config(config)
     r1 = await sm.get_routing_config("t", 1)
-    assert r1 is not None and r1.queues == ["routed"]
+    assert r1 is not None
+    assert r1.queues == ["routed"]
+
     sm.rca.get_routing_config = AsyncMock(return_value=RoutingConfig(
         task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["other"]
     ))
     r2 = await sm.get_routing_config("t", 1)
-    assert r2 is not None and r2.queues == ["routed"], "cache should serve the original value"
+    assert r2 is not None, "cache should serve the original value"
+    assert r2.queues == ["routed"], "cache should serve the original value"

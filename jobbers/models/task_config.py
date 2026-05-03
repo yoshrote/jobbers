@@ -58,6 +58,18 @@ class TaskConfig(BaseModel):
     # The tuple of expected exceptions that can be handled by the task processor
     expected_exceptions: tuple[type[Exception]] | None = Field(default=None)
 
+    # Pre-computed dependency graph for DI — populated by @register_task at decoration time.
+    # Stored as list[Any] at runtime (list[DependencyNode]); serialised to qualified names for JSON.
+    dependency_graph: Annotated[
+        list[Any],
+        WithJsonSchema({"type": "array", "readOnly": True}),
+        PlainSerializer(
+            lambda nodes: [f"{n.provider.__module__}.{n.provider.__qualname__}" for n in nodes],
+            return_type=list[str],
+            when_used="json",
+        ),
+    ] = Field(default_factory=list)
+
     def compute_retry_at(self, attempt: int) -> dt.datetime:
         """Return the datetime at which the given retry attempt should run."""
         base = float(self.retry_delay or 0)

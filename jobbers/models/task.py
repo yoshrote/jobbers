@@ -1,8 +1,7 @@
 import datetime as dt
-import inspect
 import logging
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, get_type_hints
 
 from opentelemetry import metrics
 from pydantic import BaseModel, Field, TypeAdapter, field_serializer
@@ -68,16 +67,26 @@ class Task(BaseModel):
         if not self.task_config:
             # Safer to fail here than chance something funky downstream
             return True
-        signature = inspect.get_annotations(self.task_config.function)
-        for param, psig in signature.items():
+        from jobbers.di import get_injected_param_names  # local import avoids circular dep
+        injected = get_injected_param_names(self.task_config.function)
+        try:
+            hints = get_type_hints(self.task_config.function, include_extras=True)
+        except Exception:
+            return True  # can't resolve hints — skip validation
+        for param, hint in hints.items():
             # Skip the return type annotation
             if param == "return":
+                continue
+            # Skip parameters that are dependency-injected — never in task.parameters
+            if param in injected:
                 continue
             # Skip parameters not present in the submitted payload — they may
             # have defaults or be injected at execution time (e.g. parent_results).
             if param not in self.parameters:
                 continue
-            if not isinstance(self.parameters[param], psig):
+            # Strip Annotated wrapper before isinstance (Annotated is not a valid isinstance target)
+            raw_type = get_args(hint)[0] if get_origin(hint) is Annotated else hint
+            if not isinstance(self.parameters[param], raw_type):
                 return False
         return True
 
