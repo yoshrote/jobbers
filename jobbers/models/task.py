@@ -290,6 +290,9 @@ class Task(BaseModel):
         def _dt(ts: float | None) -> dt.datetime | None:
             return dt.datetime.fromtimestamp(ts, dt.UTC) if ts is not None else None
 
+        def _ulid(v: ULID | str) -> ULID:
+            return v if isinstance(v, ULID) else ULID.from_str(v)
+
         return cls(
             id=task_id,
             name=raw.get("name", ""),
@@ -306,10 +309,10 @@ class Task(BaseModel):
             heartbeat_at=_dt(raw.get("heartbeat_at")),
             completed_at=_dt(raw.get("completed_at")),
             dag_callbacks=_dag_callback_adapter.validate_python(raw.get("dag_callbacks") or []),
-            parent_ids=[ULID.from_str(pid) for pid in raw.get("parent_ids") or []],
+            parent_ids=[_ulid(p) for p in raw.get("parent_ids") or []],
             inject_parent_results=raw.get("inject_parent_results", False),
-            cron_id=ULID.from_str(raw["cron_id"]) if raw.get("cron_id") else None,
-            dag_run_id=ULID.from_str(raw["dag_run_id"]) if raw.get("dag_run_id") else None,
+            cron_id=_ulid(raw["cron_id"]) if raw.get("cron_id") else None,
+            dag_run_id=_ulid(raw["dag_run_id"]) if raw.get("dag_run_id") else None,
         )
 
     def set_status(self, status: TaskStatus) -> None:

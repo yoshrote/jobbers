@@ -117,7 +117,13 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
 
     def pack(self, task: Task) -> bytes:
         """Serialize a task to msgpack bytes."""
-        return serialize(task.to_dict())
+        d = task.to_dict()
+        d["parent_ids"] = list(task.parent_ids)
+        if task.cron_id is not None:
+            d["cron_id"] = task.cron_id
+        if task.dag_run_id is not None:
+            d["dag_run_id"] = task.dag_run_id
+        return serialize(d)
 
     def unpack(self, task_id: ULID, data: bytes) -> Task:
         """Deserialize a task from msgpack bytes."""
