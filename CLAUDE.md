@@ -4,7 +4,7 @@ Jobbers is a lightweight distributed task execution framework (similar to Celery
 
 ## Directory Structure
 
-```
+```text
 jobbers/
 ├── jobbers/                   # Python backend package
 │   ├── runners/               # Entry points for each process
@@ -55,7 +55,7 @@ All four run as separate processes (separate Docker containers in production).
 
 ## Task Lifecycle
 
-```
+```mermaid
 UNSUBMITTED → SUBMITTED → STARTED → COMPLETED → [DAG callbacks / fan-out children]
            → SCHEDULED (task.schedule() / POST /schedule-task) → re-queued by scheduler → SUBMITTED
                                   → FAILED (no retries left) → [DLQ if policy=SAVE]
