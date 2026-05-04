@@ -230,7 +230,7 @@ async def get_queue_config(queue_name: str) -> dict[str, Any]:
 async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, Any]:
     """Create or update the configuration for a queue. The name in the body is ignored; the path name is used."""
     queue_config.name = queue_name
-    await QueueConfigAdapter(db.get_session_factory()).save_queue_config(queue_config)
+    await db.get_state_manager().save_queue_config(queue_config)
     return {"message": "Queue updated successfully", "queue": queue_config.model_dump()}
 
 
@@ -432,6 +432,17 @@ async def delete_role(role_name: str) -> dict[str, Any]:
     return {"message": f"Role '{role_name}' deleted successfully."}
 
 
+@app.post("/roles/{role_name}/refresh", status_code=200)
+async def refresh_role(role_name: str) -> dict[str, Any]:
+    """Bump the refresh tag for a role, causing workers to reload their queue list on the next poll."""
+    qca = QueueConfigAdapter(db.get_session_factory())
+    all_roles = await qca.get_all_roles()
+    if role_name not in all_roles:
+        raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
+    new_tag = await db.get_state_manager().bump_refresh_tag(role_name)
+    return {"role": role_name, "refresh_tag": new_tag}
+
+
 # ── Task routing ───────────────────────────────────────────────────────────────
 
 
@@ -447,18 +458,20 @@ async def get_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
 
 
 @app.put("/task-routing/{task_name}/{task_version}")
-async def update_task_routing(task_name: str, task_version: int, routing_config: RoutingConfig) -> dict[str, Any]:
+async def update_task_routing(
+    task_name: str, task_version: int, routing_config: RoutingConfig
+) -> dict[str, Any]:
     """Create or update the routing configuration for a task type. Path parameters override body values."""
     routing_config.task_name = task_name
     routing_config.task_version = task_version
-    await TaskRoutingConfigAdapter(db.get_session_factory()).save_routing_config(routing_config)
+    await db.get_state_manager().save_routing_config(routing_config)
     return {"message": "Task routing updated successfully", "routing": routing_config.model_dump()}
 
 
 @app.delete("/task-routing/{task_name}/{task_version}", status_code=200)
 async def delete_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
     """Remove the routing configuration for a task type. Returns 404 if it does not exist."""
-    deleted = await TaskRoutingConfigAdapter(db.get_session_factory()).delete_routing_config(task_name, task_version)
+    deleted = await db.get_state_manager().delete_routing_config(task_name, task_version)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
     return {"message": f"Routing config for '{task_name}' v{task_version} deleted successfully."}

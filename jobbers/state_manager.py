@@ -6,7 +6,7 @@ import logging
 import random
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
 from redis.exceptions import WatchError
@@ -21,7 +21,6 @@ from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy, TaskRoutingConfigAdapter
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
-from jobbers.utils.lazy_ttl import LazyTTL
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -62,7 +61,6 @@ class StateManager:
         job_store: Redis,
         session_factory: async_sessionmaker[AsyncSession],
         task_adapter: TaskAdapterProtocol | None = None,
-        config_cache_ttl: int = 30,
     ) -> None:
         self.job_store: Redis = job_store
         self.qca = QueueConfigAdapter(session_factory)
@@ -70,8 +68,8 @@ class StateManager:
         self.ta: TaskAdapterProtocol = (
             task_adapter if task_adapter is not None else JsonTaskAdapter(job_store)
         )
-        self._queue_config_cache: LazyTTL = LazyTTL(config_cache_ttl)
-        self._routing_config_cache: LazyTTL = LazyTTL(config_cache_ttl)
+        self._queue_config_cache: dict[str, QueueConfig | None] = {}
+        self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
         self.submission_limiter = SubmissionRateLimiter(job_store, self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
@@ -425,15 +423,56 @@ class StateManager:
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
         """Return queue config, reading from cache or SQL on miss."""
         if queue not in self._queue_config_cache:
-            self._queue_config_cache.set(queue, await self.qca.get_queue_config(queue))
-        return cast("QueueConfig | None", self._queue_config_cache.get(queue))
+            self._queue_config_cache[queue] = await self.qca.get_queue_config(queue)
+        return self._queue_config_cache.get(queue)
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
         """Return routing config, reading from cache or SQL on miss."""
         key = (task_name, task_version)
         if key not in self._routing_config_cache:
-            self._routing_config_cache.set(key, await self.rca.get_routing_config(task_name, task_version))
-        return cast("RoutingConfig | None", self._routing_config_cache.get(key))
+            self._routing_config_cache[key] = await self.rca.get_routing_config(task_name, task_version)
+        return self._routing_config_cache.get(key)
+
+    def invalidate_queue_config(self, queue: str) -> None:
+        self._queue_config_cache.pop(queue, None)
+
+    def invalidate_routing_config(self, task_name: str, task_version: int) -> None:
+        self._routing_config_cache.pop((task_name, task_version), None)
+
+    def invalidate_all_routing_config(self) -> None:
+        self._routing_config_cache.clear()
+
+    async def get_routing_version(self) -> ULID | None:
+        raw: bytes | None = await self.job_store.get("routing:version")
+        return ULID.from_bytes(raw) if raw else None
+
+    async def bump_routing_version(self) -> None:
+        await self.job_store.set("routing:version", ULID().bytes)
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        return await self.qca.bump_refresh_tag(role)
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        return await self.qca.bump_refresh_tags_for_queue(queue_name)
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        """Save queue config, invalidate local cache, and bump refresh_tags for affected roles."""
+        await self.qca.save_queue_config(queue_config)
+        self.invalidate_queue_config(queue_config.name)
+        await self.bump_refresh_tags_for_queue(queue_config.name)
+
+    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
+        """Save routing config, invalidate local cache entry, and bump routing version."""
+        await self.rca.save_routing_config(routing_config)
+        self.invalidate_routing_config(routing_config.task_name, routing_config.task_version)
+        await self.bump_routing_version()
+
+    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
+        """Delete routing config, invalidate local cache entry, and bump routing version."""
+        deleted = await self.rca.delete_routing_config(task_name, task_version)
+        self.invalidate_routing_config(task_name, task_version)
+        await self.bump_routing_version()
+        return deleted
 
     async def get_queues(self, role: str) -> set[str]:
         """Return the set of queues assigned to a role."""
@@ -455,9 +494,19 @@ class StateManager:
             return task.queue
         match routing.strategy:
             case RoutingStrategy.SINGLE:
-                return routing.queues[0]
+                final = routing.queues[0]
             case RoutingStrategy.WEIGHTED:
-                return random.choices(routing.queues, weights=routing.weights, k=1)[0]
+                final = random.choices(routing.queues, weights=routing.weights, k=1)[0]
+        if final != task.queue:
+            logger.info(
+                "Routing override: task=%s v%d original=%s resolved=%s strategy=%s",
+                task.name,
+                task.version,
+                task.queue,
+                final,
+                routing.strategy,
+            )
+        return final
 
     async def submit_task(self, task: Task) -> None:
         task.queue = await self.resolve_queue(task)

@@ -604,16 +604,15 @@ async def test_get_queue_config_not_found():
 
 
 @pytest.mark.asyncio
-async def test_update_queue():
-    """PUT /queues/{name} updates the queue config."""
-    mock_qca = AsyncMock()
-
-    with patch("jobbers.task_routes.QueueConfigAdapter", return_value=mock_qca):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.put("/queues/myqueue", json={"name": "myqueue"})
+async def test_update_queue(state_manager):
+    """PUT /queues/{name} saves config via StateManager (which bumps refresh_tags and invalidates cache)."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/queues/myqueue", json={"name": "myqueue", "max_concurrent": 7})
 
     assert response.status_code == 200
-    mock_qca.save_queue_config.assert_called_once()
+    saved = await state_manager.qca.get_queue_config("myqueue")
+    assert saved is not None
+    assert saved.max_concurrent == 7
 
 
 @pytest.mark.asyncio
@@ -821,6 +820,92 @@ async def test_delete_role_not_found():
             response = await client.delete("/roles/norole")
 
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_refresh_role_found(state_manager, session_factory):
+    """POST /roles/{name}/refresh returns 200 with a new refresh_tag."""
+    qca = QueueConfigAdapter(session_factory)
+    await qca.save_role("myrole", {"default"})
+    tag_before = await state_manager.get_refresh_tag("myrole")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/roles/myrole/refresh")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["role"] == "myrole"
+    assert "refresh_tag" in data
+    tag_after = await state_manager.get_refresh_tag("myrole")
+    assert tag_after != tag_before
+
+
+@pytest.mark.asyncio
+async def test_refresh_role_not_found():
+    """POST /roles/{name}/refresh returns 404 when the role doesn't exist."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/roles/doesnotexist/refresh")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_queue_bumps_refresh_tag_for_containing_roles(state_manager, session_factory):
+    """PUT /queues/{name} bumps refresh_tag for every role that includes the queue."""
+    qca = QueueConfigAdapter(session_factory)
+    await qca.save_queue_config(QueueConfig(name="q1"))
+    await qca.save_role("role_a", {"default", "q1"})
+    await qca.save_role("role_b", {"default"})
+    tag_a_before = await state_manager.get_refresh_tag("role_a")
+    tag_b_before = await state_manager.get_refresh_tag("role_b")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/queues/q1", json={"name": "q1", "max_concurrent": 3})
+
+    assert response.status_code == 200
+    tag_a_after = await state_manager.get_refresh_tag("role_a")
+    tag_b_after = await state_manager.get_refresh_tag("role_b")
+    assert tag_a_after != tag_a_before, "role_a should have a new refresh_tag (contains q1)"
+    assert tag_b_after == tag_b_before, "role_b should be unchanged (does not contain q1)"
+
+
+@pytest.mark.asyncio
+async def test_update_task_routing_bumps_routing_version(state_manager, redis):
+    """PUT /task-routing updates routing:version to a new ULID in Redis."""
+    version_before = await redis.get("routing:version")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put(
+            "/task-routing/my_task/1",
+            json={"strategy": "single", "queues": ["default"]},
+        )
+
+    assert response.status_code == 200
+    version_after = await redis.get("routing:version")
+    assert version_after is not None
+    assert version_before != version_after
+
+
+@pytest.mark.asyncio
+async def test_delete_task_routing_bumps_routing_version(state_manager, session_factory, redis):
+    """DELETE /task-routing updates routing:version to a new ULID in Redis."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy, TaskRoutingConfigAdapter
+
+    adapter = TaskRoutingConfigAdapter(session_factory)
+    await adapter.save_routing_config(
+        RoutingConfig(
+            task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["default"]
+        )
+    )
+    version_before = await redis.get("routing:version")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete("/task-routing/my_task/1")
+
+    assert response.status_code == 200
+    version_after = await redis.get("routing:version")
+    assert version_after is not None
+    assert version_before != version_after
 
 
 # ── submit_task: TaskException branch ────────────────────────────────────────
@@ -1039,7 +1124,9 @@ async def test_get_task_routing_found(session_factory):
     from jobbers.models.task_routing import RoutingConfig, RoutingStrategy, TaskRoutingConfigAdapter
 
     adapter = TaskRoutingConfigAdapter(session_factory)
-    config = RoutingConfig(task_name="echo_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"])
+    config = RoutingConfig(
+        task_name="echo_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"]
+    )
     await adapter.save_routing_config(config)
 
     with patch("jobbers.task_routes.db.get_session_factory", return_value=session_factory):

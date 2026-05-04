@@ -303,16 +303,82 @@ async def test_cancelled_error_propagates():
 @pytest.mark.asyncio
 async def test_missing_submitted_at_raises_runtime_error():
     """A task returned by get_next_task with no submitted_at raises RuntimeError."""
-    from ulid import ULID as _ULID
 
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
 
-    task = Task(id=_ULID(), name="test_task", version=1)  # submitted_at=None by default
+    task = Task(id=ULID(), name="test_task", version=1)  # submitted_at=None by default
     state_manager.get_next_task.return_value = task
 
     task_generator = TaskGenerator(state_manager)
 
     with pytest.raises(RuntimeError, match="Pulled a task that was never submitted"):
         await task_generator.__anext__()
+
+
+# ── queues(): version-based cache invalidation ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_queues_invalidates_routing_config_on_version_change():
+    """When routing_version changes between polls, invalidate_all_routing_config is called."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits = AsyncMock(return_value={})
+    tag = ULID()
+    state_manager.get_refresh_tag = AsyncMock(return_value=tag)
+    old_version = ULID()
+    new_version = ULID()
+    state_manager.get_routing_version = AsyncMock(return_value=new_version)
+
+    task_generator = TaskGenerator(state_manager, role="default")
+    task_generator.routing_version = old_version  # stale version
+    task_generator.refresh_tag = tag  # pre-warm to suppress queue reload
+
+    await task_generator.queues()
+
+    state_manager.invalidate_all_routing_config.assert_called_once()
+    assert task_generator.routing_version == new_version
+
+
+@pytest.mark.asyncio
+async def test_queues_no_routing_invalidation_when_version_unchanged():
+    """When routing_version is the same, invalidate_all_routing_config is NOT called."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits = AsyncMock(return_value={})
+    tag = ULID()
+    state_manager.get_refresh_tag = AsyncMock(return_value=tag)
+    version = ULID()
+    state_manager.get_routing_version = AsyncMock(return_value=version)
+
+    task_generator = TaskGenerator(state_manager, role="default")
+    task_generator.routing_version = version  # already current
+    task_generator.refresh_tag = tag  # pre-warm
+
+    await task_generator.queues()
+
+    state_manager.invalidate_all_routing_config.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_queues_invalidates_queue_config_on_refresh_tag_change():
+    """When refresh_tag changes, invalidate_queue_config is called for each queue in the role."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits = AsyncMock(return_value={})
+    version = ULID()
+    state_manager.get_routing_version = AsyncMock(return_value=version)
+    new_tag = ULID()
+    state_manager.get_refresh_tag = AsyncMock(return_value=new_tag)
+
+    task_generator = TaskGenerator(state_manager, role="default")
+    task_generator.routing_version = version  # pre-warm
+    task_generator.refresh_tag = ULID()  # old tag, different from new_tag
+
+    await task_generator.queues()
+
+    # Default role → queues = {"default"}
+    state_manager.invalidate_queue_config.assert_called_once_with("default")
+    assert task_generator.refresh_tag == new_tag

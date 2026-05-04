@@ -94,14 +94,13 @@ class TaskGenerator:
         state_manager: StateManager,
         role: str = "default",
         max_tasks: int = 100,
-        config_ttl: int = 60,
     ) -> None:
         self.role: str = role
         self.state_manager: StateManager = state_manager
-        self.ttl = LocalTTL(config_ttl)
         self.max_task_check = MaxTaskCounter(max_tasks)
         self.task_queues: set[str] = set()
         self.refresh_tag: ULID | None = None
+        self.routing_version: ULID | None = None
         self._run: bool = True
 
     async def find_queues(self) -> set[str]:
@@ -130,10 +129,18 @@ class TaskGenerator:
         # queues that meet configured limits so that we evaluate that aspect
         # between configuration refresh
 
+        new_routing_version = await self.state_manager.get_routing_version()
+        if new_routing_version != self.routing_version:
+            self.routing_version = new_routing_version
+            self.state_manager.invalidate_all_routing_config()
+            logger.info("Routing config invalidated at version %s", new_routing_version)
+
         new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
         if new_refresh_tag != self.refresh_tag:
             self.refresh_tag = new_refresh_tag
             self.task_queues = {queue for queue in await self.find_queues() if queue}
+            for queue in self.task_queues:
+                self.state_manager.invalidate_queue_config(queue)
             logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
         return await self.filter_by_worker_queue_capacity(self.task_queues)
 

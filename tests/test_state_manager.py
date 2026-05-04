@@ -1077,3 +1077,118 @@ async def test_get_routing_config_caches_result(redis, session_factory, dummy_ta
     r2 = await sm.get_routing_config("t", 1)
     assert r2 is not None, "cache should serve the original value"
     assert r2.queues == ["routed"], "cache should serve the original value"
+
+
+# ── explicit invalidation ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
+    redis, session_factory, dummy_task_adapter
+):
+    """save_queue_config writes to SQL, clears the cache entry, and bumps refresh_tag for containing roles."""
+    from jobbers.models.queue_config import QueueConfigAdapter
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    qca = QueueConfigAdapter(session_factory)
+    await qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
+    await qca.save_role("role_a", {"q1"})
+    tag_before = await sm.get_refresh_tag("role_a")
+
+    # Warm the cache
+    r1 = await sm.get_queue_config("q1")
+    assert r1 is not None
+    assert r1.max_concurrent == 5
+
+    # Update via the StateManager wrapper
+    await sm.save_queue_config(QueueConfig(name="q1", max_concurrent=20))
+
+    # Cache should be cleared — next call hits SQL and returns the new value
+    r2 = await sm.get_queue_config("q1")
+    assert r2 is not None
+    assert r2.max_concurrent == 20
+
+    # refresh_tag should have been bumped for role_a (contains q1)
+    tag_after = await sm.get_refresh_tag("role_a")
+    assert tag_after != tag_before
+
+
+@pytest.mark.asyncio
+async def test_save_routing_config_invalidates_cache_and_bumps_version(
+    redis, session_factory, dummy_task_adapter
+):
+    """save_routing_config writes to SQL, clears the cache entry, and updates routing:version to a new ULID."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+
+    config_v1 = RoutingConfig(
+        task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q_old"]
+    )
+    await sm.rca.save_routing_config(config_v1)
+
+    # Warm the cache
+    r1 = await sm.get_routing_config("t", 1)
+    assert r1 is not None
+    assert r1.queues == ["q_old"]
+
+    version_before = await redis.get("routing:version")
+
+    config_v2 = RoutingConfig(
+        task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q_new"]
+    )
+    await sm.save_routing_config(config_v2)
+
+    # Cache should be cleared — next call hits SQL and returns the new value
+    r2 = await sm.get_routing_config("t", 1)
+    assert r2 is not None
+    assert r2.queues == ["q_new"]
+
+    version_after = await redis.get("routing:version")
+    assert version_after is not None
+    assert version_before != version_after
+
+
+@pytest.mark.asyncio
+async def test_delete_routing_config_invalidates_cache_and_bumps_version(
+    redis, session_factory, dummy_task_adapter
+):
+    """delete_routing_config removes from SQL, clears the cache entry, and updates routing:version to a new ULID."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
+    await sm.rca.save_routing_config(config)
+
+    # Warm the cache
+    await sm.get_routing_config("t", 1)
+
+    version_before = await redis.get("routing:version")
+    deleted = await sm.delete_routing_config("t", 1)
+
+    assert deleted is True
+    # Cache entry cleared — returns None (SQL has no config now)
+    r = await sm.get_routing_config("t", 1)
+    assert r is None
+
+    version_after = await redis.get("routing:version")
+    assert version_after is not None
+    assert version_before != version_after
+
+
+@pytest.mark.asyncio
+async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_factory, dummy_task_adapter):
+    """invalidate_all_routing_config clears all entries from the routing cache dict."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    for i in range(3):
+        cfg = RoutingConfig(task_name=f"t{i}", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
+        await sm.rca.save_routing_config(cfg)
+        await sm.get_routing_config(f"t{i}", 1)
+
+    assert len(sm._routing_config_cache) == 3
+
+    sm.invalidate_all_routing_config()
+
+    assert len(sm._routing_config_cache) == 0
