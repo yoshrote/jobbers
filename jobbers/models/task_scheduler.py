@@ -6,12 +6,11 @@ from ulid import ULID
 
 if TYPE_CHECKING:
     import datetime as dt
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Callable
 
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.adapters.task_adapter import TaskAdapterProtocol
-    from jobbers.models.queue_config import QueueConfigAdapter
     from jobbers.models.task import Task
 
 
@@ -20,8 +19,8 @@ class TaskScheduler:
     Manages scheduled tasks in Redis, reusing task:<task_id> keys for task data.
 
     Keys:
-      ``schedule-queue:{queue}``  sorted set — member: task_id bytes, score: run_at Unix timestamp.
-      ``schedule-task-queue``     hash       — field: task_id bytes, value: queue name.
+    - `schedule-queue:{queue}` sorted set — member: task_id bytes, score: run_at Unix timestamp.
+    - `schedule-task-queue` hash — field: task_id bytes, value: queue name.
     """
 
     SCHEDULE_QUEUE = "schedule-queue:{queue}".format
@@ -50,11 +49,14 @@ class TaskScheduler:
     """
 
     def __init__(
-        self, data_store: Redis, task_adapter: TaskAdapterProtocol, queue_config_adapter: QueueConfigAdapter
+        self,
+        data_store: Redis,
+        task_adapter: TaskAdapterProtocol,
+        get_all_queues: Callable[[], Awaitable[list[str]]],
     ) -> None:
         self.data_store = data_store
         self.ta = task_adapter
-        self.qca = queue_config_adapter
+        self._get_all_queues = get_all_queues
 
     def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
         """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
@@ -66,6 +68,20 @@ class TaskScheduler:
         pipe.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
         pipe.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
 
+    async def get_run_at(self, task_id: ULID) -> dt.datetime | None:
+        """Return the scheduled run_at for a single task, or None if not found."""
+        import datetime as dt
+
+        queue_raw: bytes | None = await cast(
+            "Awaitable[bytes | None]", self.data_store.hget(self.SCHEDULE_TASK_QUEUE, str(task_id))
+        )
+        if queue_raw is None:
+            return None
+        score: float | None = await self.data_store.zscore(
+            self.SCHEDULE_QUEUE(queue=queue_raw.decode()), bytes(task_id)
+        )
+        return dt.datetime.fromtimestamp(score, dt.UTC) if score is not None else None
+
     async def get_by_filter(
         self,
         queue: str | None = None,
@@ -73,29 +89,32 @@ class TaskScheduler:
         task_version: int | None = None,
         limit: int = 100,
         start_after: str | None = None,
-    ) -> list[Task]:
+    ) -> list[tuple[Task, dt.datetime]]:
         """
         Fetch scheduled entries matching the given filter criteria.
 
-        ``start_after`` is an exclusive ULID cursor for page-by-page iteration.
+        `start_after` is an exclusive ULID cursor for page-by-page iteration.
+        Returns each task paired with its scheduled run_at timestamp.
         """
-        if queue is not None:
-            raw_ids: list[bytes] = await cast(
-                "Awaitable[list[bytes]]",
-                self.data_store.zrange(self.SCHEDULE_QUEUE(queue=queue), 0, -1),
-            )
-        else:
-            all_queues = await self.qca.get_all_queues()
-            raw_ids = []
-            for q in all_queues:
-                ids: list[bytes] = await cast(
-                    "Awaitable[list[bytes]]",
-                    self.data_store.zrange(self.SCHEDULE_QUEUE(queue=q), 0, -1),
-                )
-                raw_ids.extend(ids)
+        import datetime as dt
 
-        # ULID bytes are time-ordered, so sorting by bytes matches task_id ascending.
-        raw_ids.sort()
+        if queue is not None:
+            pairs: list[tuple[bytes, float]] = await cast(
+                "Awaitable[list[tuple[bytes, float]]]",
+                self.data_store.zrange(self.SCHEDULE_QUEUE(queue=queue), 0, -1, withscores=True),
+            )
+            score_map: dict[bytes, float] = dict(pairs)
+        else:
+            score_map = {}
+            all_queues = await self._get_all_queues()
+            for q in all_queues:
+                pairs = await cast(
+                    "Awaitable[list[tuple[bytes, float]]]",
+                    self.data_store.zrange(self.SCHEDULE_QUEUE(queue=q), 0, -1, withscores=True),
+                )
+                score_map.update(pairs)
+
+        raw_ids = sorted(score_map.keys())
 
         if start_after is not None:
             cursor = bytes(ULID.from_str(start_after))
@@ -103,8 +122,8 @@ class TaskScheduler:
 
         ulid_list = [ULID.from_bytes(r) for r in raw_ids]
         fetched: list[Task | None] = await self.ta.get_tasks_bulk(ulid_list)
-        results: list[Task] = []
-        for task in fetched:
+        results: list[tuple[Task, dt.datetime]] = []
+        for task, id_bytes in zip(fetched, raw_ids, strict=True):
             if len(results) >= limit:
                 break
             if task is None:
@@ -113,7 +132,8 @@ class TaskScheduler:
                 continue
             if task_version is not None and task.version != task_version:
                 continue
-            results.append(task)
+            run_at = dt.datetime.fromtimestamp(score_map[id_bytes], dt.UTC)
+            results.append((task, run_at))
 
         return results
 
@@ -121,9 +141,9 @@ class TaskScheduler:
         """
         Atomically acquire and return the earliest due task, or None.
 
-        - ``queues=None`` — match any queue
-        - ``queues=[]``   — return None immediately
-        - ``queues=[...]`` — only match tasks in the given queues
+        - `queues=None` — match any queue
+        - `queues=[]` — return None immediately
+        - `queues=[...]` — only match tasks in the given queues
         """
         results = await self.next_due_bulk(1, queues=queues)
         return results[0][0] if results else None
@@ -132,9 +152,9 @@ class TaskScheduler:
         """
         Atomically acquire and return up to n due tasks paired with their scheduled run_at.
 
-        - ``queues=None`` — match any queue
-        - ``queues=[]``   — return [] immediately
-        - ``queues=[...]`` — only match tasks in the given queues
+        - `queues=None` — match any queue
+        - `queues=[]` — return [] immediately
+        - `queues=[...]` — only match tasks in the given queues
         """
         import datetime as dt
 
@@ -142,7 +162,7 @@ class TaskScheduler:
             return []
 
         if queues is None:
-            queues = await self.qca.get_all_queues()
+            queues = await self._get_all_queues()
             if not queues:
                 return []
 

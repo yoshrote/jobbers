@@ -18,14 +18,15 @@ def make_task(task_id: str = "01JQC31AJP7TSA9X8AEP64XG08", queue: str = "default
     return Task(id=task_id, name="test_task", version=1, queue=queue, status=TaskStatus.SCHEDULED)
 
 
-@pytest.fixture
-def qca(session_factory):
-    return QueueConfigAdapter(session_factory)
+@pytest_asyncio.fixture
+async def qca(session_factory):
+    yield QueueConfigAdapter(session_factory)
 
 
 @pytest_asyncio.fixture
-async def scheduler(redis, dummy_task_adapter, qca):
-    yield TaskScheduler(redis, dummy_task_adapter, qca)
+async def scheduler(redis, dummy_task_adapter, session_factory):
+    qca = QueueConfigAdapter(session_factory)
+    yield TaskScheduler(redis, dummy_task_adapter, qca.get_all_queues)
 
 
 async def schedule(s: TaskScheduler, task: Task, run_at: dt.datetime) -> None:
@@ -265,7 +266,7 @@ async def test_get_by_filter_returns_scheduled_tasks(scheduler, dummy_task_adapt
     await schedule(scheduler, task, PAST)
     results = await scheduler.get_by_filter(queue="default")
     assert len(results) == 1
-    assert results[0].id == task.id
+    assert results[0][0].id == task.id
 
 
 @pytest.mark.asyncio
@@ -298,7 +299,7 @@ async def test_get_by_filter_cursor_pagination(scheduler, dummy_task_adapter):
         await schedule(scheduler, t, PAST)
     results = await scheduler.get_by_filter(queue="default", start_after=str(t1.id))
     assert len(results) == 1
-    assert results[0].id == t2.id
+    assert results[0][0].id == t2.id
 
 
 # ── get_by_filter: queue=None (all-queues path) ───────────────────────────────
@@ -316,7 +317,7 @@ async def test_get_by_filter_queue_none_returns_from_all_queues(scheduler, qca, 
     await qca.save_queue_config(QueueConfig(name="q2"))
 
     results = await scheduler.get_by_filter(queue=None)
-    assert {r.id for r in results} == {t1.id, t2.id}
+    assert {r[0].id for r in results} == {t1.id, t2.id}
 
 
 @pytest.mark.asyncio
@@ -341,7 +342,7 @@ async def test_get_by_filter_task_name_excludes_non_matching(scheduler, dummy_ta
 
     results = await scheduler.get_by_filter(queue="default", task_name="test_task")
     assert len(results) == 1
-    assert results[0].id == t1.id
+    assert results[0][0].id == t1.id
 
 
 @pytest.mark.asyncio
@@ -356,7 +357,7 @@ async def test_get_by_filter_task_version_excludes_non_matching(scheduler, dummy
 
     results = await scheduler.get_by_filter(queue="default", task_version=1)
     assert len(results) == 1
-    assert results[0].id == t1.id
+    assert results[0][0].id == t1.id
 
 
 # ── next_due_bulk: queues=None with empty all-queues set ──────────────────────
@@ -367,3 +368,35 @@ async def test_next_due_bulk_queues_none_empty_redis_returns_empty(scheduler):
     """next_due_bulk with queues=None returns [] when no queues are configured."""
     result = await scheduler.next_due_bulk(1, queues=None)
     assert result == []
+
+
+# ── get_by_filter: limit and None-task edge cases ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_stops_at_limit(scheduler, dummy_task_adapter):
+    """get_by_filter returns at most ``limit`` tasks even when more are scheduled."""
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    t3 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03")
+    for t in (t1, t2, t3):
+        await dummy_task_adapter.save_task(t)
+        await schedule(scheduler, t, PAST)
+
+    results = await scheduler.get_by_filter(queue="default", limit=2)
+    assert len(results) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_skips_none_tasks(scheduler, dummy_task_adapter, redis):
+    """get_by_filter silently skips IDs whose task data is missing (get_tasks_bulk returns None)."""
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    # Save only t1's data; add t2 to the schedule without persisting its task data.
+    await dummy_task_adapter.save_task(t1)
+    await schedule(scheduler, t1, PAST)
+    await schedule(scheduler, t2, PAST)  # t2 has no task data → get_tasks_bulk returns None
+
+    results = await scheduler.get_by_filter(queue="default")
+    assert len(results) == 1
+    assert results[0][0].id == t1.id

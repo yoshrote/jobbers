@@ -64,7 +64,7 @@ This starts:
 | `collector` | 4317 / 4318 | OpenTelemetry Collector |
 | `openobserve` | 5080 | Metrics and logs UI |
 
-The `cleaner` and `scheduler` are not included in the default compose file; run them as cron jobs or add them as additional services.
+The `cleaner` is not included in the default compose file; run it as a cron job or add it as an additional service.
 
 ---
 
@@ -89,6 +89,7 @@ Run one or more Manager instances. Because all state lives in Redis and SQL, any
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `TASK_ADAPTER` | `json` | Storage backend: `json` (Redis Stack) or `msgpack` (plain Redis). See [adapter selection](adapter-selection.md). |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL for queue/role config |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint for metrics |
@@ -138,7 +139,7 @@ jobbers_cleaner \
   --rate-limit-age 604800
 ```
 
-All time arguments are in **seconds** and are optional.
+Duration arguments (`--stale-time`, `--completed-task-age`, `--dlq-age`, `--rate-limit-age`) are in seconds. Range arguments (`--min-queue-age`, `--max-queue-age`) take Unix epoch timestamps in seconds. All arguments are optional.
 
 | Argument | Description |
 | --- | --- |
@@ -165,7 +166,12 @@ Recommended cron setup:
 
 ### Scheduler
 
-A long-running process that polls for retry-delayed tasks and re-enqueues them when their scheduled time arrives. Run exactly **one** Scheduler per Redis instance.
+A long-running process that handles two scheduling concerns on each poll:
+
+1. **Retry delays** — re-enqueues tasks that are waiting out a backoff delay when their `run_at` arrives.
+2. **Cron DAGs** — fires recurring `CronDAGEntry` runs when their cron expression comes due; see [docs/cron-dags.md](cron-dags.md).
+
+Run exactly **one** Scheduler per Redis instance.
 
 ```bash
 SCHEDULER_POLL_INTERVAL=5.0 \
@@ -179,6 +185,7 @@ jobbers_scheduler
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Seconds between polls when no tasks are due. |
 | `SCHEDULER_BATCH_SIZE` | `1` | Max tasks dispatched per poll iteration. |
 | `SCHEDULER_ROLE` | `default` | Limits the scheduler to queues in this role. |
+| `SCHEDULER_CONFIG_REFRESH_INTERVAL` | `3` | Minutes between queue configuration refreshes. |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL |
 
@@ -190,14 +197,12 @@ The Scheduler has no persistent state. It is safe to restart at any time — tas
 
 Jobbers ships with two interchangeable storage backends selected at startup:
 
-| Adapter | Redis requirement | Notes |
+| `TASK_ADAPTER` | Adapter | Redis requirement |
 | --- | --- | --- |
-| `MsgpackTaskAdapter` | Plain Redis | Default; tasks stored as msgpack in sorted sets |
-| `JsonTaskAdapter` | Redis Stack (JSON + RediSearch modules) | Enables richer query filtering |
+| `json` (default) | `JsonTaskAdapter` + `JsonDeadQueue` | Redis Stack (JSON + RediSearch modules) |
+| `msgpack` | `MsgpackTaskAdapter` + `DeadQueue` | Plain Redis |
 
-Set `TASK_ADAPTER=json` to use the JSON adapter (requires Redis Stack).
-
-Dead letter queue adapters (`DeadQueue` / `JsonDeadQueue`) follow the same pattern.
+See [adapter selection](adapter-selection.md) for guidance on which to choose.
 
 ---
 
@@ -214,6 +219,10 @@ The frontend (port 3000 in dev, or the build served behind your web server) prov
 - **Roles** — assign queues to roles; workers refresh automatically when roles change.
 
 All data is pulled from the Manager API at `http://localhost:8000`.
+
+### API Reference
+
+The Manager serves a full interactive API reference at `http://localhost:8000/docs` (Swagger UI). The machine-readable OpenAPI spec is available at `http://localhost:8000/openapi.json` and is also checked into the repo as `openapi.json` (source of truth for the frontend).
 
 ### API Endpoints for Monitoring
 

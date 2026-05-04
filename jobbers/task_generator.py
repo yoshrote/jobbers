@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
 
-from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task import Task
 from jobbers.state_manager import StateManager
 
@@ -23,12 +22,10 @@ class LocalTTL:
     """
     A context manager to manage time-to-live (TTL) for local operations.
 
-    Attributes
-    ----------
-    config_ttl : int
-        The TTL duration in seconds.
-    last_refreshed : datetime | None
-        The last time the TTL was refreshed.
+    **Attributes:**
+
+    - `config_ttl: int` — the TTL duration in seconds.
+    - `last_refreshed: datetime | None` — the last time the TTL was refreshed.
     """
 
     def __init__(self, config_ttl: int):
@@ -56,15 +53,13 @@ class MaxTaskCounter:
     """
     A counter to track the number of tasks processed, with a maximum limit.
 
-    Attributes
-    ----------
-    max_tasks : int
-        The maximum number of tasks allowed.
+    **Attributes:**
 
-    Methods
-    -------
-    limit_reached() -> bool
-        Check if the maximum task limit has been reached.
+    - `max_tasks: int` — the maximum number of tasks allowed.
+
+    **Methods:**
+
+    - `limit_reached() -> bool` — check if the maximum task limit has been reached.
     """
 
     def __init__(self, max_tasks: int = 0):
@@ -97,25 +92,22 @@ class TaskGenerator:
     def __init__(
         self,
         state_manager: StateManager,
-        query_config_adapter: QueueConfigAdapter,
         role: str = "default",
         max_tasks: int = 100,
-        config_ttl: int = 60,
     ) -> None:
         self.role: str = role
         self.state_manager: StateManager = state_manager
-        self.query_config_adapter = query_config_adapter
-        self.ttl = LocalTTL(config_ttl)
         self.max_task_check = MaxTaskCounter(max_tasks)
         self.task_queues: set[str] = set()
         self.refresh_tag: ULID | None = None
+        self.routing_version: ULID | None = None
         self._run: bool = True
 
     async def find_queues(self) -> set[str]:
         """Find all queues we should listen to via Redis."""
         if self.role == "default":
             return self.DEFAULT_QUEUES
-        queues = await self.query_config_adapter.get_queues(self.role)
+        queues = await self.state_manager.get_queues(self.role)
         return queues or set()
 
     async def filter_by_worker_queue_capacity(self, queues: set[str]) -> set[str]:
@@ -123,7 +115,7 @@ class TaskGenerator:
             return queues
 
         active_tasks = self.state_manager.active_tasks_per_queue
-        queue_worker_limits = await self.query_config_adapter.get_queue_limits(queues)
+        queue_worker_limits = await self.state_manager.get_queue_limits(queues)
         logger.debug("Queues: %s; Active: %s; Limits: %s", queues, active_tasks, queue_worker_limits)
         # TODO: write tests to make sure this filters correctly
         return {
@@ -137,10 +129,18 @@ class TaskGenerator:
         # queues that meet configured limits so that we evaluate that aspect
         # between configuration refresh
 
+        new_routing_version = await self.state_manager.get_routing_version()
+        if new_routing_version != self.routing_version:
+            self.routing_version = new_routing_version
+            self.state_manager.invalidate_all_routing_config()
+            logger.info("Routing config invalidated at version %s", new_routing_version)
+
         new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
         if new_refresh_tag != self.refresh_tag:
             self.refresh_tag = new_refresh_tag
             self.task_queues = {queue for queue in await self.find_queues() if queue}
+            for queue in self.task_queues:
+                self.state_manager.invalidate_queue_config(queue)
             logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
         return await self.filter_by_worker_queue_capacity(self.task_queues)
 

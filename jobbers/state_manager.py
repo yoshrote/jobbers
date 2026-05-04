@@ -3,30 +3,38 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import random
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
 from redis.exceptions import WatchError
+from ulid import ULID
 
 from jobbers import registry
 from jobbers.adapters.json_redis import JsonTaskAdapter
 from jobbers.adapters.raw_redis import DeadQueue
+from jobbers.models.cron_dag_scheduler import CronDAGScheduler
 from jobbers.models.queue_config import QueueConfigAdapter
 from jobbers.models.task_config import DeadLetterPolicy
+from jobbers.models.task_routing import RoutingStrategy, TaskRoutingConfigAdapter
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
-    from redis.asyncio.client import Redis
+    from redis.asyncio.client import Pipeline, Redis
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-    from ulid import ULID
 
     from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
+    from jobbers.models.cron_dag import CronDAGEntry
+    from jobbers.models.cron_dag_scheduler import ConcurrencyStager
+    from jobbers.models.dag import DAGNode, DAGRunPagination
+    from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task
+    from jobbers.models.task_routing import RoutingConfig
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -56,13 +64,17 @@ class StateManager:
     ) -> None:
         self.job_store: Redis = job_store
         self.qca = QueueConfigAdapter(session_factory)
+        self.rca = TaskRoutingConfigAdapter(session_factory)
         self.ta: TaskAdapterProtocol = (
             task_adapter if task_adapter is not None else JsonTaskAdapter(job_store)
         )
-        self.submission_limiter = SubmissionRateLimiter(job_store, self.qca)
+        self._queue_config_cache: dict[str, QueueConfig | None] = {}
+        self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
+        self.submission_limiter = SubmissionRateLimiter(job_store, self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
-        self.task_scheduler = TaskScheduler(job_store, self.ta, self.qca)
+        self.task_scheduler = TaskScheduler(job_store, self.ta, self.get_all_queues)
+        self.cron_dag_scheduler = CronDAGScheduler(job_store)
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -90,7 +102,7 @@ class StateManager:
     ) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.UTC)
-        queues = {q.encode() for q in await self.qca.get_all_queues()}
+        queues = {q.encode() for q in await self.get_all_queues()}
 
         clean_ops = []
         if rate_limit_age:
@@ -104,11 +116,12 @@ class StateManager:
 
         if completed_task_age:
             clean_ops.append(self.ta.clean_terminal_tasks(now, completed_task_age))
+            clean_ops.append(self.ta.clean_dag_runs(now, completed_task_age))
 
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
             async for task in self.ta.get_stale_tasks({q.decode() for q in queues}, stale_time):
-                if task.status not in {TaskStatus.STARTED, TaskStatus.HEARTBEAT}:
+                if task.status != TaskStatus.STARTED:
                     continue
                 stale_tasks_by_type[(task.name, task.version)].append(task)
 
@@ -170,6 +183,7 @@ class StateManager:
 
     async def schedule_new_task(self, task: Task, run_at: dt.datetime) -> Task:
         """Save a brand-new task directly into the scheduler in a single atomic transaction."""
+        task.queue = await self.resolve_queue(task)
         task.status = TaskStatus.SCHEDULED
         pipe = self.job_store.pipeline(transaction=True)
         self.task_scheduler.stage_add(pipe, task, run_at)
@@ -223,9 +237,122 @@ class StateManager:
             self.task_scheduler.stage_remove(pipe, task.id, task.queue)
             try:
                 await pipe.execute()
+                logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
                 return task
             except WatchError:
                 continue
+
+    @asynccontextmanager
+    async def _concurrency_guard(
+        self,
+        entry: CronDAGEntry,
+        next_run_at: dt.datetime,
+    ) -> AsyncIterator[ConcurrencyStager]:
+        """
+        Async context manager encapsulating all ConcurrencyPolicy logic for a cron dispatch.
+
+        Yields a ``ConcurrencyStager`` with:
+        - ``skipped=True`` if the previous run is still active (reschedule-only pipeline
+          already fired internally; caller should return immediately).
+        - ``skipped=False`` and a ``stage_active_run(pipe, task_id)`` callable otherwise.
+          Call it unconditionally during pipeline construction; it is a no-op for ALWAYS
+          policy and stages the NX guard for SKIP_IF_RUNNING.
+        """
+        from jobbers.models.cron_dag import ConcurrencyPolicy
+        from jobbers.models.cron_dag_scheduler import ConcurrencyStager
+
+        if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
+            active_task_id_str = await self.cron_dag_scheduler.get_active_run(entry.id)
+            if active_task_id_str is not None:
+                from ulid import ULID as _ULID
+
+                active_task = await self.ta.get_task(_ULID.from_str(active_task_id_str))
+                if active_task is not None and active_task.status in {
+                    TaskStatus.SUBMITTED,
+                    TaskStatus.STARTED,
+                }:
+                    logger.info(
+                        "Cron entry %s skipped: previous run %s still active (%s).",
+                        entry.id,
+                        active_task_id_str,
+                        active_task.status,
+                    )
+                    pipe = self.job_store.pipeline(transaction=True)
+                    self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
+                    await pipe.execute()
+                    yield ConcurrencyStager(skipped=True, _stage_fn=lambda _p, _t: None)
+                    return
+
+            def _stage_skip(pipe: Pipeline, task_id: ULID) -> None:
+                self.cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task_id, nx=True)
+
+            yield ConcurrencyStager(skipped=False, _stage_fn=_stage_skip)
+        else:
+            yield ConcurrencyStager(skipped=False, _stage_fn=lambda _p, _t: None)
+
+    async def dispatch_cron_dag(self, entry: CronDAGEntry, run_at: dt.datetime) -> None:
+        """
+        Fire a cron-scheduled DAG run and reschedule the entry for its next occurrence.
+
+        A fresh copy of the DAG spec (new ULIDs for every node) is generated on each call
+        so repeated runs never share Redis fan-in keys.  If the entry's concurrency policy
+        is SKIP_IF_RUNNING and the previous root task is still active, the run is skipped
+        but the entry is still rescheduled.
+
+        Ordering guarantee: reschedule + fan-in init are written atomically in a single
+        pipeline *before* the root task is submitted.  A crash after the pipeline but
+        before submit means the entry fires again on the next poll (tolerable duplicate),
+        but the cron schedule is never permanently lost.
+        """
+        from croniter import croniter
+
+        from jobbers.models.dag import collect_fan_in_keys
+        from jobbers.models.task import Task
+
+        next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
+
+        async with self._concurrency_guard(entry, next_run_at) as stager:
+            if stager.skipped:
+                return
+
+            fresh_spec, _ = entry.dag_spec.fresh_copy()
+            fan_ins = collect_fan_in_keys(fresh_spec)
+            queue_config = await self.get_queue_config(fresh_spec.queue)
+
+            task = Task(
+                id=fresh_spec.id,
+                name=fresh_spec.name,
+                queue=fresh_spec.queue,
+                version=fresh_spec.version,
+                parameters=fresh_spec.parameters,
+                dag_callbacks=fresh_spec.dag_callbacks,
+                cron_id=entry.id,
+                dag_run_id=ULID(),
+            )
+
+            is_rate_limited = bool(
+                queue_config
+                and queue_config.rate_numerator
+                and queue_config.rate_denominator
+                and queue_config.rate_period
+            )
+
+            # Write reschedule + fan-in sets atomically BEFORE submitting the root task.
+            # This ensures the cron entry is never permanently lost even if submit_task crashes.
+            # For SKIP_IF_RUNNING, SET NX is the authoritative guard against concurrent dispatches.
+            # For non-rate-limited queues, submission is included in the same pipeline.
+            pipe = self.job_store.pipeline(transaction=True)
+            self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
+            stager.stage_active_run(pipe, task.id)
+            for fan_in_key, predecessor_ids in fan_ins.items():
+                self.ta.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
+            if not is_rate_limited:
+                self.stage_submit_task(pipe, task, queue_config)
+            await pipe.execute()
+
+            if is_rate_limited:
+                await self.submit_task(task)
+            logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
 
     async def request_task_cancellation(self, task_id: ULID) -> Task | None:
         """
@@ -252,7 +379,7 @@ class StateManager:
                 self.ta.stage_remove_from_queue(pipe, task)
                 self.ta.stage_save(pipe, task)
                 await pipe.execute()
-            case TaskStatus.STARTED | TaskStatus.HEARTBEAT:
+            case TaskStatus.STARTED:
                 await self.job_store.publish(f"task_cancel_{task_id}", "cancel")
             case _:
                 raise TaskException(f"Task has status '{task.status}' and cannot be cancelled.")
@@ -273,8 +400,117 @@ class StateManager:
     async def get_refresh_tag(self, role: str) -> ULID:
         return await self.qca.get_refresh_tag(role)
 
+    def stage_submit_task(self, pipe: Pipeline, task: Task, queue_config: QueueConfig | None) -> None:
+        """
+        Set task status to SUBMITTED and stage ZADD + save onto pipe (no execute).
+
+        Raises ValueError if the queue has rate-limiting configured — callers must
+        use submit_task() for rate-limited queues, which enforces limits via Lua script.
+        The queue_config must be pre-fetched by the caller before building the pipeline.
+        """
+        if (
+            queue_config
+            and queue_config.rate_numerator
+            and queue_config.rate_denominator
+            and queue_config.rate_period
+        ):
+            raise ValueError(
+                f"Queue '{task.queue}' is rate-limited; use submit_task() instead of stage_submit_task()."
+            )
+        task.set_status(TaskStatus.SUBMITTED)
+        self.ta.stage_submit_task(pipe, task)
+
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
+        """Return queue config, reading from cache or SQL on miss."""
+        if queue not in self._queue_config_cache:
+            self._queue_config_cache[queue] = await self.qca.get_queue_config(queue)
+        return self._queue_config_cache.get(queue)
+
+    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
+        """Return routing config, reading from cache or SQL on miss."""
+        key = (task_name, task_version)
+        if key not in self._routing_config_cache:
+            self._routing_config_cache[key] = await self.rca.get_routing_config(task_name, task_version)
+        return self._routing_config_cache.get(key)
+
+    def invalidate_queue_config(self, queue: str) -> None:
+        self._queue_config_cache.pop(queue, None)
+
+    def invalidate_routing_config(self, task_name: str, task_version: int) -> None:
+        self._routing_config_cache.pop((task_name, task_version), None)
+
+    def invalidate_all_routing_config(self) -> None:
+        self._routing_config_cache.clear()
+
+    async def get_routing_version(self) -> ULID | None:
+        raw: bytes | None = await self.job_store.get("routing:version")
+        return ULID.from_bytes(raw) if raw else None
+
+    async def bump_routing_version(self) -> None:
+        await self.job_store.set("routing:version", ULID().bytes)
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        return await self.qca.bump_refresh_tag(role)
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        return await self.qca.bump_refresh_tags_for_queue(queue_name)
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        """Save queue config, invalidate local cache, and bump refresh_tags for affected roles."""
+        await self.qca.save_queue_config(queue_config)
+        self.invalidate_queue_config(queue_config.name)
+        await self.bump_refresh_tags_for_queue(queue_config.name)
+
+    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
+        """Save routing config, invalidate local cache entry, and bump routing version."""
+        await self.rca.save_routing_config(routing_config)
+        self.invalidate_routing_config(routing_config.task_name, routing_config.task_version)
+        await self.bump_routing_version()
+
+    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
+        """Delete routing config, invalidate local cache entry, and bump routing version."""
+        deleted = await self.rca.delete_routing_config(task_name, task_version)
+        self.invalidate_routing_config(task_name, task_version)
+        await self.bump_routing_version()
+        return deleted
+
+    async def get_queues(self, role: str) -> set[str]:
+        """Return the set of queues assigned to a role."""
+        return await self.qca.get_queues(role)
+
+    async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
+        """Return per-queue max_concurrent limits, reusing the queue-config cache."""
+        results = await asyncio.gather(*(self.get_queue_config(q) for q in queues))
+        return {q: (cfg.max_concurrent if cfg else None) for q, cfg in zip(queues, results)}
+
+    async def get_all_queues(self) -> list[str]:
+        """Return the list of all configured queue names."""
+        return await self.qca.get_all_queues()
+
+    async def resolve_queue(self, task: Task) -> str:
+        """Return the queue name to use for *task*, applying routing config if one is set."""
+        routing = await self.get_routing_config(task.name, task.version)
+        if routing is None:
+            return task.queue
+        match routing.strategy:
+            case RoutingStrategy.SINGLE:
+                final = routing.queues[0]
+            case RoutingStrategy.WEIGHTED:
+                final = random.choices(routing.queues, weights=routing.weights, k=1)[0]
+        if final != task.queue:
+            logger.info(
+                "Routing override: task=%s v%d original=%s resolved=%s strategy=%s",
+                task.name,
+                task.version,
+                task.queue,
+                final,
+                routing.strategy,
+            )
+        return final
+
     async def submit_task(self, task: Task) -> None:
-        queue_config = await self.qca.get_queue_config(queue=task.queue)
+        task.queue = await self.resolve_queue(task)
+        queue_config = await self.get_queue_config(task.queue)
         task.set_status(TaskStatus.SUBMITTED)
         if (
             queue_config
@@ -285,6 +521,66 @@ class StateManager:
             await self.ta.submit_rate_limited_task(task=task, queue_config=queue_config)
         else:
             await self.ta.submit_task(task=task)
+
+    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
+        await self.ta.init_fan_in(fan_in_key, predecessor_ids, ttl)
+
+    async def add_cron_dag(self, entry: CronDAGEntry) -> None:
+        """
+        Register a new (or replace an existing) cron DAG entry and schedule its first run.
+
+        The first run is computed from ``entry.cron_expr`` relative to now.
+        If an entry with the same ``id`` already exists it is overwritten and
+        its schedule is reset.
+        """
+        from croniter import croniter
+
+        now = dt.datetime.now(dt.UTC)
+        first_run_at = croniter(entry.cron_expr, now).get_next(dt.datetime)
+        pipe = self.job_store.pipeline(transaction=True)
+        self.cron_dag_scheduler.stage_add(pipe, entry, first_run_at)
+        await pipe.execute()
+        logger.info(
+            "Cron DAG entry '%s' (%s) registered, first run at %s.", entry.name, entry.id, first_run_at
+        )
+
+    async def remove_cron_dag(self, cron_id: ULID) -> None:
+        """Remove a cron DAG entry from the schedule."""
+        pipe = self.job_store.pipeline(transaction=True)
+        self.cron_dag_scheduler.stage_remove(pipe, cron_id)
+        await pipe.execute()
+        logger.info("Cron DAG entry %s removed.", cron_id)
+
+    async def submit_dag(self, *roots: DAGNode) -> tuple[ULID, list[Task]]:
+        """
+        Initialise fan-in sets and submit all root tasks of a DAG.
+
+        All fan-in Redis sets are populated *before* any task is enqueued so
+        that a fast-completing predecessor cannot decrement a set that does not
+        yet exist.
+        """
+        all_fan_ins: dict[str, set[ULID]] = {}
+        for root in roots:
+            for key, ids in root.fan_in_predecessors().items():
+                all_fan_ins.setdefault(key, set()).update(ids)
+
+        await asyncio.gather(*(self.init_fan_in(k, ids) for k, ids in all_fan_ins.items()))
+
+        dag_run_id = ULID()
+        submitted: list[Task] = []
+        for root in roots:
+            task = root.to_task(dag_run_id=dag_run_id)
+            await self.submit_task(task)
+            submitted.append(task)
+        return dag_run_id, submitted
+
+    async def list_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
+        """Return a paginated list of DAG runs ordered by submission time."""
+        return await self.ta.get_dag_runs(pagination)
+
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
+        """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
+        return await self.ta.get_dag_run(dag_run_id)
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
@@ -319,9 +615,11 @@ class SubmissionRateLimiter:
 
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
 
-    def __init__(self, job_store: Redis, queue_config_adapter: QueueConfigAdapter):
+    def __init__(
+        self, job_store: Redis, get_queue_config: Callable[[str], Awaitable[QueueConfig | None]]
+    ) -> None:
         self.job_store = job_store
-        self.qca = queue_config_adapter
+        self._get_queue_config = get_queue_config
 
     async def concurrency_limits(
         self, task_queues: set[str], current_tasks_by_queue: dict[str, set[ULID]]
@@ -329,8 +627,8 @@ class SubmissionRateLimiter:
         """Limit the number of concurrent tasks in each queue."""
         queues_to_use = set()
         queues = list(task_queues)
-        configs = await asyncio.gather(*(self.qca.get_queue_config(queue=q) for q in queues))
-        for queue, config in zip(queues, configs):
+        configs = await asyncio.gather(*(self._get_queue_config(q) for q in queues))
+        for queue, config in zip(queues, configs, strict=True):
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
                     queues_to_use.add(queue)

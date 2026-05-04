@@ -3,7 +3,7 @@ requires = [
     "hatchling", 
     "packaging",
     "tomli>=1.2.1; python_version<'3.11'",
-    "trove-classifiers==2026.1.14.14",
+    "trove-classifiers==2026.4.28.13",
 ]
 build-backend = "hatchling.build"
 
@@ -38,15 +38,15 @@ dependencies = [
     "opentelemetry-sdk",
     "opentelemetry-exporter-otlp",
     "opentelemetry-instrumentation-fastapi",    
-    "pydantic>=2.10.5",
+    "pydantic>=2.13.3",
     "redis",
     "python_on_whales",
     "msgpack",
     "aiosqlite",
     "sqlalchemy[asyncio]",
     "python-ulid[pydantic]",
-    "asyncio-taskpool",
     "msgpack-types",
+    "croniter>=6.2.2",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +60,7 @@ test = [
     "pytest_unordered",
     "ruff",
     "mypy",
+    "typing_extensions>=4.6.0",
 ]
 
 [tool.hatch.version]
@@ -178,7 +179,6 @@ addopts = [
     # Disable warnings summary, because we use our warning summary.
     "--disable-warnings",
     "--asyncio-mode=strict",
-    "--redis-port=6379",
 ]
 
 norecursedirs = [
@@ -208,13 +208,11 @@ relative_files = false
 omit = [
     "jobbers/db.py",
     "jobbers/runners/manager_proc.py",
+    "jobbers/utils/otel.py"
 ]
 
 [tool.coverage.report]
 skip_empty = true
-exclude = [
-    "otel.py"
-]
 exclude_also = [
     "def __repr__",
     "raise AssertionError",
@@ -223,7 +221,7 @@ exclude_also = [
     "@(abc\\.)?abstractmethod",
     "@(typing(_extensions)?\\.)?overload",
     "if (typing(_extensions)?\\.)?TYPE_CHECKING:",
-    "def run\\(\\):",
+    "def run\\(\\)",
 ]
 
 [tool.mypy]

@@ -183,3 +183,75 @@ export const updateRole = (name, queues) => put(`/roles/${name}`, queues)
 
 /** DELETE /roles/{role_name}  →  { message } */
 export const deleteRole = (name) => del(`/roles/${name}`)
+
+// ── DAG submission ─────────────────────────────────────────────────────────────
+
+/**
+ * POST /submit-dag
+ * @param {string} diagram  Mermaid flowchart TD text
+ * @returns {{ root_task_ids: string[] }}
+ */
+export const submitDag = (diagram) => post('/submit-dag', { diagram })
+
+// ── Cron DAGs ──────────────────────────────────────────────────────────────────
+
+/**
+ * GET /cron-dags
+ * @param {{ offset?: number, limit?: number }} [params]
+ * @returns {{ total: number, cron_dags: CronDAGResponse[] }}
+ */
+export const getCronDags = (params) => get('/cron-dags', params)
+
+/**
+ * GET /cron-dags/{cron_id}
+ * @param {string} cronId
+ * @returns {CronDAGResponse}
+ */
+export const getCronDag = (cronId) => get(`/cron-dags/${cronId}`)
+
+/**
+ * POST /cron-dags  →  201 CronDAGResponse
+ * @param {{
+ *   name: string,
+ *   cron_expr: string,
+ *   diagram: string,
+ *   enabled?: boolean,
+ *   concurrency_policy?: 'always' | 'skip_if_running'
+ * }} body
+ */
+export const createCronDag = (body) => post('/cron-dags', body)
+
+/**
+ * PUT /cron-dags/{cron_id}  →  CronDAGResponse
+ * @param {string} cronId
+ * @param {{
+ *   name: string,
+ *   cron_expr: string,
+ *   diagram: string,
+ *   enabled?: boolean,
+ *   concurrency_policy?: 'always' | 'skip_if_running'
+ * }} body
+ */
+export const updateCronDag = (cronId, body) => put(`/cron-dags/${cronId}`, body)
+
+/**
+ * DELETE /cron-dags/{cron_id}  →  { message }
+ * @param {string} cronId
+ */
+export const deleteCronDag = (cronId) => del(`/cron-dags/${cronId}`)
+
+// ── DAG run inspection ─────────────────────────────────────────────────────────
+
+/**
+ * GET /dags
+ * @param {{ limit?: number, offset?: number }} [params]
+ * @returns {{ total: number, dags: { dag_run_id: string, submitted_at: string }[] }}
+ */
+export const listDags = (params) => get('/dags', params)
+
+/**
+ * GET /dags/{dag_run_id}
+ * @param {string} dagRunId
+ * @returns {{ dag_run_id: string, submitted_at: string, task_ids: string[] }}
+ */
+export const getDag = (dagRunId) => get(`/dags/${dagRunId}`)

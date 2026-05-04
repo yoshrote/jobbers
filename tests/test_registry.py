@@ -1,7 +1,7 @@
 import pytest
 
 from jobbers.models.task_config import TaskConfig
-from jobbers.registry import get_task_config, register_task
+from jobbers.registry import TaskWrapper, get_task_config, register_task
 
 
 @pytest.fixture(autouse=True)
@@ -20,11 +20,12 @@ def test_register_task_success():
     def test_function():  # pragma: no cover
         pass
 
+    assert isinstance(test_function, TaskWrapper)
     task_config = get_task_config("test_task", 1)
     assert task_config is not None
     assert task_config.name == "test_task"
     assert task_config.version == 1
-    assert task_config.function == test_function
+    assert task_config.function == test_function._func
 
 
 def test_register_task_re_registration():
@@ -37,7 +38,34 @@ def test_register_task_re_registration():
 
     task_config = get_task_config("test_task", 1)
     assert task_config is not None
-    assert task_config.function == test_function
+    assert task_config.function == test_function._func
+
+
+def test_register_task_returns_wrapper():
+    """Decorator returns a TaskWrapper that is callable."""
+
+    @register_task(name="test_task", version=1)
+    async def test_function(**kwargs):  # pragma: no cover
+        return kwargs
+
+    assert isinstance(test_function, TaskWrapper)
+    assert callable(test_function)
+
+
+def test_task_wrapper_node():
+    """TaskWrapper.node() returns a DAGNode with the correct task name and version."""
+    from jobbers.models.dag import DAGNode
+
+    @register_task(name="test_task", version=2)
+    async def test_function(**kwargs):  # pragma: no cover
+        return kwargs
+
+    node = test_function.node(queue="myqueue", x=1)
+    assert isinstance(node, DAGNode)
+    assert node._name == "test_task"
+    assert node._version == 2
+    assert node._queue == "myqueue"
+    assert node._parameters == {"x": 1}
 
 
 def test_register_task_different_function_same_name_version():

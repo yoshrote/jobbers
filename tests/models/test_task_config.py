@@ -158,3 +158,44 @@ class TestMaxRetryDelay:
         )
         result = config.compute_retry_at(5)  # 1000 * 2^5 = 32000 >> 60
         assert result <= frozen_now + dt.timedelta(seconds=60)
+
+    def test_linear_exceeds_max_retry_delay_is_capped(self, frozen_now):
+        """LINEAR delay exceeding max_retry_delay is capped, same as EXPONENTIAL."""
+        config = make_config(
+            retry_delay=100,
+            backoff_strategy=BackoffStrategy.LINEAR,
+            max_retry_delay=200,
+        )
+        result = config.compute_retry_at(5)  # 100 * 5 = 500 >> 200
+        assert result == frozen_now + dt.timedelta(seconds=200)
+
+    def test_constant_exceeds_max_retry_delay_is_capped(self, frozen_now):
+        """CONSTANT retry_delay > max_retry_delay is capped to max_retry_delay."""
+        config = make_config(
+            retry_delay=7200,
+            backoff_strategy=BackoffStrategy.CONSTANT,
+            max_retry_delay=3600,
+        )
+        result = config.compute_retry_at(1)
+        assert result == frozen_now + dt.timedelta(seconds=3600)
+
+    def test_exponential_delay_exactly_at_cap_is_not_truncated(self, frozen_now):
+        """When the computed delay equals max_retry_delay exactly, no truncation occurs."""
+        config = make_config(
+            retry_delay=10,
+            backoff_strategy=BackoffStrategy.EXPONENTIAL,
+            max_retry_delay=80,
+        )
+        result = config.compute_retry_at(3)  # 10 * 2^3 = 80 == max_retry_delay
+        assert result == frozen_now + dt.timedelta(seconds=80)
+
+    def test_max_retry_delay_zero_gives_immediate_retry(self, frozen_now):
+        """max_retry_delay=0 clamps all strategies to an immediate retry (no delay)."""
+        for strategy in BackoffStrategy:
+            config = make_config(
+                retry_delay=60,
+                backoff_strategy=strategy,
+                max_retry_delay=0,
+            )
+            result = config.compute_retry_at(5)
+            assert result == frozen_now, f"{strategy}: expected no delay when max_retry_delay=0"

@@ -65,10 +65,51 @@
         }
       }
     },
+    "/schedule-task": {
+      "post": {
+        "summary": "Schedule Task",
+        "description": "Schedule a task to run at a specific UTC datetime.",
+        "operationId": "schedule_task_schedule_task_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Schedule Task Schedule Task Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/task-status/{task_id}": {
       "get": {
         "summary": "Get Task Status",
-        "description": "Retrieve the status of a specific task.",
+        "description": "Retrieve the status of a specific task.\n\nIf the task is the root of a DAG (has ``dag_callbacks``), the response\nincludes a ``dag_diagram`` field containing a mermaid flowchart of the\nfull DAG structure rooted at this task.",
         "operationId": "get_task_status_task_status__task_id__get",
         "parameters": [
           {
@@ -218,6 +259,17 @@
             }
           },
           {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
             "name": "start",
             "in": "query",
             "required": false,
@@ -281,6 +333,22 @@
                 }
               ],
               "title": "Task Version"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TaskStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
             }
           }
         ],
@@ -900,6 +968,17 @@
             }
           },
           {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
             "name": "start",
             "in": "query",
             "required": false,
@@ -963,6 +1042,22 @@
                 }
               ],
               "title": "Task Version"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TaskStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
             }
           }
         ],
@@ -1187,6 +1282,528 @@
           }
         }
       }
+    },
+    "/task-routing/{task_name}/{task_version}": {
+      "get": {
+        "summary": "Get Task Routing",
+        "description": "Retrieve the routing configuration for a specific task type.",
+        "operationId": "get_task_routing_task_routing__task_name___task_version__get",
+        "parameters": [
+          {
+            "name": "task_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Name"
+            }
+          },
+          {
+            "name": "task_version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Task Routing Task Routing  Task Name   Task Version  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update Task Routing",
+        "description": "Create or update the routing configuration for a task type. Path parameters override body values.",
+        "operationId": "update_task_routing_task_routing__task_name___task_version__put",
+        "parameters": [
+          {
+            "name": "task_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Name"
+            }
+          },
+          {
+            "name": "task_version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Version"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoutingConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Update Task Routing Task Routing  Task Name   Task Version  Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Task Routing",
+        "description": "Remove the routing configuration for a task type. Returns 404 if it does not exist.",
+        "operationId": "delete_task_routing_task_routing__task_name___task_version__delete",
+        "parameters": [
+          {
+            "name": "task_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Name"
+            }
+          },
+          {
+            "name": "task_version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Task Routing Task Routing  Task Name   Task Version  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/submit-dag": {
+      "post": {
+        "summary": "Submit Dag",
+        "description": "Submit an ad-hoc DAG defined as a mermaid flowchart.\n\nParses the diagram, assigns ULIDs to each node, initialises fan-in Redis\nsets, and enqueues all root tasks.  Returns the IDs of the submitted root\ntasks.",
+        "operationId": "submit_dag_submit_dag_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitDAGRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Submit Dag Submit Dag Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cron-dags": {
+      "post": {
+        "summary": "Create Cron Dag",
+        "description": "Create a new cron-scheduled DAG entry.",
+        "operationId": "create_cron_dag_cron_dags_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CronDAGRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Create Cron Dag Cron Dags Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List Cron Dags",
+        "description": "List all cron-scheduled DAG entries ordered by next run time.",
+        "operationId": "list_cron_dags_cron_dags_get",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response List Cron Dags Cron Dags Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/cron-dags/{cron_id}": {
+      "get": {
+        "summary": "Get Cron Dag",
+        "description": "Retrieve a single cron-scheduled DAG entry by ID.",
+        "operationId": "get_cron_dag_cron_dags__cron_id__get",
+        "parameters": [
+          {
+            "name": "cron_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cron Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Cron Dag Cron Dags  Cron Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update Cron Dag",
+        "description": "Replace the diagram and settings for a cron-scheduled DAG entry.\n\nThe entry ``id`` and ``created_at`` are preserved; the schedule is reset\nto the next occurrence of the (possibly updated) cron expression.",
+        "operationId": "update_cron_dag_cron_dags__cron_id__put",
+        "parameters": [
+          {
+            "name": "cron_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cron Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CronDAGRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Update Cron Dag Cron Dags  Cron Id  Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete Cron Dag",
+        "description": "Delete a cron-scheduled DAG entry. Returns 404 if not found.",
+        "operationId": "delete_cron_dag_cron_dags__cron_id__delete",
+        "parameters": [
+          {
+            "name": "cron_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cron Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete Cron Dag Cron Dags  Cron Id  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dags": {
+      "get": {
+        "summary": "List Dags",
+        "description": "List all DAG runs ordered by submission time (oldest first).",
+        "operationId": "list_dags_dags_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "exclusiveMinimum": 0,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response List Dags Dags Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dags/{dag_run_id}": {
+      "get": {
+        "summary": "Get Dag",
+        "description": "Get details of a single DAG run including the IDs of all tasks within it.",
+        "operationId": "get_dag_dags__dag_run_id__get",
+        "parameters": [
+          {
+            "name": "dag_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Dag Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Dag Dags  Dag Run Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1219,6 +1836,122 @@
         ],
         "title": "BulkCancelRequest",
         "description": "Request body for bulk task cancellation."
+      },
+      "ConcurrencyPolicy": {
+        "type": "string",
+        "enum": [
+          "always",
+          "skip_if_running"
+        ],
+        "title": "ConcurrencyPolicy",
+        "description": "Controls what happens when a cron fires and the previous run is still active."
+      },
+      "CronDAGRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "Human-readable name for the cron entry."
+          },
+          "cron_expr": {
+            "type": "string",
+            "title": "Cron Expr",
+            "description": "Standard 5-field cron expression (e.g. '0 6 * * *')."
+          },
+          "diagram": {
+            "type": "string",
+            "title": "Diagram",
+            "description": "Mermaid flowchart text describing the DAG."
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "description": "Whether the entry fires on schedule.",
+            "default": true
+          },
+          "concurrency_policy": {
+            "$ref": "#/components/schemas/ConcurrencyPolicy",
+            "description": "What to do when a new run fires while the previous one is still active.",
+            "default": "always"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "cron_expr",
+          "diagram"
+        ],
+        "title": "CronDAGRequest",
+        "description": "Request body for creating or updating a cron-scheduled DAG."
+      },
+      "DAGTaskSpec": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 26,
+                "minLength": 26,
+                "pattern": "[A-Z0-9]{26}"
+              },
+              {
+                "type": "string",
+                "maxLength": 16,
+                "minLength": 16,
+                "format": "binary"
+              }
+            ],
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "queue": {
+            "type": "string",
+            "title": "Queue",
+            "default": "default"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 0
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Parameters",
+            "default": {}
+          },
+          "dag_callbacks": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/SimpleCallback"
+                },
+                {
+                  "$ref": "#/components/schemas/FanInCallback"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "type",
+                "mapping": {
+                  "fan_in": "#/components/schemas/FanInCallback",
+                  "simple": "#/components/schemas/SimpleCallback"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Dag Callbacks",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "DAGTaskSpec",
+        "description": "Serialisable specification for a single task node.\n\nThe `id` is pre-assigned at DAG construction time so that fan-in sets can\nreference it before the task is ever submitted."
       },
       "DLQRemoveRequest": {
         "properties": {
@@ -1318,6 +2051,45 @@
         ],
         "title": "DeadLetterPolicy",
         "description": "Dead letter policy to use when a task fails."
+      },
+      "FanInCallback": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "fan_in",
+            "title": "Type",
+            "default": "fan_in"
+          },
+          "task": {
+            "$ref": "#/components/schemas/DAGTaskSpec"
+          },
+          "fan_in_key": {
+            "type": "string",
+            "title": "Fan In Key"
+          },
+          "error_callback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DAGTaskSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "inject_parent_results": {
+            "type": "boolean",
+            "title": "Inject Parent Results",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "task",
+          "fan_in_key"
+        ],
+        "title": "FanInCallback",
+        "description": "Submit `task` only once all fan-in predecessors have completed.\n\n`fan_in_key` is a Redis key for a set of pending predecessor task IDs.\nEach predecessor removes its own ID via `TaskAdapterProtocol.fan_in_complete`;\nwhen the set becomes empty the collector task is submitted."
       },
       "HTTPValidationError": {
         "properties": {
@@ -1468,6 +2240,129 @@
         "title": "RootResponse",
         "description": "Response model for the root endpoint."
       },
+      "RoutingConfig": {
+        "properties": {
+          "task_name": {
+            "type": "string",
+            "title": "Task Name",
+            "default": ""
+          },
+          "task_version": {
+            "type": "integer",
+            "title": "Task Version",
+            "default": 0
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/RoutingStrategy"
+          },
+          "queues": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Queues"
+          },
+          "weights": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weights"
+          }
+        },
+        "type": "object",
+        "required": [
+          "strategy",
+          "queues"
+        ],
+        "title": "RoutingConfig",
+        "description": "Queue routing configuration for a task type."
+      },
+      "RoutingStrategy": {
+        "type": "string",
+        "enum": [
+          "single",
+          "weighted"
+        ],
+        "title": "RoutingStrategy",
+        "description": "Queue routing strategy for a task type."
+      },
+      "ScheduleTaskRequest": {
+        "properties": {
+          "task": {
+            "$ref": "#/components/schemas/Task"
+          },
+          "run_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Run At",
+            "description": "UTC datetime when the task should be executed."
+          }
+        },
+        "type": "object",
+        "required": [
+          "task",
+          "run_at"
+        ],
+        "title": "ScheduleTaskRequest",
+        "description": "Request body for scheduling a task at a specific time."
+      },
+      "SimpleCallback": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "simple",
+            "title": "Type",
+            "default": "simple"
+          },
+          "task": {
+            "$ref": "#/components/schemas/DAGTaskSpec"
+          },
+          "error_callback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DAGTaskSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "inject_parent_results": {
+            "type": "boolean",
+            "title": "Inject Parent Results",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "task"
+        ],
+        "title": "SimpleCallback",
+        "description": "Submit `task` immediately when the parent task completes."
+      },
+      "SubmitDAGRequest": {
+        "properties": {
+          "diagram": {
+            "type": "string",
+            "title": "Diagram",
+            "description": "Mermaid flowchart text describing the DAG."
+          }
+        },
+        "type": "object",
+        "required": [
+          "diagram"
+        ],
+        "title": "SubmitDAGRequest",
+        "description": "Request body for ad-hoc DAG submission from a mermaid diagram."
+      },
       "Task": {
         "properties": {
           "id": {
@@ -1599,6 +2494,92 @@
                 "type": "null"
               }
             ]
+          },
+          "dag_callbacks": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/SimpleCallback"
+                },
+                {
+                  "$ref": "#/components/schemas/FanInCallback"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "type",
+                "mapping": {
+                  "fan_in": "#/components/schemas/FanInCallback",
+                  "simple": "#/components/schemas/SimpleCallback"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Dag Callbacks"
+          },
+          "parent_ids": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 26,
+                  "minLength": 26,
+                  "pattern": "[A-Z0-9]{26}"
+                },
+                {
+                  "type": "string",
+                  "maxLength": 16,
+                  "minLength": 16,
+                  "format": "binary"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Parent Ids"
+          },
+          "inject_parent_results": {
+            "type": "boolean",
+            "title": "Inject Parent Results",
+            "default": false
+          },
+          "cron_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 26,
+                "minLength": 26,
+                "pattern": "[A-Z0-9]{26}"
+              },
+              {
+                "type": "string",
+                "maxLength": 16,
+                "minLength": 16,
+                "format": "binary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron Id"
+          },
+          "dag_run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 26,
+                "minLength": 26,
+                "pattern": "[A-Z0-9]{26}"
+              },
+              {
+                "type": "string",
+                "maxLength": 16,
+                "minLength": 16,
+                "format": "binary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dag Run Id"
           }
         },
         "type": "object",
@@ -1734,7 +2715,6 @@
           "unsubmitted",
           "submitted",
           "started",
-          "heartbeat",
           "completed",
           "cancelled",
           "stalled",

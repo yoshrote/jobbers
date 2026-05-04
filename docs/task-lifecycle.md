@@ -6,6 +6,7 @@
 stateDiagram-v2
     [*] --> UNSUBMITTED : task created (client-side only)
     UNSUBMITTED --> SUBMITTED : submit_task()
+    UNSUBMITTED --> SCHEDULED : task.schedule() or POST /schedule-task
     SUBMITTED --> STARTED : worker picks up task
     STARTED --> COMPLETED : task function returns
     STARTED --> SCHEDULED : expected exception, retries remain, retry_delay set
@@ -37,7 +38,7 @@ stateDiagram-v2
 | `cancelled` | A user-initiated cancel request interrupted the task. |
 | `stalled` | Worker received SIGTERM while the task was running and `on_shutdown=stop`, OR the Cleaner detected the heartbeat has gone silent longer than `max_heartbeat_interval`. |
 | `dropped` | Worker has no registered function matching the task's name and version. |
-| `scheduled` | Task is waiting in the delay queue for a future retry time (`retry_delay` is set). The Scheduler re-enqueues it when `run_at` arrives. |
+| `scheduled` | Task is waiting in the delay queue for a future time. Entered either when a new task is submitted via `task.schedule()` / `POST /schedule-task`, or when a running task fails and `retry_delay` is set. The Scheduler re-enqueues it as `submitted` when `run_at` arrives. |
 
 ## How TaskConfig Settings Influence the Lifecycle
 

@@ -1,12 +1,10 @@
 """
 Plain Redis backed implementations (no Redis Stack modules required).
 
-``MsgpackTaskAdapter``  – stores tasks as msgpack-encoded binary strings, queries
-                          via sorted-set range commands.  Works with any standard
-                          Redis instance.
-``DeadQueue``           – dead letter queue backed by Redis sorted sets, sets, and
-                          a hash for secondary indexes.  Works with any standard
-                          Redis instance.
+- `MsgpackTaskAdapter` — stores tasks as msgpack-encoded binary strings, queries
+  via sorted-set range commands.  Works with any standard Redis instance.
+- `DeadQueue` — dead letter queue backed by Redis sorted sets, sets, and a hash
+  for secondary indexes.  Works with any standard Redis instance.
 """
 
 from __future__ import annotations
@@ -40,18 +38,21 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
     Stores tasks as msgpack-encoded binary strings; queries via sorted-set range commands.
 
     Works with any standard Redis instance (no Redis Stack required).
-    ``get_all_tasks`` applies ``task_name``, ``task_version``, and ``status`` filters
-    in Python after fetching candidate task IDs from the queue sorted set.
+    `get_all_tasks` applies `task_name`, `task_version`, and `status` filters in Python
+    after fetching candidate task IDs from the queue sorted set.
     """
 
     # Atomically enqueue a new task (no rate limiting).
     # KEYS[1] = task-queues:{queue}
     # KEYS[2] = task:{task_id}
     # KEYS[3] = task-type-idx:{name}
+    # KEYS[4] = dag-runs
+    # KEYS[5] = dag-run:{dag_run_id}:tasks (placeholder key when task has no DAG run)
     # ARGV[1] = submitted_at timestamp
     # ARGV[2] = task_id bytes
     # ARGV[3] = '1'/'0' for type index
     # ARGV[4] = msgpack-encoded task blob
+    # ARGV[5] = dag_run_id bytes (empty string if task is not part of a DAG run)
     SUBMIT_SCRIPT = """
         local exists = redis.call('EXISTS', KEYS[2])
         if exists == 0 then
@@ -63,6 +64,10 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         else
             redis.call('SREM', KEYS[3], ARGV[2])
         end
+        if ARGV[5] ~= '' then
+            redis.call('ZADD', KEYS[4], 'NX', ARGV[1], ARGV[5])
+            redis.call('ZADD', KEYS[5], ARGV[1], ARGV[2])
+        end
         return 1
     """
 
@@ -71,12 +76,15 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
     # KEYS[2] = task-queues:{queue}
     # KEYS[3] = task:{task_id}
     # KEYS[4] = task-type-idx:{name}
+    # KEYS[5] = dag-runs
+    # KEYS[6] = dag-run:{dag_run_id}:tasks (placeholder key when task has no DAG run)
     # ARGV[1] = earliest_time
     # ARGV[2] = rate_numerator
     # ARGV[3] = submitted_at timestamp
     # ARGV[4] = task_id bytes
     # ARGV[5] = '1'/'0' for type index
     # ARGV[6] = msgpack-encoded task blob
+    # ARGV[7] = dag_run_id bytes (empty string if task is not part of a DAG run)
     # Returns: 1 if enqueued, 0 if rate-limited
     SUBMIT_RATE_LIMITED_SCRIPT = """
         local enqueued = 0
@@ -100,12 +108,22 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         else
             redis.call('SREM', KEYS[4], ARGV[4])
         end
+        if enqueued == 1 and ARGV[7] ~= '' then
+            redis.call('ZADD', KEYS[5], 'NX', ARGV[3], ARGV[7])
+            redis.call('ZADD', KEYS[6], ARGV[3], ARGV[4])
+        end
         return enqueued
     """
 
     def pack(self, task: Task) -> bytes:
         """Serialize a task to msgpack bytes."""
-        return serialize(task.to_dict())
+        d = task.to_dict()
+        d["parent_ids"] = list(task.parent_ids)
+        if task.cron_id is not None:
+            d["cron_id"] = task.cron_id
+        if task.dag_run_id is not None:
+            d["dag_run_id"] = task.dag_run_id
+        return serialize(d)
 
     def unpack(self, task_id: ULID, data: bytes) -> Task:
         """Deserialize a task from msgpack bytes."""
@@ -115,18 +133,27 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
         assert task.submitted_at  # noqa: S101
         is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
+        dag_run_tasks_key = (
+            self.DAG_RUN_TASKS(dag_run_id=task.dag_run_id)
+            if task.dag_run_id is not None
+            else self.DAG_RUN_TASKS(dag_run_id="")
+        )
         result: int = await cast(
             "Awaitable[int]",
             self.data_store.eval(
                 self.SUBMIT_SCRIPT,
-                3,
+                5,
                 self.TASKS_BY_QUEUE(queue=task.queue),
                 self.TASK_DETAILS(task_id=task.id),
                 self.TASK_BY_TYPE_IDX(name=task.name),
+                self.DAG_RUNS,
+                dag_run_tasks_key,
                 task.submitted_at.timestamp(),
                 bytes(task.id),
                 is_active,
                 self.pack(task),
+                dag_run_id_bytes,
             ),
         )
         return result == 1
@@ -137,21 +164,30 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
         now = dt.datetime.now(dt.UTC)
         earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
         is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
+        dag_run_tasks_key = (
+            self.DAG_RUN_TASKS(dag_run_id=task.dag_run_id)
+            if task.dag_run_id is not None
+            else self.DAG_RUN_TASKS(dag_run_id="")
+        )
         result: int = await cast(
             "Awaitable[int]",
             self.data_store.eval(
                 self.SUBMIT_RATE_LIMITED_SCRIPT,
-                4,
+                6,
                 self.QUEUE_RATE_LIMITER(queue=task.queue),
                 self.TASKS_BY_QUEUE(queue=task.queue),
                 self.TASK_DETAILS(task_id=task.id),
                 self.TASK_BY_TYPE_IDX(name=task.name),
+                self.DAG_RUNS,
+                dag_run_tasks_key,
                 earliest_time.timestamp(),
                 queue_config.rate_numerator or 0,
                 task.submitted_at.timestamp(),
                 bytes(task.id),
                 is_active,
                 self.pack(task),
+                dag_run_id_bytes,
             ),
         )
         return result == 1
@@ -232,6 +268,40 @@ class MsgpackTaskAdapter(_BaseTaskAdapter):
             results.append(task)
         return results
 
+    def stage_register_dag_run(self, pipe: Pipeline, task: Task) -> None:
+        """Stage DAG run index updates, including the per-run task set for the raw adapter."""
+        super().stage_register_dag_run(pipe, task)
+        if task.dag_run_id is None or task.submitted_at is None:
+            return
+        score = task.submitted_at.timestamp()
+        pipe.zadd(self.DAG_RUN_TASKS(dag_run_id=task.dag_run_id), {bytes(task.id): score})
+
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
+        """Return (submitted_at, task_ids) for a DAG run using the per-run tasks sorted set."""
+        score: float | None = await self.data_store.zscore(self.DAG_RUNS, bytes(dag_run_id))
+        if score is None:
+            return None
+        submitted_at = dt.datetime.fromtimestamp(score, dt.UTC)
+        raw_ids: list[bytes] = await self.data_store.zrange(self.DAG_RUN_TASKS(dag_run_id=dag_run_id), 0, -1)
+        task_ids = [ULID.from_bytes(b) for b in raw_ids]
+        return submitted_at, task_ids
+
+    async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
+        """Remove stale DAG run entries and their per-run task sets."""
+        cutoff = (now - max_age).timestamp()
+        stale: list[bytes] = await self.data_store.zrangebyscore(self.DAG_RUNS, "-inf", cutoff)
+        if not stale:
+            return
+        pipe = self.data_store.pipeline(transaction=False)
+        pipe.zrem(self.DAG_RUNS, *stale)
+        for dag_id_bytes in stale:
+            try:
+                dag_run_id = ULID.from_bytes(dag_id_bytes)
+            except ValueError:
+                continue
+            pipe.delete(self.DAG_RUN_TASKS(dag_run_id=dag_run_id))
+        await pipe.execute()
+
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete blobs, heartbeat entries, and type-index members for old terminal tasks."""
         terminal_statuses = {
@@ -275,10 +345,10 @@ class DeadQueue:
     Dead letter queue backed by Redis, reusing task:<task_id> keys for task data.
 
     Keys:
-      ``dlq``                sorted set — member: task_id bytes, score: failed_at Unix timestamp.
-      ``dlq-queue:{queue}``  set        — task_id bytes per queue name (queue filter index).
-      ``dlq-name:{name}``    set        — task_id bytes per task name (name filter index).
-      ``dlq-meta``           hash       — field: task_id bytes, value: b"{queue}\0{name}\0{version}".
+    - `dlq` sorted set — member: task_id bytes, score: failed_at Unix timestamp.
+    - `dlq-queue:{queue}` set — task_id bytes per queue name (queue filter index).
+    - `dlq-name:{name}` set — task_id bytes per task name (name filter index).
+    - `dlq-meta` hash — field: task_id bytes, value: `b"{queue}\0{name}\0{version}"`.
     """
 
     DLQ = "dlq"
@@ -339,31 +409,33 @@ class DeadQueue:
         limit: int = 100,
     ) -> list[Task]:
         """Fetch DLQ entries matching the given filter criteria."""
-        if queue is not None and task_name is not None:
-            raw_ids: set[bytes] = await cast(
-                "Awaitable[set[bytes]]",
-                self.data_store.sinter([self.DLQ_QUEUE(queue=queue), self.DLQ_NAME(name=task_name)]),
-            )
-        elif queue is not None:
-            raw_ids = await cast(
-                "Awaitable[set[bytes]]",
-                self.data_store.smembers(self.DLQ_QUEUE(queue=queue)),
-            )
-        elif task_name is not None:
-            raw_ids = await cast(
-                "Awaitable[set[bytes]]",
-                self.data_store.smembers(self.DLQ_NAME(name=task_name)),
+        if queue is None and task_name is None:
+            # No filter: use zrevrange so results are ordered newest-first.
+            id_bytes: list[bytes] = await cast(
+                "Awaitable[list[bytes]]",
+                self.data_store.zrevrange(self.DLQ, 0, -1),
             )
         else:
-            raw_ids = set(
-                await cast(
-                    "Awaitable[list[bytes]]",
-                    self.data_store.zrange(self.DLQ, 0, -1),
+            raw_ids: set[bytes]
+            if queue is not None and task_name is not None:
+                raw_ids = await cast(
+                    "Awaitable[set[bytes]]",
+                    self.data_store.sinter([self.DLQ_QUEUE(queue=queue), self.DLQ_NAME(name=task_name)]),
                 )
-            )
-        if not raw_ids:
+            elif queue is not None:
+                raw_ids = await cast(
+                    "Awaitable[set[bytes]]",
+                    self.data_store.smembers(self.DLQ_QUEUE(queue=queue)),
+                )
+            else:
+                raw_ids = await cast(
+                    "Awaitable[set[bytes]]",
+                    self.data_store.smembers(self.DLQ_NAME(name=task_name)),
+                )
+            id_bytes = list(raw_ids)
+        if not id_bytes:
             return []
-        ulid_list = [ULID.from_bytes(b) for b in raw_ids]
+        ulid_list = [ULID.from_bytes(b) for b in id_bytes]
         fetched: list[Task | None] = await self.ta.get_tasks_bulk(ulid_list)
         results: list[Task] = []
         for task in fetched:

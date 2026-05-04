@@ -2,6 +2,7 @@ import datetime
 from typing import Any
 
 import msgpack
+from ulid import ULID
 
 EMPTY_DICT = b"\x80"
 EMPTY_LIST = b"\x90"
@@ -13,6 +14,8 @@ def default(obj: object) -> Any:
         return msgpack.ExtType(1, obj.isoformat().encode())
     elif isinstance(obj, datetime.timedelta):
         return msgpack.ExtType(2, str(obj.total_seconds()).encode())
+    elif isinstance(obj, ULID):
+        return msgpack.ExtType(3, bytes(obj))
     raise TypeError(f"Unknown type: {obj!r}")
 
 
@@ -21,6 +24,8 @@ def ext_hook(code: int, data: bytes) -> Any:
         return datetime.datetime.fromisoformat(data.decode())
     elif code == 2:
         return datetime.timedelta(seconds=float(data.decode()))
+    elif code == 3:
+        return ULID.from_bytes(data)
     return msgpack.ExtType(code, data)
 
 

@@ -2,8 +2,9 @@ import datetime
 
 import msgpack
 import pytest
+from ulid import ULID
 
-from jobbers.utils.serialization import default, ext_hook
+from jobbers.utils.serialization import default, deserialize, ext_hook, serialize
 
 
 def test_default_with_datetime():
@@ -53,3 +54,45 @@ def test_ext_hook_with_timedelta_code():
     result = ext_hook(2, data)
     assert isinstance(result, datetime.timedelta)
     assert result == datetime.timedelta(seconds=90, microseconds=500000)
+
+
+def test_default_with_ulid():
+    ulid = ULID()
+    result = default(ulid)
+    assert isinstance(result, msgpack.ExtType)
+    assert result.code == 3
+    assert result.data == bytes(ulid)
+    assert len(result.data) == 16
+
+
+def test_ext_hook_with_ulid_code():
+    ulid = ULID()
+    result = ext_hook(3, bytes(ulid))
+    assert isinstance(result, ULID)
+    assert result == ulid
+
+
+def test_ulid_round_trip():
+    ulid = ULID()
+    packed = serialize(ulid)
+    unpacked = deserialize(packed)
+    assert isinstance(unpacked, ULID)
+    assert unpacked == ulid
+
+
+def test_ulid_round_trip_in_dict():
+    ulid1 = ULID()
+    ulid2 = ULID()
+    data = {"parent_ids": [ulid1, ulid2], "cron_id": ulid1, "dag_run_id": None}
+    packed = serialize(data)
+    unpacked = deserialize(packed)
+    assert unpacked["parent_ids"] == [ulid1, ulid2]
+    assert unpacked["cron_id"] == ulid1
+    assert unpacked["dag_run_id"] is None
+
+
+def test_ulid_binary_smaller_than_string():
+    ulid = ULID()
+    binary_packed = serialize(ulid)
+    string_packed = serialize(str(ulid))
+    assert len(binary_packed) < len(string_packed)

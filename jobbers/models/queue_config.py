@@ -179,9 +179,9 @@ class QueueConfigAdapter:
         """Return the current refresh tag for a role, creating one if needed."""
         async with self.session_factory() as session:
             result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
-            row = result.fetchone()
-        if row is not None:
-            existing_tag: ULID = ULID.from_str(row[0])
+        tag_str: str | None = result.scalar()
+        if tag_str:
+            existing_tag: ULID = ULID.from_str(tag_str)
             return existing_tag
 
         init_tag = ULID()
@@ -193,5 +193,26 @@ class QueueConfigAdapter:
         # Re-read in case another process won the race
         async with self.session_factory() as session:
             result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
-            row = result.fetchone()
-        return ULID.from_str(row[0]) if row else init_tag
+        tag_str = result.scalar()
+        return ULID.from_str(tag_str) if tag_str else init_tag
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        """Generate a new ULID tag for *role* and write it to SQL. Returns the new tag string."""
+        new_tag = str(ULID())
+        async with self.session_factory.begin() as session:
+            await session.execute(update(roles).where(roles.c.name == role).values(refresh_tag=new_tag))
+        return new_tag
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        """Bump refresh_tag for every role that contains *queue_name*. Returns affected role names."""
+        new_tag = str(ULID())
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(role_queues.c.role).where(role_queues.c.queue == queue_name).distinct()
+            )
+            affected_roles = [row[0] for row in result.fetchall()]
+            if affected_roles:
+                await session.execute(
+                    update(roles).where(roles.c.name.in_(affected_roles)).values(refresh_tag=new_tag)
+                )
+        return affected_roles

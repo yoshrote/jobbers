@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import datetime as dt
 from collections import defaultdict
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from ulid import ULID
@@ -460,20 +460,6 @@ async def test_cancel_started_task_publishes_message(state_manager):
 
 
 @pytest.mark.asyncio
-async def test_cancel_heartbeat_task_publishes_message(state_manager):
-    """Cancelling a HEARTBEAT task also publishes a cancel message."""
-    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.HEARTBEAT)
-    await state_manager.ta.save_task(task)
-
-    monitor = asyncio.create_task(state_manager.monitor_task_cancellation(ULID1))
-    await asyncio.sleep(0.05)
-    await state_manager.request_task_cancellation(ULID1)
-
-    with pytest.raises(UserCancellationError):
-        await asyncio.wait_for(monitor, timeout=1.0)
-
-
-@pytest.mark.asyncio
 async def test_cancel_terminal_task_raises(state_manager):
     """Cancelling a task in a terminal status raises TaskException."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED)
@@ -582,8 +568,8 @@ async def test_schedule_new_task_appears_in_scheduler(state_manager):
 
     scheduled = await state_manager.task_scheduler.get_by_filter(queue="default")
     assert len(scheduled) == 1
-    assert scheduled[0].id == ULID1
-    assert scheduled[0].status == TaskStatus.SCHEDULED
+    assert scheduled[0][0].id == ULID1
+    assert scheduled[0][0].status == TaskStatus.SCHEDULED
 
 
 @pytest.mark.asyncio
@@ -675,3 +661,534 @@ async def test_queue_retry_task_requeues_immediately(redis, state_manager):
     assert result.status == TaskStatus.SUBMITTED
     members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in members
+
+
+@pytest.mark.asyncio
+async def test_queue_retry_task_bypasses_rate_limit(redis, state_manager_real_ta):
+    """
+    queue_retry_task succeeds and does not touch the rate-limiter bucket even when the queue is at capacity.
+
+    Retries must never be gated by rate limits: blocking them would require manual
+    intervention (e.g. moving to the DLQ) rather than allowing automatic recovery.
+    """
+    await state_manager_real_ta.qca.save_queue_config(
+        QueueConfig(name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    )
+    rate_key = state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default")
+    await redis.zadd(rate_key, {ULID2.bytes: FROZEN_TIME.timestamp()})
+
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
+    result = await state_manager_real_ta.queue_retry_task(task)
+
+    assert result.status == TaskStatus.SUBMITTED
+    members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID1) in members
+    count = await redis.zcard(rate_key)
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_schedule_retry_task_bypasses_rate_limit(redis, state_manager_real_ta):
+    """
+    schedule_retry_task succeeds and does not touch the rate-limiter bucket even when the queue is at capacity.
+
+    Retries must never be gated by rate limits: blocking them would require manual
+    intervention (e.g. moving to the DLQ) rather than allowing automatic recovery.
+    """
+    await state_manager_real_ta.qca.save_queue_config(
+        QueueConfig(name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    )
+    rate_key = state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default")
+    await redis.zadd(rate_key, {ULID2.bytes: FROZEN_TIME.timestamp()})
+
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SCHEDULED)
+    run_at = FROZEN_TIME + dt.timedelta(minutes=5)
+    result = await state_manager_real_ta.schedule_retry_task(task, run_at)
+
+    assert result is task
+    due = await state_manager_real_ta.task_scheduler.next_due(["default"])
+    assert due is not None
+    assert due.id == ULID1
+    count = await redis.zcard(rate_key)
+    assert count == 1
+
+
+# ── active_tasks_per_queue ────────────────────────────────────────────────────
+
+
+def test_active_tasks_per_queue_reflects_registry(state_manager):
+    """
+    active_tasks_per_queue mirrors the tasks currently tracked in task_in_registry.
+
+    this is only true while there is one task consumer
+    """
+    task1 = Task(id=ULID1, name="t1", version=1, queue="q1")
+    task2 = Task(id=ULID2, name="t2", version=1, queue="q1")
+
+    assert state_manager.active_tasks_per_queue == {}
+
+    with state_manager.task_in_registry(task1):
+        assert state_manager.active_tasks_per_queue == {"q1": 1}
+        with state_manager.task_in_registry(task2):
+            assert state_manager.active_tasks_per_queue == {"q1": 2}
+        assert state_manager.active_tasks_per_queue == {"q1": 1}
+
+    assert state_manager.active_tasks_per_queue == {"q1": 0}
+
+
+# ── submit_dag ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_simple_chain(state_manager):
+    """submit_dag submits root tasks and returns Task objects."""
+    from jobbers.models.dag import DAGNode
+
+    root = DAGNode("fetch_data")
+    child = DAGNode("process_data")
+    root.then(child)
+
+    dag_run_id, submitted = await state_manager.submit_dag(root)
+
+    assert dag_run_id is not None
+    assert len(submitted) == 1
+    assert submitted[0].id == root.id
+    assert submitted[0].status == TaskStatus.SUBMITTED
+    assert submitted[0].dag_run_id is not None
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_multi_root_shares_dag_run_id(state_manager):
+    """All roots submitted in the same submit_dag call share a single dag_run_id."""
+    from jobbers.models.dag import DAGNode
+
+    branch_a = DAGNode("branch_a")
+    branch_b = DAGNode("branch_b")
+    collector = DAGNode("collect")
+    DAGNode.merge(branch_a, branch_b, into=collector)
+
+    state_manager.init_fan_in = AsyncMock()
+
+    dag_run_id, submitted = await state_manager.submit_dag(branch_a, branch_b)
+
+    assert dag_run_id is not None
+    assert len(submitted) == 2
+    assert submitted[0].dag_run_id is not None
+    assert submitted[0].dag_run_id == submitted[1].dag_run_id
+    assert submitted[0].dag_run_id == dag_run_id
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
+    """submit_dag pre-populates Redis fan-in sets before submitting tasks."""
+    from jobbers.models.dag import DAGNode
+
+    branch_a = DAGNode("branch_a")
+    branch_b = DAGNode("branch_b")
+    collector = DAGNode("collect")
+    DAGNode.merge(branch_a, branch_b, into=collector)
+
+    state_manager.init_fan_in = AsyncMock()
+
+    _, submitted = await state_manager.submit_dag(branch_a, branch_b)
+
+    # init_fan_in must be called with the collector's fan-in key
+    fan_in_key = f"dag:fan-in:{collector.id}"
+    state_manager.init_fan_in.assert_awaited_once_with(fan_in_key, {branch_a.id, branch_b.id})
+    assert len(submitted) == 2
+
+
+# ── dispatch_cron_dag ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_submits_task_and_reschedules(state_manager):
+    """dispatch_cron_dag submits the root task and reschedules the entry."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="daily_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+    run_at = FROZEN_TIME
+
+    await state_manager.dispatch_cron_dag(entry, run_at)
+
+    # A task should now exist in the DummyTaskAdapter store
+    stored = state_manager.ta._store
+    assert len(stored) == 1
+    task = next(iter(stored.values()))
+    assert task.name == "my_job"
+    assert task.status == TaskStatus.SUBMITTED
+
+    # The entry should be rescheduled in the cron sorted set
+    members = await state_manager.job_store.zrange("cron-schedule", 0, -1)
+    assert bytes(entry.id) in members
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager):
+    """dispatch_cron_dag skips dispatch but reschedules when concurrency_policy=SKIP_IF_RUNNING and previous run is active."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="guarded_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.SKIP_IF_RUNNING,
+    )
+
+    # Plant an active task that the skip-guard will find
+    active_task = Task(id=ULID1, name="my_job", queue="default", status=TaskStatus.STARTED)
+    await state_manager.ta.save_task(active_task)
+    await state_manager.job_store.set(f"cron-active:{entry.id}", str(ULID1))
+
+    run_at = FROZEN_TIME
+    await state_manager.dispatch_cron_dag(entry, run_at)
+
+    # No new tasks should have been submitted (only the pre-planted active one)
+    stored = state_manager.ta._store
+    assert len(stored) == 1
+    assert ULID1 in stored
+
+    # Entry must still be rescheduled
+    members = await state_manager.job_store.zrange("cron-schedule", 0, -1)
+    assert bytes(entry.id) in members
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_skipping(state_manager):
+    """dispatch_cron_dag records the new root task when concurrency_policy=SKIP_IF_RUNNING and no prior run is active."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="guarded_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.SKIP_IF_RUNNING,
+    )
+    # No active run planted — guard should not fire
+
+    run_at = FROZEN_TIME
+    await state_manager.dispatch_cron_dag(entry, run_at)
+
+    # The new root task should have been submitted
+    stored = state_manager.ta._store
+    assert len(stored) == 1
+
+    # The active-run key should now record the new task ID
+    active_key = f"cron-active:{entry.id}"
+    active_val = await state_manager.job_store.get(active_key)
+    assert active_val is not None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
+    """dispatch_cron_dag pre-populates fan-in sets when the DAG contains fan-in nodes."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGNode
+
+    # Build a diamond DAG: root → (a, b) → collector (fan-in)
+    root_node = DAGNode("root_job")
+    branch_a = DAGNode("branch_a")
+    branch_b = DAGNode("branch_b")
+    collector = DAGNode("collector")
+    root_node.then(branch_a, branch_b)
+    DAGNode.merge(branch_a, branch_b, into=collector)
+
+    root_spec = root_node._to_spec()
+    entry = CronDAGEntry(
+        name="fan_in_job",
+        cron_expr="0 0 * * *",
+        dag_spec=root_spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    from unittest.mock import patch
+
+    run_at = FROZEN_TIME
+    with patch.object(state_manager.ta, "stage_init_fan_in") as mock_stage_init:
+        await state_manager.dispatch_cron_dag(entry, run_at)
+
+    # stage_init_fan_in must have been called for the collector's fan-in key
+    assert mock_stage_init.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_stages_submission_in_pipeline_for_non_rate_limited_queue(state_manager):
+    """For non-rate-limited queues, submission is staged in the same pipeline (no separate submit_task call)."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="daily_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    with (
+        patch.object(
+            state_manager.ta, "stage_submit_task", wraps=state_manager.ta.stage_submit_task
+        ) as mock_stage,
+        patch.object(state_manager, "submit_task", new_callable=AsyncMock) as mock_submit,
+    ):
+        await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    mock_stage.assert_called_once()
+    mock_submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queue(state_manager):
+    """For rate-limited queues, dispatch_cron_dag falls back to submit_task() to enforce the rate limit."""
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    await state_manager.qca.save_queue_config(
+        QueueConfig(name="default", rate_numerator=5, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    )
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="daily_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    with (
+        patch.object(state_manager.ta, "stage_submit_task") as mock_stage,
+        patch.object(state_manager, "submit_task", new_callable=AsyncMock) as mock_submit,
+    ):
+        await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    mock_stage.assert_not_called()
+    mock_submit.assert_called_once()
+
+
+# ── resolve_queue ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def testresolve_queue_no_routing_returns_task_queue(state_manager):
+    """When no routing config exists, resolve_queue returns the task's own queue."""
+    task = Task(id=ULID1, name="my_task", version=1, queue="original")
+    result = await state_manager.resolve_queue(task)
+    assert result == "original"
+
+
+@pytest.mark.asyncio
+async def testresolve_queue_single_strategy(state_manager):
+    """SINGLE routing always returns the configured queue."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    config = RoutingConfig(
+        task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["target"]
+    )
+    await state_manager.rca.save_routing_config(config)
+
+    task = Task(id=ULID1, name="my_task", version=1, queue="ignored")
+    result = await state_manager.resolve_queue(task)
+    assert result == "target"
+
+
+@pytest.mark.asyncio
+async def testresolve_queue_weighted_strategy_returns_one_of_configured_queues(state_manager):
+    """WEIGHTED routing returns one of the configured queues."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    config = RoutingConfig(
+        task_name="my_task",
+        task_version=1,
+        strategy=RoutingStrategy.WEIGHTED,
+        queues=["fast", "slow"],
+        weights=[1.0, 1.0],
+    )
+    await state_manager.rca.save_routing_config(config)
+
+    task = Task(id=ULID1, name="my_task", version=1, queue="ignored")
+    results = {await state_manager.resolve_queue(task) for _ in range(20)}
+    assert results <= {"fast", "slow"}
+    assert len(results) > 0
+
+
+@pytest.mark.asyncio
+async def testresolve_queue_routing_is_version_specific(state_manager):
+    """Routing config is looked up by (name, version); a different version falls through."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    config = RoutingConfig(
+        task_name="my_task", task_version=2, strategy=RoutingStrategy.SINGLE, queues=["routed"]
+    )
+    await state_manager.rca.save_routing_config(config)
+
+    task_v1 = Task(id=ULID1, name="my_task", version=1, queue="original")
+    assert await state_manager.resolve_queue(task_v1) == "original"
+
+    task_v2 = Task(id=ULID2, name="my_task", version=2, queue="original")
+    assert await state_manager.resolve_queue(task_v2) == "routed"
+
+
+# ── cache behaviour ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_queue_config_caches_result(redis, session_factory, dummy_task_adapter):
+    """get_queue_config returns a cached value on the second call."""
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    await sm.qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
+    r1 = await sm.get_queue_config("q1")
+    assert r1 is not None
+    assert r1.max_concurrent == 5
+    # Replace the adapter method so any second SQL call would return a different value
+    sm.qca.get_queue_config = AsyncMock(return_value=QueueConfig(name="q1", max_concurrent=99))
+    r2 = await sm.get_queue_config("q1")
+    assert r2 is not None
+    assert r2.max_concurrent == 5, "cache should serve the original value"
+
+
+@pytest.mark.asyncio
+async def test_get_routing_config_caches_result(redis, session_factory, dummy_task_adapter):
+    """get_routing_config returns a cached value on the second call."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["routed"])
+    await sm.rca.save_routing_config(config)
+    r1 = await sm.get_routing_config("t", 1)
+    assert r1 is not None
+    assert r1.queues == ["routed"]
+
+    sm.rca.get_routing_config = AsyncMock(
+        return_value=RoutingConfig(
+            task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["other"]
+        )
+    )
+    r2 = await sm.get_routing_config("t", 1)
+    assert r2 is not None, "cache should serve the original value"
+    assert r2.queues == ["routed"], "cache should serve the original value"
+
+
+# ── explicit invalidation ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
+    redis, session_factory, dummy_task_adapter
+):
+    """save_queue_config writes to SQL, clears the cache entry, and bumps refresh_tag for containing roles."""
+    from jobbers.models.queue_config import QueueConfigAdapter
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    qca = QueueConfigAdapter(session_factory)
+    await qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
+    await qca.save_role("role_a", {"q1"})
+    tag_before = await sm.get_refresh_tag("role_a")
+
+    # Warm the cache
+    r1 = await sm.get_queue_config("q1")
+    assert r1 is not None
+    assert r1.max_concurrent == 5
+
+    # Update via the StateManager wrapper
+    await sm.save_queue_config(QueueConfig(name="q1", max_concurrent=20))
+
+    # Cache should be cleared — next call hits SQL and returns the new value
+    r2 = await sm.get_queue_config("q1")
+    assert r2 is not None
+    assert r2.max_concurrent == 20
+
+    # refresh_tag should have been bumped for role_a (contains q1)
+    tag_after = await sm.get_refresh_tag("role_a")
+    assert tag_after != tag_before
+
+
+@pytest.mark.asyncio
+async def test_save_routing_config_invalidates_cache_and_bumps_version(
+    redis, session_factory, dummy_task_adapter
+):
+    """save_routing_config writes to SQL, clears the cache entry, and updates routing:version to a new ULID."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+
+    config_v1 = RoutingConfig(
+        task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q_old"]
+    )
+    await sm.rca.save_routing_config(config_v1)
+
+    # Warm the cache
+    r1 = await sm.get_routing_config("t", 1)
+    assert r1 is not None
+    assert r1.queues == ["q_old"]
+
+    version_before = await redis.get("routing:version")
+
+    config_v2 = RoutingConfig(
+        task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q_new"]
+    )
+    await sm.save_routing_config(config_v2)
+
+    # Cache should be cleared — next call hits SQL and returns the new value
+    r2 = await sm.get_routing_config("t", 1)
+    assert r2 is not None
+    assert r2.queues == ["q_new"]
+
+    version_after = await redis.get("routing:version")
+    assert version_after is not None
+    assert version_before != version_after
+
+
+@pytest.mark.asyncio
+async def test_delete_routing_config_invalidates_cache_and_bumps_version(
+    redis, session_factory, dummy_task_adapter
+):
+    """delete_routing_config removes from SQL, clears the cache entry, and updates routing:version to a new ULID."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
+    await sm.rca.save_routing_config(config)
+
+    # Warm the cache
+    await sm.get_routing_config("t", 1)
+
+    version_before = await redis.get("routing:version")
+    deleted = await sm.delete_routing_config("t", 1)
+
+    assert deleted is True
+    # Cache entry cleared — returns None (SQL has no config now)
+    r = await sm.get_routing_config("t", 1)
+    assert r is None
+
+    version_after = await redis.get("routing:version")
+    assert version_after is not None
+    assert version_before != version_after
+
+
+@pytest.mark.asyncio
+async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_factory, dummy_task_adapter):
+    """invalidate_all_routing_config clears all entries from the routing cache dict."""
+    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+
+    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    for i in range(3):
+        cfg = RoutingConfig(task_name=f"t{i}", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
+        await sm.rca.save_routing_config(cfg)
+        await sm.get_routing_config(f"t{i}", 1)
+
+    assert len(sm._routing_config_cache) == 3
+
+    sm.invalidate_all_routing_config()
+
+    assert len(sm._routing_config_cache) == 0

@@ -1,20 +1,23 @@
 import datetime as dt
-import inspect
 import logging
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, get_type_hints
 
 from opentelemetry import metrics
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, TypeAdapter, field_serializer
 from ulid import ULID
 
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 
+from .dag import DAGCallback
 from .task_config import TaskConfig
 from .task_status import TaskStatus
 
 if TYPE_CHECKING:
     from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.models.dag import DynamicFanOut, TaskResult
+
+_dag_callback_adapter: TypeAdapter[list[DAGCallback]] = TypeAdapter(list[DAGCallback])
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -41,6 +44,19 @@ class Task(BaseModel):
     completed_at: dt.datetime | None = None
 
     task_config: TaskConfig | None = Field(default=None, exclude=True)
+    dag_callbacks: list[DAGCallback] = Field(default_factory=list)
+    # Immediate parent task IDs — empty for root tasks, one entry for simple-chain
+    # and dynamic fan-out children, many entries for fan-in collectors.
+    parent_ids: list[ULID] = Field(default_factory=list)
+    # When True, the worker fetches parent results via parent_ids and injects them
+    # as a `parent_results` kwarg before calling the task function.
+    inject_parent_results: bool = False
+    # Set on cron-dispatched root tasks so the worker can clear the active-run key on completion.
+    cron_id: ULID | None = Field(default=None)
+    # Shared across every task in a DAG run; None for standalone tasks.
+    # Generated once at submission time (submit_dag / dispatch_cron_dag) and propagated to all
+    # descendants via generate_callbacks, generate_error_callbacks, and _handle_dynamic_fanout.
+    dag_run_id: ULID | None = Field(default=None)
 
     @field_serializer("id", when_used="json")
     def serialize_id(self, value: ULID) -> str:
@@ -51,10 +67,27 @@ class Task(BaseModel):
         if not self.task_config:
             # Safer to fail here than chance something funky downstream
             return True
-        signature = inspect.get_annotations(self.task_config.function)
-        for param, psig in signature.items():
+        from jobbers.di import get_injected_param_names  # local import avoids circular dep
+
+        injected = get_injected_param_names(self.task_config.function)
+        try:
+            hints = get_type_hints(self.task_config.function, include_extras=True)
+        except Exception:
+            return True  # can't resolve hints — skip validation
+        for param, hint in hints.items():
             # Skip the return type annotation
-            if param != "return" and not isinstance(self.parameters[param], psig):
+            if param == "return":
+                continue
+            # Skip parameters that are dependency-injected — never in task.parameters
+            if param in injected:
+                continue
+            # Skip parameters not present in the submitted payload — they may
+            # have defaults or be injected at execution time (e.g. parent_results).
+            if param not in self.parameters:
+                continue
+            # Strip Annotated wrapper before isinstance (Annotated is not a valid isinstance target)
+            raw_type = get_args(hint)[0] if get_origin(hint) is Annotated else hint
+            if not isinstance(self.parameters[param], raw_type):
                 return False
         return True
 
@@ -86,10 +119,111 @@ class Task(BaseModel):
         return self.task_config.retry_delay is not None
 
     def has_callbacks(self) -> bool:
-        return False
+        return bool(self.dag_callbacks)
 
-    def generate_callbacks(self) -> list[Self]:
-        return []
+    def generate_error_callbacks(self) -> list[Self]:
+        """
+        Return tasks to submit when this task fails permanently.
+
+        For each `dag_callback` that has an `error_callback` spec, a task is
+        created with `parent_ids=[self.id]`.  No Redis I/O is required.
+        """
+        results: list[Self] = []
+        for cb in self.dag_callbacks:
+            if cb.error_callback is not None:
+                spec = cb.error_callback
+                results.append(
+                    self.__class__(
+                        id=spec.id,
+                        name=spec.name,
+                        queue=spec.queue,
+                        version=spec.version,
+                        parameters=spec.parameters,
+                        dag_callbacks=spec.dag_callbacks,
+                        parent_ids=[self.id],
+                        dag_run_id=self.dag_run_id,
+                    )
+                )
+        return results
+
+    async def generate_callbacks(self, ta: "TaskAdapterProtocol") -> list[Self]:
+        """
+        Generate tasks to submit after this task completes.
+
+        For `SimpleCallback` entries the next task is created immediately with
+        `parent_ids=[self.id]`.  For `FanInCallback` entries the task's ID is
+        removed from the shared Redis set; the collector task is only returned
+        once the set is empty (all predecessors have completed), and its
+        `parent_ids` is populated from the permanent fan-in members set.
+
+        Returns -1 from `fan_in_complete` when the ID was not a member (already
+        processed or key expired); in that case the collector is not submitted.
+        """
+        from jobbers.models.dag import FanInCallback, SimpleCallback
+
+        results: list[Self] = []
+        for cb in self.dag_callbacks:
+            spec = cb.task
+            match cb:
+                case SimpleCallback():
+                    results.append(
+                        self.__class__(
+                            id=spec.id,
+                            name=spec.name,
+                            queue=spec.queue,
+                            version=spec.version,
+                            parameters=spec.parameters,
+                            dag_callbacks=spec.dag_callbacks,
+                            parent_ids=[self.id],
+                            inject_parent_results=cb.inject_parent_results,
+                            dag_run_id=self.dag_run_id,
+                        )
+                    )
+                case FanInCallback():
+                    remaining = await ta.fan_in_complete(cb.fan_in_key, self.id)
+                    if remaining == 0:
+                        member_ids = await ta.get_fan_in_members(cb.fan_in_key)
+                        results.append(
+                            self.__class__(
+                                id=spec.id,
+                                name=spec.name,
+                                queue=spec.queue,
+                                version=spec.version,
+                                parameters=spec.parameters,
+                                dag_callbacks=spec.dag_callbacks,
+                                parent_ids=member_ids,
+                                inject_parent_results=cb.inject_parent_results,
+                                dag_run_id=self.dag_run_id,
+                            )
+                        )
+                    elif remaining == -1:
+                        logger.warning(
+                            "fan_in_complete returned -1 for key %s task %s — "
+                            "ID was not a member (already processed or key expired); skipping collector.",
+                            cb.fan_in_key,
+                            self.id,
+                        )
+        return results
+
+    def make_result(
+        self,
+        results: "dict[Any, Any] | None" = None,
+        fanout: "DynamicFanOut | None" = None,
+    ) -> "TaskResult":
+        """
+        Create a `TaskResult` with `parent_ids` pre-populated from this task's known parents.
+
+        Use this instead of constructing `TaskResult` directly so that ancestry
+        is tracked without requiring task authors to manage it:
+
+        ```python
+        task = get_current_task()
+        return task.make_result(results={"count": n})
+        ```
+        """
+        from jobbers.models.dag import TaskResult
+
+        return TaskResult(results=results or {}, fanout=fanout, parent_ids=list(self.parent_ids))
 
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(
@@ -109,6 +243,19 @@ class Task(BaseModel):
     async def heartbeat(self) -> None:
         self.heartbeat_at = dt.datetime.now(dt.UTC)
         await self._ta.update_task_heartbeat(self)
+
+    async def parent_results(self) -> dict[Any, Any] | list[dict[Any, Any]]:
+        """
+        Fetch the results of this task's parent(s) using `parent_ids`.
+
+        Returns a single dict when there is one parent, a list of dicts when
+        there are multiple (fan-in collector), or `{}` for root tasks.
+        """
+        if not self.parent_ids:
+            return {}
+        tasks = await self._ta.get_tasks_bulk(self.parent_ids)
+        results_list = [t.results if t is not None else {} for t in tasks]
+        return results_list[0] if len(results_list) == 1 else results_list
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize task fields to a dict for RedisJSON storage."""
@@ -130,6 +277,11 @@ class Task(BaseModel):
             "started_at": _ts(self.started_at),
             "heartbeat_at": _ts(self.heartbeat_at),
             "completed_at": _ts(self.completed_at),
+            "dag_callbacks": [cb.model_dump(mode="json") for cb in self.dag_callbacks],
+            "parent_ids": [str(pid) for pid in self.parent_ids],
+            "inject_parent_results": self.inject_parent_results,
+            "cron_id": str(self.cron_id) if self.cron_id is not None else None,
+            "dag_run_id": str(self.dag_run_id) if self.dag_run_id is not None else None,
         }
 
     @classmethod
@@ -138,6 +290,9 @@ class Task(BaseModel):
 
         def _dt(ts: float | None) -> dt.datetime | None:
             return dt.datetime.fromtimestamp(ts, dt.UTC) if ts is not None else None
+
+        def _ulid(v: ULID | str) -> ULID:
+            return v if isinstance(v, ULID) else ULID.from_str(v)
 
         return cls(
             id=task_id,
@@ -154,6 +309,11 @@ class Task(BaseModel):
             started_at=_dt(raw.get("started_at")),
             heartbeat_at=_dt(raw.get("heartbeat_at")),
             completed_at=_dt(raw.get("completed_at")),
+            dag_callbacks=_dag_callback_adapter.validate_python(raw.get("dag_callbacks") or []),
+            parent_ids=[_ulid(p) for p in raw.get("parent_ids") or []],
+            inject_parent_results=raw.get("inject_parent_results", False),
+            cron_id=_ulid(raw["cron_id"]) if raw.get("cron_id") else None,
+            dag_run_id=_ulid(raw["dag_run_id"]) if raw.get("dag_run_id") else None,
         )
 
     def set_status(self, status: TaskStatus) -> None:

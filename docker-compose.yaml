@@ -52,7 +52,7 @@ services:
       OTEL_LOGS_EXPORTER: "otlp"
       OTEL_PYTHON_LOG_CORRELATION: "true"
       REDIS_URL: "redis://redis:6379"
-    command: /usr/local/bin/jobbers_manager /usr/src/app/end2end.py
+    command: /opt/venv/bin/jobbers_manager /usr/src/app/end2end.py
     ports:
       - "8000:8000"
     volumes:
@@ -76,7 +76,26 @@ services:
       OTEL_LOGS_EXPORTER: "otlp"
       OTEL_PYTHON_LOG_CORRELATION: "true"
       REDIS_URL: "redis://redis:6379"
-    command: /usr/local/bin/jobbers_worker /usr/src/app/end2end.py
+    command: /opt/venv/bin/jobbers_worker /usr/src/app/end2end.py
+    volumes:
+      - .:/usr/src/app
+    depends_on:
+      - redis
+      - collector
+  scheduler:
+    build: .
+    environment:
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://collector:4317"
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://collector:4317"
+      OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://collector:4317"
+      # # Logs are disabled by default
+      OTEL_LOGS_EXPORTER: "otlp"
+      OTEL_PYTHON_LOG_CORRELATION: "true"
+      REDIS_URL: "redis://redis:6379"
+      SCHEDULER_BATCH_SIZE: "10"
+      SCHEDULER_POLL_INTERVAL: "1.0"
+      SCHEDULER_ROLE: "default"
+    command: /opt/venv/bin/jobbers_scheduler /usr/src/app/end2end.py
     volumes:
       - .:/usr/src/app
     depends_on:
