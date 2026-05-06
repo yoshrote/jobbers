@@ -450,7 +450,9 @@ class StateManager:
         await self.job_store.set("routing:version", ULID().bytes)
 
     async def bump_refresh_tag(self, role: str) -> str:
-        return await self.qca.bump_refresh_tag(role)
+        new_tag = await self.qca.bump_refresh_tag(role)
+        await self.job_store.publish(f"queue-config-refresh:{role}", new_tag)
+        return new_tag
 
     async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
         return await self.qca.bump_refresh_tags_for_queue(queue_name)
@@ -491,7 +493,8 @@ class StateManager:
         return await self.qca.get_all_roles()
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
-        await self.qca.save_role(role, queues_set)
+        new_tag = await self.qca.save_role(role, queues_set)
+        await self.job_store.publish(f"queue-config-refresh:{role}", new_tag)
 
     async def delete_queue(self, queue_name: str) -> None:
         self.invalidate_queue_config(queue_name)

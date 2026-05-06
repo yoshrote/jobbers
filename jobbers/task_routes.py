@@ -192,7 +192,9 @@ async def get_queues(role: str) -> dict[str, Any]:
 async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
     """Set the list of all queues for a given role."""
     logger.info("Setting all queues for role %s", role)
-    await db.get_state_manager().save_role(role, set(queues))
+    sm = db.get_state_manager()
+    await _require_queues_exist(queues, sm)
+    await sm.save_role(role, set(queues))
     return {"message": "Queues set successfully"}
 
 
@@ -377,6 +379,13 @@ async def _require_role(role_name: str, sm: StateManager) -> None:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
 
 
+async def _require_queues_exist(queues: list[str], sm: StateManager) -> None:
+    all_queues = set(await sm.get_all_queues())
+    invalid = [q for q in queues if q not in all_queues]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown queues: {invalid}")
+
+
 @app.get("/roles")
 async def get_all_roles() -> dict[str, Any]:
     """Retrieve the list of all roles."""
@@ -399,6 +408,7 @@ async def create_role(role: RoleRequest) -> dict[str, Any]:
     existing = await sm.get_queues(role.name)
     if existing:
         raise HTTPException(status_code=409, detail=f"Role '{role.name}' already exists.")
+    await _require_queues_exist(role.queues, sm)
     await sm.save_role(role.name, set(role.queues))
     return {"message": "Role created successfully", "role": role.name, "queues": sorted(role.queues)}
 
@@ -417,6 +427,7 @@ async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
     """Replace the queue list for a role. Returns 404 if the role does not exist."""
     sm = db.get_state_manager()
     await _require_role(role_name, sm)
+    await _require_queues_exist(queues, sm)
     await sm.save_role(role_name, set(queues))
     return {"message": "Role updated successfully", "role": role_name, "queues": sorted(queues)}
 

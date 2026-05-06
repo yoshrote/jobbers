@@ -80,7 +80,7 @@ class QueueConfigAdapter:
             result = await session.execute(select(role_queues.c.queue).where(role_queues.c.role == role))
             return {row[0] for row in result.fetchall()}
 
-    async def save_role(self, role: str, queues_set: set[str]) -> None:
+    async def save_role(self, role: str, queues_set: set[str]) -> str:
         new_tag = str(ULID())
         async with self.session_factory.begin() as session:
             existing = await session.execute(select(roles.c.name).where(roles.c.name == role))
@@ -94,6 +94,7 @@ class QueueConfigAdapter:
                     insert(role_queues),
                     [{"role": role, "queue": q} for q in queues_set],
                 )
+        return new_tag
 
     async def get_all_queues(self) -> list[str]:
         async with self.session_factory() as session:

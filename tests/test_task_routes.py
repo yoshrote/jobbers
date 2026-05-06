@@ -186,6 +186,7 @@ async def test_get_queues():
 async def test_set_queues():
     """Test setting the list of all queues for a given role."""
     mock_sm = MagicMock()
+    mock_sm.get_all_queues = AsyncMock(return_value=["queue1", "queue2"])
     mock_sm.save_role = AsyncMock()
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -721,6 +722,7 @@ async def test_create_role():
     """POST /roles creates a new role."""
     mock_sm = MagicMock()
     mock_sm.get_queues = AsyncMock(return_value=set())
+    mock_sm.get_all_queues = AsyncMock(return_value=["default"])
     mock_sm.save_role = AsyncMock()
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -777,6 +779,7 @@ async def test_update_role_found():
     """PUT /roles/{name} replaces the queues for the role."""
     mock_sm = MagicMock()
     mock_sm.get_all_roles = AsyncMock(return_value=["myrole"])
+    mock_sm.get_all_queues = AsyncMock(return_value=["default"])
     mock_sm.save_role = AsyncMock()
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -1206,3 +1209,53 @@ async def test_delete_task_routing_not_found():
             response = await client.delete("/task-routing/ghost/99")
 
     assert response.status_code == 404
+
+
+# ── Queue existence validation ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_queues_rejects_unknown_queue():
+    """POST /queues/{role} returns 400 when any requested queue does not exist."""
+    mock_sm = MagicMock()
+    mock_sm.get_all_queues = AsyncMock(return_value=["default"])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/queues/myrole", json=["default", "ghost_queue"])
+
+    assert response.status_code == 400
+    assert "ghost_queue" in response.json()["detail"]
+    mock_sm.save_role.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_role_rejects_unknown_queue():
+    """POST /roles returns 400 when any requested queue does not exist."""
+    mock_sm = MagicMock()
+    mock_sm.get_queues = AsyncMock(return_value=set())
+    mock_sm.get_all_queues = AsyncMock(return_value=["default"])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/roles", json={"name": "newrole", "queues": ["default", "nope"]})
+
+    assert response.status_code == 400
+    assert "nope" in response.json()["detail"]
+    mock_sm.save_role.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_role_rejects_unknown_queue():
+    """PUT /roles/{name} returns 400 when any requested queue does not exist."""
+    mock_sm = MagicMock()
+    mock_sm.get_all_roles = AsyncMock(return_value=["myrole"])
+    mock_sm.get_all_queues = AsyncMock(return_value=["default"])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.put("/roles/myrole", json=["default", "missing"])
+
+    assert response.status_code == 400
+    assert "missing" in response.json()["detail"]
+    mock_sm.save_role.assert_not_called()

@@ -2,7 +2,7 @@ import asyncio
 import datetime as dt
 import logging
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry import metrics
 
@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 time_in_queue = meter.create_histogram("time_in_queue", unit="ms")
 tasks_selected = meter.create_counter("tasks_selected", unit="1")
+queue_config_refreshes = meter.create_counter("queue_config_refreshes", unit="1")
+refresh_lag_ms = meter.create_histogram("refresh_lag_ms", unit="ms")
 
 _CAPACITY_BACKOFF_SECS: float = 1.0
 
@@ -73,6 +75,13 @@ class TaskGenerator:
         self.refresh_tag: ULID | None = None
         self.routing_version: ULID | None = None
         self._run: bool = True
+        self._refresh_pubsub: Any | None = None
+
+    async def _get_refresh_pubsub(self) -> Any:
+        if self._refresh_pubsub is None:
+            self._refresh_pubsub = self.state_manager.job_store.pubsub()
+            await self._refresh_pubsub.subscribe(f"queue-config-refresh:{self.role}")
+        return self._refresh_pubsub
 
     async def find_queues(self) -> set[str]:
         """Find all queues we should listen to via Redis."""
@@ -105,17 +114,25 @@ class TaskGenerator:
             self.state_manager.invalidate_all_routing_config()
             logger.info("Routing config invalidated at version %s", new_routing_version)
 
+        pubsub = await self._get_refresh_pubsub()
+        if await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.0):
+            self.refresh_tag = None  # force tag re-read below
+
         new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
         if new_refresh_tag != self.refresh_tag:
             self.refresh_tag = new_refresh_tag
             self.task_queues = {queue for queue in await self.find_queues() if queue}
             for queue in self.task_queues:
                 self.state_manager.invalidate_queue_config(queue)
+            lag = (dt.datetime.now(dt.UTC) - new_refresh_tag.datetime).total_seconds() * 1000
+            queue_config_refreshes.add(1, {"role": self.role})
+            refresh_lag_ms.record(lag, {"role": self.role})
             logger.info("Refreshed to v %s: %s", self.refresh_tag, self.task_queues)
         return await self.filter_by_worker_queue_capacity(self.task_queues)
 
     def stop(self) -> None:
         self._run = False
+        self._refresh_pubsub = None
 
     def __aiter__(self) -> AsyncIterator[Task]:
         return self

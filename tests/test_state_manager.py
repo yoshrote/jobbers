@@ -41,6 +41,26 @@ async def test_get_refresh_tag(state_manager):
     assert tag1 == tag2
 
 
+@pytest.mark.asyncio
+async def test_bump_refresh_tag_publishes_pubsub(state_manager):
+    """bump_refresh_tag publishes the new tag value to queue-config-refresh:{role}."""
+    with patch.object(state_manager.job_store, "publish", new_callable=AsyncMock) as mock_publish:
+        new_tag = await state_manager.bump_refresh_tag("myrole")
+
+    mock_publish.assert_called_once_with("queue-config-refresh:myrole", new_tag)
+
+
+@pytest.mark.asyncio
+async def test_save_role_publishes_pubsub(state_manager):
+    """save_role publishes the new refresh tag to queue-config-refresh:{role}."""
+    with patch.object(state_manager.job_store, "publish", new_callable=AsyncMock) as mock_publish:
+        await state_manager.save_role("newrole", set())
+
+    channel, tag = mock_publish.call_args[0]
+    assert channel == "queue-config-refresh:newrole"
+    assert tag  # non-empty tag string
+
+
 # ── get_next_task ─────────────────────────────────────────────────────────────
 
 
