@@ -92,7 +92,22 @@ async def my_task(**kwargs):
 
 - **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Stored in SQL `queues` table.
 - **Roles**: named sets of queues assigned to workers. Workers consume all queues in their role. Stored in SQL `roles` table.
-- Workers detect role/queue config changes via a refresh tag TTL in `TaskGenerator`.
+- Workers detect role/queue config changes via a `refresh_tag` stored per-role in SQL. `TaskGenerator.queues()` polls on every iteration; it also subscribes to the Redis pub/sub channel `queue-config-refresh:{role}` for immediate notification when a tag changes.
+- The refresh tag is bumped automatically on `POST /queues/{role}` (set queues), `PUT /roles/{role_name}` (update role), `POST /roles` (create role), `PUT /queues/{queue_name}` (update queue config), and `DELETE /queues/{queue_name}` (delete queue). It can also be triggered manually via `POST /roles/{role_name}/refresh`.
+- `POST /queues/{role}`, `PUT /roles/{role_name}`, and `POST /roles` validate that all requested queue names exist before saving; unknown queues return 400.
+
+## OpenTelemetry Metrics
+
+All metrics use the OTLP exporter (configured in `jobbers/utils/otel.py`) and are visible in OpenObserve.
+
+| Metric | Type | Unit | Source | Description |
+| ------ | ---- | ---- | ------ | ----------- |
+| `hit_counter` | UpDownCounter | — | `task_routes.py` | Active in-flight HTTP requests (increments on entry, decrements on exit) |
+| `cancellations_requested` | Counter | `1` | `task_routes.py` | Task cancellation requests (tagged with `queue`, `task`) |
+| `time_in_queue` | Histogram | `ms` | `task_generator.py` | Time a task spent waiting in the queue before being picked up (tagged with `queue`, `role`, `task`) |
+| `tasks_selected` | Counter | `1` | `task_generator.py` | Tasks pulled from a queue by a worker (tagged with `queue`, `role`, `task`) |
+| `queue_config_refreshes` | Counter | `1` | `task_generator.py` | Queue-list refreshes triggered on a worker (tagged with `role`); fires each time a worker reloads its queue assignment due to a `refresh_tag` change |
+| `refresh_lag_ms` | Histogram | `ms` | `task_generator.py` | Lag between when the `refresh_tag` was bumped (ULID timestamp) and when the worker picked up the change (tagged with `role`) |
 
 ## Key Environment Variables
 
@@ -184,7 +199,7 @@ The test suite follows a layered approach designed for speed and systematic prot
 The following lines cannot be covered reliably without concurrent execution, low-level patching, or specially broken inputs:
 
 - `jobbers/adapters/raw_redis.py` line 312 — `if task_data is None: continue` in `MsgpackTaskAdapter.clean_terminal_tasks` (key deleted between `scan_iter` and `GET`)
-- `jobbers/task_generator.py` line 156 — the `if task:` requeue branch in `TaskGenerator.__anext__`'s `CancelledError` handler (task is always `None` when `get_next_task` raises, making this branch unreachable in practice)
+- `jobbers/task_generator.py` line 151 — the `if task:` requeue branch in `TaskGenerator.__anext__`'s `CancelledError` handler (task is always `None` when `get_next_task` raises, making this branch unreachable in practice)
 - `jobbers/di.py` lines 227, 232 — exception handlers in `DependencyResolver.__aexit__` that catch errors thrown by generator cleanup; requires an async/sync generator that raises during `.aclose()` / `.close()`
 - `jobbers/task_processor.py` line 80 — `hints = {}` fallback when `get_type_hints()` raises; only reachable with unresolvable forward references in task annotations
 

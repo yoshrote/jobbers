@@ -263,6 +263,8 @@ All four processes emit OTLP metrics automatically. No instrumentation code is r
 | --- | --- | --- | --- |
 | `time_in_queue` | Histogram (ms) | `queue`, `role`, `task` | Time from `submitted_at` to worker pickup |
 | `tasks_selected` | Counter | `queue`, `role`, `task` | Tasks pulled from queues |
+| `queue_config_refreshes` | Counter | `role` | Queue-list reloads triggered when a worker detects a `refresh_tag` change |
+| `refresh_lag_ms` | Histogram (ms) | `role` | Lag between when the `refresh_tag` was bumped and when the worker picked up the change |
 
 **Emitted by the Manager:**
 
@@ -276,6 +278,8 @@ All four processes emit OTLP metrics automatically. No instrumentation code is r
 - `time_in_queue` rising → workers are undersized or queues need splitting
 - `tasks_processed{status="dropped"}` > 0 → workers are running a stale task version
 - `tasks_retried` high → upstream dependencies are flaky; tune `expected_exceptions` or back-pressure
+- `refresh_lag_ms` high → workers are not picking up queue configuration changes promptly; check for long-running tasks blocking `queues()` calls or Redis pub/sub connectivity issues
+- `queue_config_refreshes` absent on a worker that should have received a config change → the worker may be stalled or not subscribed to the refresh channel
 
 ### OpenTelemetry Setup
 
