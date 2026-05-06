@@ -125,6 +125,37 @@ Scale horizontally by running more worker processes. Workers are fully independe
 
 On `SIGTERM`, each in-flight task is handled according to its `on_shutdown` policy before the process exits.
 
+#### Queue configuration refresh
+
+Workers do not require a restart to pick up changes to their role's queue list or to individual queue configurations (concurrency limits, rate limits). The mechanism works as follows:
+
+**Refresh tag.** Each role has a `refresh_tag` (a ULID) stored in the SQL `roles` table. `TaskGenerator.queues()` compares the stored tag against its locally cached value on every iteration. A mismatch means the role's queue assignment has changed: the worker reloads its queue list from SQL and invalidates its per-queue configuration cache.
+
+**What bumps the tag.** The tag is updated automatically whenever:
+
+| Operation | API call |
+| --- | --- |
+| Queue list for a role is replaced | `POST /queues/{role}` or `PUT /roles/{role_name}` |
+| A role is created | `POST /roles` |
+| A queue's config is updated | `PUT /queues/{queue_name}` |
+| A queue is deleted | `DELETE /queues/{queue_name}` |
+
+It can also be bumped manually:
+
+```bash
+curl -X POST http://localhost:8000/roles/default/refresh
+# {"role": "default", "refresh_tag": "01JT..."}
+```
+
+**Immediate notification via pub/sub.** In addition to polling, each worker subscribes to the Redis channel `queue-config-refresh:{role}` when it starts. Whenever a tag is bumped the Manager publishes to that channel, so workers that are idle (sleeping between polls) will receive the notification on their next loop iteration rather than waiting for the next BZPOPMIN timeout.
+
+**Typical propagation latency.** For workers actively pulling tasks the lag is one loop iteration — effectively immediate. For idle workers it is bounded by the BZPOPMIN timeout (default: no timeout, returns on the next task arrival) plus the time to the next `queues()` call. In practice the pub/sub message arrives before the next task, so the effective lag is low.
+
+**Observability.** Two OTel metrics track refresh activity on each worker:
+
+- `queue_config_refreshes{role=...}` — increments each time a worker reloads its queue list.
+- `refresh_lag_ms{role=...}` — records the time between when the tag was written and when the worker picked it up, derived from the ULID timestamp embedded in the tag.
+
 ---
 
 ### Cleaner
