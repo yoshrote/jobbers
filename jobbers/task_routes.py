@@ -373,6 +373,12 @@ async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) 
     return {"tasks": summaries}
 
 
+async def _require_role(role_name: str, qca: QueueConfigAdapter) -> None:
+    all_roles = await qca.get_all_roles()
+    if role_name not in all_roles:
+        raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
+
+
 @app.get("/roles")
 async def get_all_roles() -> dict[str, Any]:
     """Retrieve the list of all roles."""
@@ -403,9 +409,7 @@ async def create_role(role: RoleRequest) -> dict[str, Any]:
 async def get_role(role_name: str) -> dict[str, Any]:
     """Retrieve the queues assigned to a specific role."""
     qca = QueueConfigAdapter(db.get_session_factory())
-    all_roles = await qca.get_all_roles()
-    if role_name not in all_roles:
-        raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
+    await _require_role(role_name, qca)
     queues = await qca.get_queues(role_name)
     return {"role": role_name, "queues": sorted(queues)}
 
@@ -414,9 +418,7 @@ async def get_role(role_name: str) -> dict[str, Any]:
 async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
     """Replace the queue list for a role. Returns 404 if the role does not exist."""
     qca = QueueConfigAdapter(db.get_session_factory())
-    all_roles = await qca.get_all_roles()
-    if role_name not in all_roles:
-        raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
+    await _require_role(role_name, qca)
     await qca.save_role(role_name, set(queues))
     return {"message": "Role updated successfully", "role": role_name, "queues": sorted(queues)}
 
@@ -425,9 +427,7 @@ async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
 async def delete_role(role_name: str) -> dict[str, Any]:
     """Delete a role. Queue configs are preserved. Returns 404 if the role does not exist."""
     qca = QueueConfigAdapter(db.get_session_factory())
-    all_roles = await qca.get_all_roles()
-    if role_name not in all_roles:
-        raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
+    await _require_role(role_name, qca)
     await qca.delete_role(role_name)
     return {"message": f"Role '{role_name}' deleted successfully."}
 
@@ -436,9 +436,7 @@ async def delete_role(role_name: str) -> dict[str, Any]:
 async def refresh_role(role_name: str) -> dict[str, Any]:
     """Bump the refresh tag for a role, causing workers to reload their queue list on the next poll."""
     qca = QueueConfigAdapter(db.get_session_factory())
-    all_roles = await qca.get_all_roles()
-    if role_name not in all_roles:
-        raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
+    await _require_role(role_name, qca)
     new_tag = await db.get_state_manager().bump_refresh_tag(role_name)
     return {"role": role_name, "refresh_tag": new_tag}
 
