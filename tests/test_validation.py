@@ -18,19 +18,13 @@ def _mock_sm(routing=None, queue_config=None):
     return sm
 
 
-_no_routing = patch(
-    "jobbers.validation.db.get_state_manager",
-    return_value=_mock_sm(routing=None, queue_config=QueueConfig(name="default")),
-)
-
-
 @pytest.mark.asyncio
 async def test_validate_task_unregistered():
     """Unregistered task raises ValidationError without any Redis calls."""
     task = Task(id=ULID1, name="unknown_task", parameters={})
     with patch("jobbers.registry.get_task_config", return_value=None):
         with pytest.raises(ValidationError, match="Unknown task"):
-            await validate_task(task)
+            await validate_task(task, _mock_sm())
 
 
 @pytest.mark.asyncio
@@ -44,7 +38,7 @@ async def test_validate_task_invalid_params():
     task = Task(id=ULID1, name="Test Task", parameters={"foo": "bar"})
     with patch("jobbers.registry.get_task_config", return_value=task_config):
         with pytest.raises(ValidationError, match="Invalid parameters"):
-            await validate_task(task)
+            await validate_task(task, _mock_sm())
 
 
 @pytest.mark.asyncio
@@ -58,8 +52,7 @@ async def test_validate_task_valid_sets_task_config():
     task = Task(id=ULID1, name="Test Task", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with _no_routing:
-            await validate_task(task)
+        await validate_task(task, _mock_sm(routing=None, queue_config=QueueConfig(name="default")))
 
     assert task.task_config is task_config
 
@@ -75,9 +68,5 @@ async def test_validate_task_missing_queue_config():
     task = Task(id=ULID1, name="Test Task", queue="unknown-queue", parameters={"foo": 42})
 
     with patch("jobbers.registry.get_task_config", return_value=task_config):
-        with patch(
-            "jobbers.validation.db.get_state_manager",
-            return_value=_mock_sm(routing=None, queue_config=None),
-        ):
-            with pytest.raises(ValidationError, match="Unknown queue unknown-queue"):
-                await validate_task(task)
+        with pytest.raises(ValidationError, match="Unknown queue unknown-queue"):
+            await validate_task(task, _mock_sm(routing=None, queue_config=None))

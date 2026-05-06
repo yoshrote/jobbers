@@ -57,12 +57,12 @@ async def read_root() -> RootResponse:
 async def submit_task(task: Task) -> dict[str, Any]:
     """Handle task submission."""
     logger.info("Submitting a task")
+    state_manager = db.get_state_manager()
     try:
-        await validate_task(task)
+        await validate_task(task, state_manager)
     except ValidationError as ex:
         raise HTTPException(status_code=400, detail=str(ex)) from ex
     try:
-        state_manager = db.get_state_manager()
         await state_manager.submit_task(task)
     except TaskException as ex:
         raise HTTPException(status_code=400, detail=f"Invalid task parameters: {ex}") from ex
@@ -83,11 +83,11 @@ class ScheduleTaskRequest(BaseModel):
 async def schedule_task(request: ScheduleTaskRequest) -> dict[str, Any]:
     """Schedule a task to run at a specific UTC datetime."""
     logger.info("Scheduling task %s to run at %s", request.task.name, request.run_at)
+    sm = db.get_state_manager()
     try:
-        await validate_task(request.task)
+        await validate_task(request.task, sm)
     except ValidationError as ex:
         raise HTTPException(status_code=400, detail=str(ex)) from ex
-    sm = db.get_state_manager()
     await sm.schedule_new_task(request.task, request.run_at)
     return {
         "message": "Task scheduled successfully",
