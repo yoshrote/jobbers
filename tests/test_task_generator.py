@@ -1,13 +1,13 @@
 import asyncio
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from ulid import ULID
 
 from jobbers.models.task import Task, TaskStatus
 from jobbers.state_manager import StateManager
-from jobbers.task_generator import TaskGenerator
+from jobbers.task_generator import TaskGenerator, _CAPACITY_BACKOFF_SECS
 
 EXHAUSTED = object()
 
@@ -67,17 +67,38 @@ async def test_task_generator_iteration():
 
 
 @pytest.mark.asyncio
-async def test_task_generator_stops_iteration():
-    """Test that TaskGenerator stops iteration when no tasks are available."""
-    state_manager = AsyncMock(spec=StateManager)
-    state_manager.get_next_task.return_value = None
+async def test_task_generator_sleeps_and_retries_on_capacity_filter():
+    """When get_next_task returns None (all queues filtered), the generator sleeps and retries."""
+    state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
+
+    task = Task(id=ULID(), name="retry_task", version=1, status=TaskStatus.SUBMITTED, submitted_at=datetime.now(tz=UTC))
+    state_manager.get_next_task = AsyncMock(side_effect=[None, task])
+
     task_generator = TaskGenerator(state_manager, role="default")
 
-    assert await anext(task_generator, EXHAUSTED) == EXHAUSTED
+    with patch("jobbers.task_generator.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        result = await task_generator.__anext__()
 
-    state_manager.get_next_task.assert_called_once_with({"default"})
+    assert result is task
+    mock_sleep.assert_awaited_once_with(_CAPACITY_BACKOFF_SECS)
+    assert state_manager.get_next_task.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_task_generator_cancelled_during_backoff_sleep():
+    """CancelledError raised during backoff sleep propagates without requeueing."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits = AsyncMock(return_value={})
+    state_manager.get_next_task = AsyncMock(return_value=None)
+
+    task_generator = TaskGenerator(state_manager, role="default")
+
+    with patch("jobbers.task_generator.asyncio.sleep", new_callable=AsyncMock, side_effect=asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await task_generator.__anext__()
 
 
 @pytest.mark.asyncio

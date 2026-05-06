@@ -17,6 +17,8 @@ meter = metrics.get_meter(__name__)
 time_in_queue = meter.create_histogram("time_in_queue", unit="ms")
 tasks_selected = meter.create_counter("tasks_selected", unit="1")
 
+_CAPACITY_BACKOFF_SECS: float = 1.0
+
 
 class MaxTaskCounter:
     """
@@ -122,31 +124,30 @@ class TaskGenerator:
         if not self._run:
             raise StopAsyncIteration
         with self.max_task_check:
-            task_queues = await self.queues()
-            logger.debug("Checking queues %s", task_queues)
-            task = None
-            try:
-                task = await self.state_manager.get_next_task(task_queues)
-            except asyncio.CancelledError:
-                if task:
-                    pipe = self.state_manager.job_store.pipeline()
-                    self.state_manager.ta.stage_requeue(pipe, task)
-                    await pipe.execute()
-                raise
-        if not task:
-            # get_next_task returns None when all queues are filtered out by capacity or
-            # rate-limit constraints before reaching bzpopmin. The worker exits and is
-            # expected to restart; this log lets you diagnose how often capacity limits
-            # are causing premature worker termination.
-            logger.warning(
-                "All queues filtered out before task retrieval; stopping generator. "
-                "role=%s configured_queues=%s capacity_available_queues=%s tasks_processed=%d",
-                self.role,
-                self.task_queues,
-                task_queues,
-                self.max_task_check._task_count,
-            )
-            raise StopAsyncIteration
+            while True:
+                task_queues = await self.queues()
+                logger.debug("Checking queues %s", task_queues)
+                task = None
+                try:
+                    task = await self.state_manager.get_next_task(task_queues)
+                except asyncio.CancelledError:
+                    if task:
+                        pipe = self.state_manager.job_store.pipeline()
+                        self.state_manager.ta.stage_requeue(pipe, task)
+                        await pipe.execute()
+                    raise
+                if not task:
+                    logger.info(
+                        "All queues filtered out; sleeping before retry. "
+                        "role=%s configured_queues=%s capacity_available_queues=%s tasks_processed=%d",
+                        self.role,
+                        self.task_queues,
+                        task_queues,
+                        self.max_task_check._task_count,
+                    )
+                    await asyncio.sleep(_CAPACITY_BACKOFF_SECS)
+                    continue
+                break
         metric_tags = {
             "queue": task.queue,
             "role": self.role,
