@@ -134,8 +134,18 @@ class TaskGenerator:
                     await pipe.execute()
                 raise
         if not task:
-            # TODO: We need to monitor how often the generator dies this way
-            logger.warning("Strange stop")
+            # get_next_task returns None when all queues are filtered out by capacity or
+            # rate-limit constraints before reaching bzpopmin. The worker exits and is
+            # expected to restart; this log lets you diagnose how often capacity limits
+            # are causing premature worker termination.
+            logger.warning(
+                "All queues filtered out before task retrieval; stopping generator. "
+                "role=%s configured_queues=%s capacity_available_queues=%s tasks_processed=%d",
+                self.role,
+                self.task_queues,
+                task_queues,
+                self.max_task_check._task_count,
+            )
             raise StopAsyncIteration
         metric_tags = {
             "queue": task.queue,
