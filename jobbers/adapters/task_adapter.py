@@ -3,8 +3,8 @@ Protocols and shared base for task storage and dead-letter-queue adapters.
 
 - `TaskAdapterProtocol` — interface for task storage and querying.
 - `DeadQueueProtocol` — interface for dead letter queue operations.
-- `_BaseTaskAdapter` — shared key helpers and non-storage methods used by both
-  concrete task-adapter implementations.
+- `SharedTaskAdapterMixin` — ABC with shared key helpers, serialization hooks, and
+  all common Redis operations. Concrete adapters implement the storage primitives.
 
 Concrete implementations live in the sibling modules:
 
@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, runtime_checkable
 
 from opentelemetry import metrics
 from ulid import ULID
 
 from jobbers.constants import TIME_ZERO
+from jobbers.models.task_status import TaskStatus
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable
@@ -124,13 +126,26 @@ class DeadQueueProtocol(Protocol):  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# Shared base helpers (not part of public Protocol, internal reuse)
+# Shared base (ABC mixin used by both concrete adapter implementations)
 # ---------------------------------------------------------------------------
 
 
-class _BaseTaskAdapter:
-    """Shared key-name helpers and non-storage methods used by both implementations."""
+class SharedTaskAdapterMixin(ABC):
+    """
+    ABC mixin implementing all adapter logic that is identical across backends.
 
+    Subclasses must implement:
+
+    - Storage primitives: ``_load_raw``, ``_load_raw_watch``, ``_stage_store``,
+      ``_stage_load``
+    - Serialization: ``pack``, ``unpack``
+    - Lua script key helpers: ``_extra_submit_keys``, ``_extra_rate_limited_keys``
+    - Lua scripts as class attributes: ``SUBMIT_SCRIPT``,
+      ``SUBMIT_RATE_LIMITED_SCRIPT``
+    - Backend-specific queries: ``ensure_index``, ``get_all_tasks``, ``get_dag_run``
+    """
+
+    # -- key helpers (both implementations use the same Redis key names) ----
     TASKS_BY_QUEUE = "task-queues:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
     HEARTBEAT_SCORES = "task-heartbeats:{queue}".format
@@ -139,6 +154,10 @@ class _BaseTaskAdapter:
     DLQ_MISSING_DATA = "dlq-missing-data"
     DAG_RUNS = "dag-runs"
     DAG_RUN_TASKS = "dag-run:{dag_run_id}:tasks".format
+
+    # Declared without assignment — mypy requires subclasses to define them.
+    SUBMIT_SCRIPT: ClassVar[str]
+    SUBMIT_RATE_LIMITED_SCRIPT: ClassVar[str]
 
     # Atomically remove task_id from fan-in set and return remaining count.
     # Returns {removed=0, remaining=-1} if the ID was not a member (already
@@ -155,6 +174,180 @@ class _BaseTaskAdapter:
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
         self._fan_in_script = self.data_store.register_script(self._FAN_IN_SCRIPT)
+
+    # ---------------------------------------------------------------------------
+    # Abstract primitives — subclasses must implement these
+    # ---------------------------------------------------------------------------
+
+    @abstractmethod
+    def pack(self, task: Task) -> str | bytes:
+        """Serialize a task to the backend's wire format."""
+
+    @abstractmethod
+    def unpack(self, task_id: ULID, data: Any) -> Task:
+        """Deserialize a task from the backend's wire format."""
+
+    @abstractmethod
+    async def _load_raw(self, key: str) -> Any:
+        """Fetch raw task data by string key."""
+
+    @abstractmethod
+    async def _load_raw_watch(self, pipe: Pipeline, key: str) -> Any:
+        """Fetch raw task data via an active WATCH pipeline."""
+
+    @abstractmethod
+    def _stage_store(self, pipe: Pipeline, key: str, task: Task) -> None:
+        """Stage the backend's write command for task data onto pipe."""
+
+    @abstractmethod
+    def _stage_load(self, pipe: Pipeline, key: str) -> None:
+        """Stage the backend's read command for task data onto pipe."""
+
+    @abstractmethod
+    def _extra_submit_keys(self, task: Task) -> list[str]:
+        """Extra KEYS[] args for SUBMIT_SCRIPT beyond the base 4 keys."""
+
+    @abstractmethod
+    def _extra_rate_limited_keys(self, task: Task) -> list[str]:
+        """Extra KEYS[] args for SUBMIT_RATE_LIMITED_SCRIPT beyond the base 5 keys."""
+
+    @abstractmethod
+    async def ensure_index(self) -> None:
+        """Create or update any backend search index."""
+
+    @abstractmethod
+    async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
+        """Return a page of tasks matching the pagination filters."""
+
+    @abstractmethod
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
+        """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
+
+    # ---------------------------------------------------------------------------
+    # Shared implementations (identical across all backends)
+    # ---------------------------------------------------------------------------
+
+    async def submit_task(self, task: Task) -> bool:
+        """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
+        assert task.submitted_at  # noqa: S101
+        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
+        extra_keys = self._extra_submit_keys(task)
+        result: int = await cast(
+            "Awaitable[int]",
+            self.data_store.eval(
+                self.SUBMIT_SCRIPT,
+                4 + len(extra_keys),
+                self.TASKS_BY_QUEUE(queue=task.queue),
+                self.TASK_DETAILS(task_id=task.id),
+                self.TASK_BY_TYPE_IDX(name=task.name),
+                self.DAG_RUNS,
+                *extra_keys,
+                task.submitted_at.timestamp(),
+                bytes(task.id),
+                is_active,
+                self.pack(task),
+                dag_run_id_bytes,
+            ),
+        )
+        return result == 1
+
+    async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
+        """Atomically check the rate limit and enqueue the task if there is room."""
+        assert task.submitted_at  # noqa: S101
+        now = dt.datetime.now(dt.UTC)
+        earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
+        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
+        extra_keys = self._extra_rate_limited_keys(task)
+        result: int = await cast(
+            "Awaitable[int]",
+            self.data_store.eval(
+                self.SUBMIT_RATE_LIMITED_SCRIPT,
+                5 + len(extra_keys),
+                self.QUEUE_RATE_LIMITER(queue=task.queue),
+                self.TASKS_BY_QUEUE(queue=task.queue),
+                self.TASK_DETAILS(task_id=task.id),
+                self.TASK_BY_TYPE_IDX(name=task.name),
+                self.DAG_RUNS,
+                *extra_keys,
+                earliest_time.timestamp(),
+                queue_config.rate_numerator or 0,
+                task.submitted_at.timestamp(),
+                bytes(task.id),
+                is_active,
+                self.pack(task),
+                dag_run_id_bytes,
+            ),
+        )
+        return result == 1
+
+    def stage_save(self, pipe: Pipeline, task: Task) -> None:
+        """Queue task-details write + type-index update onto pipe (no execute)."""
+        self._stage_store(pipe, self.TASK_DETAILS(task_id=task.id), task)
+        if task.status in TaskStatus.active_statuses():
+            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        else:
+            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
+    async def get_task(self, task_id: ULID) -> Task | None:
+        raw_data = await self._load_raw(self.TASK_DETAILS(task_id=task_id))
+        if not raw_data:
+            return None
+        task = self.unpack(task_id, raw_data)
+        heartbeat_score: float | None = await self.data_store.zscore(
+            self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id)
+        )
+        if heartbeat_score is not None:
+            task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.UTC)
+        return task
+
+    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None:
+        """Read task data via a WATCH pipeline."""
+        raw_data = await self._load_raw_watch(pipe, self.TASK_DETAILS(task_id=task_id))
+        if not raw_data:
+            return None
+        return self.unpack(task_id, raw_data)
+
+    async def _fetch_task_data_bulk(self, task_ids: list[ULID]) -> list[Any]:
+        pipe = self.data_store.pipeline(transaction=False)
+        for task_id in task_ids:
+            self._stage_load(pipe, self.TASK_DETAILS(task_id=task_id))
+        return await pipe.execute()
+
+    def _decode_task(self, task_id: ULID, raw: Any) -> Task:
+        return self.unpack(task_id, raw)
+
+    async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
+        """Delete blobs, heartbeat entries, and type-index members for old terminal tasks."""
+        terminal_statuses = {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.STALLED,
+            TaskStatus.DROPPED,
+        }
+        cutoff = now - max_age
+        async for raw_key in self.data_store.scan_iter("task:*"):
+            key_str = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            task_id_str = key_str.removeprefix("task:")
+            try:
+                task_id = ULID.from_str(task_id_str)
+            except ValueError:
+                continue
+            task_data = await self._load_raw(key_str)
+            if not task_data:
+                continue
+            task = self.unpack(task_id, task_data)
+            if task.status not in terminal_statuses:
+                continue
+            if task.completed_at is None or task.completed_at >= cutoff:
+                continue
+            pipe = self.data_store.pipeline(transaction=True)
+            pipe.delete(key_str)
+            pipe.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id))
+            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task_id))
+            await pipe.execute()
 
     def stage_requeue(self, pipe: Pipeline, task: Task) -> None:
         """Queue ZADD task-queue + save-task commands onto pipe (no execute)."""
@@ -198,10 +391,6 @@ class _BaseTaskAdapter:
             for dag_id_bytes, score in raw
         ], total
 
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
-        """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
-        raise NotImplementedError
-
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """
         Remove DAG run index entries older than ``max_age``.
@@ -215,9 +404,6 @@ class _BaseTaskAdapter:
         stale: list[bytes] = await self.data_store.zrangebyscore(self.DAG_RUNS, "-inf", cutoff)
         if stale:
             await self.data_store.zrem(self.DAG_RUNS, *stale)
-
-    def stage_save(self, pipe: Pipeline, task: Task) -> None:
-        raise NotImplementedError
 
     async def save_task(self, task: Task) -> None:
         """Save task state to the Redis data store."""
@@ -267,12 +453,6 @@ class _BaseTaskAdapter:
             if score is not None:
                 task.heartbeat_at = dt.datetime.fromtimestamp(score, dt.UTC)
         return tasks
-
-    async def _fetch_task_data_bulk(self, _task_ids: list[ULID]) -> list[Any]:
-        raise NotImplementedError
-
-    def _decode_task(self, _task_id: ULID, _raw: Any) -> Task:
-        raise NotImplementedError
 
     async def get_active_tasks(self, queues: set[str]) -> list[Task]:
         """Return all tasks currently present in any heartbeat sorted set."""
@@ -414,25 +594,3 @@ class _BaseTaskAdapter:
         if task:
             results.append(task)
         return results
-
-    # Abstract in subclasses
-    async def get_task(self, task_id: ULID) -> Task | None:
-        raise NotImplementedError
-
-    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None:
-        raise NotImplementedError
-
-    async def ensure_index(self) -> None:
-        raise NotImplementedError
-
-    async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
-        raise NotImplementedError
-
-    async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
-        raise NotImplementedError
-
-    async def submit_task(self, task: Task) -> bool:
-        raise NotImplementedError
-
-    async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
-        raise NotImplementedError

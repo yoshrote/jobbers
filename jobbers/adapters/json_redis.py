@@ -18,17 +18,13 @@ from typing import TYPE_CHECKING, Any, cast
 from redis.exceptions import ResponseError
 from ulid import ULID
 
-from jobbers.adapters.task_adapter import _BaseTaskAdapter
+from jobbers.adapters.task_adapter import SharedTaskAdapterMixin
 from jobbers.models.task import Task, TaskPagination
-from jobbers.models.task_status import TaskStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.adapters.task_adapter import TaskAdapterProtocol
-    from jobbers.models.queue_config import QueueConfig
 
 
 def _escape_tag(value: str) -> str:
@@ -42,7 +38,7 @@ def _escape_tag(value: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class JsonTaskAdapter(_BaseTaskAdapter):
+class JsonTaskAdapter(SharedTaskAdapterMixin):
     """
     Stores tasks as RedisJSON documents; queries via RediSearch.
 
@@ -120,6 +116,8 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         return enqueued
     """
 
+    # -- Storage primitives --------------------------------------------------
+
     def pack(self, task: Task) -> str:
         """Serialize a task to a JSON string."""
         return json.dumps(task.to_dict())
@@ -129,96 +127,25 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         raw: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
         return Task.from_dict(task_id, raw)
 
-    async def submit_task(self, task: Task) -> bool:
-        """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
-        assert task.submitted_at  # noqa: S101
-        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
-        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
-        result: int = await cast(
-            "Awaitable[int]",
-            self.data_store.eval(
-                self.SUBMIT_SCRIPT,
-                4,
-                self.TASKS_BY_QUEUE(queue=task.queue),
-                self.TASK_DETAILS(task_id=task.id),
-                self.TASK_BY_TYPE_IDX(name=task.name),
-                self.DAG_RUNS,
-                task.submitted_at.timestamp(),
-                bytes(task.id),
-                is_active,
-                self.pack(task),
-                dag_run_id_bytes,
-            ),
-        )
-        return result == 1
+    async def _load_raw(self, key: str) -> dict[str, Any] | None:
+        return cast("dict[str, Any] | None", await self.data_store.json().get(key))  # type: ignore[misc]
 
-    async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
-        """Atomically check the rate limit and enqueue the task if there is room."""
-        assert task.submitted_at  # noqa: S101
-        now = dt.datetime.now(dt.UTC)
-        earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
-        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
-        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
-        result: int = await cast(
-            "Awaitable[int]",
-            self.data_store.eval(
-                self.SUBMIT_RATE_LIMITED_SCRIPT,
-                5,
-                self.QUEUE_RATE_LIMITER(queue=task.queue),
-                self.TASKS_BY_QUEUE(queue=task.queue),
-                self.TASK_DETAILS(task_id=task.id),
-                self.TASK_BY_TYPE_IDX(name=task.name),
-                self.DAG_RUNS,
-                earliest_time.timestamp(),
-                queue_config.rate_numerator or 0,
-                task.submitted_at.timestamp(),
-                bytes(task.id),
-                is_active,
-                self.pack(task),
-                dag_run_id_bytes,
-            ),
-        )
-        return result == 1
+    async def _load_raw_watch(self, pipe: Pipeline, key: str) -> dict[str, Any] | None:
+        return cast("dict[str, Any] | None", await pipe.json().get(key))  # type: ignore[misc]
 
-    def stage_save(self, pipe: Pipeline, task: Task) -> None:
-        """Queue JSON.SET task-details + type-index update onto pipe (no execute)."""
-        pipe.json().set(self.TASK_DETAILS(task_id=task.id), "$", task.to_dict())
-        if task.status in TaskStatus.active_statuses():
-            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
-        else:
-            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+    def _stage_store(self, pipe: Pipeline, key: str, task: Task) -> None:
+        pipe.json().set(key, "$", task.to_dict())
 
-    async def _fetch_task_data_bulk(self, task_ids: list[ULID]) -> list[Any]:
-        pipe = self.data_store.pipeline(transaction=False)
-        for task_id in task_ids:
-            pipe.json().get(self.TASK_DETAILS(task_id=task_id))
-        return await pipe.execute()
+    def _stage_load(self, pipe: Pipeline, key: str) -> None:
+        pipe.json().get(key)
 
-    def _decode_task(self, task_id: ULID, raw: Any) -> Task:
-        return self.unpack(task_id, raw)
+    def _extra_submit_keys(self, task: Task) -> list[str]:
+        return []
 
-    async def get_task(self, task_id: ULID) -> Task | None:
-        raw_data: dict[str, Any] | None = await self.data_store.json().get(  # type: ignore[misc]
-            self.TASK_DETAILS(task_id=task_id)
-        )
-        if raw_data is None:
-            return None
-        task = self.unpack(task_id, raw_data)
-        heartbeat_score: float | None = await self.data_store.zscore(
-            self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id)
-        )
-        if heartbeat_score is not None:
-            task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.UTC)
-        return task
+    def _extra_rate_limited_keys(self, task: Task) -> list[str]:
+        return []
 
-    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None:
-        """Read task data via a WATCH pipeline (JSON format)."""
-        raw_data: dict[str, Any] | None = await pipe.json().get(  # type: ignore[misc]
-            self.TASK_DETAILS(task_id=task_id)
-        )
-        if raw_data is None:
-            return None
-        return self.unpack(task_id, raw_data)
+    # -- Backend-specific queries --------------------------------------------
 
     async def ensure_index(self) -> None:
         """Create the RediSearch index, or add any missing fields to an existing one."""
@@ -306,37 +233,6 @@ class JsonTaskAdapter(_BaseTaskAdapter):
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
         task_ids = [ULID.from_str(doc.id.removeprefix("task:")) for doc in (search_results.docs or [])]
         return submitted_at, task_ids
-
-    async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
-        """Delete blobs, heartbeat entries, and type-index members for old terminal tasks."""
-        terminal_statuses = {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.STALLED,
-            TaskStatus.DROPPED,
-        }
-        cutoff = now - max_age
-        async for raw_key in self.data_store.scan_iter("task:*"):
-            key_str = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
-            task_id_str = key_str.removeprefix("task:")
-            try:
-                task_id = ULID.from_str(task_id_str)
-            except ValueError:
-                continue
-            task_data: dict[str, Any] | None = await self.data_store.json().get(key_str)  # type: ignore[misc]
-            if task_data is None:
-                continue
-            task = self.unpack(task_id, task_data)
-            if task.status not in terminal_statuses:
-                continue
-            if task.completed_at is None or task.completed_at >= cutoff:
-                continue
-            pipe = self.data_store.pipeline(transaction=True)
-            pipe.delete(key_str)
-            pipe.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task_id))
-            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task_id))
-            await pipe.execute()
 
 
 # ---------------------------------------------------------------------------

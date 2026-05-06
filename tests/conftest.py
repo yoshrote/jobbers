@@ -7,7 +7,7 @@ from ulid import ULID
 
 from jobbers.adapters.json_redis import JsonTaskAdapter
 from jobbers.adapters.raw_redis import MsgpackTaskAdapter
-from jobbers.adapters.task_adapter import _BaseTaskAdapter
+from jobbers.adapters.task_adapter import SharedTaskAdapterMixin
 from jobbers.migrations.runner import run_migrations
 from jobbers.models.task import Task
 from jobbers.state_manager import StateManager
@@ -64,12 +64,12 @@ class DummyTaskAdapter:
     accidental use is caught at the call site.
     """
 
-    TASKS_BY_QUEUE = _BaseTaskAdapter.TASKS_BY_QUEUE
-    TASK_DETAILS = _BaseTaskAdapter.TASK_DETAILS
-    HEARTBEAT_SCORES = _BaseTaskAdapter.HEARTBEAT_SCORES
-    TASK_BY_TYPE_IDX = _BaseTaskAdapter.TASK_BY_TYPE_IDX
-    QUEUE_RATE_LIMITER = _BaseTaskAdapter.QUEUE_RATE_LIMITER
-    DLQ_MISSING_DATA = _BaseTaskAdapter.DLQ_MISSING_DATA
+    TASKS_BY_QUEUE = SharedTaskAdapterMixin.TASKS_BY_QUEUE
+    TASK_DETAILS = SharedTaskAdapterMixin.TASK_DETAILS
+    HEARTBEAT_SCORES = SharedTaskAdapterMixin.HEARTBEAT_SCORES
+    TASK_BY_TYPE_IDX = SharedTaskAdapterMixin.TASK_BY_TYPE_IDX
+    QUEUE_RATE_LIMITER = SharedTaskAdapterMixin.QUEUE_RATE_LIMITER
+    DLQ_MISSING_DATA = SharedTaskAdapterMixin.DLQ_MISSING_DATA
 
     def __init__(self) -> None:
         self._store: dict[ULID, Task] = {}

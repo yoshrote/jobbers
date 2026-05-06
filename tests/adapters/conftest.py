@@ -11,9 +11,9 @@ from jobbers.db import DEFAULT_REDIS_URL
 
 
 @pytest.fixture
-def task_adapter_dt_module(task_adapter) -> str:
-    """Return the dotted module path for patching 'dt' in the active task adapter."""
-    return f"{type(task_adapter).__module__}.dt"
+def task_adapter_dt_module(task_adapter: object) -> str:
+    """Return the dotted module path for patching 'dt' in SharedTaskAdapterMixin."""
+    return "jobbers.adapters.task_adapter.dt"
 
 
 @pytest.fixture
