@@ -299,8 +299,8 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
     # -- Storage primitives --------------------------------------------------
 
     def pack(self, task: Task) -> str:
-        """Serialize a task to a JSON string."""
-        return json.dumps(task.to_dict())
+        """Serialize a task to a JSON string (float timestamps for RediSearch, string ULIDs)."""
+        return json.dumps(task.model_dump(context={"mode": "redis_json"}, exclude={"id"}))
 
     def unpack(self, task_id: ULID, data: str | dict[str, Any]) -> Task:
         """Deserialize a task from a JSON string or dict."""
