@@ -181,23 +181,23 @@ class StateManager:
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return task
 
-    async def schedule_new_task(self, task: Task, run_at: dt.datetime) -> Task:
-        """Save a brand-new task directly into the scheduler in a single atomic transaction."""
-        task.queue = await self.resolve_queue(task)
-        task.status = TaskStatus.SCHEDULED
+    async def _run_schedule_pipeline(self, task: Task, run_at: dt.datetime) -> None:
         pipe = self.job_store.pipeline(transaction=True)
         self.task_scheduler.stage_add(pipe, task, run_at)
         self.ta.stage_save(pipe, task)
         await pipe.execute()
+
+    async def schedule_new_task(self, task: Task, run_at: dt.datetime) -> Task:
+        """Save a brand-new task directly into the scheduler in a single atomic transaction."""
+        task.queue = await self.resolve_queue(task)
+        task.status = TaskStatus.SCHEDULED
+        await self._run_schedule_pipeline(task, run_at)
         logger.info("Task %s scheduled to run at %s.", task.id, run_at)
         return task
 
     async def schedule_retry_task(self, task: Task, run_at: dt.datetime) -> Task:
         """Add a task to the scheduler and save its state in a single atomic transaction."""
-        pipe = self.job_store.pipeline(transaction=True)
-        self.task_scheduler.stage_add(pipe, task, run_at)
-        self.ta.stage_save(pipe, task)
-        await pipe.execute()
+        await self._run_schedule_pipeline(task, run_at)
         logger.info("Task %s scheduled for retry at %s.", task.id, run_at)
         return task
 
