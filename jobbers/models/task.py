@@ -121,6 +121,24 @@ class Task(BaseModel):
     def has_callbacks(self) -> bool:
         return bool(self.dag_callbacks)
 
+    def _build_callback_task(
+        self,
+        spec: "Task",
+        parent_ids: list[ULID],
+        inject_parent_results: bool = False,
+    ) -> "Self":
+        return self.__class__(
+            id=spec.id,
+            name=spec.name,
+            queue=spec.queue,
+            version=spec.version,
+            parameters=spec.parameters,
+            dag_callbacks=spec.dag_callbacks,
+            parent_ids=parent_ids,
+            inject_parent_results=inject_parent_results,
+            dag_run_id=self.dag_run_id,
+        )
+
     def generate_error_callbacks(self) -> list[Self]:
         """
         Return tasks to submit when this task fails permanently.
@@ -128,23 +146,11 @@ class Task(BaseModel):
         For each `dag_callback` that has an `error_callback` spec, a task is
         created with `parent_ids=[self.id]`.  No Redis I/O is required.
         """
-        results: list[Self] = []
-        for cb in self.dag_callbacks:
-            if cb.error_callback is not None:
-                spec = cb.error_callback
-                results.append(
-                    self.__class__(
-                        id=spec.id,
-                        name=spec.name,
-                        queue=spec.queue,
-                        version=spec.version,
-                        parameters=spec.parameters,
-                        dag_callbacks=spec.dag_callbacks,
-                        parent_ids=[self.id],
-                        dag_run_id=self.dag_run_id,
-                    )
-                )
-        return results
+        return [
+            self._build_callback_task(cb.error_callback, [self.id])
+            for cb in self.dag_callbacks
+            if cb.error_callback is not None
+        ]
 
     async def generate_callbacks(self, ta: "TaskAdapterProtocol") -> list[Self]:
         """
@@ -163,38 +169,17 @@ class Task(BaseModel):
 
         results: list[Self] = []
         for cb in self.dag_callbacks:
-            spec = cb.task
             match cb:
                 case SimpleCallback():
                     results.append(
-                        self.__class__(
-                            id=spec.id,
-                            name=spec.name,
-                            queue=spec.queue,
-                            version=spec.version,
-                            parameters=spec.parameters,
-                            dag_callbacks=spec.dag_callbacks,
-                            parent_ids=[self.id],
-                            inject_parent_results=cb.inject_parent_results,
-                            dag_run_id=self.dag_run_id,
-                        )
+                        self._build_callback_task(cb.task, [self.id], cb.inject_parent_results)
                     )
                 case FanInCallback():
                     remaining = await ta.fan_in_complete(cb.fan_in_key, self.id)
                     if remaining == 0:
                         member_ids = await ta.get_fan_in_members(cb.fan_in_key)
                         results.append(
-                            self.__class__(
-                                id=spec.id,
-                                name=spec.name,
-                                queue=spec.queue,
-                                version=spec.version,
-                                parameters=spec.parameters,
-                                dag_callbacks=spec.dag_callbacks,
-                                parent_ids=member_ids,
-                                inject_parent_results=cb.inject_parent_results,
-                                dag_run_id=self.dag_run_id,
-                            )
+                            self._build_callback_task(cb.task, member_ids, cb.inject_parent_results)
                         )
                     elif remaining == -1:
                         logger.warning(
