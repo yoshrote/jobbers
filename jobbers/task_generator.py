@@ -18,37 +18,6 @@ time_in_queue = meter.create_histogram("time_in_queue", unit="ms")
 tasks_selected = meter.create_counter("tasks_selected", unit="1")
 
 
-class LocalTTL:
-    """
-    A context manager to manage time-to-live (TTL) for local operations.
-
-    **Attributes:**
-
-    - `config_ttl: int` — the TTL duration in seconds.
-    - `last_refreshed: datetime | None` — the last time the TTL was refreshed.
-    """
-
-    def __init__(self, config_ttl: int):
-        self.config_ttl = config_ttl
-        self.last_refreshed: dt.datetime | None = None
-        self._now: dt.datetime = dt.datetime.now(dt.UTC)
-
-    def __enter__(self) -> bool:
-        self._now = dt.datetime.now(dt.UTC)
-        return self._older_than_ttl(self._now)
-
-    def __exit__(
-        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object | None
-    ) -> None:
-        if self._older_than_ttl(self._now):
-            self.last_refreshed = self._now
-
-    def _older_than_ttl(self, now: dt.datetime) -> bool:
-        if self.last_refreshed and self.config_ttl:
-            return (now - self.last_refreshed).total_seconds() >= self.config_ttl
-        return True
-
-
 class MaxTaskCounter:
     """
     A counter to track the number of tasks processed, with a maximum limit.
