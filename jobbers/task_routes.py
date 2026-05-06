@@ -15,11 +15,11 @@ from ulid import ULID
 from jobbers import db, registry
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
-from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
+from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskPagination
-from jobbers.models.task_routing import RoutingConfig, TaskRoutingConfigAdapter
+from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
-from jobbers.state_manager import TaskException
+from jobbers.state_manager import StateManager, TaskException
 from jobbers.utils.mermaid_dag import MermaidParseError, dag_spec_to_mermaid, parse_mermaid_dag
 from jobbers.validation import ValidationError, validate_task
 
@@ -184,9 +184,7 @@ async def get_task_list(filter_query: Annotated[TaskPagination, Query()]) -> dic
 async def get_queues(role: str) -> dict[str, Any]:
     """Retrieve the list of all queues for a given role."""
     logger.info("Getting all queues for role %s", role)
-    queues = await QueueConfigAdapter(db.get_session_factory()).get_queues(
-        role
-    )  # Ensure the queues are sorted for consistency
+    queues = await db.get_state_manager().get_queues(role)
     return {"queues": sorted(queues)}
 
 
@@ -194,7 +192,7 @@ async def get_queues(role: str) -> dict[str, Any]:
 async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
     """Set the list of all queues for a given role."""
     logger.info("Setting all queues for role %s", role)
-    await QueueConfigAdapter(db.get_session_factory()).save_role(role, set(queues))
+    await db.get_state_manager().save_role(role, set(queues))
     return {"message": "Queues set successfully"}
 
 
@@ -202,25 +200,25 @@ async def set_queues(role: str, queues: list[str]) -> dict[str, Any]:
 async def get_all_queues() -> dict[str, Any]:
     """Retrieve the list of all queues."""
     logger.info("Getting all queues")
-    queues = await QueueConfigAdapter(db.get_session_factory()).get_all_queues()
+    queues = await db.get_state_manager().get_all_queues()
     return {"queues": queues}
 
 
 @app.post("/queues", status_code=201)
 async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
     """Create a new queue with its configuration. Returns 409 if the queue already exists."""
-    qca = QueueConfigAdapter(db.get_session_factory())
-    existing = await qca.get_queue_config(queue_config.name)
+    sm = db.get_state_manager()
+    existing = await sm.get_queue_config(queue_config.name)
     if existing is not None:
         raise HTTPException(status_code=409, detail=f"Queue '{queue_config.name}' already exists.")
-    await qca.save_queue_config(queue_config)
+    await sm.save_queue_config(queue_config)
     return {"message": "Queue created successfully", "queue": queue_config.model_dump()}
 
 
 @app.get("/queues/{queue_name}/config")
 async def get_queue_config(queue_name: str) -> dict[str, Any]:
     """Retrieve the configuration for a specific queue."""
-    config = await QueueConfigAdapter(db.get_session_factory()).get_queue_config(queue_name)
+    config = await db.get_state_manager().get_queue_config(queue_name)
     if config is None:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
     return {"queue": config.model_dump()}
@@ -237,11 +235,11 @@ async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, 
 @app.delete("/queues/{queue_name}", status_code=200)
 async def delete_queue(queue_name: str) -> dict[str, Any]:
     """Delete a queue and remove it from all roles. Returns 404 if the queue does not exist."""
-    qca = QueueConfigAdapter(db.get_session_factory())
-    all_queues = await qca.get_all_queues()
+    sm = db.get_state_manager()
+    all_queues = await sm.get_all_queues()
     if queue_name not in all_queues:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
-    await qca.delete_queue(queue_name)
+    await sm.delete_queue(queue_name)
     return {"message": f"Queue '{queue_name}' deleted successfully."}
 
 
@@ -353,7 +351,7 @@ async def get_active_tasks(queue: str | None = None) -> dict[str, Any]:
     if queue:
         queues: set[str] = {queue}
     else:
-        queues = set(await QueueConfigAdapter(db.get_session_factory()).get_all_queues())
+        queues = set(await sm.get_all_queues())
     tasks = await sm.get_active_tasks(queues)
     return {"tasks": [t.summarized() for t in tasks]}
 
@@ -373,8 +371,8 @@ async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) 
     return {"tasks": summaries}
 
 
-async def _require_role(role_name: str, qca: QueueConfigAdapter) -> None:
-    all_roles = await qca.get_all_roles()
+async def _require_role(role_name: str, sm: StateManager) -> None:
+    all_roles = await sm.get_all_roles()
     if role_name not in all_roles:
         raise HTTPException(status_code=404, detail=f"Role '{role_name}' not found.")
 
@@ -383,7 +381,7 @@ async def _require_role(role_name: str, qca: QueueConfigAdapter) -> None:
 async def get_all_roles() -> dict[str, Any]:
     """Retrieve the list of all roles."""
     logger.info("Getting all roles")
-    roles = await QueueConfigAdapter(db.get_session_factory()).get_all_roles()
+    roles = await db.get_state_manager().get_all_roles()
     return {"roles": roles}
 
 
@@ -397,47 +395,47 @@ class RoleRequest(BaseModel):
 @app.post("/roles", status_code=201)
 async def create_role(role: RoleRequest) -> dict[str, Any]:
     """Create a new role with an initial set of queues. Returns 409 if the role already exists."""
-    qca = QueueConfigAdapter(db.get_session_factory())
-    existing = await qca.get_queues(role.name)
+    sm = db.get_state_manager()
+    existing = await sm.get_queues(role.name)
     if existing:
         raise HTTPException(status_code=409, detail=f"Role '{role.name}' already exists.")
-    await qca.save_role(role.name, set(role.queues))
+    await sm.save_role(role.name, set(role.queues))
     return {"message": "Role created successfully", "role": role.name, "queues": sorted(role.queues)}
 
 
 @app.get("/roles/{role_name}")
 async def get_role(role_name: str) -> dict[str, Any]:
     """Retrieve the queues assigned to a specific role."""
-    qca = QueueConfigAdapter(db.get_session_factory())
-    await _require_role(role_name, qca)
-    queues = await qca.get_queues(role_name)
+    sm = db.get_state_manager()
+    await _require_role(role_name, sm)
+    queues = await sm.get_queues(role_name)
     return {"role": role_name, "queues": sorted(queues)}
 
 
 @app.put("/roles/{role_name}")
 async def update_role(role_name: str, queues: list[str]) -> dict[str, Any]:
     """Replace the queue list for a role. Returns 404 if the role does not exist."""
-    qca = QueueConfigAdapter(db.get_session_factory())
-    await _require_role(role_name, qca)
-    await qca.save_role(role_name, set(queues))
+    sm = db.get_state_manager()
+    await _require_role(role_name, sm)
+    await sm.save_role(role_name, set(queues))
     return {"message": "Role updated successfully", "role": role_name, "queues": sorted(queues)}
 
 
 @app.delete("/roles/{role_name}", status_code=200)
 async def delete_role(role_name: str) -> dict[str, Any]:
     """Delete a role. Queue configs are preserved. Returns 404 if the role does not exist."""
-    qca = QueueConfigAdapter(db.get_session_factory())
-    await _require_role(role_name, qca)
-    await qca.delete_role(role_name)
+    sm = db.get_state_manager()
+    await _require_role(role_name, sm)
+    await sm.delete_role(role_name)
     return {"message": f"Role '{role_name}' deleted successfully."}
 
 
 @app.post("/roles/{role_name}/refresh", status_code=200)
 async def refresh_role(role_name: str) -> dict[str, Any]:
     """Bump the refresh tag for a role, causing workers to reload their queue list on the next poll."""
-    qca = QueueConfigAdapter(db.get_session_factory())
-    await _require_role(role_name, qca)
-    new_tag = await db.get_state_manager().bump_refresh_tag(role_name)
+    sm = db.get_state_manager()
+    await _require_role(role_name, sm)
+    new_tag = await sm.bump_refresh_tag(role_name)
     return {"role": role_name, "refresh_tag": new_tag}
 
 
@@ -447,9 +445,7 @@ async def refresh_role(role_name: str) -> dict[str, Any]:
 @app.get("/task-routing/{task_name}/{task_version}")
 async def get_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
     """Retrieve the routing configuration for a specific task type."""
-    config = await TaskRoutingConfigAdapter(db.get_session_factory()).get_routing_config(
-        task_name, task_version
-    )
+    config = await db.get_state_manager().get_routing_config(task_name, task_version)
     if config is None:
         raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
     return {"routing": config.model_dump()}

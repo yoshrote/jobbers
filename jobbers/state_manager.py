@@ -487,6 +487,19 @@ class StateManager:
         """Return the list of all configured queue names."""
         return await self.qca.get_all_queues()
 
+    async def get_all_roles(self) -> list[str]:
+        return await self.qca.get_all_roles()
+
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
+        await self.qca.save_role(role, queues_set)
+
+    async def delete_queue(self, queue_name: str) -> None:
+        self.invalidate_queue_config(queue_name)
+        await self.qca.delete_queue(queue_name)
+
+    async def delete_role(self, role: str) -> None:
+        await self.qca.delete_role(role)
+
     async def resolve_queue(self, task: Task) -> str:
         """Return the queue name to use for *task*, applying routing config if one is set."""
         routing = await self.get_routing_config(task.name, task.version)
