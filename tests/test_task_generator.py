@@ -194,6 +194,21 @@ async def test_filter_by_worker_queue_capacity_over_limit():
 
 
 @pytest.mark.asyncio
+async def test_filter_by_worker_queue_capacity_unknown_queue():
+    """Test that queues absent from the limits dict are treated as unlimited."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {"queue1": 99}
+    state_manager.get_queue_limits = AsyncMock(return_value={})
+    task_generator = TaskGenerator(state_manager)
+
+    queues = {"queue1"}
+    result = await task_generator.filter_by_worker_queue_capacity(queues)
+
+    assert result == {"queue1"}
+    state_manager.get_queue_limits.assert_called_once_with(queues)
+
+
+@pytest.mark.asyncio
 async def test_filter_by_worker_queue_capacity_mixed_scenarios():
     """Test that filter_by_worker_queue_capacity handles mixed scenarios correctly."""
     state_manager = Mock(spec=StateManager)

@@ -117,11 +117,10 @@ class TaskGenerator:
         active_tasks = self.state_manager.active_tasks_per_queue
         queue_worker_limits = await self.state_manager.get_queue_limits(queues)
         logger.debug("Queues: %s; Active: %s; Limits: %s", queues, active_tasks, queue_worker_limits)
-        # TODO: write tests to make sure this filters correctly
         return {
             q
             for q in queues
-            if not queue_worker_limits.get(q, 0) or active_tasks.get(q, 0) < (queue_worker_limits.get(q) or 0)
+            if not (limit := queue_worker_limits.get(q, 0)) or active_tasks.get(q, 0) < limit
         }
 
     async def queues(self) -> set[str]:
