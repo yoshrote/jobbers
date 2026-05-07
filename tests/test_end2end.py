@@ -6,6 +6,7 @@ import pytest_asyncio
 from ulid import ULID
 
 from jobbers.adapters.raw_redis import MsgpackTaskAdapter
+from jobbers.adapters.routing_backend import SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import clear_registry
@@ -29,7 +30,7 @@ def register_e2e_tasks():
 @pytest_asyncio.fixture
 async def sm(redis, session_factory):
     await QueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
-    return StateManager(redis, session_factory, task_adapter=MsgpackTaskAdapter(redis))
+    return StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=MsgpackTaskAdapter(redis))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

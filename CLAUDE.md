@@ -109,6 +109,35 @@ All metrics use the OTLP exporter (configured in `jobbers/utils/otel.py`) and ar
 | `queue_config_refreshes` | Counter | `1` | `task_generator.py` | Queue-list refreshes triggered on a worker (tagged with `role`); fires each time a worker reloads its queue assignment due to a `refresh_tag` change |
 | `refresh_lag_ms` | Histogram | `ms` | `task_generator.py` | Lag between when the `refresh_tag` was bumped (ULID timestamp) and when the worker picked up the change (tagged with `role`) |
 
+## Routing Backends
+
+The routing backend controls where queue/role/task-routing config is stored. Select via `ROUTING_BACKEND`:
+
+| Value | Storage | SQL needed? | Dynamic CRUD? |
+|-------|---------|-------------|---------------|
+| `sql` (default) | SQLAlchemy (SQLite or Postgres) | Yes | Yes |
+| `redis` | Plain Redis keys | No | Yes |
+| `static` | In-process memory (read-only) | No | No (405 on writes) |
+
+### Static backend configuration
+
+Config is loaded once at startup. Priority (highest to lowest):
+
+1. **Programmatic** — call `db.register_routing_backend(StaticRoutingBackend(...))` before `init_state_manager()`
+2. **Config file via env var** — `STATIC_CONFIG_FILE=/path/to/routing.json` (also accepts `.yaml`/`.yml` with `pyyaml` installed)
+3. **CLI runners** — pass `--static-config routing.json` to any runner (implies static backend)
+4. **Inline JSON env vars** — `STATIC_QUEUES`, `STATIC_ROLES`, `STATIC_ROUTING`
+5. **Built-in defaults** — one `default` queue, one `default` role
+
+Config file format (`routing.json`):
+```json
+{
+  "queues": [{"name": "default", "max_concurrent": 10}],
+  "roles": {"default": ["default"]},
+  "routing": []
+}
+```
+
 ## Key Environment Variables
 
 | Variable | Default | Used by |
@@ -119,8 +148,13 @@ All metrics use the OTLP exporter (configured in `jobbers/utils/otel.py`) and ar
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Scheduler |
 | `SCHEDULER_BATCH_SIZE` | `1` | Scheduler |
 | `TASK_ADAPTER` | `"json"` | All (`"json"` or `"msgpack"`) |
+| `ROUTING_BACKEND` | `"sql"` | All (`"sql"`, `"redis"`, or `"static"`) |
 | `REDIS_URL` | `redis://localhost:6379` | All |
-| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All |
+| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (only used when `ROUTING_BACKEND=sql`) |
+| `STATIC_CONFIG_FILE` | — | All (path to JSON/YAML routing config; requires `ROUTING_BACKEND=static`) |
+| `STATIC_QUEUES` | — | All (inline JSON array of queue configs; fallback when no `STATIC_CONFIG_FILE`) |
+| `STATIC_ROLES` | — | All (inline JSON object mapping role → queue list) |
+| `STATIC_ROUTING` | — | All (inline JSON array of routing configs) |
 | `CONFIG_CACHE_TTL` | `30` | All (queue/routing config cache TTL in seconds) |
 
 ## Testing

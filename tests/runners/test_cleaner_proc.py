@@ -13,6 +13,7 @@ from jobbers.runners.cleaner_proc import cleaner
 
 def _make_args(**kwargs: object) -> argparse.Namespace:
     defaults = {
+        "static_config": None,
         "rate_limit_age": None,
         "min_queue_age": None,
         "max_queue_age": None,

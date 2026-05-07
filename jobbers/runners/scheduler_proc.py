@@ -89,7 +89,23 @@ async def main(poll_interval: float, config_interval: dt.timedelta, role: str, b
 
 
 def run() -> None:
+    import argparse
+
     from jobbers.utils.otel import enable_otel
+
+    parser = argparse.ArgumentParser(description="Jobbers Scheduler")
+    parser.add_argument(
+        "--static-config",
+        metavar="FILE",
+        default=None,
+        help="Path to a JSON/YAML static routing config file. Implies ROUTING_BACKEND=static.",
+    )
+    args = parser.parse_args()
+
+    if args.static_config:
+        from jobbers.adapters.static_routing import StaticRoutingBackend
+
+        db.register_routing_backend(StaticRoutingBackend.from_file(args.static_config))
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-scheduler")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import importlib
 import importlib.util
@@ -81,12 +82,27 @@ def _load_task_module(arg: str) -> None:
 def run() -> None:
     from jobbers.utils.otel import enable_otel
 
+    parser = argparse.ArgumentParser(description="Jobbers Worker")
+    parser.add_argument("task_module", help="Task module to load (dotted name or file path)")
+    parser.add_argument(
+        "--static-config",
+        metavar="FILE",
+        default=None,
+        help="Path to a JSON/YAML static routing config file. Implies ROUTING_BACKEND=static.",
+    )
+    args = parser.parse_args()
+
+    if args.static_config:
+        from jobbers import db
+        from jobbers.adapters.static_routing import StaticRoutingBackend
+
+        db.register_routing_backend(StaticRoutingBackend.from_file(args.static_config))
+
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-worker")
     logging.basicConfig(level=logging.INFO, handlers=handlers)
     logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
-    # register tasks
-    _load_task_module(sys.argv[1])
+    _load_task_module(args.task_module)
 
     asyncio.run(main(), debug=True)

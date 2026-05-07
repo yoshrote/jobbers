@@ -613,7 +613,7 @@ async def test_update_queue(state_manager):
         response = await client.put("/queues/myqueue", json={"name": "myqueue", "max_concurrent": 7})
 
     assert response.status_code == 200
-    saved = await state_manager.qca.get_queue_config("myqueue")
+    saved = await state_manager.routing.get_queue_config("myqueue")
     assert saved is not None
     assert saved.max_concurrent == 7
 

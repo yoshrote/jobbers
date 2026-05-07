@@ -1,4 +1,5 @@
 # Run the server using uvicorn
+import argparse
 import importlib
 import importlib.util
 import logging
@@ -25,6 +26,22 @@ def _load_task_module(arg: str) -> None:
 def run() -> None:
     from jobbers.task_routes import app
 
+    parser = argparse.ArgumentParser(description="Jobbers Manager")
+    parser.add_argument("task_module", help="Task module to load (dotted name or file path)")
+    parser.add_argument(
+        "--static-config",
+        metavar="FILE",
+        default=None,
+        help="Path to a JSON/YAML static routing config file. Implies ROUTING_BACKEND=static.",
+    )
+    args = parser.parse_args()
+
+    if args.static_config:
+        from jobbers import db
+        from jobbers.adapters.static_routing import StaticRoutingBackend
+
+        db.register_routing_backend(StaticRoutingBackend.from_file(args.static_config))
+
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
 
     if ENABLE_OTEL:
@@ -39,8 +56,7 @@ def run() -> None:
     logging.basicConfig(level=logging.INFO, handlers=handlers)
     logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
-    # register tasks so we can validate submitted task signatures
-    _load_task_module(sys.argv[1])
+    _load_task_module(args.task_module)
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
 

@@ -7,6 +7,7 @@ from ulid import ULID
 
 from jobbers.adapters.json_redis import JsonTaskAdapter
 from jobbers.adapters.raw_redis import MsgpackTaskAdapter
+from jobbers.adapters.routing_backend import SQLRoutingBackend
 from jobbers.adapters.task_adapter import SharedTaskAdapterMixin
 from jobbers.migrations.runner import run_migrations
 from jobbers.models.task import Task
@@ -28,24 +29,30 @@ def task_adapter(redis, request):
 
 
 @pytest_asyncio.fixture
-async def state_manager(redis, session_factory, dummy_task_adapter):
+async def routing_backend(session_factory):
+    """SQLRoutingBackend backed by the in-memory SQLite session factory."""
+    return SQLRoutingBackend(session_factory)
+
+
+@pytest_asyncio.fixture
+async def state_manager(redis, routing_backend, dummy_task_adapter):
     """StateManager backed by DummyTaskAdapter: fast, single-run, for tests that don't exercise adapter internals."""
-    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
-    sm.get_queue_config = sm.qca.get_queue_config
-    sm.get_routing_config = sm.rca.get_routing_config
-    sm.get_queues = sm.qca.get_queues
-    sm.get_all_queues = sm.qca.get_all_queues
+    sm = StateManager(redis, routing_backend, task_adapter=dummy_task_adapter)
+    sm.get_queue_config = sm.routing.get_queue_config
+    sm.get_routing_config = sm.routing.get_routing_config
+    sm.get_queues = sm.routing.get_queues
+    sm.get_all_queues = sm.routing.get_all_queues
     return sm
 
 
 @pytest_asyncio.fixture
-async def state_manager_real_ta(redis, session_factory):
+async def state_manager_real_ta(redis, routing_backend):
     """StateManager backed by MsgpackTaskAdapter for tests that exercise the full adapter call path."""
-    sm = StateManager(redis, session_factory, task_adapter=MsgpackTaskAdapter(redis))
-    sm.get_queue_config = sm.qca.get_queue_config
-    sm.get_routing_config = sm.rca.get_routing_config
-    sm.get_queues = sm.qca.get_queues
-    sm.get_all_queues = sm.qca.get_all_queues
+    sm = StateManager(redis, routing_backend, task_adapter=MsgpackTaskAdapter(redis))
+    sm.get_queue_config = sm.routing.get_queue_config
+    sm.get_routing_config = sm.routing.get_routing_config
+    sm.get_queues = sm.routing.get_queues
+    sm.get_all_queues = sm.routing.get_all_queues
     return sm
 
 

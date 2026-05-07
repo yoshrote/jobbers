@@ -8,6 +8,7 @@ import pytest
 from ulid import ULID
 
 from jobbers import registry
+from jobbers.adapters.routing_backend import SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
@@ -119,8 +120,8 @@ async def test_concurrency_limits_no_limits(rate_limiter):
 
 @pytest.mark.asyncio
 async def test_concurrency_limits_with_limits(state_manager, rate_limiter):
-    await state_manager.qca.save_queue_config(QueueConfig(name="queue1", max_concurrent=1))
-    await state_manager.qca.save_queue_config(QueueConfig(name="queue2", max_concurrent=2))
+    await state_manager.routing.save_queue_config(QueueConfig(name="queue1", max_concurrent=1))
+    await state_manager.routing.save_queue_config(QueueConfig(name="queue2", max_concurrent=2))
 
     task_queues = ["queue1", "queue2"]
     current_tasks_by_queue = {
@@ -134,8 +135,8 @@ async def test_concurrency_limits_with_limits(state_manager, rate_limiter):
 
 @pytest.mark.asyncio
 async def test_concurrency_limits_empty_queues(state_manager, rate_limiter):
-    await state_manager.qca.save_queue_config(QueueConfig(name="queue1", max_concurrent=1))
-    await state_manager.qca.save_queue_config(QueueConfig(name="queue2", max_concurrent=1))
+    await state_manager.routing.save_queue_config(QueueConfig(name="queue1", max_concurrent=1))
+    await state_manager.routing.save_queue_config(QueueConfig(name="queue2", max_concurrent=1))
 
     task_queues = ["queue1", "queue2"]
     current_tasks_by_queue = defaultdict(set)
@@ -150,8 +151,8 @@ async def test_concurrency_limits_empty_queues(state_manager, rate_limiter):
 @pytest.mark.asyncio
 async def test_clean_rate_limit_age(redis, state_manager):
     """Test cleaning tasks from the rate limiter based on rate_limit_age."""
-    await state_manager.qca.save_queue_config(QueueConfig(name="queue1"))
-    await state_manager.qca.save_queue_config(QueueConfig(name="queue2"))
+    await state_manager.routing.save_queue_config(QueueConfig(name="queue1"))
+    await state_manager.routing.save_queue_config(QueueConfig(name="queue2"))
     await redis.zadd("rate-limiter:queue1", {ULID1.bytes: FROZEN_TIME.timestamp() - 3600})
     await redis.zadd("rate-limiter:queue2", {ULID2.bytes: FROZEN_TIME.timestamp() - 1800})
 
@@ -168,7 +169,7 @@ async def test_clean_rate_limit_age(redis, state_manager):
 @pytest.mark.asyncio
 async def test_clean_dlq_age_removes_old_entries(redis, state_manager):
     """dlq_age removes DLQ index entries older than the cutoff."""
-    await state_manager.qca.save_queue_config(QueueConfig(name="default"))
+    await state_manager.routing.save_queue_config(QueueConfig(name="default"))
     old_task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
     recent_task = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.FAILED)
     await add_to_dlq(state_manager, old_task, FROZEN_TIME - dt.timedelta(days=8))
@@ -186,7 +187,7 @@ async def test_clean_dlq_age_removes_old_entries(redis, state_manager):
 @pytest.mark.asyncio
 async def test_clean_dlq_age_keeps_recent_entries(redis, state_manager):
     """dlq_age does not remove DLQ entries within the cutoff window."""
-    await state_manager.qca.save_queue_config(QueueConfig(name="default"))
+    await state_manager.routing.save_queue_config(QueueConfig(name="default"))
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
     await add_to_dlq(state_manager, task, FROZEN_TIME - dt.timedelta(days=6))
 
@@ -211,7 +212,7 @@ async def test_clean_stale_time_skips_terminal_tasks(redis, state_manager_real_t
     )
     await state_manager_real_ta.ta.save_task(completed)
     await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
-    await state_manager_real_ta.qca.save_queue_config(QueueConfig(name="default"))
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
 
     stale_config = TaskConfig(
         name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
@@ -238,7 +239,7 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager_
     )
     await state_manager_real_ta.ta.save_task(started)
     await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
-    await state_manager_real_ta.qca.save_queue_config(QueueConfig(name="default"))
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
 
     stale_config = TaskConfig(
         name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
@@ -495,7 +496,7 @@ async def test_cancel_terminal_task_raises(state_manager):
 @pytest.mark.asyncio
 async def test_submit_task_rate_limited_branch(redis, state_manager_real_ta):
     """submit_task routes through submit_rate_limited_task when queue has rate config."""
-    await state_manager_real_ta.qca.save_queue_config(
+    await state_manager_real_ta.routing.save_queue_config(
         QueueConfig(
             name="default",
             rate_numerator=5,
@@ -691,7 +692,7 @@ async def test_queue_retry_task_bypasses_rate_limit(redis, state_manager_real_ta
     Retries must never be gated by rate limits: blocking them would require manual
     intervention (e.g. moving to the DLQ) rather than allowing automatic recovery.
     """
-    await state_manager_real_ta.qca.save_queue_config(
+    await state_manager_real_ta.routing.save_queue_config(
         QueueConfig(name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE)
     )
     rate_key = state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default")
@@ -715,7 +716,7 @@ async def test_schedule_retry_task_bypasses_rate_limit(redis, state_manager_real
     Retries must never be gated by rate limits: blocking them would require manual
     intervention (e.g. moving to the DLQ) rather than allowing automatic recovery.
     """
-    await state_manager_real_ta.qca.save_queue_config(
+    await state_manager_real_ta.routing.save_queue_config(
         QueueConfig(name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE)
     )
     rate_key = state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default")
@@ -974,7 +975,7 @@ async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queu
     from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
     from jobbers.models.dag import DAGTaskSpec
 
-    await state_manager.qca.save_queue_config(
+    await state_manager.routing.save_queue_config(
         QueueConfig(name="default", rate_numerator=5, rate_denominator=1, rate_period=RatePeriod.MINUTE)
     )
 
@@ -1015,7 +1016,7 @@ async def testresolve_queue_single_strategy(state_manager):
     config = RoutingConfig(
         task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["target"]
     )
-    await state_manager.rca.save_routing_config(config)
+    await state_manager.routing.save_routing_config(config)
 
     task = Task(id=ULID1, name="my_task", version=1, queue="ignored")
     result = await state_manager.resolve_queue(task)
@@ -1034,7 +1035,7 @@ async def testresolve_queue_weighted_strategy_returns_one_of_configured_queues(s
         queues=["fast", "slow"],
         weights=[1.0, 1.0],
     )
-    await state_manager.rca.save_routing_config(config)
+    await state_manager.routing.save_routing_config(config)
 
     task = Task(id=ULID1, name="my_task", version=1, queue="ignored")
     results = {await state_manager.resolve_queue(task) for _ in range(20)}
@@ -1050,7 +1051,7 @@ async def testresolve_queue_routing_is_version_specific(state_manager):
     config = RoutingConfig(
         task_name="my_task", task_version=2, strategy=RoutingStrategy.SINGLE, queues=["routed"]
     )
-    await state_manager.rca.save_routing_config(config)
+    await state_manager.routing.save_routing_config(config)
 
     task_v1 = Task(id=ULID1, name="my_task", version=1, queue="original")
     assert await state_manager.resolve_queue(task_v1) == "original"
@@ -1065,13 +1066,13 @@ async def testresolve_queue_routing_is_version_specific(state_manager):
 @pytest.mark.asyncio
 async def test_get_queue_config_caches_result(redis, session_factory, dummy_task_adapter):
     """get_queue_config returns a cached value on the second call."""
-    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
-    await sm.qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
+    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
+    await sm.routing.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
     r1 = await sm.get_queue_config("q1")
     assert r1 is not None
     assert r1.max_concurrent == 5
     # Replace the adapter method so any second SQL call would return a different value
-    sm.qca.get_queue_config = AsyncMock(return_value=QueueConfig(name="q1", max_concurrent=99))
+    sm.routing.get_queue_config = AsyncMock(return_value=QueueConfig(name="q1", max_concurrent=99))
     r2 = await sm.get_queue_config("q1")
     assert r2 is not None
     assert r2.max_concurrent == 5, "cache should serve the original value"
@@ -1082,14 +1083,14 @@ async def test_get_routing_config_caches_result(redis, session_factory, dummy_ta
     """get_routing_config returns a cached value on the second call."""
     from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 
-    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["routed"])
-    await sm.rca.save_routing_config(config)
+    await sm.routing.save_routing_config(config)
     r1 = await sm.get_routing_config("t", 1)
     assert r1 is not None
     assert r1.queues == ["routed"]
 
-    sm.rca.get_routing_config = AsyncMock(
+    sm.routing.get_routing_config = AsyncMock(
         return_value=RoutingConfig(
             task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["other"]
         )
@@ -1109,7 +1110,7 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
     """save_queue_config writes to SQL, clears the cache entry, and bumps refresh_tag for containing roles."""
     from jobbers.models.queue_config import QueueConfigAdapter
 
-    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
     qca = QueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
     await qca.save_role("role_a", {"q1"})
@@ -1140,12 +1141,12 @@ async def test_save_routing_config_invalidates_cache_and_bumps_version(
     """save_routing_config writes to SQL, clears the cache entry, and updates routing:version to a new ULID."""
     from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 
-    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
 
     config_v1 = RoutingConfig(
         task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q_old"]
     )
-    await sm.rca.save_routing_config(config_v1)
+    await sm.routing.save_routing_config(config_v1)
 
     # Warm the cache
     r1 = await sm.get_routing_config("t", 1)
@@ -1176,9 +1177,9 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
     """delete_routing_config removes from SQL, clears the cache entry, and updates routing:version to a new ULID."""
     from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 
-    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
-    await sm.rca.save_routing_config(config)
+    await sm.routing.save_routing_config(config)
 
     # Warm the cache
     await sm.get_routing_config("t", 1)
@@ -1201,10 +1202,10 @@ async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_
     """invalidate_all_routing_config clears all entries from the routing cache dict."""
     from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 
-    sm = StateManager(redis, session_factory, task_adapter=dummy_task_adapter)
+    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
     for i in range(3):
         cfg = RoutingConfig(task_name=f"t{i}", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
-        await sm.rca.save_routing_config(cfg)
+        await sm.routing.save_routing_config(cfg)
         await sm.get_routing_config(f"t{i}", 1)
 
     assert len(sm._routing_config_cache) == 3
