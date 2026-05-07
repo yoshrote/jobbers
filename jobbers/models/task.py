@@ -4,7 +4,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, get_type_hints
 
 from opentelemetry import metrics
-from pydantic import BaseModel, Field, TypeAdapter, field_serializer
+from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter, field_serializer
 from ulid import ULID
 
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
@@ -219,15 +219,13 @@ class Task(BaseModel):
             summary["last_error"] = self.errors[-1]
         return summary
 
-    @property
-    def _ta(self) -> "TaskAdapterProtocol":
-        from jobbers.db import create_task_adapter, get_client
-
-        return create_task_adapter(get_client())
+    _adapter: "TaskAdapterProtocol | None" = PrivateAttr(default=None)
 
     async def heartbeat(self) -> None:
+        if self._adapter is None:
+            raise RuntimeError("Task adapter not injected — set task._adapter before running")
         self.heartbeat_at = dt.datetime.now(dt.UTC)
-        await self._ta.update_task_heartbeat(self)
+        await self._adapter.update_task_heartbeat(self)
 
     async def parent_results(self) -> dict[Any, Any] | list[dict[Any, Any]]:
         """
@@ -238,7 +236,9 @@ class Task(BaseModel):
         """
         if not self.parent_ids:
             return {}
-        tasks = await self._ta.get_tasks_bulk(self.parent_ids)
+        if self._adapter is None:
+            raise RuntimeError("Task adapter not injected — set task._adapter before running")
+        tasks = await self._adapter.get_tasks_bulk(self.parent_ids)
         results_list = [t.results if t is not None else {} for t in tasks]
         return results_list[0] if len(results_list) == 1 else results_list
 

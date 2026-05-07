@@ -1,5 +1,5 @@
 import datetime as dt
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from ulid import ULID
@@ -158,17 +158,11 @@ def test_summarized_omits_last_error_when_no_errors():
 
 @pytest.mark.asyncio
 async def test_heartbeat_sets_heartbeat_at_and_calls_adapter():
-    """
-    heartbeat() timestamps heartbeat_at and delegates to the task adapter.
-
-    Patches at the jobbers.db level so the real _ta property body (lines 105-107)
-    executes, covering both the property and the heartbeat method.
-    """
+    """heartbeat() timestamps heartbeat_at and delegates to the injected adapter."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
     mock_adapter = AsyncMock()
-    with patch("jobbers.db.get_client", return_value=MagicMock()):
-        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
-            await task.heartbeat()
+    task._adapter = mock_adapter
+    await task.heartbeat()
     assert task.heartbeat_at is not None
     mock_adapter.update_task_heartbeat.assert_awaited_once_with(task)
 
@@ -505,9 +499,8 @@ async def test_parent_results_with_parent_ids_returns_parent_results():
     )
     mock_adapter = AsyncMock()
     mock_adapter.get_tasks_bulk.return_value = [parent_task]
-    with patch("jobbers.db.get_client", return_value=MagicMock()):
-        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
-            result = await task.parent_results()
+    task._adapter = mock_adapter
+    result = await task.parent_results()
 
     assert result == {"val": 42}
     mock_adapter.get_tasks_bulk.assert_awaited_once_with([parent_id])
@@ -524,9 +517,8 @@ async def test_parent_results_parent_not_found_returns_empty():
         status=TaskStatus.STARTED,
     )
     mock_adapter = AsyncMock()
-    with patch("jobbers.db.get_client", return_value=MagicMock()):
-        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
-            result = await task.parent_results()
+    task._adapter = mock_adapter
+    result = await task.parent_results()
 
     assert result == {}
     mock_adapter.get_tasks_bulk.assert_not_called()
@@ -552,10 +544,8 @@ async def test_parent_results_fan_in_returns_list_of_results():
 
     mock_adapter = AsyncMock()
     mock_adapter.get_tasks_bulk.return_value = [p1, p2]
-
-    with patch("jobbers.db.get_client", return_value=MagicMock()):
-        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
-            result = await collector.parent_results()
+    collector._adapter = mock_adapter
+    result = await collector.parent_results()
 
     assert isinstance(result, list)
     assert {"a": 1} in result
@@ -566,12 +556,7 @@ async def test_parent_results_fan_in_returns_list_of_results():
 async def test_parent_results_no_parent_info_returns_empty():
     """parent_results() returns {} when there is no parent information at all."""
     task = Task(id=ULID1, name="root", version=1, queue="default", status=TaskStatus.STARTED)
-    mock_adapter = AsyncMock()
-    mock_adapter.get_fan_in_members.return_value = []
-
-    with patch("jobbers.db.get_client", return_value=MagicMock()):
-        with patch("jobbers.db.create_task_adapter", return_value=mock_adapter):
-            result = await task.parent_results()
+    result = await task.parent_results()
 
     assert result == {}
 

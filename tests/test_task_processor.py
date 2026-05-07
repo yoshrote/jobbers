@@ -508,6 +508,7 @@ def _make_state_manager():
     state_manager = AsyncMock(spec=StateManager)
     state_manager.task_scheduler = AsyncMock(spec=TaskScheduler)
     state_manager.job_store = fakeredis.FakeRedis()
+    state_manager.ta = AsyncMock()
 
     async def _schedule_retry_task(task: Task, run_at: dt.datetime) -> Task:
         return task

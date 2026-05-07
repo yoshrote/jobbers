@@ -64,6 +64,7 @@ class TaskProcessor:
 
             with self.state_manager.task_in_registry(task):
                 await self.state_manager.update_task_heartbeat(task)
+                task._adapter = self.state_manager.ta
                 _token = _current_task_cv.set(task)
                 kwargs = dict(task.parameters)
                 if task.inject_parent_results and task.parent_ids:
