@@ -106,7 +106,9 @@ async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol
     if backend_type == "redis_json":
         from jobbers.adapters.redis_json import RedisJSONRoutingBackend
 
-        return RedisJSONRoutingBackend(client)
+        backend = RedisJSONRoutingBackend(client)
+        await backend.ensure_indexes()
+        return backend
 
     if backend_type == "static":
         from jobbers.adapters.static import StaticRoutingBackend

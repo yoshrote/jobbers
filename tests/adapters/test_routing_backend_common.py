@@ -37,7 +37,7 @@ async def routing_backend(request, session_factory, redis):
             pytest.skip(f"Redis not available: {exc}")
         backend = RedisJSONRoutingBackend(r)
         try:
-            await backend._ensure_role_index()
+            await backend.ensure_indexes()
         except ResponseError as exc:  # pragma: no cover
             await r.aclose()
             pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")

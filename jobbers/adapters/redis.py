@@ -84,11 +84,13 @@ class RedisRoutingBackend:
         await pipe.execute()
         raw_roles: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
         role_names = [r.decode() for r in raw_roles]
-        affected: list[str] = []
+        if not role_names:
+            return
+        srem_pipe = self._client.pipeline(transaction=False)
         for role in role_names:
-            removed = await self._client.srem(self.ROLE_QUEUES_KEY(name=role), queue_name)  # type: ignore[misc]
-            if removed:
-                affected.append(role)
+            srem_pipe.srem(self.ROLE_QUEUES_KEY(name=role), queue_name)
+        removed_counts: list[int] = await srem_pipe.execute()
+        affected = [role for role, count in zip(role_names, removed_counts) if count]
         if affected:
             new_tag = str(ULID())
             bump_pipe = self._client.pipeline(transaction=True)
@@ -148,11 +150,13 @@ class RedisRoutingBackend:
     async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
         raw_roles: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
         role_names = [r.decode() for r in raw_roles]
-        affected: list[str] = []
+        if not role_names:
+            return []
+        check_pipe = self._client.pipeline(transaction=False)
         for role in role_names:
-            is_member: bool = await self._client.sismember(self.ROLE_QUEUES_KEY(name=role), queue_name)  # type: ignore[misc]
-            if is_member:
-                affected.append(role)
+            check_pipe.sismember(self.ROLE_QUEUES_KEY(name=role), queue_name)
+        is_member_list: list[bool] = await check_pipe.execute()
+        affected = [role for role, is_member in zip(role_names, is_member_list) if is_member]
         if affected:
             new_tag = str(ULID())
             pipe = self._client.pipeline(transaction=True)
