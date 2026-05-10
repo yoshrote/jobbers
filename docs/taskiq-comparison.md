@@ -355,10 +355,24 @@ Both frameworks support Redis. Durability depends on Redis persistence configura
 **Jobbers:**
 
 - **Broker:** Redis only
-- **Storage adapters:** `MsgpackTaskAdapter` (plain Redis + msgpack) or `JsonTaskAdapter` (Redis Stack with JSON module + RediSearch for richer queries). Selected via `TASK_ADAPTER` env var.
-- **Results:** Stored as part of task state in Redis; no separate result backend.
+- **Task adapters** (`TASK_ADAPTER`): how task state is stored in Redis
+  - `MsgpackTaskAdapter` — plain Redis + msgpack; works with any standard Redis instance
+  - `JsonTaskAdapter` — Redis Stack with JSON module + RediSearch; enables richer query and filtering support
+- **Dead letter adapters:** `DeadQueue` (plain Redis sorted set) or `JsonDeadQueue` (Redis Stack JSON; supports richer DLQ filtering). Selection follows the task adapter.
+- **Routing backends** (`ROUTING_BACKEND`): where queue, role, and task-routing config is stored
 
-**Verdict:** TaskIQ wins significantly. Organizations with existing RabbitMQ, NATS, or SQS infrastructure, or with compliance requirements around message durability, will find TaskIQ's broker flexibility essential. Jobbers' Redis-only constraint is a deliberate trade-off for simplicity.
+  | Backend | Storage | SQL? | Redis Stack? | Dynamic CRUD? |
+  | --- | --- | --- | --- | --- |
+  | `static` | In-process memory | No | No | No — config from file/env, read-only |
+  | `sql` (default) | SQLAlchemy (SQLite or Postgres) | Yes | No | Yes |
+  | `redis` | Plain Redis keys | No | No | Yes |
+  | `redis_json` | RedisJSON + RediSearch | No | Yes | Yes |
+
+  The `static` backend eliminates the SQL dependency entirely; with `static` + `MsgpackTaskAdapter`, Jobbers runs on a single plain Redis instance with no other database. The `redis` and `redis_json` backends support full live CRUD without introducing SQL. For details see [docs/routing-backends.md](routing-backends.md).
+
+- **Results:** Stored as part of task state in Redis; no separate result backend. Cleanup is handled by Cleaner's `--completed-task-age`.
+
+**Verdict:** TaskIQ wins for transport-layer flexibility — RabbitMQ for durability, NATS for low-latency, SQS for cloud-native deployments. Jobbers' Redis-only broker is a deliberate trade-off for operational simplicity. Within that constraint, Jobbers offers meaningful flexibility: four routing backend options spanning zero-dependency to SQL-backed configurations, two task adapters, and two DLQ implementations. If your team needs to swap brokers or wants configurable result TTLs backed by a separate database, TaskIQ is the better fit.
 
 ---
 
@@ -467,7 +481,7 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 | **Graceful restart safety** | Good | Good | Both handle SIGTERM correctly |
 | **Hard crash recovery** | None | Heartbeat + Cleaner | Jobbers detects stalls; TaskIQ has no equivalent |
 | **Broker durability** | RabbitMQ: strong | Redis only | TaskIQ + RabbitMQ offers stronger durability |
-| **Broker flexibility** | Redis, AMQP, NATS, SQS, Kafka | Redis only | TaskIQ wins significantly |
+| **Broker flexibility** | Redis, AMQP, NATS, SQS, Kafka | Redis only (4 routing backends, 2 task adapters) | TaskIQ wins for transport; Jobbers flexible within Redis |
 | **Periodic/cron scheduling** | Cron + interval + datetime | Cron DAGs + REST CRUD | TaskIQ: sub-minute intervals. Jobbers: SKIP_IF_RUNNING, REST API |
 | **Task introspection** | Result future only | Full lifecycle API | Jobbers: query by status/queue/name, cooperative cancel |
 | **Admin UI** | Third-party (taskiq-dashboard) | Built-in React UI | Jobbers UI ships with the project |
