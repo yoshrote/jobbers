@@ -16,19 +16,20 @@ Routing backends (queues, roles, task routing config):
 - `RoutingBackendReadOnlyError` — raised by read-only backends on write ops.
 - `SQLRoutingBackend` — SQLAlchemy backend (default; requires SQL_PATH).
 - `RedisRoutingBackend` — plain Redis backend (no SQL required).
+- `RedisJSONRoutingBackend` — Redis Stack backend (RedisJSON + RediSearch; no SQL required).
 - `StaticRoutingBackend` — read-only hardcoded config (no database required).
 """
 
-from jobbers.adapters.json_redis import JsonDeadQueue, JsonTaskAdapter
-from jobbers.adapters.raw_redis import DeadQueue, MsgpackTaskAdapter
-from jobbers.adapters.redis_routing import RedisRoutingBackend
-from jobbers.adapters.routing_backend import (
+from jobbers.adapters.protocols import (
+    DeadQueueProtocol,
     RoutingBackendProtocol,
     RoutingBackendReadOnlyError,
-    SQLRoutingBackend,
+    TaskAdapterProtocol,
 )
-from jobbers.adapters.static_routing import StaticRoutingBackend
-from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
+from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter, RedisRoutingBackend
+from jobbers.adapters.redis_json import JsonDeadQueue, JsonTaskAdapter, RedisJSONRoutingBackend
+from jobbers.adapters.sql import SQLRoutingBackend
+from jobbers.adapters.static import StaticRoutingBackend
 
 __all__ = [
     "TaskAdapterProtocol",
@@ -41,5 +42,6 @@ __all__ = [
     "RoutingBackendReadOnlyError",
     "SQLRoutingBackend",
     "RedisRoutingBackend",
+    "RedisJSONRoutingBackend",
     "StaticRoutingBackend",
 ]

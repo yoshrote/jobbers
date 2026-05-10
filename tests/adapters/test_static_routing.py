@@ -9,9 +9,9 @@ import tempfile
 import pytest
 import pytest_asyncio
 
-from jobbers.adapters.routing_backend import RoutingBackendReadOnlyError
-from jobbers.adapters.static_routing import StaticRoutingBackend
-from jobbers.models.queue_config import QueueConfig, RatePeriod
+from jobbers.adapters.protocols import RoutingBackendReadOnlyError
+from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 
 
@@ -161,7 +161,7 @@ async def test_delete_routing_config_returns_false(backend):
 async def test_from_env_inline_json(monkeypatch):
     monkeypatch.setenv("STATIC_QUEUES", '[{"name":"q1","max_concurrent":7}]')
     monkeypatch.setenv("STATIC_ROLES", '{"r1":["q1"]}')
-    monkeypatch.setenv("STATIC_ROUTING", '[]')
+    monkeypatch.setenv("STATIC_ROUTING", "[]")
     monkeypatch.delenv("STATIC_CONFIG_FILE", raising=False)
 
     b = StaticRoutingBackend.from_env()
@@ -188,9 +188,7 @@ async def test_from_file_json():
     data = {
         "queues": [{"name": "file_q", "max_concurrent": 4}],
         "roles": {"file_role": ["file_q"]},
-        "routing": [
-            {"task_name": "ft", "task_version": 1, "strategy": "single", "queues": ["file_q"]}
-        ],
+        "routing": [{"task_name": "ft", "task_version": 1, "strategy": "single", "queues": ["file_q"]}],
     }
     with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
         json.dump(data, f)
@@ -202,6 +200,7 @@ async def test_from_file_json():
         assert (await b.get_queue_config("file_q")).max_concurrent == 4
         assert await b.get_queues("file_role") == {"file_q"}
         rc = await b.get_routing_config("ft", 1)
-        assert rc is not None and rc.queues == ["file_q"]
+        assert rc is not None
+        assert rc.queues == ["file_q"]
     finally:
         os.unlink(path)

@@ -53,7 +53,7 @@ async def cleaner(args: argparse.Namespace) -> None:
     from jobbers import db
 
     if args.static_config:
-        from jobbers.adapters.static_routing import StaticRoutingBackend
+        from jobbers.adapters.static import StaticRoutingBackend
 
         db.register_routing_backend(StaticRoutingBackend.from_file(args.static_config))
 

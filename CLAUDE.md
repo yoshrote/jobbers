@@ -117,6 +117,7 @@ The routing backend controls where queue/role/task-routing config is stored. Sel
 |-------|---------|-------------|---------------|
 | `sql` (default) | SQLAlchemy (SQLite or Postgres) | Yes | Yes |
 | `redis` | Plain Redis keys | No | Yes |
+| `redis_json` | RedisJSON + RediSearch (Redis Stack) | No | Yes |
 | `static` | In-process memory (read-only) | No | No (405 on writes) |
 
 ### Static backend configuration
@@ -148,7 +149,7 @@ Config file format (`routing.json`):
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Scheduler |
 | `SCHEDULER_BATCH_SIZE` | `1` | Scheduler |
 | `TASK_ADAPTER` | `"json"` | All (`"json"` or `"msgpack"`) |
-| `ROUTING_BACKEND` | `"sql"` | All (`"sql"`, `"redis"`, or `"static"`) |
+| `ROUTING_BACKEND` | `"sql"` | All (`"sql"`, `"redis"`, `"redis_json"`, or `"static"`) |
 | `REDIS_URL` | `redis://localhost:6379` | All |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (only used when `ROUTING_BACKEND=sql`) |
 | `STATIC_CONFIG_FILE` | — | All (path to JSON/YAML routing config; requires `ROUTING_BACKEND=static`) |

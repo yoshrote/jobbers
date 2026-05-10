@@ -13,8 +13,8 @@ from redis.exceptions import WatchError
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.adapters.json_redis import JsonTaskAdapter
-from jobbers.adapters.raw_redis import DeadQueue
+from jobbers.adapters.redis import DeadQueue
+from jobbers.adapters.redis_json import JsonTaskAdapter
 from jobbers.models.cron_dag_scheduler import CronDAGScheduler
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
@@ -26,8 +26,7 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.routing_backend import RoutingBackendProtocol
-    from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
+    from jobbers.adapters.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.cron_dag_scheduler import ConcurrencyStager
     from jobbers.models.dag import DAGNode, DAGRunPagination

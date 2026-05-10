@@ -14,7 +14,7 @@ from .task_config import TaskConfig
 from .task_status import TaskStatus
 
 if TYPE_CHECKING:
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.protocols import TaskAdapterProtocol
     from jobbers.models.dag import DynamicFanOut, TaskResult
 
 _dag_callback_adapter: TypeAdapter[list[DAGCallback]] = TypeAdapter(list[DAGCallback])
@@ -171,9 +171,7 @@ class Task(BaseModel):
         for cb in self.dag_callbacks:
             match cb:
                 case SimpleCallback():
-                    results.append(
-                        self._build_callback_task(cb.task, [self.id], cb.inject_parent_results)
-                    )
+                    results.append(self._build_callback_task(cb.task, [self.id], cb.inject_parent_results))
                 case FanInCallback():
                     remaining = await ta.fan_in_complete(cb.fan_in_key, self.id)
                     if remaining == 0:

@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.protocols import TaskAdapterProtocol
     from jobbers.models.task import Task
 
 

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.raw_redis import MsgpackTaskAdapter
+from jobbers.adapters.redis import MsgpackTaskAdapter
 from jobbers.models.dag import DAGRunPagination
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import PaginationOrder, Task, TaskPagination

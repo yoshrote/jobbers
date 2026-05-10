@@ -8,7 +8,7 @@ import pytest
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.adapters.routing_backend import SQLRoutingBackend
+from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig

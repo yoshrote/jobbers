@@ -5,8 +5,8 @@ import pytest
 import pytest_asyncio
 from ulid import ULID
 
-from jobbers.adapters.raw_redis import MsgpackTaskAdapter
-from jobbers.adapters.routing_backend import SQLRoutingBackend
+from jobbers.adapters.redis import MsgpackTaskAdapter
+from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import clear_registry

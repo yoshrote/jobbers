@@ -1,8 +1,8 @@
+"""SQLAlchemy-backed routing backend (the default)."""
+
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, runtime_checkable
-
-from typing_extensions import Protocol
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -10,47 +10,6 @@ if TYPE_CHECKING:
 
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
-
-
-class RoutingBackendReadOnlyError(Exception):
-    """Raised when a write operation is attempted on a read-only routing backend."""
-
-
-@runtime_checkable
-class RoutingBackendProtocol(Protocol):
-    """Interface all routing backends must implement."""
-
-    # Queue CRUD
-    async def get_queue_config(self, queue: str) -> QueueConfig | None: ...
-
-    async def save_queue_config(self, queue_config: QueueConfig) -> None: ...
-
-    async def delete_queue(self, queue_name: str) -> None: ...
-
-    async def get_all_queues(self) -> list[str]: ...
-
-    # Role CRUD
-    async def get_queues(self, role: str) -> set[str]: ...
-
-    async def save_role(self, role: str, queues_set: set[str]) -> str: ...
-
-    async def get_all_roles(self) -> list[str]: ...
-
-    async def delete_role(self, role: str) -> None: ...
-
-    # Change detection (ULID-stamped refresh tags drive pub/sub worker refresh)
-    async def get_refresh_tag(self, role: str) -> ULID: ...
-
-    async def bump_refresh_tag(self, role: str) -> str: ...
-
-    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]: ...
-
-    # Task routing config CRUD
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None: ...
-
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None: ...
-
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
 
 
 class SQLRoutingBackend:

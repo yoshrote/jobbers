@@ -9,7 +9,7 @@ import datetime as dt
 
 import pytest
 
-from jobbers.adapters.raw_redis import DeadQueue
+from jobbers.adapters.redis import DeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 

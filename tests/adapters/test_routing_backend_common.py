@@ -10,19 +10,40 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
+import redis.asyncio as aioredis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError
 
-from jobbers.adapters.redis_routing import RedisRoutingBackend
-from jobbers.adapters.routing_backend import SQLRoutingBackend
+from jobbers.adapters.redis import RedisRoutingBackend
+from jobbers.adapters.redis_json import RedisJSONRoutingBackend
+from jobbers.adapters.sql import SQLRoutingBackend
+from jobbers.db import DEFAULT_REDIS_URL
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 
 
-@pytest_asyncio.fixture(params=["sql", "redis"], ids=["sql", "redis"])
+@pytest_asyncio.fixture(params=["sql", "redis", "redis_json"], ids=["sql", "redis", "redis_json"])
 async def routing_backend(request, session_factory, redis):
     if request.param == "sql":
         yield SQLRoutingBackend(session_factory)
-    else:
+    elif request.param == "redis":
         yield RedisRoutingBackend(redis)
+    else:
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+        try:
+            await r.flushdb()
+        except RedisConnectionError as exc:  # pragma: no cover
+            await r.aclose()
+            pytest.skip(f"Redis not available: {exc}")
+        backend = RedisJSONRoutingBackend(r)
+        try:
+            await backend._ensure_role_index()
+        except ResponseError as exc:  # pragma: no cover
+            await r.aclose()
+            pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
+        yield backend
+        await r.flushdb()
+        await r.aclose()
 
 
 # ── queue CRUD ────────────────────────────────────────────────────────────────

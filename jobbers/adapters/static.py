@@ -1,3 +1,5 @@
+"""Read-only in-process routing backend — no database required."""
+
 from __future__ import annotations
 
 import json
@@ -7,7 +9,7 @@ from typing import Any
 
 from ulid import ULID
 
-from jobbers.adapters.routing_backend import RoutingBackendReadOnlyError
+from jobbers.adapters.protocols import RoutingBackendReadOnlyError
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 
@@ -22,9 +24,7 @@ def _load_file(path: str) -> dict[str, Any]:
         try:
             import yaml  # type: ignore[import-untyped]
         except ImportError as exc:
-            raise ImportError(
-                "PyYAML is required for YAML config files: pip install jobbers[yaml]"
-            ) from exc
+            raise ImportError("PyYAML is required for YAML config files: pip install jobbers[yaml]") from exc
         return yaml.safe_load(text)  # type: ignore[no-any-return]
     return json.loads(text)  # type: ignore[no-any-return]
 

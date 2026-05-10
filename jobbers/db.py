@@ -10,8 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from jobbers.migrations.runner import run_migrations
 
 if TYPE_CHECKING:
-    from jobbers.adapters.routing_backend import RoutingBackendProtocol
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.protocols import RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.state_manager import StateManager
 
 TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")
@@ -100,17 +99,22 @@ async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol
     backend_type = os.environ.get("ROUTING_BACKEND", "sql")
 
     if backend_type == "redis":
-        from jobbers.adapters.redis_routing import RedisRoutingBackend
+        from jobbers.adapters.redis import RedisRoutingBackend
 
         return RedisRoutingBackend(client)
 
+    if backend_type == "redis_json":
+        from jobbers.adapters.redis_json import RedisJSONRoutingBackend
+
+        return RedisJSONRoutingBackend(client)
+
     if backend_type == "static":
-        from jobbers.adapters.static_routing import StaticRoutingBackend
+        from jobbers.adapters.static import StaticRoutingBackend
 
         return StaticRoutingBackend.from_env()
 
     # sql (default) — initialize SQLAlchemy
-    from jobbers.adapters.routing_backend import SQLRoutingBackend
+    from jobbers.adapters.sql import SQLRoutingBackend
 
     db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
     _engine = create_async_engine(db_path)

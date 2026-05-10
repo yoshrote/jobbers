@@ -5,15 +5,15 @@ import redis.asyncio as aioredis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
-from jobbers.adapters.json_redis import JsonDeadQueue, JsonTaskAdapter
-from jobbers.adapters.raw_redis import DeadQueue, MsgpackTaskAdapter
+from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter
+from jobbers.adapters.redis_json import JsonDeadQueue, JsonTaskAdapter
 from jobbers.db import DEFAULT_REDIS_URL
 
 
 @pytest.fixture
 def task_adapter_dt_module(task_adapter: object) -> str:
     """Return the dotted module path for patching 'dt' in SharedTaskAdapterMixin."""
-    return "jobbers.adapters.task_adapter.dt"
+    return "jobbers.adapters._shared.dt"
 
 
 @pytest.fixture

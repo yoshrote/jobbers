@@ -103,7 +103,7 @@ def run() -> None:
     args = parser.parse_args()
 
     if args.static_config:
-        from jobbers.adapters.static_routing import StaticRoutingBackend
+        from jobbers.adapters.static import StaticRoutingBackend
 
         db.register_routing_backend(StaticRoutingBackend.from_file(args.static_config))
 

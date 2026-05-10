@@ -5,10 +5,10 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from ulid import ULID
 
-from jobbers.adapters.json_redis import JsonTaskAdapter
-from jobbers.adapters.raw_redis import MsgpackTaskAdapter
-from jobbers.adapters.routing_backend import SQLRoutingBackend
-from jobbers.adapters.task_adapter import SharedTaskAdapterMixin
+from jobbers.adapters._shared import SharedTaskAdapterMixin
+from jobbers.adapters.redis import MsgpackTaskAdapter
+from jobbers.adapters.redis_json import JsonTaskAdapter
+from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.migrations.runner import run_migrations
 from jobbers.models.task import Task
 from jobbers.state_manager import StateManager

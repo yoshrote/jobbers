@@ -1,21 +1,29 @@
 """
 Plain Redis backed implementations (no Redis Stack modules required).
 
-- `MsgpackTaskAdapter` — stores tasks as msgpack-encoded binary strings, queries
-  via sorted-set range commands.  Works with any standard Redis instance.
-- `DeadQueue` — dead letter queue backed by Redis sorted sets, sets, and a hash
-  for secondary indexes.  Works with any standard Redis instance.
+Routing:
+- `RedisRoutingBackend` — stores queue/role/routing config as JSON strings
+  in plain Redis keys and sets. No SQL required.
+
+Task storage / dead-letter queue:
+- `MsgpackTaskAdapter` — stores tasks as msgpack-encoded binary strings,
+  queries via sorted-set range commands.
+- `DeadQueue` — dead letter queue backed by Redis sorted sets, sets, and a
+  hash for secondary indexes.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
 
-from jobbers.adapters.task_adapter import SharedTaskAdapterMixin
+from jobbers.adapters._shared import SharedTaskAdapterMixin
+from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskPagination
+from jobbers.models.task_routing import RoutingConfig
 from jobbers.utils.serialization import deserialize, serialize
 
 if TYPE_CHECKING:
@@ -23,7 +31,156 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.protocols import TaskAdapterProtocol
+
+
+# ---------------------------------------------------------------------------
+# RedisRoutingBackend  (plain Redis: string values + sets)
+# ---------------------------------------------------------------------------
+
+
+class RedisRoutingBackend:
+    """
+    RoutingBackendProtocol backed by Redis. No SQL required.
+
+    Key scheme:
+      config:queue:{name}                — JSON string (QueueConfig fields)
+      config:queues                      — Set of all queue names
+      config:role:{name}:queues          — Set of queue names for the role
+      config:roles                       — Set of all role names
+      config:role:{name}:refresh_tag     — String (ULID)
+      config:routing:{task_name}:{ver}   — JSON string (RoutingConfig fields)
+    """
+
+    QUEUE_KEY = "config:queue:{name}".format
+    QUEUES_INDEX = "config:queues"
+    ROLE_QUEUES_KEY = "config:role:{name}:queues".format
+    ROLES_INDEX = "config:roles"
+    ROLE_REFRESH_TAG_KEY = "config:role:{name}:refresh_tag".format
+    ROUTING_KEY = "config:routing:{task_name}:{task_version}".format
+
+    def __init__(self, client: Redis) -> None:
+        self._client = client
+
+    # ── Queue CRUD ────────────────────────────────────────────────────────────
+
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
+        raw = await self._client.get(self.QUEUE_KEY(name=queue))
+        if raw is None:
+            return None
+        return QueueConfig.model_validate(json.loads(raw))
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        payload = json.dumps(queue_config.to_dict())
+        pipe = self._client.pipeline(transaction=True)
+        pipe.set(self.QUEUE_KEY(name=queue_config.name), payload)
+        pipe.sadd(self.QUEUES_INDEX, queue_config.name)
+        await pipe.execute()
+
+    async def delete_queue(self, queue_name: str) -> None:
+        pipe = self._client.pipeline(transaction=True)
+        pipe.delete(self.QUEUE_KEY(name=queue_name))
+        pipe.srem(self.QUEUES_INDEX, queue_name)
+        await pipe.execute()
+        raw_roles: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
+        role_names = [r.decode() for r in raw_roles]
+        affected: list[str] = []
+        for role in role_names:
+            removed = await self._client.srem(self.ROLE_QUEUES_KEY(name=role), queue_name)  # type: ignore[misc]
+            if removed:
+                affected.append(role)
+        if affected:
+            new_tag = str(ULID())
+            bump_pipe = self._client.pipeline(transaction=True)
+            for role in affected:
+                bump_pipe.set(self.ROLE_REFRESH_TAG_KEY(name=role), new_tag)
+            await bump_pipe.execute()
+
+    async def get_all_queues(self) -> list[str]:
+        raw: set[bytes] = await self._client.smembers(self.QUEUES_INDEX)  # type: ignore[misc]
+        return sorted(m.decode() for m in raw)
+
+    # ── Role CRUD ─────────────────────────────────────────────────────────────
+
+    async def get_queues(self, role: str) -> set[str]:
+        raw: set[bytes] = await self._client.smembers(self.ROLE_QUEUES_KEY(name=role))  # type: ignore[misc]
+        return {m.decode() for m in raw}
+
+    async def save_role(self, role: str, queues_set: set[str]) -> str:
+        new_tag = str(ULID())
+        pipe = self._client.pipeline(transaction=True)
+        pipe.delete(self.ROLE_QUEUES_KEY(name=role))
+        if queues_set:
+            pipe.sadd(self.ROLE_QUEUES_KEY(name=role), *queues_set)
+        pipe.sadd(self.ROLES_INDEX, role)
+        pipe.set(self.ROLE_REFRESH_TAG_KEY(name=role), new_tag)
+        await pipe.execute()
+        return new_tag
+
+    async def get_all_roles(self) -> list[str]:
+        raw: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
+        return sorted(m.decode() for m in raw)
+
+    async def delete_role(self, role: str) -> None:
+        pipe = self._client.pipeline(transaction=True)
+        pipe.delete(self.ROLE_QUEUES_KEY(name=role))
+        pipe.delete(self.ROLE_REFRESH_TAG_KEY(name=role))
+        pipe.srem(self.ROLES_INDEX, role)
+        await pipe.execute()
+
+    # ── Refresh tags ──────────────────────────────────────────────────────────
+
+    async def get_refresh_tag(self, role: str) -> ULID:
+        raw: bytes | None = await self._client.get(self.ROLE_REFRESH_TAG_KEY(name=role))
+        if raw:
+            return ULID.from_str(raw.decode())
+        init_tag = ULID()
+        # SET NX so two concurrent callers don't clobber each other.
+        await self._client.set(self.ROLE_REFRESH_TAG_KEY(name=role), str(init_tag), nx=True)
+        raw = await self._client.get(self.ROLE_REFRESH_TAG_KEY(name=role))
+        return ULID.from_str(raw.decode()) if raw else init_tag
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        new_tag = str(ULID())
+        await self._client.set(self.ROLE_REFRESH_TAG_KEY(name=role), new_tag)
+        return new_tag
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        raw_roles: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
+        role_names = [r.decode() for r in raw_roles]
+        affected: list[str] = []
+        for role in role_names:
+            is_member: bool = await self._client.sismember(self.ROLE_QUEUES_KEY(name=role), queue_name)  # type: ignore[misc]
+            if is_member:
+                affected.append(role)
+        if affected:
+            new_tag = str(ULID())
+            pipe = self._client.pipeline(transaction=True)
+            for role in affected:
+                pipe.set(self.ROLE_REFRESH_TAG_KEY(name=role), new_tag)
+            await pipe.execute()
+        return affected
+
+    # ── Task routing config ───────────────────────────────────────────────────
+
+    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
+        raw = await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version))
+        if raw is None:
+            return None
+        return RoutingConfig.model_validate(json.loads(raw))
+
+    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
+        payload = json.dumps(routing_config.to_dict())
+        await self._client.set(
+            self.ROUTING_KEY(task_name=routing_config.task_name, task_version=routing_config.task_version),
+            payload,
+        )
+
+    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
+        deleted: int = await self._client.delete(
+            self.ROUTING_KEY(task_name=task_name, task_version=task_version)
+        )
+        return deleted > 0
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +327,7 @@ class MsgpackTaskAdapter(SharedTaskAdapterMixin):
                 "-inf",
                 "+inf",
                 start=pagination.offset,
-                num=pagination.limit * 5,  # over-fetch to allow for Python-side filtering
+                num=pagination.limit * 5,
             )
         else:
             raw_ids = await self.data_store.zrange(
@@ -287,7 +444,6 @@ class DeadQueue:
         if not task_ids:
             return []
         ulids = [ULID.from_str(tid) for tid in task_ids]
-        # Check which IDs are actually in the DLQ
         pipe = self.data_store.pipeline(transaction=False)
         for u in ulids:
             pipe.zscore(self.DLQ, bytes(u))
@@ -307,7 +463,6 @@ class DeadQueue:
     ) -> list[Task]:
         """Fetch DLQ entries matching the given filter criteria."""
         if queue is None and task_name is None:
-            # No filter: use zrevrange so results are ordered newest-first.
             id_bytes: list[bytes] = await cast(
                 "Awaitable[list[bytes]]",
                 self.data_store.zrevrange(self.DLQ, 0, -1),
@@ -350,7 +505,6 @@ class DeadQueue:
         if not task_ids:
             return
         ulids = [ULID.from_str(tid) for tid in task_ids]
-        # Batch-fetch metadata for all IDs
         read_pipe = self.data_store.pipeline(transaction=False)
         for u in ulids:
             read_pipe.hget(self.DLQ_META, str(u))
@@ -371,7 +525,6 @@ class DeadQueue:
         )
         if not old_ids:
             return
-        # Batch-fetch metadata so we can clean up secondary indexes
         old_ulid_strs = [str(ULID.from_bytes(b)) for b in old_ids]
         pipe = self.data_store.pipeline(transaction=False)
         for uid_str in old_ulid_strs:

@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from ulid import ULID
 
 from jobbers import db, registry
-from jobbers.adapters.routing_backend import RoutingBackendReadOnlyError
+from jobbers.adapters.protocols import RoutingBackendReadOnlyError
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig
@@ -38,8 +38,11 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.exception_handler(RoutingBackendReadOnlyError)
-async def routing_backend_read_only_handler(request: Request, exc: RoutingBackendReadOnlyError) -> JSONResponse:
+async def routing_backend_read_only_handler(
+    request: Request, exc: RoutingBackendReadOnlyError
+) -> JSONResponse:
     return JSONResponse(status_code=405, content={"detail": str(exc)})
+
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)

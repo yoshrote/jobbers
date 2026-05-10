@@ -50,6 +50,9 @@ class QueueConfig(BaseModel):
             case RatePeriod.DAY:
                 return 86400 * self.rate_denominator
 
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump()
+
     @classmethod
     def from_row(cls, row: Any) -> Self:
         """Construct from a row (name, max_concurrent, rate_numerator, rate_denominator, rate_period)."""
