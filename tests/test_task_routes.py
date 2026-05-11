@@ -924,7 +924,6 @@ async def test_submit_task_raises_400_on_task_exception():
     async def task_function(foo: int) -> None:  # pragma: no cover
         pass
 
-
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
 

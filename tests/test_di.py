@@ -397,6 +397,7 @@ async def test_dependency_overrides_restores_after_context():
 
 def test_valid_task_params_skips_di_params(tmp_path):
     """DI params absent from task.parameters should not fail validation."""
+
     async def get_db() -> str:
         return "db"
 
@@ -416,6 +417,7 @@ def test_valid_task_params_skips_di_params(tmp_path):
 
 def test_valid_task_params_still_rejects_wrong_type():
     """Non-DI param type mismatch is still caught."""
+
     async def get_db() -> str:
         return "db"
 

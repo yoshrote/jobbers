@@ -213,11 +213,13 @@ async def test_from_env_loads_config_file_when_env_var_set(monkeypatch, tmp_path
     """from_env() calls from_file() when STATIC_CONFIG_FILE is set."""
     config_file = tmp_path / "routing.json"
     config_file.write_text(
-        json.dumps({
-            "queues": [{"name": "env_q", "max_concurrent": 3}],
-            "roles": {"env_role": ["env_q"]},
-            "routing": [],
-        })
+        json.dumps(
+            {
+                "queues": [{"name": "env_q", "max_concurrent": 3}],
+                "roles": {"env_role": ["env_q"]},
+                "routing": [],
+            }
+        )
     )
     monkeypatch.setenv("STATIC_CONFIG_FILE", str(config_file))
     monkeypatch.delenv("STATIC_QUEUES", raising=False)

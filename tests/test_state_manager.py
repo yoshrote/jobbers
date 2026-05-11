@@ -918,7 +918,6 @@ async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
         concurrency_policy=ConcurrencyPolicy.ALWAYS,
     )
 
-
     run_at = FROZEN_TIME
     with patch.object(state_manager.ta, "stage_init_fan_in") as mock_stage_init:
         await state_manager.dispatch_cron_dag(entry, run_at)

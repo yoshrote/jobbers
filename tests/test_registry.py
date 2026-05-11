@@ -53,6 +53,7 @@ def test_register_task_returns_wrapper():
 
 def test_task_wrapper_node():
     """TaskWrapper.node() returns a DAGNode with the correct task name and version."""
+
     @register_task(name="test_task", version=2)
     async def test_function(**kwargs):  # pragma: no cover
         return kwargs

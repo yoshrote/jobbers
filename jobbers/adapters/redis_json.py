@@ -130,9 +130,7 @@ class RedisJSONRoutingBackend:
         await write_pipe.execute()
 
     async def get_all_queues(self) -> list[str]:
-        results = await self._client.ft(self.QUEUE_IDX).search(
-            SearchQuery("*").no_content().paging(0, 10000)
-        )
+        results = await self._client.ft(self.QUEUE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
         return sorted(doc.id.removeprefix("routing:queue:") for doc in (results.docs or []))
 
     # ── Role CRUD ─────────────────────────────────────────────────────────────
@@ -152,9 +150,7 @@ class RedisJSONRoutingBackend:
         return new_tag
 
     async def get_all_roles(self) -> list[str]:
-        results = await self._client.ft(self.ROLE_IDX).search(
-            SearchQuery("*").no_content().paging(0, 10000)
-        )
+        results = await self._client.ft(self.ROLE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
         return sorted(doc.id.removeprefix("routing:role:") for doc in (results.docs or []))
 
     async def delete_role(self, role: str) -> None:
