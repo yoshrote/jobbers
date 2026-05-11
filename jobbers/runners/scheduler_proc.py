@@ -9,6 +9,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import datetime as dt
 import logging
@@ -16,9 +17,12 @@ import os
 import sys
 from typing import TYPE_CHECKING
 
+from croniter import croniter
 from opentelemetry import metrics
 
 from jobbers import db
+from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.utils.otel import enable_otel
 
 if TYPE_CHECKING:
     from jobbers.state_manager import StateManager
@@ -76,8 +80,6 @@ async def main(poll_interval: float, config_interval: dt.timedelta, role: str, b
             # reschedule them so they aren't lost.
             disabled = [(entry, run_at) for entry, run_at in cron_entries if not entry.enabled]
             if disabled:
-                from croniter import croniter
-
                 pipe = state_manager.job_store.pipeline(transaction=True)
                 for entry, run_at in disabled:
                     next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
@@ -89,7 +91,17 @@ async def main(poll_interval: float, config_interval: dt.timedelta, role: str, b
 
 
 def run() -> None:
-    from jobbers.utils.otel import enable_otel
+    parser = argparse.ArgumentParser(description="Jobbers Scheduler")
+    parser.add_argument(
+        "--static-config",
+        metavar="FILE",
+        default=None,
+        help="Path to a JSON/YAML static routing config file. Implies ROUTING_BACKEND=static.",
+    )
+    args = parser.parse_args()
+
+    if args.static_config:
+        db.register_routing_backend(StaticRoutingBackend.from_file(args.static_config))
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
     enable_otel(handlers, service_name="jobbers-scheduler")

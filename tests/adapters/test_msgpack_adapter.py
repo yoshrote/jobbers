@@ -1,8 +1,7 @@
 """
-Raw-adapter-specific tripwires and edge cases not covered by protocol contract tests.
+MsgpackTaskAdapter- and DeadQueue-specific edge cases not covered by protocol contract tests.
 
-Covers MsgpackTaskAdapter (task storage) and DeadQueue (dead letter queue) — the two
-plain-Redis implementations that share a FakeAsyncRedis fixture.
+Both implementations live in ``jobbers/adapters/redis.py`` and share a FakeAsyncRedis fixture.
 
 Contract tests (including ensure_index, read_for_watch, get_all_tasks missing-blob) live in
 test_task_adapter_common.py and test_dead_queue_common.py and run against all implementations.
@@ -31,8 +30,6 @@ def make_task(
     status: TaskStatus = TaskStatus.SUBMITTED,
     submitted_at: dt.datetime = FROZEN_TIME,
 ):
-    from jobbers.models.task import Task
-
     task = Task(id=task_id, name=name, version=version, queue=queue, status=status)
     task.submitted_at = submitted_at
     return task
@@ -126,14 +123,14 @@ async def test_get_all_tasks_task_id_order(msgpack_adapter):
         await msgpack_adapter.submit_task(t)
 
     results = await msgpack_adapter.get_all_tasks(
-        TaskPagination(queue="default", order_by=PaginationOrder.TASK_ID)
-    )
-    assert [r.id for r in results] == [ULID1, ULID2, ULID3]
-
-    results = await msgpack_adapter.get_all_tasks(
         TaskPagination(queue="default", order_by=PaginationOrder.SUBMITTED_AT)
     )
     assert [r.id for r in results] == [ULID3, ULID2, ULID1]
+
+    results = await msgpack_adapter.get_all_tasks(
+        TaskPagination(queue="default", order_by=PaginationOrder.TASK_ID)
+    )
+    assert [r.id for r in results] == [ULID1, ULID2, ULID3]
 
 
 # ── clean_terminal_tasks: edge cases ─────────────────────────────────────────
@@ -170,7 +167,7 @@ async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
 
 
 @pytest.mark.asyncio
-async def test_clean_handles_missing_meta(raw_dead_queue):
+async def test_clean_handles_missing_meta(msgpack_dead_queue):
     """
     clean() removes the sorted-set entry even when the meta hash entry is absent.
 
@@ -181,10 +178,40 @@ async def test_clean_handles_missing_meta(raw_dead_queue):
     task = make_task(task_id=ULID1, status=TaskStatus.FAILED)
     old_time = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 
-    await raw_dead_queue.data_store.zadd(raw_dead_queue.DLQ, {bytes(task.id): old_time.timestamp()})
+    await add_to_dlq(msgpack_dead_queue, task, old_time)
+    # Remove the meta hash entry to simulate an older code version / partial write
+    await msgpack_dead_queue.data_store.hdel(msgpack_dead_queue.DLQ_META, str(task.id))
 
     cutoff = dt.datetime(2025, 1, 1, tzinfo=dt.UTC)
-    await raw_dead_queue.clean(cutoff)
+    await msgpack_dead_queue.clean(cutoff)
 
-    score = await raw_dead_queue.data_store.zscore(raw_dead_queue.DLQ, bytes(task.id))
+    score = await msgpack_dead_queue.data_store.zscore(msgpack_dead_queue.DLQ, bytes(task.id))
+    assert score is None
+
+
+# ── MsgpackTaskAdapter: serialization edge cases ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pack_includes_cron_id(msgpack_adapter):
+    """pack() includes cron_id when set; unpack() round-trips it correctly."""
+    task = make_task(task_id=ULID1)
+    cron_id = ULID()
+    task.cron_id = cron_id
+    packed = msgpack_adapter.pack(task)
+    unpacked = msgpack_adapter.unpack(task.id, packed)
+    assert unpacked.cron_id == cron_id
+
+
+@pytest.mark.asyncio
+async def test_clean_dag_runs_skips_invalid_ulid_bytes(msgpack_adapter):
+    """clean_dag_runs silently skips sorted-set entries whose bytes cannot be parsed as a ULID."""
+    # ULID.from_bytes() expects exactly 16 bytes; use fewer to guarantee a ValueError
+    invalid_bytes = b"bad"
+    old_score = (FROZEN_TIME - dt.timedelta(days=10)).timestamp()
+    await msgpack_adapter.data_store.zadd(msgpack_adapter.DAG_RUNS, {invalid_bytes: old_score})
+
+    await msgpack_adapter.clean_dag_runs(FROZEN_TIME, dt.timedelta(seconds=1))
+
+    score = await msgpack_adapter.data_store.zscore(msgpack_adapter.DAG_RUNS, invalid_bytes)
     assert score is None

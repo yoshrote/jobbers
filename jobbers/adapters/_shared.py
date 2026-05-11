@@ -1,15 +1,18 @@
 """
-Protocols and shared base for task storage and dead-letter-queue adapters.
+Shared base class for Redis-backed task adapters.
 
-- `TaskAdapterProtocol` — interface for task storage and querying.
-- `DeadQueueProtocol` — interface for dead letter queue operations.
-- `SharedTaskAdapterMixin` — ABC with shared key helpers, serialization hooks, and
-  all common Redis operations. Concrete adapters implement the storage primitives.
+`SharedTaskAdapterMixin` is an internal ABC that implements all adapter logic
+identical across the plain-Redis and RedisJSON backends.  It is not part of the
+public adapter API — import concrete classes from `redis` or `redis_json` instead.
 
-Concrete implementations live in the sibling modules:
-
-- `jobbers.adapters.json_redis` — Redis Stack (RedisJSON + RediSearch) backed classes.
-- `jobbers.adapters.raw_redis` — plain Redis (msgpack / sorted-set) backed classes.
+Concrete adapters implement:
+  - Storage primitives: ``_load_raw``, ``_load_raw_watch``, ``_stage_store``,
+    ``_stage_load``
+  - Serialization: ``pack``, ``unpack``
+  - Lua script key helpers: ``_extra_submit_keys``, ``_extra_rate_limited_keys``
+  - Lua scripts as class attributes: ``SUBMIT_SCRIPT``,
+    ``SUBMIT_RATE_LIMITED_SCRIPT``
+  - Backend-specific queries: ``ensure_index``, ``get_all_tasks``, ``get_dag_run``
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from opentelemetry import metrics
 from ulid import ULID
@@ -38,112 +41,8 @@ logger = logging.getLogger(__name__)
 tasks_missing_data = metrics.get_meter(__name__).create_counter("tasks_missing_data", unit="1")
 
 
-# ---------------------------------------------------------------------------
-# Protocols
-# ---------------------------------------------------------------------------
-
-
-@runtime_checkable
-class TaskAdapterProtocol(Protocol):  # pragma: no cover
-    """Interface for task storage and querying."""
-
-    # -- key helpers (both implementations use the same Redis key names) ----
-    TASKS_BY_QUEUE: Any
-    TASK_DETAILS: Any
-    HEARTBEAT_SCORES: Any
-    TASK_BY_TYPE_IDX: Any
-    QUEUE_RATE_LIMITER: Any
-    DLQ_MISSING_DATA: str
-    DAG_RUNS: str
-    DAG_RUN_TASKS: Any
-
-    # -- write path ----------------------------------------------------------
-    async def submit_task(self, task: Task) -> bool: ...
-    async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool: ...
-    def stage_save(self, pipe: Pipeline, task: Task) -> None: ...
-    def stage_requeue(self, pipe: Pipeline, task: Task) -> None: ...
-    def stage_submit_task(self, pipe: Pipeline, task: Task) -> None: ...
-
-    # -- read path -----------------------------------------------------------
-    async def get_task(self, task_id: ULID) -> Task | None: ...
-    async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]: ...
-    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None: ...
-    async def task_exists(self, task_id: ULID) -> bool: ...
-    async def get_active_tasks(self, queues: set[str]) -> list[Task]: ...
-    def get_stale_tasks(self, queues: set[str], stale_time: dt.timedelta) -> AsyncGenerator[Task, None]: ...
-    async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]: ...
-    async def get_next_task(self, queues: set[str], pop_timeout: int) -> Task | None: ...
-
-    # -- queue management ----------------------------------------------------
-    def stage_remove_from_queue(self, pipe: Pipeline, task: Task) -> None: ...
-    async def update_task_heartbeat(self, task: Task) -> None: ...
-    async def remove_task_heartbeat(self, task: Task) -> None: ...
-
-    # -- dag fan-in ----------------------------------------------------------
-    def stage_init_fan_in(
-        self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
-    ) -> None: ...
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
-    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int: ...
-    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
-
-    # -- dag run index -------------------------------------------------------
-    async def get_dag_runs(
-        self, pagination: DAGRunPagination
-    ) -> tuple[list[tuple[ULID, dt.datetime]], int]: ...
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None: ...
-    async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
-
-    # -- lifecycle -----------------------------------------------------------
-    async def ensure_index(self) -> None: ...
-    async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
-    async def clean(
-        self,
-        queues: set[bytes],
-        now: dt.datetime,
-        min_queue_age: dt.datetime | None,
-        max_queue_age: dt.datetime | None,
-    ) -> None: ...
-
-
-class DeadQueueProtocol(Protocol):  # pragma: no cover
-    """Interface for dead letter queue operations."""
-
-    async def ensure_index(self) -> None: ...
-    def stage_add(self, pipe: Pipeline, task: Task, failed_at: dt.datetime) -> None: ...
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str, name: str) -> None: ...
-    async def get_history(self, task_id: str) -> list[dict[str, Any]]: ...
-    async def get_by_ids(self, task_ids: list[str]) -> list[Task]: ...
-    async def get_by_filter(
-        self,
-        queue: str | None,
-        task_name: str | None,
-        task_version: int | None,
-        limit: int,
-    ) -> list[Task]: ...
-    async def remove_many(self, task_ids: list[str]) -> None: ...
-    async def clean(self, earlier_than: dt.datetime) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# Shared base (ABC mixin used by both concrete adapter implementations)
-# ---------------------------------------------------------------------------
-
-
 class SharedTaskAdapterMixin(ABC):
-    """
-    ABC mixin implementing all adapter logic that is identical across backends.
-
-    Subclasses must implement:
-
-    - Storage primitives: ``_load_raw``, ``_load_raw_watch``, ``_stage_store``,
-      ``_stage_load``
-    - Serialization: ``pack``, ``unpack``
-    - Lua script key helpers: ``_extra_submit_keys``, ``_extra_rate_limited_keys``
-    - Lua scripts as class attributes: ``SUBMIT_SCRIPT``,
-      ``SUBMIT_RATE_LIMITED_SCRIPT``
-    - Backend-specific queries: ``ensure_index``, ``get_all_tasks``, ``get_dag_run``
-    """
+    """ABC mixin implementing all adapter logic that is identical across backends."""
 
     # -- key helpers (both implementations use the same Redis key names) ----
     TASKS_BY_QUEUE = "task-queues:{queue}".format
@@ -356,25 +255,14 @@ class SharedTaskAdapterMixin(ABC):
         self.stage_save(pipe, task)
 
     def stage_submit_task(self, pipe: Pipeline, task: Task) -> None:
-        """
-        Queue ZADD + save-task onto pipe for initial submission (no execute).
-
-        Identical Redis ops to stage_requeue; use for first-time submission where
-        the task ULID is guaranteed fresh and the Lua EXISTS guard is not needed.
-        """
+        """Queue ZADD + save-task onto pipe for initial submission (no execute)."""
         assert task.submitted_at  # noqa: S101
         pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
         self.stage_save(pipe, task)
         self.stage_register_dag_run(pipe, task)
 
     def stage_register_dag_run(self, pipe: Pipeline, task: Task) -> None:
-        """
-        Stage DAG run index updates onto pipe if the task belongs to a DAG run.
-
-        Base implementation registers the dag_run_id in the global ``dag-runs``
-        sorted set (score = submitted_at, NX so the score always reflects the
-        first root task).  Subclasses may override to stage additional keys.
-        """
+        """Stage DAG run index updates onto pipe if the task belongs to a DAG run."""
         if task.dag_run_id is None or task.submitted_at is None:
             return
         score = task.submitted_at.timestamp()
@@ -392,14 +280,7 @@ class SharedTaskAdapterMixin(ABC):
         ], total
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
-        """
-        Remove DAG run index entries older than ``max_age``.
-
-        Uses the same threshold as ``clean_terminal_tasks`` so that a DAG run's
-        listing entry is pruned at the same time its task blobs are deleted.
-        Subclasses should call ``super()`` and then delete any adapter-specific
-        per-run keys.
-        """
+        """Remove DAG run index entries older than ``max_age``."""
         cutoff = (now - max_age).timestamp()
         stale: list[bytes] = await self.data_store.zrangebyscore(self.DAG_RUNS, "-inf", cutoff)
         if stale:
@@ -431,7 +312,6 @@ class SharedTaskAdapterMixin(ABC):
         """Fetch multiple tasks in 2 batched round-trips instead of 2N individual calls."""
         if not task_ids:
             return []
-        # Round-trip 1: batch fetch all task documents
         raws = await self._fetch_task_data_bulk(task_ids)
         tasks: list[Task | None] = []
         valid: list[tuple[int, Task]] = []
@@ -444,7 +324,6 @@ class SharedTaskAdapterMixin(ABC):
                 valid.append((i, task))
         if not valid:
             return tasks
-        # Round-trip 2: batch fetch heartbeat scores for all found tasks
         pipe = self.data_store.pipeline(transaction=False)
         for _, task in valid:
             pipe.zscore(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
@@ -483,20 +362,7 @@ class SharedTaskAdapterMixin(ABC):
     def stage_init_fan_in(
         self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
     ) -> None:
-        """
-        Queue fan-in set initialisation commands onto *pipe* without executing.
-
-        Writes two keys:
-
-        - `fan_in_key` — decrementing tracking set; empty when all predecessors done.
-        - `{fan_in_key}:members` — permanent membership record; read by the collector
-          via `get_fan_in_members` to retrieve all parents' results even after the
-          tracking set has expired.
-
-        The *ttl* (seconds) guards against orphaned keys if the DAG is never fully
-        executed.  The members set uses `ttl * 2` so a slow collector can still read
-        it after the tracking set has expired.
-        """
+        """Queue fan-in set initialisation commands onto *pipe* without executing."""
         members_key = f"{fan_in_key}:members"
         encoded = [str(pid).encode() for pid in predecessor_ids]
         pipe.sadd(fan_in_key, *encoded)
@@ -505,29 +371,18 @@ class SharedTaskAdapterMixin(ABC):
         pipe.expire(members_key, ttl * 2)
 
     async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
-        """Pre-populate a fan-in tracking set in Redis (see stage_init_fan_in for key details)."""
+        """Pre-populate a fan-in tracking set in Redis."""
         pipe = self.data_store.pipeline(transaction=True)
         self.stage_init_fan_in(pipe, fan_in_key, predecessor_ids, ttl)
         await pipe.execute()
 
     async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
-        """
-        Atomically remove *task_id* from the fan-in set and return the remaining count.
-
-        Uses a Lua script so the SREM+SCARD pair is truly atomic across all workers.
-        Returns -1 if the task ID was not a member of the set (already processed or
-        key expired); callers must treat -1 as "do nothing" and not submit the
-        collector.  Returns 0 when this was the last predecessor.
-        """
+        """Atomically remove *task_id* from the fan-in set and return the remaining count."""
         results: list[int] = await self._fan_in_script(keys=[fan_in_key], args=[str(task_id).encode()])
         return int(results[1])
 
     async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]:
-        """
-        Return the permanent list of predecessor IDs for a fan-in collector.
-
-        Reads the `{fan_in_key}:members` set written by `init_fan_in`.
-        """
+        """Return the permanent list of predecessor IDs for a fan-in collector."""
         members_key = f"{fan_in_key}:members"
         raw: set[bytes] = await cast("Awaitable[set[bytes]]", self.data_store.smembers(members_key))
         return [ULID.from_str(m.decode()) for m in raw]
@@ -537,8 +392,7 @@ class SharedTaskAdapterMixin(ABC):
         return does_exists == 1
 
     async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
-        """Get the next task from the queues in order of priority (first in the list is highest priority)."""
-        # TODO: Shuffle/rotate the order of queues to avoid starving any of them
+        """Get the next task from the queues in order of priority."""
         task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
         while pop_result := await self.data_store.bzpopmin(task_queues, timeout=pop_timeout):
             queue_name, task_id_bytes, _ = pop_result

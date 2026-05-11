@@ -6,13 +6,15 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 from croniter import croniter
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.params import Query
+from fastapi.responses import JSONResponse
 from opentelemetry import metrics
 from pydantic import BaseModel, Field
 from ulid import ULID
 
 from jobbers import db, registry
+from jobbers.adapters.protocols import RoutingBackendReadOnlyError
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig
@@ -33,6 +35,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(RoutingBackendReadOnlyError)
+async def routing_backend_read_only_handler(
+    request: Request, exc: RoutingBackendReadOnlyError
+) -> JSONResponse:
+    return JSONResponse(status_code=405, content={"detail": str(exc)})
+
+
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 hit_counter = meter.create_up_down_counter("hit_counter")

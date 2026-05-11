@@ -45,7 +45,9 @@ dependencies = [
     "aiosqlite",
     "sqlalchemy[asyncio]",
     "python-ulid[pydantic]",
+    "pyyaml",
     "msgpack-types",
+    "types-croniter",
     "croniter>=6.2.2",
 ]
 
@@ -222,6 +224,7 @@ exclude_also = [
     "@(typing(_extensions)?\\.)?overload",
     "if (typing(_extensions)?\\.)?TYPE_CHECKING:",
     "def run\\(\\)",
+    "\\.\\.\\.",
 ]
 
 [tool.mypy]

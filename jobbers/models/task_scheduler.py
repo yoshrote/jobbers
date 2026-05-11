@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import datetime as dt
 from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
 
 if TYPE_CHECKING:
-    import datetime as dt
     from collections.abc import Awaitable, Callable
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.protocols import TaskAdapterProtocol
     from jobbers.models.task import Task
 
 
@@ -70,8 +70,6 @@ class TaskScheduler:
 
     async def get_run_at(self, task_id: ULID) -> dt.datetime | None:
         """Return the scheduled run_at for a single task, or None if not found."""
-        import datetime as dt
-
         queue_raw: bytes | None = await cast(
             "Awaitable[bytes | None]", self.data_store.hget(self.SCHEDULE_TASK_QUEUE, str(task_id))
         )
@@ -96,8 +94,6 @@ class TaskScheduler:
         `start_after` is an exclusive ULID cursor for page-by-page iteration.
         Returns each task paired with its scheduled run_at timestamp.
         """
-        import datetime as dt
-
         if queue is not None:
             pairs: list[tuple[bytes, float]] = await cast(
                 "Awaitable[list[tuple[bytes, float]]]",
@@ -156,8 +152,6 @@ class TaskScheduler:
         - `queues=[]` — return [] immediately
         - `queues=[...]` — only match tasks in the given queues
         """
-        import datetime as dt
-
         if queues is not None and not queues:
             return []
 

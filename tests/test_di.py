@@ -4,18 +4,20 @@ from collections.abc import AsyncGenerator, Generator
 from typing import Annotated
 
 import pytest
+from ulid import ULID
 
 from jobbers.di import (
     DependencyNode,
     DependencyResolver,
     Depends,
+    _build_graph,
     dependency_overrides,
     get_injected_param_names,
     inspect_task_dependencies,
 )
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
-from jobbers.registry import clear_registry, register_task
+from jobbers.registry import clear_registry, get_task_config, register_task
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -23,8 +25,6 @@ from jobbers.registry import clear_registry, register_task
 
 
 def _make_task_config(func, **kwargs) -> TaskConfig:
-    from jobbers.di import inspect_task_dependencies
-
     return TaskConfig(
         name="test",
         version=1,
@@ -93,11 +93,11 @@ def test_inspect_nested_deps_topological_order():
 
 
 def test_inspect_detects_cycle():
-    async def a(x: Annotated[int, Depends(lambda: None)]) -> int:  # type: ignore[arg-type]
+    async def a(x: Annotated[int, Depends(lambda: None)]) -> int:
         return 1
 
     # Build a cycle: a → b → a (can't express cleanly with closures, use patching)
-    async def b(x: "Annotated[int, Depends(a)]") -> int:  # type: ignore[assignment]
+    async def b(x: "Annotated[int, Depends(a)]") -> int:
         return 1
 
     # Manually construct a cycle through dep_params
@@ -109,8 +109,6 @@ def test_inspect_detects_cycle():
     # The simplest real cycle: use a module-level reference trick.
     # For simplicity, verify ValueError is raised by creating two mutually-annotated functions.
     # We do this by manually calling _build_graph with a pre-seeded `visiting` set.
-    from jobbers.di import _build_graph
-
     visited: dict = {}
     visiting = {a}  # pretend `a` is already in the DFS stack
     # `a` depends on `a` itself (via visiting set already containing `a`)
@@ -399,7 +397,6 @@ async def test_dependency_overrides_restores_after_context():
 
 def test_valid_task_params_skips_di_params(tmp_path):
     """DI params absent from task.parameters should not fail validation."""
-    from ulid import ULID
 
     async def get_db() -> str:
         return "db"
@@ -420,7 +417,6 @@ def test_valid_task_params_skips_di_params(tmp_path):
 
 def test_valid_task_params_still_rejects_wrong_type():
     """Non-DI param type mismatch is still caught."""
-    from ulid import ULID
 
     async def get_db() -> str:
         return "db"
@@ -453,8 +449,6 @@ def test_register_task_populates_dependency_graph():
         @register_task(name="di_test_task", version=1)
         async def task_func(v: Annotated[int, Depends(get_val)]) -> None: ...
 
-        from jobbers.registry import get_task_config
-
         cfg = get_task_config("di_test_task", 1)
         assert cfg is not None
         assert len(cfg.dependency_graph) == 1
@@ -464,8 +458,6 @@ def test_register_task_populates_dependency_graph():
 
 
 def test_register_task_cycle_raises_at_decoration_time():
-    from jobbers.di import _build_graph
-
     async def a() -> int:
         return 1
 

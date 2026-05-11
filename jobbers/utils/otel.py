@@ -34,7 +34,7 @@ def setup_tracer(resource: Resource) -> None:
         endpoint=os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4317"), insecure=True
     )
     trace_processor = BatchSpanProcessor(trace_exporter)
-    trace.get_tracer_provider().add_span_processor(trace_processor)  # type: ignore
+    trace.get_tracer_provider().add_span_processor(trace_processor)  # type: ignore[attr-defined]
 
 
 def setup_logger(resource: Resource) -> LoggingHandler:

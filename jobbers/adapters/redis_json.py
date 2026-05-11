@@ -1,11 +1,17 @@
 """
 Redis Stack (RedisJSON + RediSearch) backed implementations.
 
+Routing:
+- `RedisJSONRoutingBackend` — stores queue/role/routing config as RedisJSON
+  documents. Uses RediSearch to find roles containing a given queue, replacing
+  the O(N) scan in the plain Redis backend with an indexed query.
+
+Task storage / dead-letter queue:
 - `JsonTaskAdapter` — stores tasks as RedisJSON documents, queries via RediSearch.
 - `JsonDeadQueue` — stores dead-letter entries as RedisJSON documents with a
   RediSearch index for server-side filtering and sorting.
 
-Both require a Redis Stack instance with the RedisJSON and RediSearch modules.
+All three require a Redis Stack instance with the RedisJSON and RediSearch modules.
 """
 
 from __future__ import annotations
@@ -15,22 +21,196 @@ import json
 from asyncio import TaskGroup
 from typing import TYPE_CHECKING, Any, cast
 
+from redis.commands.search.field import NumericField, TagField
+from redis.commands.search.index_definition import IndexDefinition, IndexType
+from redis.commands.search.query import Query as SearchQuery
 from redis.exceptions import ResponseError
 from ulid import ULID
 
-from jobbers.adapters.task_adapter import SharedTaskAdapterMixin
-from jobbers.models.task import Task, TaskPagination
+from jobbers.adapters._shared import SharedTaskAdapterMixin
+from jobbers.models.queue_config import QueueConfig
+from jobbers.models.task import PaginationOrder, Task, TaskPagination
+from jobbers.models.task_routing import RoutingConfig
 
 if TYPE_CHECKING:
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.protocols import TaskAdapterProtocol
 
 
 def _escape_tag(value: str) -> str:
     """Escape special characters for a RediSearch TAG query value."""
     special = set(r',.<>{}[]"\':;!@#$%^&*()\-+=~| ')
     return "".join(f"\\{c}" if c in special else c for c in value)
+
+
+# ---------------------------------------------------------------------------
+# RedisJSONRoutingBackend  (Redis Stack: RedisJSON + RediSearch)
+# ---------------------------------------------------------------------------
+
+
+class RedisJSONRoutingBackend:
+    """
+    RoutingBackendProtocol backed by RedisJSON. Requires Redis Stack.
+
+    Stores routing config as JSON documents. Two RediSearch indexes replace the
+    plain-Redis set indexes (`routing:queues`, `routing:roles`) used by
+    RedisRoutingBackend:
+
+      routing_queue_idx — on routing:queue:* docs; enables enumeration and fast
+                          queue-membership queries without a separate index set.
+      routing_role_idx  — on routing:role:* docs; enables bump_refresh_tags_for_queue
+                          to find affected roles via an indexed query rather than
+                          scanning all roles.
+
+    Key scheme:
+      routing:queue:{name}                    — JSON doc (QueueConfig fields)
+      routing:role:{name}                     — JSON doc {queues: [...]}
+      routing:tag:{name}                      — String (ULID, refresh tag)
+      routing:config:{task_name}:{ver}        — JSON doc (RoutingConfig fields)
+    """
+
+    QUEUE_IDX = "routing_queue_idx"
+    ROLE_IDX = "routing_role_idx"
+    QUEUE_KEY = "routing:queue:{name}".format
+    ROLE_KEY = "routing:role:{name}".format
+    REFRESH_TAG_KEY = "routing:tag:{name}".format
+    ROUTING_KEY = "routing:config:{task_name}:{task_version}".format
+
+    def __init__(self, client: Redis) -> None:
+        self._client = client
+
+    async def ensure_indexes(self) -> None:
+        """Create RediSearch indexes for queues and roles if they do not already exist."""
+        try:
+            await self._client.ft(self.QUEUE_IDX).info()  # type: ignore[no-untyped-call]
+        except ResponseError:
+            await self._client.ft(self.QUEUE_IDX).create_index(
+                fields=[TagField("$.name", as_name="name")],
+                definition=IndexDefinition(prefix=["routing:queue:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
+            )
+        try:
+            await self._client.ft(self.ROLE_IDX).info()  # type: ignore[no-untyped-call]
+        except ResponseError:
+            await self._client.ft(self.ROLE_IDX).create_index(
+                fields=[TagField("$.queues[*]", as_name="queues")],
+                definition=IndexDefinition(prefix=["routing:role:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
+            )
+
+    # ── Queue CRUD ────────────────────────────────────────────────────────────
+
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
+        raw: dict[str, Any] | None = await self._client.json().get(self.QUEUE_KEY(name=queue))  # type: ignore[misc]
+        if raw is None:
+            return None
+        return QueueConfig.model_validate(raw)
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", queue_config.to_dict())  # type: ignore[misc]
+
+    async def delete_queue(self, queue_name: str) -> None:
+        await self._client.delete(self.QUEUE_KEY(name=queue_name))
+        results = await self._client.ft(self.ROLE_IDX).search(
+            SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
+        )
+        affected = [doc.id.removeprefix("routing:role:") for doc in (results.docs or [])]
+        if not affected:
+            return
+        get_pipe = self._client.pipeline(transaction=False)
+        for role in affected:
+            get_pipe.json().get(self.ROLE_KEY(name=role))
+        role_docs: list[dict[str, Any] | None] = await get_pipe.execute()
+        new_tag = str(ULID())
+        write_pipe = self._client.pipeline(transaction=True)
+        for role, role_doc in zip(affected, role_docs):
+            if role_doc is not None:
+                new_queues = [q for q in role_doc.get("queues", []) if q != queue_name]
+                write_pipe.json().set(self.ROLE_KEY(name=role), "$.queues", new_queues)
+            write_pipe.set(self.REFRESH_TAG_KEY(name=role), new_tag)
+        await write_pipe.execute()
+
+    async def get_all_queues(self) -> list[str]:
+        results = await self._client.ft(self.QUEUE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
+        return sorted(doc.id.removeprefix("routing:queue:") for doc in (results.docs or []))
+
+    # ── Role CRUD ─────────────────────────────────────────────────────────────
+
+    async def get_queues(self, role: str) -> set[str]:
+        raw: dict[str, Any] | None = await self._client.json().get(self.ROLE_KEY(name=role))  # type: ignore[misc]
+        if raw is None:
+            return set()
+        return set(raw.get("queues", []))
+
+    async def save_role(self, role: str, queues_set: set[str]) -> str:
+        new_tag = str(ULID())
+        pipe = self._client.pipeline(transaction=True)
+        pipe.json().set(self.ROLE_KEY(name=role), "$", {"queues": list(queues_set)})
+        pipe.set(self.REFRESH_TAG_KEY(name=role), new_tag)
+        await pipe.execute()
+        return new_tag
+
+    async def get_all_roles(self) -> list[str]:
+        results = await self._client.ft(self.ROLE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
+        return sorted(doc.id.removeprefix("routing:role:") for doc in (results.docs or []))
+
+    async def delete_role(self, role: str) -> None:
+        pipe = self._client.pipeline(transaction=True)
+        pipe.delete(self.ROLE_KEY(name=role))
+        pipe.delete(self.REFRESH_TAG_KEY(name=role))
+        await pipe.execute()
+
+    # ── Refresh tags ──────────────────────────────────────────────────────────
+
+    async def get_refresh_tag(self, role: str) -> ULID:
+        raw: bytes | None = await self._client.get(self.REFRESH_TAG_KEY(name=role))
+        if raw:
+            return ULID.from_str(raw.decode())
+        init_tag = ULID()
+        await self._client.set(self.REFRESH_TAG_KEY(name=role), str(init_tag), nx=True)
+        raw = await self._client.get(self.REFRESH_TAG_KEY(name=role))
+        return ULID.from_str(raw.decode()) if raw else init_tag
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        new_tag = str(ULID())
+        await self._client.set(self.REFRESH_TAG_KEY(name=role), new_tag)
+        return new_tag
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        """Find all roles containing queue_name via RediSearch and bump their refresh tags."""
+        results = await self._client.ft(self.ROLE_IDX).search(
+            SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
+        )
+        affected = [doc.id.removeprefix("routing:role:") for doc in (results.docs or [])]
+        if affected:
+            new_tag = str(ULID())
+            pipe = self._client.pipeline(transaction=True)
+            for role in affected:
+                pipe.set(self.REFRESH_TAG_KEY(name=role), new_tag)
+            await pipe.execute()
+        return affected
+
+    # ── Task routing config ───────────────────────────────────────────────────
+
+    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
+        raw: dict[str, Any] | None = await self._client.json().get(  # type: ignore[misc]
+            self.ROUTING_KEY(task_name=task_name, task_version=task_version)
+        )
+        if raw is None:
+            return None
+        return RoutingConfig.model_validate(raw)
+
+    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
+        await self._client.json().set(  # type: ignore[misc]
+            self.ROUTING_KEY(task_name=routing_config.task_name, task_version=routing_config.task_version),
+            "$",
+            routing_config.to_dict(),
+        )
+
+    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
+        deleted: int = await self._client.delete(
+            self.ROUTING_KEY(task_name=task_name, task_version=task_version)
+        )
+        return deleted > 0
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +329,6 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
 
     async def ensure_index(self) -> None:
         """Create the RediSearch index, or add any missing fields to an existing one."""
-        from redis.commands.search.field import NumericField, TagField
-        from redis.commands.search.index_definition import (
-            IndexDefinition,
-            IndexType,
-        )
-
         desired_fields = [
             TagField("$.name", as_name="name"),
             TagField("$.queue", as_name="queue"),
@@ -166,15 +340,12 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
         try:
             await self.data_store.ft(self.INDEX_NAME).info()  # type: ignore[no-untyped-call]
         except ResponseError:
-            # Index does not exist — create it fresh.
             await self.data_store.ft(self.INDEX_NAME).create_index(
                 fields=desired_fields,
                 definition=IndexDefinition(prefix=["task:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
             )
             return
 
-        # Index exists — add any fields the live schema is missing.
-        # Try each field individually; RediSearch returns ResponseError for duplicates.
         for field in desired_fields:
             try:
                 await self.data_store.ft(self.INDEX_NAME).alter_schema_add([field])
@@ -184,10 +355,6 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Query tasks via the RediSearch index with optional filters."""
-        from redis.commands.search.query import Query as SearchQuery
-
-        from jobbers.models.task import PaginationOrder
-
         query_parts = [f"@queue:{{{_escape_tag(pagination.queue)}}}"]
         if pagination.task_name:
             query_parts.append(f"@name:{{{_escape_tag(pagination.task_name)}}}")
@@ -212,17 +379,14 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
                 task_id = ULID.from_str(doc.id.removeprefix("task:"))
                 group.create_task(self._add_task_to_results(task_id, results))
 
-        # final sort to ensure correct order after async fetches
         if pagination.order_by == PaginationOrder.SUBMITTED_AT:
             results.sort(key=lambda t: t.submitted_at or dt.datetime.min)
-        else:  # default to sorting by ID (which is roughly creation time) if not sorting by submitted_at
+        else:
             results.sort(key=lambda t: t.id)
         return results
 
     async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
         """Return (submitted_at, task_ids) for a DAG run using the RediSearch index."""
-        from redis.commands.search.query import Query as SearchQuery
-
         score: float | None = await self.data_store.zscore(self.DAG_RUNS, bytes(dag_run_id))
         if score is None:
             return None
@@ -255,8 +419,6 @@ class JsonDeadQueue:
 
     A RediSearch index (`dlq-json-idx`) on `dlq:*` keys enables server-side filtering
     by `name` and `queue` (tag fields) and sorting by `failed_at` (numeric, sortable).
-
-    Full task data is loaded from the `task_adapter` when Task objects are needed.
     """
 
     INDEX_NAME = "dlq-json-idx"
@@ -268,9 +430,6 @@ class JsonDeadQueue:
 
     async def ensure_index(self) -> None:
         """Create the RediSearch index on DLQ JSON documents if it does not exist."""
-        from redis.commands.search.field import NumericField, TagField
-        from redis.commands.search.index_definition import IndexDefinition, IndexType
-
         try:
             await self.data_store.ft(self.INDEX_NAME).info()  # type: ignore[no-untyped-call]
         except ResponseError:
@@ -315,7 +474,6 @@ class JsonDeadQueue:
         if not task_ids:
             return []
         ulids = [ULID.from_str(tid) for tid in task_ids]
-        # Check which IDs actually have DLQ entries
         pipe = self.data_store.pipeline(transaction=False)
         for u in ulids:
             pipe.exists(self.DLQ_KEY(task_id=u))
@@ -334,8 +492,6 @@ class JsonDeadQueue:
         limit: int = 100,
     ) -> list[Task]:
         """Fetch DLQ entries matching filter criteria using RediSearch, sorted by failed_at descending."""
-        from redis.commands.search.query import Query as SearchQuery
-
         query_parts = []
         if queue is not None:
             query_parts.append(f"@queue:{{{_escape_tag(queue)}}}")
@@ -360,13 +516,11 @@ class JsonDeadQueue:
             return
         pipe = self.data_store.pipeline(transaction=True)
         for tid in task_ids:
-            self.stage_remove(pipe, ULID.from_str(tid), "", "")  # queue and name are not needed for removal
+            self.stage_remove(pipe, ULID.from_str(tid), "", "")
         await pipe.execute()
 
     async def clean(self, earlier_than: dt.datetime) -> None:
         """Remove failed tasks older than the specified datetime."""
-        from redis.commands.search.query import Query as SearchQuery
-
         ts = earlier_than.timestamp()
         q: SearchQuery = SearchQuery(f"@failed_at:[-inf ({ts}]").no_content().paging(0, 10000)
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)

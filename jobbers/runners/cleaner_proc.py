@@ -4,7 +4,17 @@ import datetime as dt
 import logging
 import sys
 
+from jobbers import db
+from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.utils.otel import enable_otel
+
 parser = argparse.ArgumentParser(description="Jobbers Cleaner")
+parser.add_argument(
+    "--static-config",
+    metavar="FILE",
+    default=None,
+    help="Path to a JSON/YAML static routing config file. Implies ROUTING_BACKEND=static.",
+)
 parser.add_argument(
     "--rate-limit-age",
     type=lambda x: dt.timedelta(seconds=int(x)),
@@ -44,7 +54,8 @@ parser.add_argument(
 
 
 async def cleaner(args: argparse.Namespace) -> None:
-    from jobbers import db
+    if args.static_config:
+        db.register_routing_backend(StaticRoutingBackend.from_file(args.static_config))
 
     state_manager = await db.init_state_manager()
     await state_manager.clean(
@@ -59,9 +70,6 @@ async def cleaner(args: argparse.Namespace) -> None:
 
 def run() -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]
-
-    from jobbers.utils.otel import enable_otel
-
     enable_otel(handlers, service_name="jobbers-cleaner")
 
     logging.basicConfig(level=logging.INFO, handlers=handlers)

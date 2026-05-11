@@ -8,17 +8,20 @@ from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
+from croniter import croniter
 from opentelemetry import metrics
 from redis.exceptions import WatchError
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.adapters.json_redis import JsonTaskAdapter
-from jobbers.adapters.raw_redis import DeadQueue
-from jobbers.models.cron_dag_scheduler import CronDAGScheduler
-from jobbers.models.queue_config import QueueConfigAdapter
+from jobbers.adapters.redis import DeadQueue
+from jobbers.adapters.redis_json import JsonTaskAdapter
+from jobbers.models.cron_dag import ConcurrencyPolicy
+from jobbers.models.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
+from jobbers.models.dag import collect_fan_in_keys
+from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
-from jobbers.models.task_routing import RoutingStrategy, TaskRoutingConfigAdapter
+from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
 
@@ -26,14 +29,11 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
     from redis.asyncio.client import Pipeline, Redis
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from jobbers.adapters.task_adapter import DeadQueueProtocol, TaskAdapterProtocol
+    from jobbers.adapters.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.models.cron_dag import CronDAGEntry
-    from jobbers.models.cron_dag_scheduler import ConcurrencyStager
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
-    from jobbers.models.task import Task
     from jobbers.models.task_routing import RoutingConfig
 
 logger = logging.getLogger(__name__)
@@ -59,12 +59,11 @@ class StateManager:
     def __init__(
         self,
         job_store: Redis,
-        session_factory: async_sessionmaker[AsyncSession],
+        routing_backend: RoutingBackendProtocol,
         task_adapter: TaskAdapterProtocol | None = None,
     ) -> None:
         self.job_store: Redis = job_store
-        self.qca = QueueConfigAdapter(session_factory)
-        self.rca = TaskRoutingConfigAdapter(session_factory)
+        self.routing: RoutingBackendProtocol = routing_backend
         self.ta: TaskAdapterProtocol = (
             task_adapter if task_adapter is not None else JsonTaskAdapter(job_store)
         )
@@ -258,15 +257,10 @@ class StateManager:
           Call it unconditionally during pipeline construction; it is a no-op for ALWAYS
           policy and stages the NX guard for SKIP_IF_RUNNING.
         """
-        from jobbers.models.cron_dag import ConcurrencyPolicy
-        from jobbers.models.cron_dag_scheduler import ConcurrencyStager
-
         if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
             active_task_id_str = await self.cron_dag_scheduler.get_active_run(entry.id)
             if active_task_id_str is not None:
-                from ulid import ULID as _ULID
-
-                active_task = await self.ta.get_task(_ULID.from_str(active_task_id_str))
+                active_task = await self.ta.get_task(ULID.from_str(active_task_id_str))
                 if active_task is not None and active_task.status in {
                     TaskStatus.SUBMITTED,
                     TaskStatus.STARTED,
@@ -304,11 +298,6 @@ class StateManager:
         before submit means the entry fires again on the next poll (tolerable duplicate),
         but the cron schedule is never permanently lost.
         """
-        from croniter import croniter
-
-        from jobbers.models.dag import collect_fan_in_keys
-        from jobbers.models.task import Task
-
         next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
 
         async with self._concurrency_guard(entry, next_run_at) as stager:
@@ -398,7 +387,7 @@ class StateManager:
 
     # Proxy methods
     async def get_refresh_tag(self, role: str) -> ULID:
-        return await self.qca.get_refresh_tag(role)
+        return await self.routing.get_refresh_tag(role)
 
     def stage_submit_task(self, pipe: Pipeline, task: Task, queue_config: QueueConfig | None) -> None:
         """
@@ -421,16 +410,16 @@ class StateManager:
         self.ta.stage_submit_task(pipe, task)
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
-        """Return queue config, reading from cache or SQL on miss."""
+        """Return queue config, reading from cache on hit."""
         if queue not in self._queue_config_cache:
-            self._queue_config_cache[queue] = await self.qca.get_queue_config(queue)
+            self._queue_config_cache[queue] = await self.routing.get_queue_config(queue)
         return self._queue_config_cache.get(queue)
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        """Return routing config, reading from cache or SQL on miss."""
+        """Return routing config, reading from cache on hit."""
         key = (task_name, task_version)
         if key not in self._routing_config_cache:
-            self._routing_config_cache[key] = await self.rca.get_routing_config(task_name, task_version)
+            self._routing_config_cache[key] = await self.routing.get_routing_config(task_name, task_version)
         return self._routing_config_cache.get(key)
 
     def invalidate_queue_config(self, queue: str) -> None:
@@ -450,35 +439,35 @@ class StateManager:
         await self.job_store.set("routing:version", ULID().bytes)
 
     async def bump_refresh_tag(self, role: str) -> str:
-        new_tag = await self.qca.bump_refresh_tag(role)
+        new_tag = await self.routing.bump_refresh_tag(role)
         await self.job_store.publish(f"queue-config-refresh:{role}", new_tag)
         return new_tag
 
     async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
-        return await self.qca.bump_refresh_tags_for_queue(queue_name)
+        return await self.routing.bump_refresh_tags_for_queue(queue_name)
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         """Save queue config, invalidate local cache, and bump refresh_tags for affected roles."""
-        await self.qca.save_queue_config(queue_config)
+        await self.routing.save_queue_config(queue_config)
         self.invalidate_queue_config(queue_config.name)
         await self.bump_refresh_tags_for_queue(queue_config.name)
 
     async def save_routing_config(self, routing_config: RoutingConfig) -> None:
         """Save routing config, invalidate local cache entry, and bump routing version."""
-        await self.rca.save_routing_config(routing_config)
+        await self.routing.save_routing_config(routing_config)
         self.invalidate_routing_config(routing_config.task_name, routing_config.task_version)
         await self.bump_routing_version()
 
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
         """Delete routing config, invalidate local cache entry, and bump routing version."""
-        deleted = await self.rca.delete_routing_config(task_name, task_version)
+        deleted = await self.routing.delete_routing_config(task_name, task_version)
         self.invalidate_routing_config(task_name, task_version)
         await self.bump_routing_version()
         return deleted
 
     async def get_queues(self, role: str) -> set[str]:
         """Return the set of queues assigned to a role."""
-        return await self.qca.get_queues(role)
+        return await self.routing.get_queues(role)
 
     async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
         """Return per-queue max_concurrent limits, reusing the queue-config cache."""
@@ -487,21 +476,21 @@ class StateManager:
 
     async def get_all_queues(self) -> list[str]:
         """Return the list of all configured queue names."""
-        return await self.qca.get_all_queues()
+        return await self.routing.get_all_queues()
 
     async def get_all_roles(self) -> list[str]:
-        return await self.qca.get_all_roles()
+        return await self.routing.get_all_roles()
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
-        new_tag = await self.qca.save_role(role, queues_set)
+        new_tag = await self.routing.save_role(role, queues_set)
         await self.job_store.publish(f"queue-config-refresh:{role}", new_tag)
 
     async def delete_queue(self, queue_name: str) -> None:
         self.invalidate_queue_config(queue_name)
-        await self.qca.delete_queue(queue_name)
+        await self.routing.delete_queue(queue_name)
 
     async def delete_role(self, role: str) -> None:
-        await self.qca.delete_role(role)
+        await self.routing.delete_role(role)
 
     async def resolve_queue(self, task: Task) -> str:
         """Return the queue name to use for *task*, applying routing config if one is set."""
@@ -549,8 +538,6 @@ class StateManager:
         If an entry with the same ``id`` already exists it is overwritten and
         its schedule is reset.
         """
-        from croniter import croniter
-
         now = dt.datetime.now(dt.UTC)
         first_run_at = croniter(entry.cron_expr, now).get_next(dt.datetime)
         pipe = self.job_store.pipeline(transaction=True)

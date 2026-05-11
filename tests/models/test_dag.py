@@ -94,7 +94,7 @@ def test_fresh_copy_fan_in_rewrites_fan_in_key():
     fresh_root, id_map = root.fresh_copy()
 
     new_collector_id = id_map[collector.id]
-    fresh_branch = fresh_root.dag_callbacks[0].task  # type: ignore[union-attr]
+    fresh_branch = fresh_root.dag_callbacks[0].task
     assert isinstance(fresh_branch.dag_callbacks[0], FanInCallback)
     assert fresh_branch.dag_callbacks[0].fan_in_key == f"dag:fan-in:{new_collector_id}"
 
@@ -121,8 +121,8 @@ def test_fresh_copy_fan_in_two_predecessors_same_new_collector():
 
     new_collector_id = id_map[collector.id]
     # Both branches' fan_in_key should reference the same new collector ID
-    fresh_b1 = fresh.dag_callbacks[0].task  # type: ignore[union-attr]
-    fresh_b2 = fresh.dag_callbacks[1].task  # type: ignore[union-attr]
+    fresh_b1 = fresh.dag_callbacks[0].task
+    fresh_b2 = fresh.dag_callbacks[1].task
     assert fresh_b1.dag_callbacks[0].fan_in_key == f"dag:fan-in:{new_collector_id}"  # type: ignore[union-attr]
     assert fresh_b2.dag_callbacks[0].fan_in_key == f"dag:fan-in:{new_collector_id}"  # type: ignore[union-attr]
 
@@ -403,7 +403,7 @@ def test_fresh_copy_fan_in_remaps_error_callback_id():
     root = DAGTaskSpec(name="root", dag_callbacks=[SimpleCallback(task=branch)])
     fresh, id_map = root.fresh_copy()
 
-    fresh_branch = fresh.dag_callbacks[0].task  # type: ignore[union-attr]
+    fresh_branch = fresh.dag_callbacks[0].task
     fan_in_cb = fresh_branch.dag_callbacks[0]
     assert isinstance(fan_in_cb, FanInCallback)
     assert fan_in_cb.error_callback is not None

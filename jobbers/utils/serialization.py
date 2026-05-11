@@ -12,6 +12,7 @@ EXT_DATETIME = 1
 EXT_TIMEDELTA = 2
 EXT_ULID = 3
 
+
 def default(obj: object) -> Any:
     if isinstance(obj, datetime.datetime):
         return msgpack.ExtType(EXT_DATETIME, obj.isoformat().encode())

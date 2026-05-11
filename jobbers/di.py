@@ -4,7 +4,7 @@ import contextlib
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type_hints
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Generator
@@ -59,9 +59,7 @@ class DependencyNode:
 
 def _extract_depends(hint: Any) -> Depends | None:
     """Return the Depends marker from an Annotated hint, or None."""
-    import typing
-
-    if get_origin(hint) is not typing.Annotated:
+    if get_origin(hint) is not Annotated:
         return None
     for meta in get_args(hint)[1:]:
         if isinstance(meta, Depends):

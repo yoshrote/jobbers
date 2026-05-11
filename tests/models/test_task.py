@@ -4,9 +4,10 @@ from unittest.mock import AsyncMock
 import pytest
 from ulid import ULID
 
-from jobbers.models.dag import DAGTaskSpec, FanInCallback, SimpleCallback
+from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, FanInCallback, SimpleCallback, TaskResult
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_config import TaskConfig
+from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -28,8 +29,7 @@ def test_valid_params():
         completed_at=None,
     )
 
-    def task_function(foo: str, bar: int | None = 5) -> None:  # pragma: no cover
-        pass
+    def task_function(foo: str, bar: int | None = 5) -> None: ...
 
     task.task_config = TaskConfig(
         name="test_task",
@@ -70,7 +70,6 @@ def test_shutdown_no_task_config_is_noop():
 
 def test_shutdown_continue_policy_is_noop():
     """shutdown() with CONTINUE policy leaves the task status unchanged."""
-    from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 
     async def noop() -> None: ...
 
@@ -82,7 +81,6 @@ def test_shutdown_continue_policy_is_noop():
 
 def test_shutdown_resubmit_policy_sets_status_unsubmitted():
     """shutdown() with RESUBMIT policy sets status to UNSUBMITTED without incrementing retry_attempt."""
-    from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 
     async def noop() -> None: ...
 
@@ -98,7 +96,7 @@ def test_shutdown_resubmit_policy_sets_status_unsubmitted():
 
 
 def test_should_retry_true_when_retries_remain():
-    async def noop() -> None: ...  # pragma: no cover
+    async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
@@ -107,7 +105,7 @@ def test_should_retry_true_when_retries_remain():
 
 
 def test_should_retry_false_when_exhausted():
-    async def noop() -> None: ...  # pragma: no cover
+    async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
@@ -116,7 +114,7 @@ def test_should_retry_false_when_exhausted():
 
 
 def test_should_schedule_true_when_retry_delay_set():
-    async def noop() -> None: ...  # pragma: no cover
+    async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, retry_delay=10)
@@ -124,7 +122,7 @@ def test_should_schedule_true_when_retry_delay_set():
 
 
 def test_should_schedule_false_when_no_retry_delay():
-    async def noop() -> None: ...  # pragma: no cover
+    async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, retry_delay=None)
@@ -566,8 +564,6 @@ async def test_parent_results_no_parent_info_returns_empty():
 
 def test_make_result_populates_parent_ids():
     """make_result() returns a TaskResult with parent_ids copied from the task."""
-    from jobbers.models.dag import TaskResult
-
     parent_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
     task = Task(
         id=ULID1, name="child", version=1, queue="default", status=TaskStatus.STARTED, parent_ids=[parent_id]
@@ -582,8 +578,6 @@ def test_make_result_populates_parent_ids():
 
 def test_make_result_empty_parent_ids_for_root_task():
     """make_result() returns TaskResult with empty parent_ids for root tasks."""
-    from jobbers.models.dag import TaskResult
-
     task = Task(id=ULID1, name="root", version=1, queue="default", status=TaskStatus.STARTED)
     result = task.make_result(results={"y": 2})
 
@@ -593,8 +587,6 @@ def test_make_result_empty_parent_ids_for_root_task():
 
 def test_make_result_passes_fanout_through():
     """make_result() includes a fanout when provided."""
-    from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
-
     task = Task(id=ULID1, name="dispatcher", version=1, queue="default", status=TaskStatus.STARTED)
     fanout = DynamicFanOut(children=[DAGNode("child")], collector=DAGNode("collect"))
     result = task.make_result(results={}, fanout=fanout)
@@ -605,8 +597,6 @@ def test_make_result_passes_fanout_through():
 
 def test_make_result_defaults_to_empty_results():
     """make_result() with no arguments returns TaskResult with empty results."""
-    from jobbers.models.dag import TaskResult
-
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.STARTED)
     result = task.make_result()
 
@@ -679,8 +669,7 @@ def test_valid_task_params_skips_annotated_missing_param():
     """valid_task_params passes when an annotated parameter is absent from parameters (e.g. to-be-injected)."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
 
-    def fn(parent_results: dict | None = None) -> None:  # pragma: no cover
-        pass
+    def fn(parent_results: dict | None = None) -> None: ...
 
     task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
     task.parameters = {}  # parent_results not yet present
@@ -691,8 +680,7 @@ def test_valid_task_params_still_checks_provided_params():
     """valid_task_params still type-checks parameters that are present."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
 
-    def fn(x: int) -> None:  # pragma: no cover
-        pass
+    def fn(x: int) -> None: ...
 
     task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
     task.parameters = {"x": "not_an_int"}

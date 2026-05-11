@@ -5,11 +5,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
+from jobbers.models.dag import DAGRunPagination
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
+from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+from jobbers.state_manager import TaskException
 from jobbers.task_routes import app
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -18,8 +22,9 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
 @pytest_asyncio.fixture(autouse=True)
 async def setup(session_factory, state_manager):
-    """Seed the in-memory SQLite DB with a 'default' queue."""
+    """Seed the 'default' queue into both SQL (for task-routing CRUD tests) and the routing backend."""
     await QueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
+    await state_manager.routing.save_queue_config(QueueConfig(name="default"))
     patches = [
         patch("jobbers.task_routes.db.get_session_factory", return_value=session_factory),
         patch("jobbers.task_routes.db.get_state_manager", return_value=state_manager),
@@ -57,8 +62,7 @@ async def test_submit_valid_task(state_manager):
     This task may flake out if there is a worker listening to the queue
     """
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
@@ -97,8 +101,7 @@ async def test_submit_invalid_task():
 
     # jobber_registry.register_task("test_task", test_task_function, parameters=["foo"])
     # add a task config with a function that requires a parameter to the jobber registry
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": "bar"})
@@ -201,8 +204,6 @@ async def test_set_queues():
 @pytest.mark.asyncio
 async def test_set_queues_rolls_back_on_invalid_queue(session_factory):
     """Adding a nonexistent queue to a role rolls back: original queues are preserved."""
-    from sqlalchemy.exc import IntegrityError
-
     qca = QueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="extra_queue"))
     await qca.save_role("myrole", {"default", "extra_queue"})
@@ -478,8 +479,6 @@ async def test_cancel_task_not_found():
 @pytest.mark.asyncio
 async def test_cancel_task_not_cancellable():
     """Test cancelling a completed task returns 409."""
-    from jobbers.state_manager import TaskException
-
     mock_sm = MagicMock()
     mock_sm.request_task_cancellation = AsyncMock(
         side_effect=TaskException("Task has status 'completed' and cannot be cancelled.")
@@ -518,8 +517,6 @@ async def test_cancel_tasks_all_success():
 @pytest.mark.asyncio
 async def test_cancel_tasks_mixed_results():
     """Test bulk cancellation with a mix of success, not found, and not cancellable."""
-    from jobbers.state_manager import TaskException
-
     task1 = Task(id=ULID1, name="Task 1", status="submitted", parameters={})
 
     mock_sm = MagicMock()
@@ -613,7 +610,7 @@ async def test_update_queue(state_manager):
         response = await client.put("/queues/myqueue", json={"name": "myqueue", "max_concurrent": 7})
 
     assert response.status_code == 200
-    saved = await state_manager.qca.get_queue_config("myqueue")
+    saved = await state_manager.routing.get_queue_config("myqueue")
     assert saved is not None
     assert saved.max_concurrent == 7
 
@@ -832,10 +829,9 @@ async def test_delete_role_not_found():
 
 
 @pytest.mark.asyncio
-async def test_refresh_role_found(state_manager, session_factory):
+async def test_refresh_role_found(state_manager):
     """POST /roles/{name}/refresh returns 200 with a new refresh_tag."""
-    qca = QueueConfigAdapter(session_factory)
-    await qca.save_role("myrole", {"default"})
+    await state_manager.routing.save_role("myrole", {"default"})
     tag_before = await state_manager.get_refresh_tag("myrole")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -859,12 +855,10 @@ async def test_refresh_role_not_found():
 
 
 @pytest.mark.asyncio
-async def test_update_queue_bumps_refresh_tag_for_containing_roles(state_manager, session_factory):
+async def test_update_queue_bumps_refresh_tag_for_containing_roles(state_manager):
     """PUT /queues/{name} bumps refresh_tag for every role that includes the queue."""
-    qca = QueueConfigAdapter(session_factory)
-    await qca.save_queue_config(QueueConfig(name="q1"))
-    await qca.save_role("role_a", {"default", "q1"})
-    await qca.save_role("role_b", {"default"})
+    await state_manager.routing.save_role("role_a", {"default", "q1"})
+    await state_manager.routing.save_role("role_b", {"default"})
     tag_a_before = await state_manager.get_refresh_tag("role_a")
     tag_b_before = await state_manager.get_refresh_tag("role_b")
 
@@ -896,12 +890,9 @@ async def test_update_task_routing_bumps_routing_version(state_manager, redis):
 
 
 @pytest.mark.asyncio
-async def test_delete_task_routing_bumps_routing_version(state_manager, session_factory, redis):
+async def test_delete_task_routing_bumps_routing_version(state_manager, redis):
     """DELETE /task-routing updates routing:version to a new ULID in Redis."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy, TaskRoutingConfigAdapter
-
-    adapter = TaskRoutingConfigAdapter(session_factory)
-    await adapter.save_routing_config(
+    await state_manager.routing.save_routing_config(
         RoutingConfig(
             task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["default"]
         )
@@ -923,17 +914,12 @@ async def test_delete_task_routing_bumps_routing_version(state_manager, session_
 @pytest.mark.asyncio
 async def test_submit_task_raises_400_on_task_exception():
     """POST /submit-task returns 400 when the state manager raises TaskException."""
-    from jobbers.state_manager import TaskException
-
     mock_sm = MagicMock()
     mock_sm.get_routing_config = AsyncMock(return_value=None)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
     mock_sm.submit_task = AsyncMock(side_effect=TaskException("bad params"))
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
-
-    from jobbers.models.task_config import TaskConfig
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
@@ -959,10 +945,8 @@ RUN_AT = dt.datetime(2026, 3, 18, 12, 0, 0, tzinfo=dt.UTC)
 @pytest.mark.asyncio
 async def test_schedule_task_valid(state_manager):
     """POST /schedule-task schedules the task and returns 200 with task summary and run_at."""
-    from jobbers.models.task_config import TaskConfig
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", queue="default", parameters={"foo": 1})
@@ -991,10 +975,8 @@ async def test_schedule_task_valid(state_manager):
 @pytest.mark.asyncio
 async def test_schedule_task_invalid_params_returns_400():
     """POST /schedule-task returns 400 when task parameters fail validation."""
-    from jobbers.models.task_config import TaskConfig
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", queue="default", parameters={"foo": "not_an_int"})
@@ -1070,8 +1052,6 @@ async def test_list_dags_returns_runs(state_manager):
 @pytest.mark.asyncio
 async def test_list_dags_passes_pagination(state_manager):
     """GET /dags forwards offset and limit query params as a DAGRunPagination object."""
-    from jobbers.models.dag import DAGRunPagination
-
     state_manager.list_dag_runs = AsyncMock(return_value=([], 0))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -1124,15 +1104,12 @@ async def test_get_task_routing_not_found():
 
 
 @pytest.mark.asyncio
-async def test_get_task_routing_found(session_factory):
+async def test_get_task_routing_found(state_manager):
     """GET /task-routing returns the routing config when it exists."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy, TaskRoutingConfigAdapter
-
-    adapter = TaskRoutingConfigAdapter(session_factory)
     config = RoutingConfig(
         task_name="echo_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"]
     )
-    await adapter.save_routing_config(config)
+    await state_manager.routing.save_routing_config(config)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/task-routing/echo_task/1")
@@ -1144,10 +1121,8 @@ async def test_get_task_routing_found(session_factory):
 
 
 @pytest.mark.asyncio
-async def test_put_task_routing_creates(session_factory):
+async def test_put_task_routing_creates(state_manager):
     """PUT /task-routing creates a new routing config."""
-    from jobbers.models.task_routing import RoutingStrategy, TaskRoutingConfigAdapter
-
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(
             "/task-routing/echo_task/1",
@@ -1157,17 +1132,15 @@ async def test_put_task_routing_creates(session_factory):
     assert response.status_code == 200
     assert response.json()["routing"]["strategy"] == "single"
 
-    saved = await TaskRoutingConfigAdapter(session_factory).get_routing_config("echo_task", 1)
+    saved = await state_manager.routing.get_routing_config("echo_task", 1)
     assert saved is not None
     assert saved.strategy == RoutingStrategy.SINGLE
     assert saved.queues == ["fast"]
 
 
 @pytest.mark.asyncio
-async def test_put_task_routing_path_overrides_body(session_factory):
+async def test_put_task_routing_path_overrides_body(state_manager):
     """PUT uses path task_name/task_version even when body contains different values."""
-    from jobbers.models.task_routing import TaskRoutingConfigAdapter
-
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(
             "/task-routing/real_name/3",
@@ -1175,19 +1148,16 @@ async def test_put_task_routing_path_overrides_body(session_factory):
         )
 
     assert response.status_code == 200
-    saved = await TaskRoutingConfigAdapter(session_factory).get_routing_config("real_name", 3)
+    saved = await state_manager.routing.get_routing_config("real_name", 3)
     assert saved is not None
     assert saved.task_name == "real_name"
     assert saved.task_version == 3
 
 
 @pytest.mark.asyncio
-async def test_delete_task_routing_removes_config(session_factory):
+async def test_delete_task_routing_removes_config(state_manager):
     """DELETE /task-routing removes the config and returns 200."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy, TaskRoutingConfigAdapter
-
-    adapter = TaskRoutingConfigAdapter(session_factory)
-    await adapter.save_routing_config(
+    await state_manager.routing.save_routing_config(
         RoutingConfig(task_name="echo_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"])
     )
 
@@ -1195,7 +1165,7 @@ async def test_delete_task_routing_removes_config(session_factory):
         response = await client.delete("/task-routing/echo_task/1")
 
     assert response.status_code == 200
-    assert await adapter.get_routing_config("echo_task", 1) is None
+    assert await state_manager.routing.get_routing_config("echo_task", 1) is None
 
 
 @pytest.mark.asyncio

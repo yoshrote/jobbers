@@ -1,14 +1,15 @@
 import datetime as dt
 import logging
 from collections.abc import Awaitable, Callable, Iterator
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from ulid import ULID
+
+from jobbers import db
 from jobbers.di import inspect_task_dependencies
+from jobbers.models.dag import DAGNode
+from jobbers.models.task import Task
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
-
-if TYPE_CHECKING:
-    from jobbers.models.dag import DAGNode
-    from jobbers.models.task import Task
 
 logger = logging.getLogger(__name__)
 _task_function_map: dict[tuple[str, int], TaskConfig] = {}
@@ -37,30 +38,18 @@ class TaskWrapper:
 
     async def submit(self, queue: str = "default", **params: Any) -> "Task":
         """Create a Task and submit it to *queue*."""
-        from ulid import ULID
-
-        from jobbers import db
-        from jobbers.models.task import Task
-
         task = Task(id=ULID(), name=self._name, version=self._version, queue=queue, parameters=params)
         await db.get_state_manager().submit_task(task)
         return task
 
     async def schedule(self, run_at: dt.datetime, queue: str = "default", **params: Any) -> "Task":
         """Create a Task and schedule it to run at *run_at*."""
-        from ulid import ULID
-
-        from jobbers import db
-        from jobbers.models.task import Task
-
         task = Task(id=ULID(), name=self._name, version=self._version, queue=queue, parameters=params)
         await db.get_state_manager().schedule_new_task(task, run_at)
         return task
 
     def node(self, queue: str = "default", **params: Any) -> "DAGNode":
         """Return a :class:`~jobbers.models.dag.DAGNode` for this task."""
-        from jobbers.models.dag import DAGNode
-
         return DAGNode(self._name, queue=queue, version=self._version, parameters=params)
 
 

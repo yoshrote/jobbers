@@ -7,7 +7,7 @@ from opentelemetry import metrics
 from jobbers.context import _current_task as _current_task_cv
 from jobbers.di import DependencyResolver
 from jobbers.di import Depends as _Depends
-from jobbers.models.dag import DynamicFanOut, TaskResult
+from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
@@ -201,8 +201,6 @@ class TaskProcessor:
         Capacity limits (max_concurrent) are not enforced at submission time
         but a low limit may cause queue backpressure that delays fan-in completion.
         """
-        from jobbers.models.dag import DAGNode
-
         if not fanout.children:
             # Degenerate case: no children — submit the collector immediately.
             solo = fanout.collector.to_task(dag_run_id=parent.dag_run_id)

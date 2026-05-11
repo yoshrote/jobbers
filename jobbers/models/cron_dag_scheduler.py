@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
 
+from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+from jobbers.models.dag import DAGTaskSpec
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,8 +20,6 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from redis.asyncio.client import Pipeline, Redis
-
-    from jobbers.models.cron_dag import CronDAGEntry
 
 
 @dataclass
@@ -98,9 +99,6 @@ class CronDAGScheduler:
 
     async def get(self, cron_id: ULID) -> CronDAGEntry | None:
         """Fetch and deserialize a single CronDAGEntry from its hash, or None if missing."""
-        from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-        from jobbers.models.dag import DAGTaskSpec
-
         raw: dict[bytes, bytes] = await cast(
             "Awaitable[dict[bytes, bytes]]",
             self.data_store.hgetall(self.CRON_DAG_KEY(cron_id=str(cron_id))),

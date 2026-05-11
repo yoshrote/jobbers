@@ -8,8 +8,9 @@ fixture defined in ``tests/adapters/conftest.py``.
 import datetime as dt
 
 import pytest
+from ulid import ULID
 
-from jobbers.adapters.raw_redis import DeadQueue
+from jobbers.adapters.redis import DeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 
@@ -25,8 +26,6 @@ def make_task(
     queue: str = "default",
     errors: list[str] | None = None,
 ) -> Task:
-    from ulid import ULID
-
     return Task(
         id=ULID.from_str(task_id),
         name=name,

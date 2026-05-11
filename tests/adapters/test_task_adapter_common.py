@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.raw_redis import MsgpackTaskAdapter
+from jobbers.adapters.redis import MsgpackTaskAdapter
 from jobbers.models.dag import DAGRunPagination
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
@@ -1361,6 +1361,32 @@ async def test_clean_dag_runs_noop_when_nothing_stale(task_adapter):
 
     score = await task_adapter.data_store.zscore(task_adapter.DAG_RUNS, bytes(dag_run_id))
     assert score is not None
+
+
+@pytest.mark.asyncio
+async def test_get_dag_run_returns_none_for_unknown(task_adapter):
+    """get_dag_run returns None when the dag_run_id has never been registered."""
+    result = await task_adapter.get_dag_run(ULID())
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_dag_run_returns_submitted_at_and_task_ids(task_adapter):
+    """get_dag_run returns (submitted_at, task_ids) for a known DAG run."""
+    dag_run_id = ULID1
+    task_a = make_task(ULID2, submitted_at=FROZEN_TIME)
+    task_b = make_task(ULID3, submitted_at=FROZEN_TIME)
+    task_a.dag_run_id = dag_run_id
+    task_b.dag_run_id = dag_run_id
+    await task_adapter.submit_task(task_a)
+    await task_adapter.submit_task(task_b)
+
+    result = await task_adapter.get_dag_run(dag_run_id)
+
+    assert result is not None
+    submitted_at, task_ids = result
+    assert submitted_at == pytest.approx(FROZEN_TIME, abs=dt.timedelta(seconds=1))
+    assert set(task_ids) == {ULID2, ULID3}
 
 
 # ── fan-in ────────────────────────────────────────────────────────────────────

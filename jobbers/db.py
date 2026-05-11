@@ -7,10 +7,15 @@ import redis.asyncio as redis
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
+from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
+from jobbers.adapters.redis import RedisRoutingBackend
+from jobbers.adapters.redis_json import RedisJSONRoutingBackend
+from jobbers.adapters.sql import SQLRoutingBackend
+from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.migrations.runner import run_migrations
 
 if TYPE_CHECKING:
-    from jobbers.adapters.task_adapter import TaskAdapterProtocol
+    from jobbers.adapters.protocols import RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.state_manager import StateManager
 
 TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")
@@ -21,6 +26,7 @@ _state_manager: StateManager | None = None
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _task_adapter: TaskAdapterProtocol | None = None
+_pre_registered_routing_backend: RoutingBackendProtocol | None = None
 
 
 def get_client() -> redis.Redis:
@@ -63,8 +69,6 @@ async def close_sqlite_conn() -> None:
 
 def create_task_adapter(client: redis.Redis) -> TaskAdapterProtocol:
     """Create a TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
-    from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
-
     if TASK_ADAPTER_BACKEND == "msgpack":
         return MsgpackTaskAdapter(client)
     return JsonTaskAdapter(client)
@@ -77,10 +81,38 @@ def get_task_adapter() -> TaskAdapterProtocol:
     return _task_adapter
 
 
-async def init_state_manager() -> StateManager:
-    global _state_manager, _engine, _session_factory, _task_adapter
-    from jobbers.state_manager import StateManager
+def register_routing_backend(backend: RoutingBackendProtocol) -> None:
+    """
+    Pre-register a routing backend for library/programmatic use.
 
+    Call this before init_state_manager(). When set, it takes priority over
+    the ROUTING_BACKEND environment variable.
+    """
+    global _pre_registered_routing_backend
+    _pre_registered_routing_backend = backend
+
+
+async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol:
+    """Create the routing backend, initializing SQL only when needed."""
+    global _engine, _session_factory
+
+    if _pre_registered_routing_backend is not None:
+        return _pre_registered_routing_backend
+
+    backend_type = os.environ.get("ROUTING_BACKEND", "sql")
+
+    if backend_type == "redis":
+        return RedisRoutingBackend(client)
+
+    if backend_type == "redis_json":
+        backend = RedisJSONRoutingBackend(client)
+        await backend.ensure_indexes()
+        return backend
+
+    if backend_type == "static":
+        return StaticRoutingBackend.from_env()
+
+    # sql (default) — initialize SQLAlchemy
     db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
     _engine = create_async_engine(db_path)
 
@@ -93,9 +125,17 @@ async def init_state_manager() -> StateManager:
 
     await run_migrations(_engine)
     _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
+    return SQLRoutingBackend(_session_factory)
+
+
+async def init_state_manager() -> StateManager:
+    global _state_manager, _task_adapter
+    from jobbers.state_manager import StateManager
+
     client = get_client()
     _task_adapter = create_task_adapter(client)
-    _state_manager = StateManager(client, _session_factory, task_adapter=_task_adapter)
+    routing_backend = await _create_routing_backend(client)
+    _state_manager = StateManager(client, routing_backend, task_adapter=_task_adapter)
     await _task_adapter.ensure_index()
     await _state_manager.dead_queue.ensure_index()
     return _state_manager

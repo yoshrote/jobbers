@@ -6,9 +6,10 @@ and run against all adapter implementations via parametrized fixtures.
 """
 
 import datetime as dt
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redis.exceptions import ResponseError
 from ulid import ULID
 
 from jobbers.models.task import Task, TaskPagination
@@ -130,3 +131,18 @@ async def test_get_by_filter_sorted_by_failed_at_desc(json_dead_queue, json_adap
     results = await json_dead_queue.get_by_filter()
     assert len(results) == 2
     assert results[0].id == t2.id  # LATER first
+
+
+# ── ensure_index: non-duplicate ResponseError re-raise ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ensure_index_reraises_non_duplicate_error(json_adapter):
+    """ensure_index re-raises ResponseError from alter_schema_add when the message is not 'duplicate'."""
+    mock_search = MagicMock()
+    mock_search.info = AsyncMock(return_value={"attributes": []})
+    mock_search.alter_schema_add = AsyncMock(side_effect=ResponseError("ERR: unknown field type"))
+
+    with patch.object(json_adapter.data_store, "ft", return_value=mock_search):
+        with pytest.raises(ResponseError, match="unknown field type"):
+            await json_adapter.ensure_index()

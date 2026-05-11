@@ -1,15 +1,14 @@
 import pytest
 
+from jobbers.models.dag import DAGNode
 from jobbers.models.task_config import TaskConfig
-from jobbers.registry import TaskWrapper, get_task_config, register_task
+from jobbers.registry import TaskWrapper, _task_function_map, get_task_config, register_task
 
 
 @pytest.fixture(autouse=True)
 def setup():
     """Fixture to reset the tasks in the mocked Redis before each test."""
     # Clear the internal task function map before each test to ensure isolation
-    from jobbers.registry import _task_function_map
-
     _task_function_map.clear()
 
 
@@ -54,7 +53,6 @@ def test_register_task_returns_wrapper():
 
 def test_task_wrapper_node():
     """TaskWrapper.node() returns a DAGNode with the correct task name and version."""
-    from jobbers.models.dag import DAGNode
 
     @register_task(name="test_task", version=2)
     async def test_function(**kwargs):  # pragma: no cover
