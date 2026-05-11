@@ -264,3 +264,58 @@ async def test_delete_routing_config_returns_true_when_existed(routing_backend):
 async def test_delete_routing_config_returns_false_when_missing(routing_backend):
     deleted = await routing_backend.delete_routing_config("nonexistent", 1)
     assert deleted is False
+
+
+# ── delete_queue cascade ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_also_removes_from_roles_and_bumps_refresh_tag(routing_backend):
+    """delete_queue removes the queue from roles that contained it and bumps their refresh tag."""
+    await routing_backend.save_queue_config(QueueConfig(name="q"))
+    await routing_backend.save_queue_config(QueueConfig(name="other_q"))
+    await routing_backend.save_role("r", {"q"})
+    await routing_backend.save_role("r2", {"other_q"})
+    tag_r_before = await routing_backend.get_refresh_tag("r")
+    tag_r2_before = await routing_backend.get_refresh_tag("r2")
+
+    await routing_backend.delete_queue("q")
+
+    assert await routing_backend.get_queue_config("q") is None
+    assert "q" not in await routing_backend.get_queues("r")
+    assert tag_r_before != await routing_backend.get_refresh_tag("r")
+    assert tag_r2_before == await routing_backend.get_refresh_tag("r2")
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_with_roles_but_none_containing_it_skips_tag_bump(routing_backend):
+    """delete_queue does not bump any refresh tag when roles exist but none contain the deleted queue."""
+    await routing_backend.save_queue_config(QueueConfig(name="q"))
+    await routing_backend.save_queue_config(QueueConfig(name="other_q"))
+    await routing_backend.save_role("r", {"other_q"})
+    tag_before = await routing_backend.get_refresh_tag("r")
+
+    await routing_backend.delete_queue("q")
+
+    assert await routing_backend.get_queue_config("q") is None
+    assert await routing_backend.get_refresh_tag("r") == tag_before
+
+
+@pytest.mark.asyncio
+async def test_bump_refresh_tags_for_queue_no_roles_returns_empty(routing_backend):
+    """bump_refresh_tags_for_queue returns [] when no roles exist."""
+    affected = await routing_backend.bump_refresh_tags_for_queue("any_queue")
+    assert affected == []
+
+
+@pytest.mark.asyncio
+async def test_bump_refresh_tags_for_queue_no_matching_role_returns_empty(routing_backend):
+    """bump_refresh_tags_for_queue returns [] when roles exist but none contain the queue."""
+    await routing_backend.save_queue_config(QueueConfig(name="other_q"))
+    await routing_backend.save_role("r", {"other_q"})
+    tag_before = await routing_backend.get_refresh_tag("r")
+
+    affected = await routing_backend.bump_refresh_tags_for_queue("missing_q")
+
+    assert affected == []
+    assert await routing_backend.get_refresh_tag("r") == tag_before

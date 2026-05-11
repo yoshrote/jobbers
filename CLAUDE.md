@@ -233,7 +233,8 @@ The test suite follows a layered approach designed for speed and systematic prot
 
 The following lines cannot be covered reliably without concurrent execution, low-level patching, or specially broken inputs:
 
-- `jobbers/adapters/raw_redis.py` line 312 — `if task_data is None: continue` in `MsgpackTaskAdapter.clean_terminal_tasks` (key deleted between `scan_iter` and `GET`)
+- `jobbers/adapters/redis.py` — `if task_data is None: continue` in `MsgpackTaskAdapter.clean_terminal_tasks` (key deleted between `scan_iter` and `GET`)
+- `jobbers/adapters/redis_json.py` — `if role_doc is not None:` false branch in `RedisJSONRoutingBackend.delete_queue`: JSON document deleted between the RediSearch result and the `JSON.GET` pipeline call (requires concurrent deletion)
 - `jobbers/task_generator.py` line 151 — the `if task:` requeue branch in `TaskGenerator.__anext__`'s `CancelledError` handler (task is always `None` when `get_next_task` raises, making this branch unreachable in practice)
 - `jobbers/di.py` lines 227, 232 — exception handlers in `DependencyResolver.__aexit__` that catch errors thrown by generator cleanup; requires an async/sync generator that raises during `.aclose()` / `.close()`
 - `jobbers/task_processor.py` line 80 — `hints = {}` fallback when `get_type_hints()` raises; only reachable with unresolvable forward references in task annotations

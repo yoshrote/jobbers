@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -204,3 +206,46 @@ async def test_from_file_json():
         assert rc.queues == ["file_q"]
     finally:
         os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_from_env_loads_config_file_when_env_var_set(monkeypatch, tmp_path):
+    """from_env() calls from_file() when STATIC_CONFIG_FILE is set."""
+    config_file = tmp_path / "routing.json"
+    config_file.write_text(
+        json.dumps({
+            "queues": [{"name": "env_q", "max_concurrent": 3}],
+            "roles": {"env_role": ["env_q"]},
+            "routing": [],
+        })
+    )
+    monkeypatch.setenv("STATIC_CONFIG_FILE", str(config_file))
+    monkeypatch.delenv("STATIC_QUEUES", raising=False)
+
+    b = StaticRoutingBackend.from_env()
+    assert await b.get_queue_config("env_q") is not None
+    assert (await b.get_queue_config("env_q")).max_concurrent == 3
+    assert await b.get_queues("env_role") == {"env_q"}
+
+
+def test_from_file_yaml_raises_when_pyyaml_missing(tmp_path):
+    """from_file() raises ImportError with install instructions when loading YAML without PyYAML."""
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text("queues: []\n")
+
+    with patch.dict(sys.modules, {"yaml": None}):
+        with pytest.raises(ImportError, match="pip install jobbers"):
+            StaticRoutingBackend.from_file(str(yaml_file))
+
+
+@pytest.mark.asyncio
+async def test_from_file_yaml(tmp_path):
+    """from_file() loads YAML config when PyYAML is available."""
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(
+        "queues:\n  - name: yaml_q\n    max_concurrent: 5\nroles:\n  yaml_role:\n    - yaml_q\nrouting: []\n"
+    )
+    b = StaticRoutingBackend.from_file(str(yaml_file))
+    assert await b.get_queue_config("yaml_q") is not None
+    assert (await b.get_queue_config("yaml_q")).max_concurrent == 5
+    assert await b.get_queues("yaml_role") == {"yaml_q"}

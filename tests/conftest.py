@@ -10,7 +10,9 @@ from jobbers.adapters.redis import MsgpackTaskAdapter
 from jobbers.adapters.redis_json import JsonTaskAdapter
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.migrations.runner import run_migrations
+from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
+from jobbers.models.task_routing import RoutingConfig
 from jobbers.state_manager import StateManager
 
 
@@ -35,9 +37,9 @@ async def routing_backend(session_factory):
 
 
 @pytest_asyncio.fixture
-async def state_manager(redis, routing_backend, dummy_task_adapter):
-    """StateManager backed by DummyTaskAdapter: fast, single-run, for tests that don't exercise adapter internals."""
-    sm = StateManager(redis, routing_backend, task_adapter=dummy_task_adapter)
+async def state_manager(redis, dummy_routing_backend, dummy_task_adapter):
+    """StateManager backed by DummyTaskAdapter + DummyRoutingBackend: fully in-memory, no SQL."""
+    sm = StateManager(redis, dummy_routing_backend, task_adapter=dummy_task_adapter)
     sm.get_queue_config = sm.routing.get_queue_config
     sm.get_routing_config = sm.routing.get_routing_config
     sm.get_queues = sm.routing.get_queues
@@ -46,9 +48,9 @@ async def state_manager(redis, routing_backend, dummy_task_adapter):
 
 
 @pytest_asyncio.fixture
-async def state_manager_real_ta(redis, routing_backend):
-    """StateManager backed by MsgpackTaskAdapter for tests that exercise the full adapter call path."""
-    sm = StateManager(redis, routing_backend, task_adapter=MsgpackTaskAdapter(redis))
+async def state_manager_real_ta(redis, dummy_routing_backend):
+    """StateManager backed by MsgpackTaskAdapter + DummyRoutingBackend for tests that exercise the full adapter call path."""
+    sm = StateManager(redis, dummy_routing_backend, task_adapter=MsgpackTaskAdapter(redis))
     sm.get_queue_config = sm.routing.get_queue_config
     sm.get_routing_config = sm.routing.get_routing_config
     sm.get_queues = sm.routing.get_queues
@@ -137,6 +139,96 @@ class DummyTaskAdapter:
 def dummy_task_adapter() -> DummyTaskAdapter:
     """Fixture providing a fresh DummyTaskAdapter for each test."""
     return DummyTaskAdapter()
+
+
+class DummyRoutingBackend:
+    """
+    In-memory RoutingBackendProtocol stub for orchestration tests.
+
+    All protocol methods are implemented with plain dicts. Intended for
+    StateManager / task-route tests that need a routing backend without
+    depending on a real database or Redis.
+    """
+
+    def __init__(self) -> None:
+        self._queues: dict[str, QueueConfig] = {}
+        self._roles: dict[str, set[str]] = {}
+        self._routing: dict[tuple[str, int], RoutingConfig] = {}
+        self._tags: dict[str, ULID] = {}
+
+    # ── Queue CRUD ────────────────────────────────────────────────────────────
+
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
+        return self._queues.get(queue)
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        self._queues[queue_config.name] = queue_config
+
+    async def delete_queue(self, queue_name: str) -> None:
+        self._queues.pop(queue_name, None)
+        new_tag = ULID()
+        for role, queues in self._roles.items():
+            if queue_name in queues:
+                queues.discard(queue_name)
+                self._tags[role] = new_tag
+
+    async def get_all_queues(self) -> list[str]:
+        return sorted(self._queues)
+
+    # ── Role CRUD ─────────────────────────────────────────────────────────────
+
+    async def get_queues(self, role: str) -> set[str]:
+        return set(self._roles.get(role, set()))
+
+    async def save_role(self, role: str, queues_set: set[str]) -> str:
+        self._roles[role] = set(queues_set)
+        new_tag = ULID()
+        self._tags[role] = new_tag
+        return str(new_tag)
+
+    async def get_all_roles(self) -> list[str]:
+        return sorted(self._roles)
+
+    async def delete_role(self, role: str) -> None:
+        self._roles.pop(role, None)
+        self._tags.pop(role, None)
+
+    # ── Refresh tags ──────────────────────────────────────────────────────────
+
+    async def get_refresh_tag(self, role: str) -> ULID:
+        if role not in self._tags:
+            self._tags[role] = ULID()
+        return self._tags[role]
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        new_tag = ULID()
+        self._tags[role] = new_tag
+        return str(new_tag)
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        affected = [role for role, queues in self._roles.items() if queue_name in queues]
+        if affected:
+            new_tag = ULID()
+            for role in affected:
+                self._tags[role] = new_tag
+        return affected
+
+    # ── Task routing config ───────────────────────────────────────────────────
+
+    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
+        return self._routing.get((task_name, task_version))
+
+    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
+        self._routing[(routing_config.task_name, routing_config.task_version)] = routing_config
+
+    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
+        return self._routing.pop((task_name, task_version), None) is not None
+
+
+@pytest.fixture
+def dummy_routing_backend() -> DummyRoutingBackend:
+    """Fixture providing a fresh DummyRoutingBackend for each test."""
+    return DummyRoutingBackend()
 
 
 @pytest_asyncio.fixture

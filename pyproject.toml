@@ -45,6 +45,7 @@ dependencies = [
     "aiosqlite",
     "sqlalchemy[asyncio]",
     "python-ulid[pydantic]",
+    "pyyaml",
     "msgpack-types",
     "croniter>=6.2.2",
 ]
