@@ -314,7 +314,7 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
         return cast("dict[str, Any] | None", await pipe.json().get(key))  # type: ignore[misc]
 
     def _stage_store(self, pipe: Pipeline, key: str, task: Task) -> None:
-        pipe.json().set(key, "$", task.to_dict())
+        pipe.json().set(key, "$", task.model_dump(context={"mode": "redis_json"}, exclude={"id"}))
 
     def _stage_load(self, pipe: Pipeline, key: str) -> None:
         pipe.json().get(key)
