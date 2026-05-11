@@ -22,7 +22,7 @@ from ulid import ULID
 
 from jobbers.adapters._shared import SharedTaskAdapterMixin
 from jobbers.models.queue_config import QueueConfig
-from jobbers.models.task import Task, TaskPagination
+from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
 from jobbers.utils.serialization import deserialize, serialize
 
@@ -323,8 +323,6 @@ class MsgpackTaskAdapter(SharedTaskAdapterMixin):
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Fetch tasks from the queue sorted set and filter in Python."""
-        from jobbers.models.task import PaginationOrder
-
         if pagination.order_by == PaginationOrder.SUBMITTED_AT:
             raw_ids = await self.data_store.zrangebyscore(
                 self.TASKS_BY_QUEUE(queue=pagination.queue),

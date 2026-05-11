@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 from ulid import ULID
 
+import end2end
 from jobbers.adapters.redis import MsgpackTaskAdapter
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
@@ -19,8 +20,6 @@ from jobbers.utils.mermaid_dag import parse_mermaid_dag
 
 @pytest.fixture(autouse=True)
 def register_e2e_tasks():
-    import end2end
-
     clear_registry()
     importlib.reload(end2end)
     yield

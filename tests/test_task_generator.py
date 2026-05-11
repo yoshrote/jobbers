@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 from ulid import ULID
 
+from jobbers import task_generator as tg_module
 from jobbers.models.task import Task, TaskStatus
 from jobbers.state_manager import StateManager
 from jobbers.task_generator import _CAPACITY_BACKOFF_SECS, TaskGenerator
@@ -494,8 +495,6 @@ async def test_queues_records_refresh_metrics():
     task_generator.routing_version = version
     task_generator.refresh_tag = ULID()  # old tag — triggers refresh
     _silent_pubsub(task_generator)
-
-    from jobbers import task_generator as tg_module
 
     with (
         patch.object(tg_module.queue_config_refreshes, "add") as mock_counter,

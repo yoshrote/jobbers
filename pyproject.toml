@@ -47,6 +47,7 @@ dependencies = [
     "python-ulid[pydantic]",
     "pyyaml",
     "msgpack-types",
+    "types-croniter",
     "croniter>=6.2.2",
 ]
 

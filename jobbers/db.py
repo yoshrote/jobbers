@@ -7,6 +7,11 @@ import redis.asyncio as redis
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
+from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
+from jobbers.adapters.redis import RedisRoutingBackend
+from jobbers.adapters.redis_json import RedisJSONRoutingBackend
+from jobbers.adapters.sql import SQLRoutingBackend
+from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.migrations.runner import run_migrations
 
 if TYPE_CHECKING:
@@ -64,8 +69,6 @@ async def close_sqlite_conn() -> None:
 
 def create_task_adapter(client: redis.Redis) -> TaskAdapterProtocol:
     """Create a TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
-    from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
-
     if TASK_ADAPTER_BACKEND == "msgpack":
         return MsgpackTaskAdapter(client)
     return JsonTaskAdapter(client)
@@ -99,25 +102,17 @@ async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol
     backend_type = os.environ.get("ROUTING_BACKEND", "sql")
 
     if backend_type == "redis":
-        from jobbers.adapters.redis import RedisRoutingBackend
-
         return RedisRoutingBackend(client)
 
     if backend_type == "redis_json":
-        from jobbers.adapters.redis_json import RedisJSONRoutingBackend
-
         backend = RedisJSONRoutingBackend(client)
         await backend.ensure_indexes()
         return backend
 
     if backend_type == "static":
-        from jobbers.adapters.static import StaticRoutingBackend
-
         return StaticRoutingBackend.from_env()
 
     # sql (default) — initialize SQLAlchemy
-    from jobbers.adapters.sql import SQLRoutingBackend
-
     db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
     _engine = create_async_engine(db_path)
 

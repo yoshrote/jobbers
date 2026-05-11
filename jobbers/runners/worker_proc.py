@@ -10,8 +10,10 @@ import sys
 from typing import TYPE_CHECKING
 
 from jobbers import db
+from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
+from jobbers.utils.otel import enable_otel
 
 if TYPE_CHECKING:
     from jobbers.models.task import Task
@@ -80,8 +82,6 @@ def _load_task_module(arg: str) -> None:
 
 
 def run() -> None:
-    from jobbers.utils.otel import enable_otel
-
     parser = argparse.ArgumentParser(description="Jobbers Worker")
     parser.add_argument("task_module", help="Task module to load (dotted name or file path)")
     parser.add_argument(
@@ -93,9 +93,6 @@ def run() -> None:
     args = parser.parse_args()
 
     if args.static_config:
-        from jobbers import db
-        from jobbers.adapters.static import StaticRoutingBackend
-
         db.register_routing_backend(StaticRoutingBackend.from_file(args.static_config))
 
     handlers: list[logging.Handler] = [logging.StreamHandler(stream=sys.stdout)]

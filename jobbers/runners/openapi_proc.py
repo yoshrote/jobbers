@@ -8,6 +8,8 @@ from pathlib import Path
 import anyio
 import httpx
 
+from jobbers.task_routes import app
+
 
 def run() -> None:
     output_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("openapi.json")
@@ -15,8 +17,6 @@ def run() -> None:
 
 
 async def _write_spec(output_path: Path) -> None:
-    from jobbers.task_routes import app
-
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",

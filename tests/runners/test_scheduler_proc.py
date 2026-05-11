@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -134,8 +135,6 @@ async def test_scheduler_uses_env_var_poll_interval(monkeypatch):
     async def fake_sleep(interval: float) -> None:
         received_intervals.append(interval)
         raise asyncio.CancelledError
-
-    import os
 
     with (
         patch("jobbers.runners.scheduler_proc.db.init_state_manager", return_value=state_manager),

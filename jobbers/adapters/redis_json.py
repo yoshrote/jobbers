@@ -21,12 +21,15 @@ import json
 from asyncio import TaskGroup
 from typing import TYPE_CHECKING, Any, cast
 
+from redis.commands.search.field import NumericField, TagField
+from redis.commands.search.index_definition import IndexDefinition, IndexType
+from redis.commands.search.query import Query as SearchQuery
 from redis.exceptions import ResponseError
 from ulid import ULID
 
 from jobbers.adapters._shared import SharedTaskAdapterMixin
 from jobbers.models.queue_config import QueueConfig
-from jobbers.models.task import Task, TaskPagination
+from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
 
 if TYPE_CHECKING:
@@ -79,9 +82,6 @@ class RedisJSONRoutingBackend:
 
     async def ensure_indexes(self) -> None:
         """Create RediSearch indexes for queues and roles if they do not already exist."""
-        from redis.commands.search.field import TagField
-        from redis.commands.search.index_definition import IndexDefinition, IndexType
-
         try:
             await self._client.ft(self.QUEUE_IDX).info()  # type: ignore[no-untyped-call]
         except ResponseError:
@@ -109,8 +109,6 @@ class RedisJSONRoutingBackend:
         await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", queue_config.to_dict())  # type: ignore[misc]
 
     async def delete_queue(self, queue_name: str) -> None:
-        from redis.commands.search.query import Query as SearchQuery
-
         await self._client.delete(self.QUEUE_KEY(name=queue_name))
         results = await self._client.ft(self.ROLE_IDX).search(
             SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
@@ -132,8 +130,6 @@ class RedisJSONRoutingBackend:
         await write_pipe.execute()
 
     async def get_all_queues(self) -> list[str]:
-        from redis.commands.search.query import Query as SearchQuery
-
         results = await self._client.ft(self.QUEUE_IDX).search(
             SearchQuery("*").no_content().paging(0, 10000)
         )
@@ -156,8 +152,6 @@ class RedisJSONRoutingBackend:
         return new_tag
 
     async def get_all_roles(self) -> list[str]:
-        from redis.commands.search.query import Query as SearchQuery
-
         results = await self._client.ft(self.ROLE_IDX).search(
             SearchQuery("*").no_content().paging(0, 10000)
         )
@@ -187,8 +181,6 @@ class RedisJSONRoutingBackend:
 
     async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
         """Find all roles containing queue_name via RediSearch and bump their refresh tags."""
-        from redis.commands.search.query import Query as SearchQuery
-
         results = await self._client.ft(self.ROLE_IDX).search(
             SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
         )
@@ -341,12 +333,6 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
 
     async def ensure_index(self) -> None:
         """Create the RediSearch index, or add any missing fields to an existing one."""
-        from redis.commands.search.field import NumericField, TagField
-        from redis.commands.search.index_definition import (
-            IndexDefinition,
-            IndexType,
-        )
-
         desired_fields = [
             TagField("$.name", as_name="name"),
             TagField("$.queue", as_name="queue"),
@@ -373,10 +359,6 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Query tasks via the RediSearch index with optional filters."""
-        from redis.commands.search.query import Query as SearchQuery
-
-        from jobbers.models.task import PaginationOrder
-
         query_parts = [f"@queue:{{{_escape_tag(pagination.queue)}}}"]
         if pagination.task_name:
             query_parts.append(f"@name:{{{_escape_tag(pagination.task_name)}}}")
@@ -409,8 +391,6 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
 
     async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
         """Return (submitted_at, task_ids) for a DAG run using the RediSearch index."""
-        from redis.commands.search.query import Query as SearchQuery
-
         score: float | None = await self.data_store.zscore(self.DAG_RUNS, bytes(dag_run_id))
         if score is None:
             return None
@@ -454,9 +434,6 @@ class JsonDeadQueue:
 
     async def ensure_index(self) -> None:
         """Create the RediSearch index on DLQ JSON documents if it does not exist."""
-        from redis.commands.search.field import NumericField, TagField
-        from redis.commands.search.index_definition import IndexDefinition, IndexType
-
         try:
             await self.data_store.ft(self.INDEX_NAME).info()  # type: ignore[no-untyped-call]
         except ResponseError:
@@ -519,8 +496,6 @@ class JsonDeadQueue:
         limit: int = 100,
     ) -> list[Task]:
         """Fetch DLQ entries matching filter criteria using RediSearch, sorted by failed_at descending."""
-        from redis.commands.search.query import Query as SearchQuery
-
         query_parts = []
         if queue is not None:
             query_parts.append(f"@queue:{{{_escape_tag(queue)}}}")
@@ -550,8 +525,6 @@ class JsonDeadQueue:
 
     async def clean(self, earlier_than: dt.datetime) -> None:
         """Remove failed tasks older than the specified datetime."""
-        from redis.commands.search.query import Query as SearchQuery
-
         ts = earlier_than.timestamp()
         q: SearchQuery = SearchQuery(f"@failed_at:[-inf ({ts}]").no_content().paging(0, 10000)
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from jobbers.models.queue_config import QueueConfigAdapter
+from jobbers.models.task_routing import TaskRoutingConfigAdapter
+
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
     from ulid import ULID
@@ -16,9 +19,6 @@ class SQLRoutingBackend:
     """RoutingBackendProtocol backed by SQLAlchemy (the original SQL-based implementation)."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        from jobbers.models.queue_config import QueueConfigAdapter
-        from jobbers.models.task_routing import TaskRoutingConfigAdapter
-
         self._qca = QueueConfigAdapter(session_factory)
         self._rca = TaskRoutingConfigAdapter(session_factory)
 

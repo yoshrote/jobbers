@@ -30,8 +30,6 @@ def make_task(
     status: TaskStatus = TaskStatus.SUBMITTED,
     submitted_at: dt.datetime = FROZEN_TIME,
 ):
-    from jobbers.models.task import Task
-
     task = Task(id=task_id, name=name, version=version, queue=queue, status=status)
     task.submitted_at = submitted_at
     return task

@@ -5,7 +5,10 @@ import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from ulid import ULID
 
+from jobbers.models.task import Task
+from jobbers.models.task_status import TaskStatus
 from jobbers.runners.worker_proc import _load_task_module, main
 
 # ── _load_task_module ─────────────────────────────────────────────────────────
@@ -59,11 +62,6 @@ def _make_state_manager() -> MagicMock:
 @pytest.mark.asyncio
 async def test_main_processes_tasks_until_exhausted():
     """main() pulls tasks from the generator and processes each one."""
-    from ulid import ULID
-
-    from jobbers.models.task import Task
-    from jobbers.models.task_status import TaskStatus
-
     task = Task(id=ULID(), name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
 
     process_calls: list[object] = []
@@ -85,9 +83,7 @@ async def test_main_processes_tasks_until_exhausted():
         gen_instance.queues = AsyncMock(return_value={"default"})
         gen_instance.stop = MagicMock()
 
-        from unittest.mock import AsyncMock as _AM
-
-        gen_instance.__anext__ = _AM(side_effect=[task, StopAsyncIteration()])
+        gen_instance.__anext__ = AsyncMock(side_effect=[task, StopAsyncIteration()])
         MockGen.return_value = gen_instance
 
         await main()

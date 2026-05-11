@@ -5,7 +5,9 @@ from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import fakeredis.aioredis as fakeredis
 import pytest
+from ulid import ULID
 
+from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, SimpleCallback, TaskResult
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_scheduler import TaskScheduler
@@ -37,7 +39,6 @@ async def test_task_processor_success():
         status=TaskStatus.SUBMITTED,
         queue="test_queue",
     )
-    from jobbers.models.dag import TaskResult
 
     state_manager = _make_state_manager()
     task_function = AsyncMock(return_value=TaskResult(results={"result": "success"}))
@@ -827,10 +828,6 @@ async def test_process_does_not_overwrite_cancelled_status_on_system_cancel():
 @pytest.mark.asyncio
 async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     """Normal fan-out: children are submitted atomically via pipeline and collector is pre-saved."""
-    from ulid import ULID
-
-    from jobbers.models.dag import DAGNode, DynamicFanOut
-
     dag_run_id = ULID()
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -888,10 +885,6 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
 @pytest.mark.asyncio
 async def test_handle_dynamic_fanout_no_children_submits_collector_immediately():
     """Degenerate fan-out with no children submits the collector directly."""
-    from ulid import ULID
-
-    from jobbers.models.dag import DAGNode, DynamicFanOut
-
     dag_run_id = ULID()
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -922,8 +915,6 @@ async def test_handle_dynamic_fanout_no_children_submits_collector_immediately()
 @pytest.mark.asyncio
 async def test_task_processor_stores_task_result_on_success():
     """TaskProcessor stores results from a TaskResult return value."""
-    from jobbers.models.dag import TaskResult
-
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -974,10 +965,6 @@ async def test_monitor_task_cancellation_calls_handle_user_cancelled_task():
 @pytest.mark.asyncio
 async def test_post_process_triggers_dag_callbacks():
     """post_process submits callbacks produced by generate_callbacks when has_callbacks() is True."""
-    from unittest.mock import AsyncMock
-
-    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
-
     # Build a parent task with a SimpleCallback so has_callbacks() → True
     child_spec = DAGTaskSpec(name="child_task", queue="default")
     parent = Task(
@@ -1010,10 +997,6 @@ async def test_post_process_triggers_dag_callbacks():
 @pytest.mark.asyncio
 async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
     """post_process delegates to _handle_dynamic_fanout when a DynamicFanOut is passed."""
-    from unittest.mock import AsyncMock, patch
-
-    from jobbers.models.dag import DAGNode, DynamicFanOut
-
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -1035,10 +1018,6 @@ async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
 @pytest.mark.asyncio
 async def test_task_result_parent_ids_copied_to_task():
     """When a TaskResult carries parent_ids, processor copies them onto the task."""
-    from ulid import ULID
-
-    from jobbers.models.dag import TaskResult
-
     parent_id = ULID()
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -1061,8 +1040,6 @@ async def test_task_result_parent_ids_copied_to_task():
 @pytest.mark.asyncio
 async def test_end_to_end_latency_recorded_when_submitted_at_set():
     """end_to_end_latency metric is recorded when task has submitted_at and completed_at."""
-    from jobbers.models.dag import TaskResult
-
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -1117,8 +1094,6 @@ async def test_run_reraises_non_user_cancellation_error():
 @pytest.mark.asyncio
 async def test_post_process_error_submits_error_callbacks():
     """post_process_error submits tasks returned by generate_error_callbacks."""
-    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
-
     error_spec = DAGTaskSpec(name="error_handler")
     child_spec = DAGTaskSpec(name="child")
     task = Task(
@@ -1144,8 +1119,6 @@ async def test_post_process_error_submits_error_callbacks():
 @pytest.mark.asyncio
 async def test_post_process_error_no_error_callbacks_does_nothing():
     """post_process_error does not call submit_task when no error callbacks are set."""
-    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
-
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -1165,8 +1138,6 @@ async def test_post_process_error_no_error_callbacks_does_nothing():
 @pytest.mark.asyncio
 async def test_failed_task_triggers_error_callback():
     """When a task fails with an unexpected exception, error callbacks are submitted."""
-    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
-
     error_spec = DAGTaskSpec(name="error_handler")
     child_spec = DAGTaskSpec(name="child")
     task = Task(
@@ -1204,8 +1175,6 @@ async def test_non_failed_terminal_statuses_do_not_trigger_error_callback(trigge
     system stopped it, or it was never registered) where firing an error
     callback would be surprising and is explicitly not supported.
     """
-    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
-
     error_spec = DAGTaskSpec(name="error_handler")
     child_spec = DAGTaskSpec(name="child")
     task = Task(
@@ -1282,8 +1251,6 @@ async def test_handle_success_without_cron_id_calls_save_task():
 @pytest.mark.asyncio
 async def test_handle_success_with_cron_id_uses_pipeline_not_save_task():
     """handle_success uses a transactional pipeline (stage_save + stage_clear_active_run) when cron_id is set."""
-    from ulid import ULID
-
     cron_id = ULID()
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -1421,8 +1388,6 @@ async def test_timeout_retry_delay_uses_pre_increment_attempt(
 @pytest.mark.asyncio
 async def test_retried_task_does_not_trigger_error_callback():
     """A task being retried (SCHEDULED) does not fire error callbacks."""
-    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
-
     error_spec = DAGTaskSpec(name="error_handler")
     child_spec = DAGTaskSpec(name="child")
     task = Task(
@@ -1471,12 +1436,6 @@ async def test_retried_task_does_not_trigger_error_callback():
 @pytest.mark.asyncio
 async def test_inject_parent_results_passes_results_as_kwarg():
     """When inject_parent_results=True and parent_ids is set, the task function receives parent_results."""
-    from unittest.mock import patch
-
-    from ulid import ULID
-
-    from jobbers.models.dag import TaskResult
-
     parent_id = ULID()
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -1505,10 +1464,6 @@ async def test_inject_parent_results_passes_results_as_kwarg():
 @pytest.mark.asyncio
 async def test_no_injection_when_flag_is_false():
     """When inject_parent_results=False, the task function is called with only task.parameters."""
-    from ulid import ULID
-
-    from jobbers.models.dag import TaskResult
-
     parent_id = ULID()
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",

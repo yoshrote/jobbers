@@ -8,6 +8,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
+from croniter import croniter
 from opentelemetry import metrics
 from redis.exceptions import WatchError
 from ulid import ULID
@@ -15,7 +16,10 @@ from ulid import ULID
 from jobbers import registry
 from jobbers.adapters.redis import DeadQueue
 from jobbers.adapters.redis_json import JsonTaskAdapter
-from jobbers.models.cron_dag_scheduler import CronDAGScheduler
+from jobbers.models.cron_dag import ConcurrencyPolicy
+from jobbers.models.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
+from jobbers.models.dag import collect_fan_in_keys
+from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_scheduler import TaskScheduler
@@ -28,10 +32,8 @@ if TYPE_CHECKING:
 
     from jobbers.adapters.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.models.cron_dag import CronDAGEntry
-    from jobbers.models.cron_dag_scheduler import ConcurrencyStager
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
-    from jobbers.models.task import Task
     from jobbers.models.task_routing import RoutingConfig
 
 logger = logging.getLogger(__name__)
@@ -255,15 +257,10 @@ class StateManager:
           Call it unconditionally during pipeline construction; it is a no-op for ALWAYS
           policy and stages the NX guard for SKIP_IF_RUNNING.
         """
-        from jobbers.models.cron_dag import ConcurrencyPolicy
-        from jobbers.models.cron_dag_scheduler import ConcurrencyStager
-
         if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
             active_task_id_str = await self.cron_dag_scheduler.get_active_run(entry.id)
             if active_task_id_str is not None:
-                from ulid import ULID as _ULID
-
-                active_task = await self.ta.get_task(_ULID.from_str(active_task_id_str))
+                active_task = await self.ta.get_task(ULID.from_str(active_task_id_str))
                 if active_task is not None and active_task.status in {
                     TaskStatus.SUBMITTED,
                     TaskStatus.STARTED,
@@ -301,11 +298,6 @@ class StateManager:
         before submit means the entry fires again on the next poll (tolerable duplicate),
         but the cron schedule is never permanently lost.
         """
-        from croniter import croniter
-
-        from jobbers.models.dag import collect_fan_in_keys
-        from jobbers.models.task import Task
-
         next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
 
         async with self._concurrency_guard(entry, next_run_at) as stager:
@@ -546,8 +538,6 @@ class StateManager:
         If an entry with the same ``id`` already exists it is overwritten and
         its schedule is reset.
         """
-        from croniter import croniter
-
         now = dt.datetime.now(dt.UTC)
         first_run_at = croniter(entry.cron_expr, now).get_next(dt.datetime)
         pipe = self.job_store.pipeline(transaction=True)

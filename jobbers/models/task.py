@@ -7,15 +7,16 @@ from opentelemetry import metrics
 from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter, field_serializer
 from ulid import ULID
 
+from jobbers.di import get_injected_param_names
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 
-from .dag import DAGCallback
+from .dag import DAGCallback, FanInCallback, SimpleCallback, TaskResult
 from .task_config import TaskConfig
 from .task_status import TaskStatus
 
 if TYPE_CHECKING:
     from jobbers.adapters.protocols import TaskAdapterProtocol
-    from jobbers.models.dag import DynamicFanOut, TaskResult
+    from jobbers.models.dag import DynamicFanOut
 
 _dag_callback_adapter: TypeAdapter[list[DAGCallback]] = TypeAdapter(list[DAGCallback])
 
@@ -67,8 +68,6 @@ class Task(BaseModel):
         if not self.task_config:
             # Safer to fail here than chance something funky downstream
             return True
-        from jobbers.di import get_injected_param_names  # local import avoids circular dep
-
         injected = get_injected_param_names(self.task_config.function)
         try:
             hints = get_type_hints(self.task_config.function, include_extras=True)
@@ -165,8 +164,6 @@ class Task(BaseModel):
         Returns -1 from `fan_in_complete` when the ID was not a member (already
         processed or key expired); in that case the collector is not submitted.
         """
-        from jobbers.models.dag import FanInCallback, SimpleCallback
-
         results: list[Self] = []
         for cb in self.dag_callbacks:
             match cb:
@@ -204,8 +201,6 @@ class Task(BaseModel):
         return task.make_result(results={"count": n})
         ```
         """
-        from jobbers.models.dag import TaskResult
-
         return TaskResult(results=results or {}, fanout=fanout, parent_ids=list(self.parent_ids))
 
     def summarized(self) -> dict[str, Any]:

@@ -9,9 +9,12 @@ from ulid import ULID
 
 from jobbers import registry
 from jobbers.adapters.sql import SQLRoutingBackend
-from jobbers.models.queue_config import QueueConfig, RatePeriod
+from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+from jobbers.models.dag import DAGNode, DAGTaskSpec
+from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
+from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import StateManager, TaskException, UserCancellationError
 
@@ -763,8 +766,6 @@ def test_active_tasks_per_queue_reflects_registry(state_manager):
 @pytest.mark.asyncio
 async def test_submit_dag_simple_chain(state_manager):
     """submit_dag submits root tasks and returns Task objects."""
-    from jobbers.models.dag import DAGNode
-
     root = DAGNode("fetch_data")
     child = DAGNode("process_data")
     root.then(child)
@@ -781,8 +782,6 @@ async def test_submit_dag_simple_chain(state_manager):
 @pytest.mark.asyncio
 async def test_submit_dag_multi_root_shares_dag_run_id(state_manager):
     """All roots submitted in the same submit_dag call share a single dag_run_id."""
-    from jobbers.models.dag import DAGNode
-
     branch_a = DAGNode("branch_a")
     branch_b = DAGNode("branch_b")
     collector = DAGNode("collect")
@@ -802,8 +801,6 @@ async def test_submit_dag_multi_root_shares_dag_run_id(state_manager):
 @pytest.mark.asyncio
 async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
     """submit_dag pre-populates Redis fan-in sets before submitting tasks."""
-    from jobbers.models.dag import DAGNode
-
     branch_a = DAGNode("branch_a")
     branch_b = DAGNode("branch_b")
     collector = DAGNode("collect")
@@ -825,9 +822,6 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_submits_task_and_reschedules(state_manager):
     """dispatch_cron_dag submits the root task and reschedules the entry."""
-    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-    from jobbers.models.dag import DAGTaskSpec
-
     spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="daily_job",
@@ -854,9 +848,6 @@ async def test_dispatch_cron_dag_submits_task_and_reschedules(state_manager):
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager):
     """dispatch_cron_dag skips dispatch but reschedules when concurrency_policy=SKIP_IF_RUNNING and previous run is active."""
-    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-    from jobbers.models.dag import DAGTaskSpec
-
     spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="guarded_job",
@@ -886,9 +877,6 @@ async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_skipping(state_manager):
     """dispatch_cron_dag records the new root task when concurrency_policy=SKIP_IF_RUNNING and no prior run is active."""
-    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-    from jobbers.models.dag import DAGTaskSpec
-
     spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="guarded_job",
@@ -914,9 +902,6 @@ async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_sk
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
     """dispatch_cron_dag pre-populates fan-in sets when the DAG contains fan-in nodes."""
-    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-    from jobbers.models.dag import DAGNode
-
     # Build a diamond DAG: root → (a, b) → collector (fan-in)
     root_node = DAGNode("root_job")
     branch_a = DAGNode("branch_a")
@@ -933,7 +918,6 @@ async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
         concurrency_policy=ConcurrencyPolicy.ALWAYS,
     )
 
-    from unittest.mock import patch
 
     run_at = FROZEN_TIME
     with patch.object(state_manager.ta, "stage_init_fan_in") as mock_stage_init:
@@ -946,9 +930,6 @@ async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_stages_submission_in_pipeline_for_non_rate_limited_queue(state_manager):
     """For non-rate-limited queues, submission is staged in the same pipeline (no separate submit_task call)."""
-    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-    from jobbers.models.dag import DAGTaskSpec
-
     spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="daily_job",
@@ -972,9 +953,6 @@ async def test_dispatch_cron_dag_stages_submission_in_pipeline_for_non_rate_limi
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queue(state_manager):
     """For rate-limited queues, dispatch_cron_dag falls back to submit_task() to enforce the rate limit."""
-    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-    from jobbers.models.dag import DAGTaskSpec
-
     await state_manager.routing.save_queue_config(
         QueueConfig(name="default", rate_numerator=5, rate_denominator=1, rate_period=RatePeriod.MINUTE)
     )
@@ -1011,8 +989,6 @@ async def testresolve_queue_no_routing_returns_task_queue(state_manager):
 @pytest.mark.asyncio
 async def testresolve_queue_single_strategy(state_manager):
     """SINGLE routing always returns the configured queue."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-
     config = RoutingConfig(
         task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["target"]
     )
@@ -1026,8 +1002,6 @@ async def testresolve_queue_single_strategy(state_manager):
 @pytest.mark.asyncio
 async def testresolve_queue_weighted_strategy_returns_one_of_configured_queues(state_manager):
     """WEIGHTED routing returns one of the configured queues."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-
     config = RoutingConfig(
         task_name="my_task",
         task_version=1,
@@ -1046,8 +1020,6 @@ async def testresolve_queue_weighted_strategy_returns_one_of_configured_queues(s
 @pytest.mark.asyncio
 async def testresolve_queue_routing_is_version_specific(state_manager):
     """Routing config is looked up by (name, version); a different version falls through."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-
     config = RoutingConfig(
         task_name="my_task", task_version=2, strategy=RoutingStrategy.SINGLE, queues=["routed"]
     )
@@ -1081,8 +1053,6 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
 @pytest.mark.asyncio
 async def test_get_routing_config_caches_result(redis, session_factory, dummy_task_adapter):
     """get_routing_config returns a cached value on the second call."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-
     sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["routed"])
     await sm.routing.save_routing_config(config)
@@ -1108,8 +1078,6 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
     redis, session_factory, dummy_task_adapter
 ):
     """save_queue_config writes to SQL, clears the cache entry, and bumps refresh_tag for containing roles."""
-    from jobbers.models.queue_config import QueueConfigAdapter
-
     sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
     qca = QueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
@@ -1139,8 +1107,6 @@ async def test_save_routing_config_invalidates_cache_and_bumps_version(
     redis, session_factory, dummy_task_adapter
 ):
     """save_routing_config writes to SQL, clears the cache entry, and updates routing:version to a new ULID."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-
     sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
 
     config_v1 = RoutingConfig(
@@ -1175,8 +1141,6 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
     redis, session_factory, dummy_task_adapter
 ):
     """delete_routing_config removes from SQL, clears the cache entry, and updates routing:version to a new ULID."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-
     sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
     await sm.routing.save_routing_config(config)
@@ -1200,8 +1164,6 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
 @pytest.mark.asyncio
 async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_factory, dummy_task_adapter):
     """invalidate_all_routing_config clears all entries from the routing cache dict."""
-    from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-
     sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
     for i in range(3):
         cfg = RoutingConfig(task_name=f"t{i}", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
