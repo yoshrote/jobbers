@@ -172,11 +172,11 @@ def test_parse_linear_chain() -> None:
     roots = parse_mermaid_dag(text)
     assert len(roots) == 1
     root = roots[0]
-    assert root._name == "fetch_data"  # type: ignore[attr-defined]
-    assert len(root._successors) == 1  # type: ignore[attr-defined]
-    b_node = root._successors[0][0]  # type: ignore[attr-defined]
-    assert b_node._name == "process_data"  # type: ignore[attr-defined]
-    assert len(b_node._successors) == 1  # type: ignore[attr-defined]
+    assert root._name == "fetch_data"
+    assert len(root._successors) == 1
+    b_node = root._successors[0][0]
+    assert b_node._name == "process_data"
+    assert len(b_node._successors) == 1
 
 
 def test_parse_inline_edge_with_label() -> None:
@@ -184,7 +184,7 @@ def test_parse_inline_edge_with_label() -> None:
     text = 'flowchart TD\n    A["fetch_data"] --> B["process_data"]'
     roots = parse_mermaid_dag(text)
     assert len(roots) == 1
-    assert roots[0]._name == "fetch_data"  # type: ignore[attr-defined]
+    assert roots[0]._name == "fetch_data"
 
 
 # ── parse_mermaid_dag — fan-out ───────────────────────────────────────────────
@@ -202,8 +202,8 @@ def test_parse_fan_out() -> None:
     roots = parse_mermaid_dag(text)
     assert len(roots) == 1
     root = roots[0]
-    assert len(root._successors) == 2  # type: ignore[attr-defined]
-    successor_names = {s[0]._name for s in root._successors}  # type: ignore[attr-defined]
+    assert len(root._successors) == 2
+    successor_names = {s[0]._name for s in root._successors}
     assert successor_names == {"process_chunk_a", "process_chunk_b"}
 
 
@@ -226,18 +226,18 @@ def test_parse_diamond() -> None:
     assert len(roots) == 1
     root = roots[0]
     # Root fans out to B and C.
-    assert len(root._successors) == 2  # type: ignore[attr-defined]
+    assert len(root._successors) == 2
 
     # B and C should both have a FanInCallback pointing to D.
-    b_node = next(s[0] for s in root._successors if s[0]._name == "process_chunk_a")  # type: ignore[attr-defined]
-    assert len(b_node._successors) == 1  # type: ignore[attr-defined]
-    fan_in_key = b_node._successors[0][1]  # type: ignore[attr-defined]
+    b_node = next(s[0] for s in root._successors if s[0]._name == "process_chunk_a")
+    assert len(b_node._successors) == 1
+    fan_in_key = b_node._successors[0][1]
     assert fan_in_key is not None  # FanInCallback has a key
     assert "dag:fan-in:" in fan_in_key
 
     # The fan-in collector has the expected name.
-    collector = b_node._successors[0][0]  # type: ignore[attr-defined]
-    assert collector._name == "merge_results"  # type: ignore[attr-defined]
+    collector = b_node._successors[0][0]
+    assert collector._name == "merge_results"
 
 
 def test_parse_diamond_fan_in_predecessors() -> None:
@@ -278,13 +278,13 @@ def test_parse_error_callback() -> None:
     assert len(roots) == 1
     root = roots[0]
     # err node should NOT be a root.
-    assert root._name == "fetch_data"  # type: ignore[attr-defined]
+    assert root._name == "fetch_data"
     # The success edge should carry the on_error node.
-    assert len(root._successors) == 1  # type: ignore[attr-defined]
-    _successor, _fan_in_key, on_error, _ipr = root._successors[0]  # type: ignore[attr-defined]
+    assert len(root._successors) == 1
+    _successor, _fan_in_key, on_error, _ipr = root._successors[0]
     assert on_error is not None
-    assert on_error._name == "notify_failure"  # type: ignore[attr-defined]
-    assert on_error._parameters == {"channel": "ops"}  # type: ignore[attr-defined]
+    assert on_error._name == "notify_failure"
+    assert on_error._parameters == {"channel": "ops"}
 
 
 def test_parse_multiple_error_callbacks_raises() -> None:
@@ -311,9 +311,9 @@ def test_parse_queue_and_params() -> None:
     roots = parse_mermaid_dag(text)
     assert len(roots) == 1
     root = roots[0]
-    assert root._name == "fetch_data"  # type: ignore[attr-defined]
-    assert root._queue == "heavy_queue"  # type: ignore[attr-defined]
-    assert root._parameters == {"limit": 50, "dry_run": False}  # type: ignore[attr-defined]
+    assert root._name == "fetch_data"
+    assert root._queue == "heavy_queue"
+    assert root._parameters == {"limit": 50, "dry_run": False}
 
 
 def test_parse_default_queue() -> None:

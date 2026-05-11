@@ -29,7 +29,7 @@ def test_load_task_module_by_file_path():
 
     _load_task_module(path)
     assert "_user_tasks" in sys.modules
-    assert sys.modules["_user_tasks"].LOADED is True  # type: ignore[attr-defined]
+    assert sys.modules["_user_tasks"].LOADED is True
 
     del sys.modules["_user_tasks"]
 
@@ -41,7 +41,7 @@ def test_load_task_module_by_relative_py_extension():
         path = f.name
 
     _load_task_module(path)
-    assert sys.modules["_user_tasks"].VALUE == 42  # type: ignore[attr-defined]
+    assert sys.modules["_user_tasks"].VALUE == 42
     del sys.modules["_user_tasks"]
 
 

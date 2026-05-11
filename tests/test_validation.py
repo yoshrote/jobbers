@@ -31,8 +31,7 @@ async def test_validate_task_unregistered():
 async def test_validate_task_invalid_params():
     """Task with wrong parameter type raises ValidationError."""
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     task_config = TaskConfig(name="Test Task", function=task_function)
     task = Task(id=ULID1, name="Test Task", parameters={"foo": "bar"})
@@ -45,8 +44,7 @@ async def test_validate_task_invalid_params():
 async def test_validate_task_valid_sets_task_config():
     """Valid task passes validation and task_config is set on the task."""
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     task_config = TaskConfig(name="Test Task", function=task_function)
     task = Task(id=ULID1, name="Test Task", parameters={"foo": 42})
@@ -61,8 +59,7 @@ async def test_validate_task_valid_sets_task_config():
 async def test_validate_task_missing_queue_config():
     """Task targeting an unconfigured queue raises ValidationError."""
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     task_config = TaskConfig(name="Test Task", function=task_function)
     task = Task(id=ULID1, name="Test Task", queue="unknown-queue", parameters={"foo": 42})

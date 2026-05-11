@@ -224,6 +224,7 @@ exclude_also = [
     "@(typing(_extensions)?\\.)?overload",
     "if (typing(_extensions)?\\.)?TYPE_CHECKING:",
     "def run\\(\\)",
+    "\\.\\.\\.",
 ]
 
 [tool.mypy]

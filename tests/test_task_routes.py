@@ -62,8 +62,7 @@ async def test_submit_valid_task(state_manager):
     This task may flake out if there is a worker listening to the queue
     """
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
@@ -102,8 +101,7 @@ async def test_submit_invalid_task():
 
     # jobber_registry.register_task("test_task", test_task_function, parameters=["foo"])
     # add a task config with a function that requires a parameter to the jobber registry
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": "bar"})
@@ -921,8 +919,7 @@ async def test_submit_task_raises_400_on_task_exception():
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
     mock_sm.submit_task = AsyncMock(side_effect=TaskException("bad params"))
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
@@ -949,8 +946,7 @@ RUN_AT = dt.datetime(2026, 3, 18, 12, 0, 0, tzinfo=dt.UTC)
 async def test_schedule_task_valid(state_manager):
     """POST /schedule-task schedules the task and returns 200 with task summary and run_at."""
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", queue="default", parameters={"foo": 1})
@@ -980,8 +976,7 @@ async def test_schedule_task_valid(state_manager):
 async def test_schedule_task_invalid_params_returns_400():
     """POST /schedule-task returns 400 when task parameters fail validation."""
 
-    async def task_function(foo: int) -> None:  # pragma: no cover
-        pass
+    async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", queue="default", parameters={"foo": "not_an_int"})

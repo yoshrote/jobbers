@@ -110,8 +110,8 @@ async def test_linear_chain(sm: StateManager) -> None:
     await run_until_done(sm)
 
     a_node = roots[0]
-    b_node = a_node._successors[0][0]  # type: ignore[attr-defined]
-    c_node = b_node._successors[0][0]  # type: ignore[attr-defined]
+    b_node = a_node._successors[0][0]
+    c_node = b_node._successors[0][0]
 
     task_a = await sm.ta.get_task(a_node.id)
     task_b = await sm.ta.get_task(b_node.id)
@@ -150,9 +150,9 @@ async def test_diamond_fan_out_fan_in(sm: StateManager) -> None:
     await run_until_done(sm)
 
     a_node = roots[0]
-    b_node = a_node._successors[0][0]  # type: ignore[attr-defined]
-    c_node = a_node._successors[1][0]  # type: ignore[attr-defined]
-    d_node = b_node._successors[0][0]  # type: ignore[attr-defined]
+    b_node = a_node._successors[0][0]
+    c_node = a_node._successors[1][0]
+    d_node = b_node._successors[0][0]
 
     task_a = await sm.ta.get_task(a_node.id)
     task_b = await sm.ta.get_task(b_node.id)
@@ -195,7 +195,7 @@ async def test_error_callback_fires_on_failure(sm: StateManager) -> None:
 
     a_node = roots[0]
     # _successors entry: (successor, fan_in_key, error_node, inject_parent_results)
-    c_node = a_node._successors[0][2]  # type: ignore[attr-defined]
+    c_node = a_node._successors[0][2]
 
     task_a = await sm.ta.get_task(a_node.id)
     task_c = await sm.ta.get_task(c_node.id)
@@ -227,7 +227,7 @@ async def test_downstream_not_submitted_on_parent_failure(sm: StateManager) -> N
     await run_until_done(sm)
 
     a_node = roots[0]
-    b_node = a_node._successors[0][0]  # type: ignore[attr-defined]
+    b_node = a_node._successors[0][0]
 
     task_a = await sm.ta.get_task(a_node.id)
     task_b = await sm.ta.get_task(b_node.id)
@@ -252,8 +252,8 @@ async def test_multi_root_dag(sm: StateManager) -> None:
     await run_until_done(sm)
 
     # roots order is non-deterministic (set iteration); look up by parameter
-    a_root = next(r for r in roots if r._parameters.get("value") == "a")  # type: ignore[attr-defined]
-    b_root = next(r for r in roots if r._parameters.get("value") == "b")  # type: ignore[attr-defined]
+    a_root = next(r for r in roots if r._parameters.get("value") == "a")
+    b_root = next(r for r in roots if r._parameters.get("value") == "b")
     task_a = await sm.ta.get_task(a_root.id)
     task_b = await sm.ta.get_task(b_root.id)
 
@@ -383,7 +383,7 @@ async def test_cancel_dag_root_leaves_downstream_unsubmitted(sm: StateManager) -
     await sm.submit_dag(*roots)
 
     a_node = roots[0]
-    b_node = a_node._successors[0][0]  # type: ignore[attr-defined]
+    b_node = a_node._successors[0][0]
 
     drain_bg = asyncio.create_task(drain(sm))
     await _wait_for_started(sm, a_node.id)

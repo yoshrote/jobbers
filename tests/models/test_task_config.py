@@ -22,8 +22,7 @@ def test_all_dead_letter_policy_values() -> None:
     }
 
 
-async def dummy_task():  # pragma: no cover
-    pass
+async def dummy_task(): ...
 
 
 def make_config(**kwargs) -> TaskConfig:

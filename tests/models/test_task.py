@@ -29,8 +29,7 @@ def test_valid_params():
         completed_at=None,
     )
 
-    def task_function(foo: str, bar: int | None = 5) -> None:  # pragma: no cover
-        pass
+    def task_function(foo: str, bar: int | None = 5) -> None: ...
 
     task.task_config = TaskConfig(
         name="test_task",
@@ -97,7 +96,7 @@ def test_shutdown_resubmit_policy_sets_status_unsubmitted():
 
 
 def test_should_retry_true_when_retries_remain():
-    async def noop() -> None: ...  # pragma: no cover
+    async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
@@ -106,7 +105,7 @@ def test_should_retry_true_when_retries_remain():
 
 
 def test_should_retry_false_when_exhausted():
-    async def noop() -> None: ...  # pragma: no cover
+    async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, max_retries=3)
@@ -115,7 +114,7 @@ def test_should_retry_false_when_exhausted():
 
 
 def test_should_schedule_true_when_retry_delay_set():
-    async def noop() -> None: ...  # pragma: no cover
+    async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, retry_delay=10)
@@ -123,7 +122,7 @@ def test_should_schedule_true_when_retry_delay_set():
 
 
 def test_should_schedule_false_when_no_retry_delay():
-    async def noop() -> None: ...  # pragma: no cover
+    async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     task.task_config = TaskConfig(name="t", function=noop, retry_delay=None)
@@ -670,8 +669,7 @@ def test_valid_task_params_skips_annotated_missing_param():
     """valid_task_params passes when an annotated parameter is absent from parameters (e.g. to-be-injected)."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
 
-    def fn(parent_results: dict | None = None) -> None:  # pragma: no cover
-        pass
+    def fn(parent_results: dict | None = None) -> None: ...
 
     task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
     task.parameters = {}  # parent_results not yet present
@@ -682,8 +680,7 @@ def test_valid_task_params_still_checks_provided_params():
     """valid_task_params still type-checks parameters that are present."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
 
-    def fn(x: int) -> None:  # pragma: no cover
-        pass
+    def fn(x: int) -> None: ...
 
     task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
     task.parameters = {"x": "not_an_int"}

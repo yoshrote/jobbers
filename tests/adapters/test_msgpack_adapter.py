@@ -123,14 +123,14 @@ async def test_get_all_tasks_task_id_order(msgpack_adapter):
         await msgpack_adapter.submit_task(t)
 
     results = await msgpack_adapter.get_all_tasks(
+        TaskPagination(queue="default", order_by=PaginationOrder.SUBMITTED_AT)
+    )
+    assert [r.id for r in results] == [ULID3, ULID2, ULID1]
+
+    results = await msgpack_adapter.get_all_tasks(
         TaskPagination(queue="default", order_by=PaginationOrder.TASK_ID)
     )
     assert [r.id for r in results] == [ULID1, ULID2, ULID3]
-
-    results = await msgpack_adapter.get_all_tasks(  # pragma: no cover
-        TaskPagination(queue="default", order_by=PaginationOrder.SUBMITTED_AT)  # pragma: no cover
-    )  # pragma: no cover
-    assert [r.id for r in results] == [ULID3, ULID2, ULID1]  # pragma: no cover
 
 
 # ── clean_terminal_tasks: edge cases ─────────────────────────────────────────

@@ -93,11 +93,11 @@ def test_inspect_nested_deps_topological_order():
 
 
 def test_inspect_detects_cycle():
-    async def a(x: Annotated[int, Depends(lambda: None)]) -> int:  # type: ignore[arg-type]
+    async def a(x: Annotated[int, Depends(lambda: None)]) -> int:
         return 1
 
     # Build a cycle: a → b → a (can't express cleanly with closures, use patching)
-    async def b(x: "Annotated[int, Depends(a)]") -> int:  # type: ignore[assignment]
+    async def b(x: "Annotated[int, Depends(a)]") -> int:
         return 1
 
     # Manually construct a cycle through dep_params
