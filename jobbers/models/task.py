@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, ge
 
 from opentelemetry import metrics
 from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter, field_serializer
+from pydantic.functional_serializers import SerializationInfo
+from pydantic.functional_validators import BeforeValidator
 from ulid import ULID
 
 from jobbers.di import get_injected_param_names
@@ -24,6 +26,31 @@ logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 
 
+def _parse_timestamp(v: object) -> dt.datetime | None:
+    if v is None or isinstance(v, dt.datetime):
+        return v  # type: ignore[return-value]
+    if isinstance(v, (int, float)):
+        return dt.datetime.fromtimestamp(v, dt.UTC)
+    if isinstance(v, str):
+        return dt.datetime.fromisoformat(v)
+    raise ValueError(f"Cannot parse timestamp: {v!r}")
+
+
+def _parse_ulid(v: object) -> ULID | None:
+    if v is None or isinstance(v, ULID):
+        return v  # type: ignore[return-value]
+    if isinstance(v, str):
+        return ULID.from_str(v)
+    if isinstance(v, (bytes, bytearray)):
+        return ULID.from_bytes(bytes(v))
+    raise ValueError(f"Cannot parse ULID: {v!r}")
+
+
+Timestamp = Annotated[dt.datetime | None, BeforeValidator(_parse_timestamp)]
+ULIDField = Annotated[ULID, BeforeValidator(_parse_ulid)]
+OptionalULIDField = Annotated[ULID | None, BeforeValidator(_parse_ulid)]
+
+
 class Task(BaseModel):
     """A task to be executed."""
 
@@ -38,31 +65,65 @@ class Task(BaseModel):
     # status fields
     retry_attempt: int = 0  # Number of times this task has been retried
     status: TaskStatus = Field(default=TaskStatus.UNSUBMITTED)
-    submitted_at: dt.datetime | None = None
-    retried_at: dt.datetime | None = None
-    started_at: dt.datetime | None = None
-    heartbeat_at: dt.datetime | None = None
-    completed_at: dt.datetime | None = None
+    submitted_at: Timestamp = None
+    retried_at: Timestamp = None
+    started_at: Timestamp = None
+    heartbeat_at: Timestamp = None
+    completed_at: Timestamp = None
 
     task_config: TaskConfig | None = Field(default=None, exclude=True)
     dag_callbacks: list[DAGCallback] = Field(default_factory=list)
     # Immediate parent task IDs — empty for root tasks, one entry for simple-chain
     # and dynamic fan-out children, many entries for fan-in collectors.
-    parent_ids: list[ULID] = Field(default_factory=list)
+    parent_ids: list[ULIDField] = Field(default_factory=list)
     # When True, the worker fetches parent results via parent_ids and injects them
     # as a `parent_results` kwarg before calling the task function.
     inject_parent_results: bool = False
     # Set on cron-dispatched root tasks so the worker can clear the active-run key on completion.
-    cron_id: ULID | None = Field(default=None)
+    cron_id: OptionalULIDField = Field(default=None)
     # Shared across every task in a DAG run; None for standalone tasks.
     # Generated once at submission time (submit_dag / dispatch_cron_dag) and propagated to all
     # descendants via generate_callbacks, generate_error_callbacks, and _handle_dynamic_fanout.
-    dag_run_id: ULID | None = Field(default=None)
+    dag_run_id: OptionalULIDField = Field(default=None)
 
     @field_serializer("id", when_used="json")
     def serialize_id(self, value: ULID) -> str:
-        """Serialize ULID to string for JSON output."""
         return str(value)
+
+    @field_serializer("submitted_at", "retried_at", "started_at", "heartbeat_at", "completed_at")
+    def serialize_timestamp(
+        self, value: dt.datetime | None, info: SerializationInfo
+    ) -> float | str | dt.datetime | None:
+        if value is None:
+            return None
+        mode = (info.context or {}).get("mode")
+        if mode == "msgpack":
+            return value  # msgpack ExtType(1) handles datetime → binary
+        if mode == "redis_json":
+            return value.timestamp()  # float for RediSearch NumericField
+        return value.isoformat()  # ISO string for SQL columns and API responses
+
+    @field_serializer("cron_id", "dag_run_id")
+    def serialize_optional_ulid(
+        self, value: ULID | None, info: SerializationInfo
+    ) -> ULID | str | None:
+        if value is None:
+            return None
+        if (info.context or {}).get("mode") == "msgpack":
+            return value  # msgpack ExtType(3) handles ULID → binary
+        return str(value)
+
+    @field_serializer("parent_ids")
+    def serialize_parent_ids(
+        self, value: list[ULID], info: SerializationInfo
+    ) -> list[ULID] | list[str]:
+        if (info.context or {}).get("mode") == "msgpack":
+            return list(value)  # msgpack ExtType(3) handles each ULID → binary
+        return [str(v) for v in value]
+
+    @field_serializer("dag_callbacks")
+    def serialize_dag_callbacks(self, value: list[DAGCallback]) -> list[dict[str, Any]]:
+        return [cb.model_dump(mode="json") for cb in value]
 
     def valid_task_params(self) -> bool:
         if not self.task_config:
@@ -205,9 +266,9 @@ class Task(BaseModel):
 
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(
+            mode="json",
             include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"}
         )
-        summary["id"] = str(self.id)
         if self.errors:
             summary["last_error"] = self.errors[-1]
         return summary
@@ -234,65 +295,6 @@ class Task(BaseModel):
         tasks = await self._adapter.get_tasks_bulk(self.parent_ids)
         results_list = [t.results if t is not None else {} for t in tasks]
         return results_list[0] if len(results_list) == 1 else results_list
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize task fields to a dict for RedisJSON storage."""
-
-        def _ts(d: dt.datetime | None) -> float | None:
-            return d.timestamp() if d is not None else None
-
-        return {
-            "name": self.name,
-            "queue": self.queue,
-            "version": self.version,
-            "parameters": self.parameters or {},
-            "results": self.results or {},
-            "errors": self.errors,
-            "retry_attempt": self.retry_attempt,
-            "status": str(self.status),
-            "submitted_at": _ts(self.submitted_at),
-            "retried_at": _ts(self.retried_at),
-            "started_at": _ts(self.started_at),
-            "heartbeat_at": _ts(self.heartbeat_at),
-            "completed_at": _ts(self.completed_at),
-            "dag_callbacks": [cb.model_dump(mode="json") for cb in self.dag_callbacks],
-            "parent_ids": [str(pid) for pid in self.parent_ids],
-            "inject_parent_results": self.inject_parent_results,
-            "cron_id": str(self.cron_id) if self.cron_id is not None else None,
-            "dag_run_id": str(self.dag_run_id) if self.dag_run_id is not None else None,
-        }
-
-    @classmethod
-    def from_dict(cls, task_id: ULID, raw: dict[str, Any]) -> "Self":
-        """Construct a Task from a plain dict (as produced by to_dict())."""
-
-        def _dt(ts: float | None) -> dt.datetime | None:
-            return dt.datetime.fromtimestamp(ts, dt.UTC) if ts is not None else None
-
-        def _ulid(v: ULID | str) -> ULID:
-            return v if isinstance(v, ULID) else ULID.from_str(v)
-
-        return cls(
-            id=task_id,
-            name=raw.get("name", ""),
-            queue=raw.get("queue", "default"),
-            version=raw.get("version", 0),
-            parameters=raw.get("parameters") or {},
-            results=raw.get("results") or {},
-            errors=raw.get("errors") or [],
-            retry_attempt=raw.get("retry_attempt", 0),
-            status=raw.get("status", TaskStatus.UNSUBMITTED),
-            submitted_at=_dt(raw.get("submitted_at")),
-            retried_at=_dt(raw.get("retried_at")),
-            started_at=_dt(raw.get("started_at")),
-            heartbeat_at=_dt(raw.get("heartbeat_at")),
-            completed_at=_dt(raw.get("completed_at")),
-            dag_callbacks=_dag_callback_adapter.validate_python(raw.get("dag_callbacks") or []),
-            parent_ids=[_ulid(p) for p in raw.get("parent_ids") or []],
-            inject_parent_results=raw.get("inject_parent_results", False),
-            cron_id=_ulid(raw["cron_id"]) if raw.get("cron_id") else None,
-            dag_run_id=_ulid(raw["dag_run_id"]) if raw.get("dag_run_id") else None,
-        )
 
     def set_status(self, status: TaskStatus) -> None:
         match status:
