@@ -33,6 +33,7 @@ from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
 
 if TYPE_CHECKING:
+    from pydantic import BaseModel
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.adapters.protocols import TaskAdapterProtocol
@@ -43,6 +44,9 @@ def _escape_tag(value: str) -> str:
     special = set(r',.<>{}[]"\':;!@#$%^&*()\-+=~| ')
     return "".join(f"\\{c}" if c in special else c for c in value)
 
+def _pack(model: BaseModel) -> dict[str, Any]:
+    """Pack a Pydantic model to a dict with RedisJSON-compatible values (e.g. ULIDs as strings)."""
+    return model.model_dump(mode="json", context={"mode": "redis_json"})
 
 # ---------------------------------------------------------------------------
 # RedisJSONRoutingBackend  (Redis Stack: RedisJSON + RediSearch)
@@ -106,7 +110,7 @@ class RedisJSONRoutingBackend:
         return QueueConfig.model_validate(raw)
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
-        await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", queue_config.to_dict())  # type: ignore[misc]
+        await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", _pack(queue_config))  # type: ignore[misc]
 
     async def delete_queue(self, queue_name: str) -> None:
         await self._client.delete(self.QUEUE_KEY(name=queue_name))
@@ -203,7 +207,7 @@ class RedisJSONRoutingBackend:
         await self._client.json().set(  # type: ignore[misc]
             self.ROUTING_KEY(task_name=routing_config.task_name, task_version=routing_config.task_version),
             "$",
-            routing_config.to_dict(),
+            _pack(routing_config),
         )
 
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
@@ -300,12 +304,12 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
 
     def pack(self, task: Task) -> str:
         """Serialize a task to a JSON string (float timestamps for RediSearch, string ULIDs)."""
-        return json.dumps(task.model_dump(context={"mode": "redis_json"}, exclude={"id"}))
+        return json.dumps(_pack(task))
 
     def unpack(self, task_id: ULID, data: str | dict[str, Any]) -> Task:
         """Deserialize a task from a JSON string or dict."""
         raw: dict[str, Any] = json.loads(data) if isinstance(data, str) else data
-        return Task.from_dict(task_id, raw)
+        return Task.model_validate({"id": task_id, **raw})
 
     async def _load_raw(self, key: str) -> dict[str, Any] | None:
         return cast("dict[str, Any] | None", await self.data_store.json().get(key))  # type: ignore[misc]
@@ -314,7 +318,7 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
         return cast("dict[str, Any] | None", await pipe.json().get(key))  # type: ignore[misc]
 
     def _stage_store(self, pipe: Pipeline, key: str, task: Task) -> None:
-        pipe.json().set(key, "$", task.model_dump(context={"mode": "redis_json"}, exclude={"id"}))
+        pipe.json().set(key, "$", json.loads(self.pack(task)))
 
     def _stage_load(self, pipe: Pipeline, key: str) -> None:
         pipe.json().get(key)

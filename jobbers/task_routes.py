@@ -225,7 +225,7 @@ async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
     if existing is not None:
         raise HTTPException(status_code=409, detail=f"Queue '{queue_config.name}' already exists.")
     await sm.save_queue_config(queue_config)
-    return {"message": "Queue created successfully", "queue": queue_config.model_dump()}
+    return {"message": "Queue created successfully", "queue": queue_config.model_dump(mode="json")}
 
 
 @app.get("/queues/{queue_name}/config")
@@ -234,7 +234,7 @@ async def get_queue_config(queue_name: str) -> dict[str, Any]:
     config = await db.get_state_manager().get_queue_config(queue_name)
     if config is None:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
-    return {"queue": config.model_dump()}
+    return {"queue": config.model_dump(mode="json")}
 
 
 @app.put("/queues/{queue_name}")
@@ -242,8 +242,7 @@ async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, 
     """Create or update the configuration for a queue. The name in the body is ignored; the path name is used."""
     queue_config.name = queue_name
     await db.get_state_manager().save_queue_config(queue_config)
-    return {"message": "Queue updated successfully", "queue": queue_config.model_dump()}
-
+    return {"message": "Queue updated successfully", "queue": queue_config.model_dump(mode="json")}
 
 @app.delete("/queues/{queue_name}", status_code=200)
 async def delete_queue(queue_name: str) -> dict[str, Any]:
@@ -470,7 +469,7 @@ async def get_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
     config = await db.get_state_manager().get_routing_config(task_name, task_version)
     if config is None:
         raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
-    return {"routing": config.model_dump()}
+    return {"routing": config.model_dump(mode="json")}
 
 
 @app.put("/task-routing/{task_name}/{task_version}")
@@ -481,7 +480,7 @@ async def update_task_routing(
     routing_config.task_name = task_name
     routing_config.task_version = task_version
     await db.get_state_manager().save_routing_config(routing_config)
-    return {"message": "Task routing updated successfully", "routing": routing_config.model_dump()}
+    return {"message": "Task routing updated successfully", "routing": routing_config.model_dump(mode="json")}
 
 
 @app.delete("/task-routing/{task_name}/{task_version}", status_code=200)

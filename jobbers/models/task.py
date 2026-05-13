@@ -266,9 +266,9 @@ class Task(BaseModel):
 
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(
+            mode="json",
             include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"}
         )
-        summary["id"] = str(self.id)
         if self.errors:
             summary["last_error"] = self.errors[-1]
         return summary
@@ -295,15 +295,6 @@ class Task(BaseModel):
         tasks = await self._adapter.get_tasks_bulk(self.parent_ids)
         results_list = [t.results if t is not None else {} for t in tasks]
         return results_list[0] if len(results_list) == 1 else results_list
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize for msgpack storage — datetimes and ULIDs passed as objects for ExtType encoding."""
-        return self.model_dump(context={"mode": "msgpack"}, exclude={"id"})
-
-    @classmethod
-    def from_dict(cls, task_id: ULID, raw: dict[str, Any]) -> "Self":
-        """Construct a Task from any storage dict (msgpack, redis_json, or SQL)."""
-        return cls.model_validate({"id": task_id, **raw})
 
     def set_status(self, status: TaskStatus) -> None:
         match status:

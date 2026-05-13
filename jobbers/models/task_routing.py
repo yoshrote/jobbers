@@ -43,9 +43,6 @@ class RoutingConfig(BaseModel):
                 raise ValueError("WEIGHTED routing requires weights with the same length as queues")
         return self
 
-    def to_dict(self) -> dict[str, Any]:
-        return self.model_dump()
-
     @classmethod
     def from_row(cls, row: Any) -> Self:
         """Construct from a DB row (task_name, task_version, strategy, queues_json, weights_json)."""

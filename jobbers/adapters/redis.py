@@ -2,8 +2,8 @@
 Plain Redis backed implementations (no Redis Stack modules required).
 
 Routing:
-- `RedisRoutingBackend` — stores queue/role/routing config as JSON strings
-  in plain Redis keys and sets. No SQL required.
+- `RedisRoutingBackend` — stores queue/role/routing config as msgpack-encoded
+  binary strings in plain Redis keys and sets. No SQL required.
 
 Task storage / dead-letter queue:
 - `MsgpackTaskAdapter` — stores tasks as msgpack-encoded binary strings,
@@ -15,7 +15,6 @@ Task storage / dead-letter queue:
 from __future__ import annotations
 
 import datetime as dt
-import json
 from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
@@ -29,9 +28,18 @@ from jobbers.utils.serialization import deserialize, serialize
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
+    from pydantic import BaseModel
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.adapters.protocols import TaskAdapterProtocol
+
+
+def _pack(obj: BaseModel, exclude: set[str] | None = None) -> bytes:
+    """Serialize any Pydantic model to msgpack bytes."""
+    kw: dict[str, Any] = {"context": {"mode": "msgpack"}}
+    if exclude:
+        kw["exclude"] = exclude
+    return serialize(obj.model_dump(**kw))
 
 
 # ---------------------------------------------------------------------------
@@ -68,10 +76,10 @@ class RedisRoutingBackend:
         raw = await self._client.get(self.QUEUE_KEY(name=queue))
         if raw is None:
             return None
-        return QueueConfig.model_validate(json.loads(raw))
+        return QueueConfig.model_validate(deserialize(raw))
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
-        payload = json.dumps(queue_config.to_dict())
+        payload = _pack(queue_config)
         pipe = self._client.pipeline(transaction=True)
         pipe.set(self.QUEUE_KEY(name=queue_config.name), payload)
         pipe.sadd(self.QUEUES_INDEX, queue_config.name)
@@ -171,10 +179,10 @@ class RedisRoutingBackend:
         raw = await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version))
         if raw is None:
             return None
-        return RoutingConfig.model_validate(json.loads(raw))
+        return RoutingConfig.model_validate(deserialize(raw))
 
     async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        payload = json.dumps(routing_config.to_dict())
+        payload = _pack(routing_config)
         await self._client.set(
             self.ROUTING_KEY(task_name=routing_config.task_name, task_version=routing_config.task_version),
             payload,
@@ -278,11 +286,11 @@ class MsgpackTaskAdapter(SharedTaskAdapterMixin):
 
     def pack(self, task: Task) -> bytes:
         """Serialize a task to msgpack bytes."""
-        return serialize(task.to_dict())
+        return _pack(task, exclude={"id"})
 
     def unpack(self, task_id: ULID, data: bytes) -> Task:
         """Deserialize a task from msgpack bytes."""
-        return Task.from_dict(task_id, deserialize(data))
+        return Task.model_validate({"id": task_id, **deserialize(data)})
 
     async def _load_raw(self, key: str) -> bytes | None:
         return cast("bytes | None", await self.data_store.get(key))

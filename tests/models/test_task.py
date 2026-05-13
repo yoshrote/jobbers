@@ -236,8 +236,8 @@ def _make_full_task(**overrides) -> Task:
 def test_to_dict_round_trip():
     """from_dict(to_dict()) reproduces the original task."""
     task = _make_full_task()
-    d = task.to_dict()
-    restored = Task.from_dict(task.id, d)
+    d = task.model_dump(context={"mode": "msgpack"}, exclude={"id"})
+    restored = Task.model_validate({"id": task.id, **d})
     assert restored.id == task.id
     assert restored.name == task.name
     assert restored.parameters == task.parameters
@@ -248,8 +248,8 @@ def test_to_dict_round_trip():
 
 def test_from_dict_missing_parent_ids_defaults_to_empty():
     """from_dict handles a dict with no parent_ids gracefully."""
-    minimal = {"name": "t", "queue": "default", "version": 1, "status": "submitted"}
-    task = Task.from_dict(ULID1, minimal)
+    minimal = {"id": ULID1, "name": "t", "queue": "default", "version": 1, "status": "submitted"}
+    task = Task.model_validate(minimal)
     assert task.parent_ids == []
 
 
@@ -264,8 +264,8 @@ def test_to_dict_preserves_dag_callbacks():
         status=TaskStatus.SUBMITTED,
         dag_callbacks=[SimpleCallback(task=child_spec)],
     )
-    d = task.to_dict()
-    restored = Task.from_dict(ULID1, d)
+    d = task.model_dump(context={"mode": "msgpack"}, exclude={"id"})
+    restored = Task.model_validate({"id": ULID1, **d})
     assert len(restored.dag_callbacks) == 1
     assert isinstance(restored.dag_callbacks[0], SimpleCallback)
     assert restored.dag_callbacks[0].task.name == "child"
@@ -690,13 +690,13 @@ def test_valid_task_params_still_checks_provided_params():
 def test_to_dict_round_trip_preserves_inject_flag():
     """inject_parent_results survives a to_dict/from_dict round-trip."""
     task = _make_full_task(inject_parent_results=True)
-    d = task.to_dict()
-    restored = Task.from_dict(task.id, d)
+    d = task.model_dump(context={"mode": "msgpack"}, exclude={"id"})
+    restored = Task.model_validate({"id": task.id, **d})
     assert restored.inject_parent_results is True
 
 
 def test_from_dict_missing_inject_flag_defaults_false():
     """from_dict defaults inject_parent_results to False for records that predate the field."""
-    minimal = {"name": "t", "queue": "default", "version": 1, "status": "submitted"}
-    task = Task.from_dict(ULID1, minimal)
+    minimal = {"id": ULID1, "name": "t", "queue": "default", "version": 1, "status": "submitted"}
+    task = Task.model_validate(minimal)
     assert task.inject_parent_results is False
