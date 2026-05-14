@@ -20,16 +20,16 @@ Routing backends (queues, roles, task routing config):
 - `StaticRoutingBackend` — read-only hardcoded config (no database required).
 """
 
-from jobbers.adapters.protocols import (
+from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter, RedisRoutingBackend
+from jobbers.adapters.redis_json import JsonDeadQueue, JsonTaskAdapter, RedisJSONRoutingBackend
+from jobbers.adapters.sql import SQLRoutingBackend
+from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.protocols import (
     DeadQueueProtocol,
     RoutingBackendProtocol,
     RoutingBackendReadOnlyError,
     TaskAdapterProtocol,
 )
-from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter, RedisRoutingBackend
-from jobbers.adapters.redis_json import JsonDeadQueue, JsonTaskAdapter, RedisJSONRoutingBackend
-from jobbers.adapters.sql import SQLRoutingBackend
-from jobbers.adapters.static import StaticRoutingBackend
 
 __all__ = [
     "TaskAdapterProtocol",

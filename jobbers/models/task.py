@@ -16,8 +16,8 @@ from .task_config import TaskConfig
 from .task_status import TaskStatus
 
 if TYPE_CHECKING:
-    from jobbers.adapters.protocols import TaskAdapterProtocol
     from jobbers.models.dag import DynamicFanOut
+    from jobbers.protocols import TaskAdapterProtocol
 
 _dag_callback_adapter: TypeAdapter[list[DAGCallback]] = TypeAdapter(list[DAGCallback])
 

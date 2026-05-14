@@ -14,13 +14,13 @@ from pydantic import BaseModel, Field
 from ulid import ULID
 
 from jobbers import db, registry
-from jobbers.adapters.protocols import RoutingBackendReadOnlyError
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
+from jobbers.protocols import RoutingBackendReadOnlyError
 from jobbers.state_manager import StateManager, TaskException
 from jobbers.utils.mermaid_dag import MermaidParseError, dag_spec_to_mermaid, parse_mermaid_dag
 from jobbers.validation import ValidationError, validate_task

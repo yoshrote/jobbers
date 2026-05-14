@@ -15,7 +15,7 @@ from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.migrations.runner import run_migrations
 
 if TYPE_CHECKING:
-    from jobbers.adapters.protocols import RoutingBackendProtocol, TaskAdapterProtocol
+    from jobbers.protocols import RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.state_manager import StateManager
 
 TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")

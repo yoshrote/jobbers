@@ -9,9 +9,9 @@ from typing import Any
 
 from ulid import ULID
 
-from jobbers.adapters.protocols import RoutingBackendReadOnlyError
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+from jobbers.protocols import RoutingBackendReadOnlyError
 
 _DEFAULT_QUEUE = QueueConfig(name="default", max_concurrent=10)
 _DEFAULT_ROLES: dict[str, set[str]] = {"default": {"default"}}

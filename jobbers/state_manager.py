@@ -30,11 +30,11 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
+    from jobbers.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)

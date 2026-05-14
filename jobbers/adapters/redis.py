@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.protocols import TaskAdapterProtocol
+    from jobbers.protocols import TaskAdapterProtocol
 
 
 def _pack(obj: BaseModel, exclude: set[str] | None = None) -> bytes:

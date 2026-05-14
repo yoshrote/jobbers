@@ -11,10 +11,10 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 
-from jobbers.adapters.protocols import RoutingBackendReadOnlyError
 from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+from jobbers.protocols import RoutingBackendReadOnlyError
 
 
 @pytest_asyncio.fixture
