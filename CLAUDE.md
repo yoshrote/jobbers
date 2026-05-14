@@ -14,8 +14,7 @@ jobbers/
 │   ├── schedulers/            # Scheduler logic (task promotion, cron DAG execution)
 │   │   ├── task_scheduler.py  # TaskScheduler: promotes due scheduled tasks into queues
 │   │   └── cron_dag_scheduler.py  # CronDAGScheduler: drives cron DAG execution
-│   ├── utils/                 # OpenTelemetry, serialization
-│   ├── di.py                  # FastAPI-styled dependency injection resolver
+│   ├── utils/                 # OpenTelemetry, serialization, dependency injection resolver
 │   ├── state_manager.py       # Central Redis/SQL state management
 │   ├── task_processor.py      # Single-task execution lifecycle
 │   ├── task_generator.py      # Async iterator: yields tasks from queues

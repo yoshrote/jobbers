@@ -8,8 +8,8 @@ from pydantic.functional_serializers import SerializationInfo
 from pydantic.functional_validators import BeforeValidator
 from ulid import ULID
 
-from jobbers.di import get_injected_param_names
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+from jobbers.utils.di import get_injected_param_names
 
 from .dag import DAGCallback, FanInCallback, SimpleCallback, TaskResult
 from .task_config import TaskConfig
