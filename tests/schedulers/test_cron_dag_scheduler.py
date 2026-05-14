@@ -7,8 +7,8 @@ import pytest_asyncio
 from ulid import ULID
 
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
 from jobbers.models.dag import DAGTaskSpec
+from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
 
 PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 FUTURE = dt.datetime(2099, 1, 1, tzinfo=dt.UTC)

@@ -17,13 +17,13 @@ from jobbers import registry
 from jobbers.adapters.redis import DeadQueue
 from jobbers.adapters.redis_json import JsonTaskAdapter
 from jobbers.models.cron_dag import ConcurrencyPolicy
-from jobbers.models.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
 from jobbers.models.dag import collect_fan_in_keys
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
-from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
+from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
+from jobbers.schedulers.task_scheduler import TaskScheduler
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
