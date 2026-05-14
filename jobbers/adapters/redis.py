@@ -1,9 +1,10 @@
 """
 Plain Redis backed implementations (no Redis Stack modules required).
 
-Routing:
-- `RedisRoutingBackend` — stores queue/role/routing config as msgpack-encoded
-  binary strings in plain Redis keys and sets. No SQL required.
+Routing sub-adapters:
+- `RedisQueueConfigAdapter` — queue/role config and refresh tags in plain Redis keys/sets.
+- `RedisTaskRoutingConfigAdapter` — task routing config in plain Redis keys.
+- `RedisRoutingBackend` — composes the two sub-adapters to satisfy RoutingBackendProtocol.
 
 Task storage / dead-letter queue:
 - `MsgpackTaskAdapter` — stores tasks as msgpack-encoded binary strings,
@@ -43,21 +44,20 @@ def _pack(obj: BaseModel, exclude: set[str] | None = None) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# RedisRoutingBackend  (plain Redis: string values + sets)
+# RedisQueueConfigAdapter  (plain Redis: string values + sets)
 # ---------------------------------------------------------------------------
 
 
-class RedisRoutingBackend:
+class RedisQueueConfigAdapter:
     """
-    RoutingBackendProtocol backed by Redis. No SQL required.
+    QueueConfigProtocol backed by plain Redis keys and sets. No SQL required.
 
     Key scheme:
-      config:queue:{name}                — JSON string (QueueConfig fields)
+      config:queue:{name}                — msgpack bytes (QueueConfig fields)
       config:queues                      — Set of all queue names
       config:role:{name}:queues          — Set of queue names for the role
       config:roles                       — Set of all role names
       config:role:{name}:refresh_tag     — String (ULID)
-      config:routing:{task_name}:{ver}   — JSON string (RoutingConfig fields)
     """
 
     QUEUE_KEY = "config:queue:{name}".format
@@ -65,7 +65,6 @@ class RedisRoutingBackend:
     ROLE_QUEUES_KEY = "config:role:{name}:queues".format
     ROLES_INDEX = "config:roles"
     ROLE_REFRESH_TAG_KEY = "config:role:{name}:refresh_tag".format
-    ROUTING_KEY = "config:routing:{task_name}:{task_version}".format
 
     def __init__(self, client: Redis) -> None:
         self._client = client
@@ -173,7 +172,43 @@ class RedisRoutingBackend:
             await pipe.execute()
         return affected
 
-    # ── Task routing config ───────────────────────────────────────────────────
+    # ── Queue limits (batch read) ─────────────────────────────────────────────
+
+    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]:
+        if not queues_set:
+            return {}
+        ordered = list(queues_set)
+        pipe = self._client.pipeline(transaction=False)
+        for name in ordered:
+            pipe.get(self.QUEUE_KEY(name=name))
+        raws: list[bytes | None] = await pipe.execute()
+        result: dict[str, int | None] = {}
+        for name, raw in zip(ordered, raws):
+            if raw is None:
+                result[name] = None
+            else:
+                cfg = QueueConfig.model_validate(deserialize(raw))
+                result[name] = cfg.max_concurrent
+        return result
+
+
+# ---------------------------------------------------------------------------
+# RedisTaskRoutingConfigAdapter  (plain Redis: string values)
+# ---------------------------------------------------------------------------
+
+
+class RedisTaskRoutingConfigAdapter:
+    """
+    TaskRoutingConfigProtocol backed by plain Redis keys. No SQL required.
+
+    Key scheme:
+      config:routing:{task_name}:{task_version}   — msgpack bytes (RoutingConfig fields)
+    """
+
+    ROUTING_KEY = "config:routing:{task_name}:{task_version}".format
+
+    def __init__(self, client: Redis) -> None:
+        self._client = client
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
         raw = await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version))
@@ -193,6 +228,61 @@ class RedisRoutingBackend:
             self.ROUTING_KEY(task_name=task_name, task_version=task_version)
         )
         return deleted > 0
+
+
+# ---------------------------------------------------------------------------
+# RedisRoutingBackend  (composes the two sub-adapters above)
+# ---------------------------------------------------------------------------
+
+
+class RedisRoutingBackend:
+    """RoutingBackendProtocol backed by Redis. Delegates to RedisQueueConfigAdapter and RedisTaskRoutingConfigAdapter."""
+
+    def __init__(self, client: Redis) -> None:
+        self._qca = RedisQueueConfigAdapter(client)
+        self._rca = RedisTaskRoutingConfigAdapter(client)
+
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
+        return await self._qca.get_queue_config(queue)
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        await self._qca.save_queue_config(queue_config)
+
+    async def delete_queue(self, queue_name: str) -> None:
+        await self._qca.delete_queue(queue_name)
+
+    async def get_all_queues(self) -> list[str]:
+        return await self._qca.get_all_queues()
+
+    async def get_queues(self, role: str) -> set[str]:
+        return await self._qca.get_queues(role)
+
+    async def save_role(self, role: str, queues_set: set[str]) -> str:
+        return await self._qca.save_role(role, queues_set)
+
+    async def get_all_roles(self) -> list[str]:
+        return await self._qca.get_all_roles()
+
+    async def delete_role(self, role: str) -> None:
+        await self._qca.delete_role(role)
+
+    async def get_refresh_tag(self, role: str) -> ULID:
+        return await self._qca.get_refresh_tag(role)
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        return await self._qca.bump_refresh_tag(role)
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        return await self._qca.bump_refresh_tags_for_queue(queue_name)
+
+    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
+        return await self._rca.get_routing_config(task_name, task_version)
+
+    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
+        await self._rca.save_routing_config(routing_config)
+
+    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
+        return await self._rca.delete_routing_config(task_name, task_version)
 
 
 # ---------------------------------------------------------------------------

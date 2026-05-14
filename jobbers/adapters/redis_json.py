@@ -1,17 +1,18 @@
 """
 Redis Stack (RedisJSON + RediSearch) backed implementations.
 
-Routing:
-- `RedisJSONRoutingBackend` — stores queue/role/routing config as RedisJSON
-  documents. Uses RediSearch to find roles containing a given queue, replacing
-  the O(N) scan in the plain Redis backend with an indexed query.
+Routing sub-adapters:
+- `RedisJSONQueueConfigAdapter` — queue/role config and refresh tags in RedisJSON docs
+  with RediSearch indexes. Replaces the O(N) set scans in the plain Redis backend.
+- `RedisJSONTaskRoutingConfigAdapter` — task routing config in RedisJSON docs.
+- `RedisJSONRoutingBackend` — composes the two sub-adapters to satisfy RoutingBackendProtocol.
 
 Task storage / dead-letter queue:
 - `JsonTaskAdapter` — stores tasks as RedisJSON documents, queries via RediSearch.
 - `JsonDeadQueue` — stores dead-letter entries as RedisJSON documents with a
   RediSearch index for server-side filtering and sorting.
 
-All three require a Redis Stack instance with the RedisJSON and RediSearch modules.
+All classes require a Redis Stack instance with the RedisJSON and RediSearch modules.
 """
 
 from __future__ import annotations
@@ -44,22 +45,23 @@ def _escape_tag(value: str) -> str:
     special = set(r',.<>{}[]"\':;!@#$%^&*()\-+=~| ')
     return "".join(f"\\{c}" if c in special else c for c in value)
 
+
 def _pack(model: BaseModel) -> dict[str, Any]:
     """Pack a Pydantic model to a dict with RedisJSON-compatible values (e.g. ULIDs as strings)."""
     return model.model_dump(mode="json", context={"mode": "redis_json"})
 
+
 # ---------------------------------------------------------------------------
-# RedisJSONRoutingBackend  (Redis Stack: RedisJSON + RediSearch)
+# RedisJSONQueueConfigAdapter  (Redis Stack: RedisJSON + RediSearch)
 # ---------------------------------------------------------------------------
 
 
-class RedisJSONRoutingBackend:
+class RedisJSONQueueConfigAdapter:
     """
-    RoutingBackendProtocol backed by RedisJSON. Requires Redis Stack.
+    QueueConfigProtocol backed by RedisJSON. Requires Redis Stack.
 
-    Stores routing config as JSON documents. Two RediSearch indexes replace the
-    plain-Redis set indexes (`routing:queues`, `routing:roles`) used by
-    RedisRoutingBackend:
+    Two RediSearch indexes replace the plain-Redis set indexes used by
+    RedisQueueConfigAdapter:
 
       routing_queue_idx — on routing:queue:* docs; enables enumeration and fast
                           queue-membership queries without a separate index set.
@@ -68,10 +70,9 @@ class RedisJSONRoutingBackend:
                           scanning all roles.
 
     Key scheme:
-      routing:queue:{name}                    — JSON doc (QueueConfig fields)
-      routing:role:{name}                     — JSON doc {queues: [...]}
-      routing:tag:{name}                      — String (ULID, refresh tag)
-      routing:config:{task_name}:{ver}        — JSON doc (RoutingConfig fields)
+      routing:queue:{name}   — JSON doc (QueueConfig fields)
+      routing:role:{name}    — JSON doc {queues: [...]}
+      routing:tag:{name}     — String (ULID, refresh tag)
     """
 
     QUEUE_IDX = "routing_queue_idx"
@@ -79,7 +80,6 @@ class RedisJSONRoutingBackend:
     QUEUE_KEY = "routing:queue:{name}".format
     ROLE_KEY = "routing:role:{name}".format
     REFRESH_TAG_KEY = "routing:tag:{name}".format
-    ROUTING_KEY = "routing:config:{task_name}:{task_version}".format
 
     def __init__(self, client: Redis) -> None:
         self._client = client
@@ -137,6 +137,22 @@ class RedisJSONRoutingBackend:
         results = await self._client.ft(self.QUEUE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
         return sorted(doc.id.removeprefix("routing:queue:") for doc in (results.docs or []))
 
+    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]:
+        if not queues_set:
+            return {}
+        ordered = list(queues_set)
+        pipe = self._client.pipeline(transaction=False)
+        for name in ordered:
+            pipe.json().get(self.QUEUE_KEY(name=name))
+        raws: list[dict[str, Any] | None] = await pipe.execute()
+        result: dict[str, int | None] = {}
+        for name, raw in zip(ordered, raws):
+            if raw is None:
+                result[name] = None
+            else:
+                result[name] = QueueConfig.model_validate(raw).max_concurrent
+        return result
+
     # ── Role CRUD ─────────────────────────────────────────────────────────────
 
     async def get_queues(self, role: str) -> set[str]:
@@ -193,7 +209,19 @@ class RedisJSONRoutingBackend:
             await pipe.execute()
         return affected
 
-    # ── Task routing config ───────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# RedisJSONTaskRoutingConfigAdapter  (Redis Stack: RedisJSON)
+# ---------------------------------------------------------------------------
+
+
+class RedisJSONTaskRoutingConfigAdapter:
+    """TaskRoutingConfigProtocol backed by RedisJSON plain key-value docs."""
+
+    ROUTING_KEY = "routing:config:{task_name}:{task_version}".format
+
+    def __init__(self, client: Redis) -> None:
+        self._client = client
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
         raw: dict[str, Any] | None = await self._client.json().get(  # type: ignore[misc]
@@ -215,6 +243,64 @@ class RedisJSONRoutingBackend:
             self.ROUTING_KEY(task_name=task_name, task_version=task_version)
         )
         return deleted > 0
+
+
+# ---------------------------------------------------------------------------
+# RedisJSONRoutingBackend  (Redis Stack: RedisJSON + RediSearch)
+# ---------------------------------------------------------------------------
+
+
+class RedisJSONRoutingBackend:
+    """RoutingBackendProtocol backed by RedisJSON. Delegates to sub-adapters."""
+
+    def __init__(self, client: Redis) -> None:
+        self._qca = RedisJSONQueueConfigAdapter(client)
+        self._rca = RedisJSONTaskRoutingConfigAdapter(client)
+
+    async def ensure_indexes(self) -> None:
+        await self._qca.ensure_indexes()
+
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
+        return await self._qca.get_queue_config(queue)
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        await self._qca.save_queue_config(queue_config)
+
+    async def delete_queue(self, queue_name: str) -> None:
+        await self._qca.delete_queue(queue_name)
+
+    async def get_all_queues(self) -> list[str]:
+        return await self._qca.get_all_queues()
+
+    async def get_queues(self, role: str) -> set[str]:
+        return await self._qca.get_queues(role)
+
+    async def save_role(self, role: str, queues_set: set[str]) -> str:
+        return await self._qca.save_role(role, queues_set)
+
+    async def get_all_roles(self) -> list[str]:
+        return await self._qca.get_all_roles()
+
+    async def delete_role(self, role: str) -> None:
+        await self._qca.delete_role(role)
+
+    async def get_refresh_tag(self, role: str) -> ULID:
+        return await self._qca.get_refresh_tag(role)
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        return await self._qca.bump_refresh_tag(role)
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        return await self._qca.bump_refresh_tags_for_queue(queue_name)
+
+    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
+        return await self._rca.get_routing_config(task_name, task_version)
+
+    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
+        await self._rca.save_routing_config(routing_config)
+
+    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
+        return await self._rca.delete_routing_config(task_name, task_version)
 
 
 # ---------------------------------------------------------------------------

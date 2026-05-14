@@ -8,10 +8,10 @@ import pytest
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.adapters.sql import SQLRoutingBackend
+from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGNode, DAGTaskSpec
-from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter, RatePeriod
+from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
@@ -1078,7 +1078,7 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
 ):
     """save_queue_config writes to SQL, clears the cache entry, and bumps refresh_tag for containing roles."""
     sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
-    qca = QueueConfigAdapter(session_factory)
+    qca = SQLQueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
     await qca.save_role("role_a", {"q1"})
     tag_before = await sm.get_refresh_tag("role_a")
