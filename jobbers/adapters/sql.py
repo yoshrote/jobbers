@@ -1,26 +1,266 @@
-"""SQLAlchemy-backed routing backend (the default)."""
+"""SQLAlchemy-backed routing sub-adapters and routing backend (the default)."""
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
-from jobbers.models.queue_config import QueueConfigAdapter
-from jobbers.models.task_routing import TaskRoutingConfigAdapter
+from sqlalchemy import delete, insert, select, update
+from sqlalchemy.exc import IntegrityError
+from ulid import ULID
+
+from jobbers.migrations.schema import queues, role_queues, roles, task_routing
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-    from ulid import ULID
 
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
+
+
+class SQLQueueConfigAdapter:
+    """
+    Manages queue configuration in a data store via SQLAlchemy async sessions.
+
+    - `roles`: table of named roles, each with a refresh_tag for change detection.
+    - `queues`: table of queue configurations (concurrency and rate limiting).
+    - `role_queues`: many-to-many mapping of roles to queues.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.session_factory = session_factory
+
+    async def get_queues(self, role: str) -> set[str]:
+        async with self.session_factory() as session:
+            result = await session.execute(select(role_queues.c.queue).where(role_queues.c.role == role))
+            return {row[0] for row in result.fetchall()}
+
+    async def save_role(self, role: str, queues_set: set[str]) -> str:
+        new_tag = str(ULID())
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(select(roles.c.name).where(roles.c.name == role))
+            if existing.fetchone():
+                await session.execute(update(roles).where(roles.c.name == role).values(refresh_tag=new_tag))
+            else:
+                await session.execute(insert(roles).values(name=role, refresh_tag=new_tag))
+            await session.execute(delete(role_queues).where(role_queues.c.role == role))
+            if queues_set:
+                await session.execute(
+                    insert(role_queues),
+                    [{"role": role, "queue": q} for q in queues_set],
+                )
+        return new_tag
+
+    async def get_all_queues(self) -> list[str]:
+        async with self.session_factory() as session:
+            result = await session.execute(select(queues.c.name).order_by(queues.c.name))
+            return [row[0] for row in result.fetchall()]
+
+    async def get_all_roles(self) -> list[str]:
+        async with self.session_factory() as session:
+            result = await session.execute(select(roles.c.name).order_by(roles.c.name))
+            return [row[0] for row in result.fetchall()]
+
+    async def get_queue_config(self, queue: str) -> QueueConfig | None:
+        from jobbers.models.queue_config import QueueConfig as QC
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    queues.c.name,
+                    queues.c.max_concurrent,
+                    queues.c.rate_numerator,
+                    queues.c.rate_denominator,
+                    queues.c.rate_period,
+                ).where(queues.c.name == queue)
+            )
+            row = result.fetchone()
+        if row is None:
+            return None
+        return QC.from_row(row)
+
+    async def save_queue_config(self, queue_config: QueueConfig) -> None:
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(select(queues.c.name).where(queues.c.name == queue_config.name))
+            if existing.fetchone():
+                await session.execute(
+                    update(queues)
+                    .where(queues.c.name == queue_config.name)
+                    .values(
+                        max_concurrent=queue_config.max_concurrent,
+                        rate_numerator=queue_config.rate_numerator,
+                        rate_denominator=queue_config.rate_denominator,
+                        rate_period=queue_config.rate_period,
+                    )
+                )
+            else:
+                await session.execute(
+                    insert(queues).values(
+                        name=queue_config.name,
+                        max_concurrent=queue_config.max_concurrent,
+                        rate_numerator=queue_config.rate_numerator,
+                        rate_denominator=queue_config.rate_denominator,
+                        rate_period=queue_config.rate_period,
+                    )
+                )
+
+    async def delete_queue(self, queue_name: str) -> None:
+        """Delete a queue and cascade to role_queues; bump refresh_tag for affected roles."""
+        new_tag = str(ULID())
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(role_queues.c.role).where(role_queues.c.queue == queue_name).distinct()
+            )
+            affected_roles = [row[0] for row in result.fetchall()]
+            await session.execute(delete(queues).where(queues.c.name == queue_name))
+            if affected_roles:
+                await session.execute(
+                    update(roles).where(roles.c.name.in_(affected_roles)).values(refresh_tag=new_tag)
+                )
+
+    async def delete_role(self, role: str) -> None:
+        """Delete a role (cascades to role_queues). Queue configs are preserved."""
+        async with self.session_factory.begin() as session:
+            await session.execute(delete(roles).where(roles.c.name == role))
+
+    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]:
+
+        if not queues_set:
+            return {}
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(queues.c.name, queues.c.max_concurrent).where(queues.c.name.in_(list(queues_set)))
+            )
+            found = {row[0]: row[1] for row in result.fetchall()}
+        return {q: found.get(q) for q in queues_set}
+
+    async def get_refresh_tag(self, role: str) -> ULID:
+        """Return the current refresh tag for a role, creating one if needed."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
+        tag_str: str | None = result.scalar()
+        if tag_str:
+            existing_tag: ULID = ULID.from_str(tag_str)
+            return existing_tag
+
+        init_tag = ULID()
+        try:
+            async with self.session_factory.begin() as session:
+                await session.execute(insert(roles).values(name=role, refresh_tag=str(init_tag)))
+        except IntegrityError:
+            pass  # Another process inserted first
+        # Re-read in case another process won the race
+        async with self.session_factory() as session:
+            result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
+        tag_str = result.scalar()
+        return ULID.from_str(tag_str) if tag_str else init_tag
+
+    async def bump_refresh_tag(self, role: str) -> str:
+        """Generate a new ULID tag for *role* and write it to SQL. Returns the new tag string."""
+        new_tag = str(ULID())
+        async with self.session_factory.begin() as session:
+            await session.execute(update(roles).where(roles.c.name == role).values(refresh_tag=new_tag))
+        return new_tag
+
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
+        """Bump refresh_tag for every role that contains *queue_name*. Returns affected role names."""
+        new_tag = str(ULID())
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(role_queues.c.role).where(role_queues.c.queue == queue_name).distinct()
+            )
+            affected_roles = [row[0] for row in result.fetchall()]
+            if affected_roles:
+                await session.execute(
+                    update(roles).where(roles.c.name.in_(affected_roles)).values(refresh_tag=new_tag)
+                )
+        return affected_roles
+
+
+class SQLTaskRoutingConfigAdapter:
+    """Manages task routing configuration in the SQL data store."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.session_factory = session_factory
+
+    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
+        from jobbers.models.task_routing import RoutingConfig as RC
+
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(
+                    task_routing.c.task_name,
+                    task_routing.c.task_version,
+                    task_routing.c.strategy,
+                    task_routing.c.queues,
+                    task_routing.c.weights,
+                ).where(
+                    task_routing.c.task_name == task_name,
+                    task_routing.c.task_version == task_version,
+                )
+            )
+            row = result.fetchone()
+        if row is None:
+            return None
+        return RC.from_row(row)
+
+    async def save_routing_config(self, config: RoutingConfig) -> None:
+        """Create or replace the routing config for a task type."""
+        queues_json = json.dumps(config.queues)
+        weights_json = json.dumps(config.weights) if config.weights is not None else None
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(
+                select(task_routing.c.task_name).where(
+                    task_routing.c.task_name == config.task_name,
+                    task_routing.c.task_version == config.task_version,
+                )
+            )
+            if existing.fetchone():
+                await session.execute(
+                    update(task_routing)
+                    .where(
+                        task_routing.c.task_name == config.task_name,
+                        task_routing.c.task_version == config.task_version,
+                    )
+                    .values(strategy=config.strategy, queues=queues_json, weights=weights_json)
+                )
+            else:
+                await session.execute(
+                    insert(task_routing).values(
+                        task_name=config.task_name,
+                        task_version=config.task_version,
+                        strategy=config.strategy,
+                        queues=queues_json,
+                        weights=weights_json,
+                    )
+                )
+
+    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
+        """Remove the routing config for a task type. Returns False if it did not exist."""
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(
+                select(task_routing.c.task_name).where(
+                    task_routing.c.task_name == task_name,
+                    task_routing.c.task_version == task_version,
+                )
+            )
+            if existing.fetchone() is None:
+                return False
+            await session.execute(
+                delete(task_routing).where(
+                    task_routing.c.task_name == task_name,
+                    task_routing.c.task_version == task_version,
+                )
+            )
+        return True
 
 
 class SQLRoutingBackend:
     """RoutingBackendProtocol backed by SQLAlchemy (the original SQL-based implementation)."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
-        self._qca = QueueConfigAdapter(session_factory)
-        self._rca = TaskRoutingConfigAdapter(session_factory)
+        self._qca = SQLQueueConfigAdapter(session_factory)
+        self._rca = SQLTaskRoutingConfigAdapter(session_factory)
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
         return await self._qca.get_queue_config(queue)

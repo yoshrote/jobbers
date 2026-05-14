@@ -5,8 +5,19 @@ import redis.asyncio as aioredis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
-from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter
-from jobbers.adapters.redis_json import JsonDeadQueue, JsonTaskAdapter
+from jobbers.adapters.redis import (
+    DeadQueue,
+    MsgpackTaskAdapter,
+    RedisQueueConfigAdapter,
+    RedisTaskRoutingConfigAdapter,
+)
+from jobbers.adapters.redis_json import (
+    JsonDeadQueue,
+    JsonTaskAdapter,
+    RedisJSONQueueConfigAdapter,
+    RedisJSONTaskRoutingConfigAdapter,
+)
+from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLTaskRoutingConfigAdapter
 from jobbers.db import DEFAULT_REDIS_URL
 
 
@@ -95,6 +106,63 @@ async def json_dead_queue(json_adapter):
     dq = JsonDeadQueue(json_adapter.data_store, json_adapter)
     await dq.ensure_index()
     yield dq
+
+
+@pytest_asyncio.fixture(params=["sql", "redis", "redis_json"], ids=["sql", "redis", "redis_json"])
+async def queue_config_adapter(request, session_factory, redis):
+    """
+    Parameterized fixture yielding a QueueConfigProtocol implementation for each backend.
+
+    - ``"sql"``: SQLQueueConfigAdapter backed by in-memory SQLite
+    - ``"redis"``: RedisQueueConfigAdapter backed by FakeAsyncRedis
+    - ``"redis_json"``: RedisJSONQueueConfigAdapter backed by real Redis Stack; skips if unavailable
+    """
+    if request.param == "sql":
+        yield SQLQueueConfigAdapter(session_factory)
+    elif request.param == "redis":
+        yield RedisQueueConfigAdapter(redis)
+    else:
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+        try:
+            await r.flushdb()
+        except RedisConnectionError as exc:  # pragma: no cover
+            await r.aclose()
+            pytest.skip(f"Redis not available: {exc}")
+        adapter = RedisJSONQueueConfigAdapter(r)
+        try:
+            await adapter.ensure_indexes()
+        except ResponseError as exc:  # pragma: no cover
+            await r.aclose()
+            pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
+        yield adapter
+        await r.flushdb()
+        await r.aclose()
+
+
+@pytest_asyncio.fixture(params=["sql", "redis", "redis_json"], ids=["sql", "redis", "redis_json"])
+async def task_routing_config_adapter(request, session_factory, redis):
+    """
+    Parameterized fixture yielding a TaskRoutingConfigProtocol implementation for each backend.
+
+    - ``"sql"``: SQLTaskRoutingConfigAdapter backed by in-memory SQLite
+    - ``"redis"``: RedisTaskRoutingConfigAdapter backed by FakeAsyncRedis
+    - ``"redis_json"``: RedisJSONTaskRoutingConfigAdapter backed by real Redis Stack; skips if unavailable
+    """
+    if request.param == "sql":
+        yield SQLTaskRoutingConfigAdapter(session_factory)
+    elif request.param == "redis":
+        yield RedisTaskRoutingConfigAdapter(redis)
+    else:
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+        try:
+            await r.flushdb()
+        except RedisConnectionError as exc:  # pragma: no cover
+            await r.aclose()
+            pytest.skip(f"Redis not available: {exc}")
+        adapter = RedisJSONTaskRoutingConfigAdapter(r)
+        yield adapter
+        await r.flushdb()
+        await r.aclose()
 
 
 @pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])

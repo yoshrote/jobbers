@@ -7,8 +7,8 @@ from ulid import ULID
 
 import end2end
 from jobbers.adapters.redis import MsgpackTaskAdapter
-from jobbers.adapters.sql import SQLRoutingBackend
-from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
+from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
+from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import clear_registry
 from jobbers.state_manager import StateManager
@@ -28,7 +28,7 @@ def register_e2e_tasks():
 
 @pytest_asyncio.fixture
 async def sm(redis, session_factory):
-    await QueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
+    await SQLQueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
     return StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=MsgpackTaskAdapter(redis))
 
 

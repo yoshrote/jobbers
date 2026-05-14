@@ -14,13 +14,13 @@ from pydantic import BaseModel, Field
 from ulid import ULID
 
 from jobbers import db, registry
-from jobbers.adapters.protocols import RoutingBackendReadOnlyError
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
+from jobbers.protocols import RoutingBackendReadOnlyError
 from jobbers.state_manager import StateManager, TaskException
 from jobbers.utils.mermaid_dag import MermaidParseError, dag_spec_to_mermaid, parse_mermaid_dag
 from jobbers.validation import ValidationError, validate_task
@@ -243,6 +243,7 @@ async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, 
     queue_config.name = queue_name
     await db.get_state_manager().save_queue_config(queue_config)
     return {"message": "Queue updated successfully", "queue": queue_config.model_dump(mode="json")}
+
 
 @app.delete("/queues/{queue_name}", status_code=200)
 async def delete_queue(queue_name: str) -> dict[str, Any]:

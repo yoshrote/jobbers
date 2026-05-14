@@ -5,14 +5,14 @@ from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type
 from opentelemetry import metrics
 
 from jobbers.context import _current_task as _current_task_cv
-from jobbers.di import DependencyResolver
-from jobbers.di import Depends as _Depends
 from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import get_task_config
 from jobbers.state_manager import StateManager, UserCancellationError
+from jobbers.utils.di import DependencyResolver
+from jobbers.utils.di import Depends as _Depends
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable

@@ -8,8 +8,9 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
+from jobbers.adapters.sql import SQLQueueConfigAdapter
 from jobbers.models.dag import DAGRunPagination
-from jobbers.models.queue_config import QueueConfig, QueueConfigAdapter
+from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
@@ -23,7 +24,7 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 @pytest_asyncio.fixture(autouse=True)
 async def setup(session_factory, state_manager):
     """Seed the 'default' queue into both SQL (for task-routing CRUD tests) and the routing backend."""
-    await QueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
+    await SQLQueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
     await state_manager.routing.save_queue_config(QueueConfig(name="default"))
     patches = [
         patch("jobbers.task_routes.db.get_session_factory", return_value=session_factory),
@@ -204,7 +205,7 @@ async def test_set_queues():
 @pytest.mark.asyncio
 async def test_set_queues_rolls_back_on_invalid_queue(session_factory):
     """Adding a nonexistent queue to a role rolls back: original queues are preserved."""
-    qca = QueueConfigAdapter(session_factory)
+    qca = SQLQueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="extra_queue"))
     await qca.save_role("myrole", {"default", "extra_queue"})
 

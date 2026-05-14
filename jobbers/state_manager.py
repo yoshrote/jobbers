@@ -17,24 +17,24 @@ from jobbers import registry
 from jobbers.adapters.redis import DeadQueue
 from jobbers.adapters.redis_json import JsonTaskAdapter
 from jobbers.models.cron_dag import ConcurrencyPolicy
-from jobbers.models.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
 from jobbers.models.dag import collect_fan_in_keys
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
-from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_status import TaskStatus
+from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
+from jobbers.schedulers.task_scheduler import TaskScheduler
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.adapters.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
+    from jobbers.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)

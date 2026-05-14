@@ -3,27 +3,25 @@ import logging
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, get_type_hints
 
-from opentelemetry import metrics
 from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter, field_serializer
 from pydantic.functional_serializers import SerializationInfo
 from pydantic.functional_validators import BeforeValidator
 from ulid import ULID
 
-from jobbers.di import get_injected_param_names
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+from jobbers.utils.di import get_injected_param_names
 
 from .dag import DAGCallback, FanInCallback, SimpleCallback, TaskResult
 from .task_config import TaskConfig
 from .task_status import TaskStatus
 
 if TYPE_CHECKING:
-    from jobbers.adapters.protocols import TaskAdapterProtocol
     from jobbers.models.dag import DynamicFanOut
+    from jobbers.protocols import TaskAdapterProtocol
 
 _dag_callback_adapter: TypeAdapter[list[DAGCallback]] = TypeAdapter(list[DAGCallback])
 
 logger = logging.getLogger(__name__)
-meter = metrics.get_meter(__name__)
 
 
 def _parse_timestamp(v: object) -> dt.datetime | None:
@@ -104,9 +102,7 @@ class Task(BaseModel):
         return value.isoformat()  # ISO string for SQL columns and API responses
 
     @field_serializer("cron_id", "dag_run_id")
-    def serialize_optional_ulid(
-        self, value: ULID | None, info: SerializationInfo
-    ) -> ULID | str | None:
+    def serialize_optional_ulid(self, value: ULID | None, info: SerializationInfo) -> ULID | str | None:
         if value is None:
             return None
         if (info.context or {}).get("mode") == "msgpack":
@@ -114,9 +110,7 @@ class Task(BaseModel):
         return str(value)
 
     @field_serializer("parent_ids")
-    def serialize_parent_ids(
-        self, value: list[ULID], info: SerializationInfo
-    ) -> list[ULID] | list[str]:
+    def serialize_parent_ids(self, value: list[ULID], info: SerializationInfo) -> list[ULID] | list[str]:
         if (info.context or {}).get("mode") == "msgpack":
             return list(value)  # msgpack ExtType(3) handles each ULID → binary
         return [str(v) for v in value]
@@ -266,8 +260,7 @@ class Task(BaseModel):
 
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(
-            mode="json",
-            include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"}
+            mode="json", include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"}
         )
         if self.errors:
             summary["last_error"] = self.errors[-1]

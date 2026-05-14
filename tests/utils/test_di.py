@@ -6,7 +6,10 @@ from typing import Annotated
 import pytest
 from ulid import ULID
 
-from jobbers.di import (
+from jobbers.models.task import Task
+from jobbers.models.task_config import TaskConfig
+from jobbers.registry import clear_registry, get_task_config, register_task
+from jobbers.utils.di import (
     DependencyNode,
     DependencyResolver,
     Depends,
@@ -15,9 +18,6 @@ from jobbers.di import (
     get_injected_param_names,
     inspect_task_dependencies,
 )
-from jobbers.models.task import Task
-from jobbers.models.task_config import TaskConfig
-from jobbers.registry import clear_registry, get_task_config, register_task
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -10,9 +10,9 @@ from ulid import ULID
 from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, SimpleCallback, TaskResult
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
-from jobbers.models.task_scheduler import TaskScheduler
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
+from jobbers.schedulers.task_scheduler import TaskScheduler
 from jobbers.state_manager import StateManager, UserCancellationError
 from jobbers.task_processor import TaskProcessor
 

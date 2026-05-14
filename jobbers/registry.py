@@ -6,10 +6,10 @@ from typing import Any
 from ulid import ULID
 
 from jobbers import db
-from jobbers.di import inspect_task_dependencies
 from jobbers.models.dag import DAGNode
 from jobbers.models.task import Task
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
+from jobbers.utils.di import inspect_task_dependencies
 
 logger = logging.getLogger(__name__)
 _task_function_map: dict[tuple[str, int], TaskConfig] = {}
