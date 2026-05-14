@@ -244,6 +244,7 @@ async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, 
     await db.get_state_manager().save_queue_config(queue_config)
     return {"message": "Queue updated successfully", "queue": queue_config.model_dump(mode="json")}
 
+
 @app.delete("/queues/{queue_name}", status_code=200)
 async def delete_queue(queue_name: str) -> dict[str, Any]:
     """Delete a queue and remove it from all roles. Returns 404 if the queue does not exist."""
