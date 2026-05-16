@@ -1,16 +1,20 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pytest:*)",
-      "Bash(mypy:*)",
-      "Bash(ruff check:*)",
-      "Bash(docker-compose ps:*)",
-      "Bash(docker run:*)",
-      "Bash(gh issue create:*)",
       "Bash(grep:*)",
-      "Bash(gh api:*)",
-      "Bash(git checkout:*)",
-      "Bash(pip install:*)"
+      "Bash(ls:*)",
+      "Bash(dir:*)",
+      "Bash(pytest:*)",
+      "Bash(python -m pytest *)",
+      "Bash(coverage:*)",
+      "Bash(python -m coverage *)",
+      "Bash(mypy:*)",
+      "Bash(python -m mypy *)",
+      "Bash(ruff check:*)",
+      "Bash(docker-compose:*)",
+      "Bash(ruff format:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh pr:*)"
     ]
   }
 }
