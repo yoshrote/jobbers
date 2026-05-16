@@ -8,6 +8,7 @@ import pytest
 from ulid import ULID
 
 from jobbers import registry
+from jobbers.adapters.redis import RedisTaskScheduler
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGNode, DAGTaskSpec
@@ -1059,7 +1060,13 @@ async def testresolve_queue_routing_is_version_specific(state_manager):
 @pytest.mark.asyncio
 async def test_get_queue_config_caches_result(redis, session_factory, dummy_task_adapter):
     """get_queue_config returns a cached value on the second call."""
-    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
+    routing = SQLRoutingBackend(session_factory)
+    sm = StateManager(
+        redis,
+        routing,
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing.get_all_queues),
+        task_adapter=dummy_task_adapter,
+    )
     await sm.routing.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
     r1 = await sm.get_queue_config("q1")
     assert r1 is not None
@@ -1074,7 +1081,13 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
 @pytest.mark.asyncio
 async def test_get_routing_config_caches_result(redis, session_factory, dummy_task_adapter):
     """get_routing_config returns a cached value on the second call."""
-    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
+    routing = SQLRoutingBackend(session_factory)
+    sm = StateManager(
+        redis,
+        routing,
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing.get_all_queues),
+        task_adapter=dummy_task_adapter,
+    )
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["routed"])
     await sm.routing.save_routing_config(config)
     r1 = await sm.get_routing_config("t", 1)
@@ -1099,7 +1112,13 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
     redis, session_factory, dummy_task_adapter
 ):
     """save_queue_config writes to SQL, clears the cache entry, and bumps refresh_tag for containing roles."""
-    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
+    routing = SQLRoutingBackend(session_factory)
+    sm = StateManager(
+        redis,
+        routing,
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing.get_all_queues),
+        task_adapter=dummy_task_adapter,
+    )
     qca = SQLQueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
     await qca.save_role("role_a", {"q1"})
@@ -1128,7 +1147,13 @@ async def test_save_routing_config_invalidates_cache_and_bumps_version(
     redis, session_factory, dummy_task_adapter
 ):
     """save_routing_config writes to SQL, clears the cache entry, and updates routing:version to a new ULID."""
-    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
+    routing = SQLRoutingBackend(session_factory)
+    sm = StateManager(
+        redis,
+        routing,
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing.get_all_queues),
+        task_adapter=dummy_task_adapter,
+    )
 
     config_v1 = RoutingConfig(
         task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q_old"]
@@ -1162,7 +1187,13 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
     redis, session_factory, dummy_task_adapter
 ):
     """delete_routing_config removes from SQL, clears the cache entry, and updates routing:version to a new ULID."""
-    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
+    routing = SQLRoutingBackend(session_factory)
+    sm = StateManager(
+        redis,
+        routing,
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing.get_all_queues),
+        task_adapter=dummy_task_adapter,
+    )
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
     await sm.routing.save_routing_config(config)
 
@@ -1185,7 +1216,13 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
 @pytest.mark.asyncio
 async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_factory, dummy_task_adapter):
     """invalidate_all_routing_config clears all entries from the routing cache dict."""
-    sm = StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=dummy_task_adapter)
+    routing = SQLRoutingBackend(session_factory)
+    sm = StateManager(
+        redis,
+        routing,
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing.get_all_queues),
+        task_adapter=dummy_task_adapter,
+    )
     for i in range(3):
         cfg = RoutingConfig(task_name=f"t{i}", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
         await sm.routing.save_routing_config(cfg)

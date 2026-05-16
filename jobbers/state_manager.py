@@ -23,7 +23,6 @@ from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_status import TaskStatus
 from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
-from jobbers.schedulers.task_scheduler import TaskScheduler
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -34,7 +33,12 @@ if TYPE_CHECKING:
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
-    from jobbers.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
+    from jobbers.protocols import (
+        DeadQueueProtocol,
+        RoutingBackendProtocol,
+        TaskAdapterProtocol,
+        TaskSchedulerProtocol,
+    )
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -60,6 +64,7 @@ class StateManager:
         self,
         job_store: Redis,
         routing_backend: RoutingBackendProtocol,
+        task_scheduler: TaskSchedulerProtocol,
         task_adapter: TaskAdapterProtocol | None = None,
     ) -> None:
         self.job_store: Redis = job_store
@@ -73,7 +78,7 @@ class StateManager:
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self._cancel_events: dict[ULID, asyncio.Event] = {}
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
-        self.task_scheduler = TaskScheduler(job_store, self.ta, self.get_all_queues)
+        self.task_scheduler: TaskSchedulerProtocol = task_scheduler
         self.cron_dag_scheduler = CronDAGScheduler(job_store)
 
     @property

@@ -7,9 +7,10 @@ Routing:
 - `TaskRoutingConfigProtocol` — interface for task routing configuration.
 - `RoutingBackendProtocol` — interface all routing backends must implement.
 
-Task storage / dead-letter queue:
+Task storage / dead-letter queue / scheduling:
 - `TaskAdapterProtocol` — interface all task adapters must implement.
 - `DeadQueueProtocol` — interface all dead-letter queue implementations must implement.
+- `TaskSchedulerProtocol` — interface all task scheduler implementations must implement.
 """
 
 from __future__ import annotations
@@ -170,3 +171,23 @@ class DeadQueueProtocol(Protocol):  # pragma: no cover
     ) -> list[Task]: ...
     async def remove_many(self, task_ids: list[str]) -> None: ...
     async def clean(self, earlier_than: dt.datetime) -> None: ...
+
+
+class TaskSchedulerProtocol(Protocol):  # pragma: no cover
+    """Interface all task scheduler implementations must implement."""
+
+    def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None: ...
+    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str) -> None: ...
+    async def get_run_at(self, task_id: ULID) -> dt.datetime | None: ...
+    async def get_by_filter(
+        self,
+        queue: str | None = None,
+        task_name: str | None = None,
+        task_version: int | None = None,
+        limit: int = 100,
+        start_after: str | None = None,
+    ) -> list[tuple[Task, dt.datetime]]: ...
+    async def next_due(self, queues: list[str] | None = None) -> Task | None: ...
+    async def next_due_bulk(
+        self, n: int, queues: list[str] | None = None
+    ) -> list[tuple[Task, dt.datetime]]: ...

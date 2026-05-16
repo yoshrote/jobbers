@@ -1,15 +1,15 @@
-"""Tests for TaskScheduler."""
+"""Tests for RedisTaskScheduler."""
 
 import datetime as dt
 
 import pytest
 import pytest_asyncio
 
+from jobbers.adapters.redis import RedisTaskScheduler
 from jobbers.adapters.sql import SQLQueueConfigAdapter
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
-from jobbers.schedulers.task_scheduler import TaskScheduler
 
 PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 FUTURE = dt.datetime(2099, 1, 1, tzinfo=dt.UTC)
@@ -27,10 +27,10 @@ async def qca(session_factory):
 @pytest_asyncio.fixture
 async def scheduler(redis, dummy_task_adapter, session_factory):
     qca = SQLQueueConfigAdapter(session_factory)
-    yield TaskScheduler(redis, dummy_task_adapter, qca.get_all_queues)
+    yield RedisTaskScheduler(redis, dummy_task_adapter, qca.get_all_queues)
 
 
-async def schedule(s: TaskScheduler, task: Task, run_at: dt.datetime) -> None:
+async def schedule(s: RedisTaskScheduler, task: Task, run_at: dt.datetime) -> None:
     pipe = s.data_store.pipeline(transaction=True)
     s.stage_add(pipe, task, run_at)
     await pipe.execute()

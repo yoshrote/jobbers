@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from ulid import ULID
 
 from jobbers.adapters._shared import SharedTaskAdapterMixin
-from jobbers.adapters.redis import MsgpackTaskAdapter
+from jobbers.adapters.redis import MsgpackTaskAdapter, RedisTaskScheduler
 from jobbers.adapters.redis_json import JsonTaskAdapter
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.migrations.runner import run_migrations
@@ -39,7 +39,12 @@ async def routing_backend(session_factory):
 @pytest_asyncio.fixture
 async def state_manager(redis, dummy_routing_backend, dummy_task_adapter):
     """StateManager backed by DummyTaskAdapter + DummyRoutingBackend: fully in-memory, no SQL."""
-    sm = StateManager(redis, dummy_routing_backend, task_adapter=dummy_task_adapter)
+    sm = StateManager(
+        redis,
+        dummy_routing_backend,
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, dummy_routing_backend.get_all_queues),
+        task_adapter=dummy_task_adapter,
+    )
     sm.get_queue_config = sm.routing.get_queue_config
     sm.get_routing_config = sm.routing.get_routing_config
     sm.get_queues = sm.routing.get_queues
@@ -50,7 +55,13 @@ async def state_manager(redis, dummy_routing_backend, dummy_task_adapter):
 @pytest_asyncio.fixture
 async def state_manager_real_ta(redis, dummy_routing_backend):
     """StateManager backed by MsgpackTaskAdapter + DummyRoutingBackend for tests that exercise the full adapter call path."""
-    sm = StateManager(redis, dummy_routing_backend, task_adapter=MsgpackTaskAdapter(redis))
+    ta = MsgpackTaskAdapter(redis)
+    sm = StateManager(
+        redis,
+        dummy_routing_backend,
+        task_scheduler=RedisTaskScheduler(redis, ta, dummy_routing_backend.get_all_queues),
+        task_adapter=ta,
+    )
     sm.get_queue_config = sm.routing.get_queue_config
     sm.get_routing_config = sm.routing.get_routing_config
     sm.get_queues = sm.routing.get_queues

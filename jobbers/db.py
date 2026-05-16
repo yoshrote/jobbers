@@ -8,7 +8,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
-from jobbers.adapters.redis import RedisRoutingBackend
+from jobbers.adapters.redis import RedisRoutingBackend, RedisTaskScheduler
 from jobbers.adapters.redis_json import RedisJSONRoutingBackend
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.adapters.static import StaticRoutingBackend
@@ -135,7 +135,10 @@ async def init_state_manager() -> StateManager:
     client = get_client()
     _task_adapter = create_task_adapter(client)
     routing_backend = await _create_routing_backend(client)
-    _state_manager = StateManager(client, routing_backend, task_adapter=_task_adapter)
+    task_scheduler = RedisTaskScheduler(client, _task_adapter, routing_backend.get_all_queues)
+    _state_manager = StateManager(
+        client, routing_backend, task_scheduler=task_scheduler, task_adapter=_task_adapter
+    )
     await _task_adapter.ensure_index()
     await _state_manager.dead_queue.ensure_index()
     return _state_manager

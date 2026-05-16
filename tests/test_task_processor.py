@@ -7,12 +7,12 @@ import fakeredis.aioredis as fakeredis
 import pytest
 from ulid import ULID
 
+from jobbers.adapters.redis import RedisTaskScheduler
 from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, SimpleCallback, TaskResult
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
-from jobbers.schedulers.task_scheduler import TaskScheduler
 from jobbers.state_manager import StateManager, UserCancellationError
 from jobbers.task_processor import TaskProcessor
 
@@ -507,7 +507,7 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
 def _make_state_manager():
     """Return a mock StateManager whose retry_task mirrors the real SM behaviour."""
     state_manager = AsyncMock(spec=StateManager)
-    state_manager.task_scheduler = AsyncMock(spec=TaskScheduler)
+    state_manager.task_scheduler = AsyncMock(spec=RedisTaskScheduler)
     state_manager.job_store = fakeredis.FakeRedis()
     state_manager.ta = AsyncMock()
 
