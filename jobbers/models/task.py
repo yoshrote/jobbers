@@ -150,9 +150,10 @@ class Task(BaseModel):
             return
         match self.task_config.on_shutdown:
             case TaskShutdownPolicy.CONTINUE:
-                # NOOP: The execution of the task function needs to be wrapped
-                # in `shield()` already.
-                # TODO: maybe warn or panic since this should be unreachable
+                # NOOP: the task coroutine is wrapped in asyncio.shield(), so even if
+                # CancelledError propagates to the outer await, the inner coroutine keeps
+                # running. STARTED is the correct state to persist — the task is still
+                # in flight.
                 pass
             case TaskShutdownPolicy.STOP:
                 self.set_status(TaskStatus.STALLED)
