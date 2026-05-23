@@ -152,8 +152,7 @@ class Task(BaseModel):
             case TaskShutdownPolicy.CONTINUE:
                 # NOOP: The execution of the task function needs to be wrapped
                 # in `shield()` already.
-                # TODO: maybe warn or panic since this should be unreachable
-                pass
+                raise RuntimeError("TaskShutdownPolicy.CONTINUE should be handled by shielding task execution")
             case TaskShutdownPolicy.STOP:
                 self.set_status(TaskStatus.STALLED)
             case TaskShutdownPolicy.RESUBMIT:
