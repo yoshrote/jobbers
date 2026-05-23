@@ -71,6 +71,7 @@ class StateManager:
         self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
         self.submission_limiter = SubmissionRateLimiter(job_store, self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
+        self._cancel_events: dict[ULID, asyncio.Event] = {}
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
         self.task_scheduler = TaskScheduler(job_store, self.ta, self.get_all_queues)
         self.cron_dag_scheduler = CronDAGScheduler(job_store)
@@ -87,6 +88,21 @@ class StateManager:
             yield
         finally:
             self.current_tasks_by_queue[task.queue].remove(task.id)
+
+    @contextmanager
+    def cancel_event(self, task_id: ULID) -> Iterator[None]:
+        self._cancel_events[task_id] = asyncio.Event()
+        try:
+            yield
+        finally:
+            self._cancel_events.pop(task_id, None)
+
+    def signal_cancel(self, task_id: ULID) -> bool:
+        event = self._cancel_events.get(task_id)
+        if event is not None:
+            event.set()
+            return True
+        return False
 
     async def clean(
         self,
@@ -367,20 +383,33 @@ class StateManager:
                 self.ta.stage_save(pipe, task)
                 await pipe.execute()
             case TaskStatus.STARTED:
-                await self.job_store.publish(f"task_cancel_{task_id}", "cancel")
+                await self.job_store.publish("task_cancellations", str(task_id))
             case _:
                 raise TaskException(f"Task has status '{task.status}' and cannot be cancelled.")
         return task
 
     async def monitor_task_cancellation(self, task_id: ULID) -> None:
-        """Monitor for user cancellation of the task."""
+        """Wait for a cancel signal for this task and raise UserCancellationError when it arrives."""
+        event = self._cancel_events.get(task_id)
+        if event is None:
+            return
+        await event.wait()
+        logger.info("Received cancellation signal for task %s", task_id)
+        raise UserCancellationError(f"Task {task_id} was cancelled by user request.")
+
+    async def run_cancel_listener(self) -> None:
+        """Subscribe to the shared cancellations channel and signal matching active tasks."""
         async with self.job_store.pubsub() as pubsub:
-            await pubsub.subscribe(f"task_cancel_{task_id}")
+            await pubsub.subscribe("task_cancellations")
             while True:
                 message = await pubsub.get_message(ignore_subscribe_messages=True)
                 if message is not None:
-                    logger.info("Received cancellation message %s for task %s", message, task_id)
-                    raise UserCancellationError(f"Task {task_id} was cancelled by user request.")
+                    raw = message["data"]
+                    task_id_str = raw.decode() if isinstance(raw, bytes) else raw
+                    try:
+                        self.signal_cancel(ULID.from_str(task_id_str))
+                    except Exception:
+                        logger.warning("Invalid task_id in cancellations channel: %r", task_id_str)
                 await asyncio.sleep(0.01)
 
     # Proxy methods

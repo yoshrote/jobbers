@@ -469,18 +469,24 @@ async def test_cancel_submitted_task(redis, state_manager):
 
 @pytest.mark.asyncio
 async def test_cancel_started_task_publishes_message(state_manager):
-    """Cancelling a STARTED task publishes a cancel message on the task's pubsub channel."""
+    """Cancelling a STARTED task signals the cancel event via the shared pubsub channel."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
     await state_manager.ta.save_task(task)
 
-    monitor = asyncio.create_task(state_manager.monitor_task_cancellation(ULID1))
-    await asyncio.sleep(0.05)
-    result = await state_manager.request_task_cancellation(ULID1)
+    with state_manager.cancel_event(ULID1):
+        cancel_listener = asyncio.create_task(state_manager.run_cancel_listener())
+        monitor = asyncio.create_task(state_manager.monitor_task_cancellation(ULID1))
+        await asyncio.sleep(0.05)  # let the listener subscribe
+        result = await state_manager.request_task_cancellation(ULID1)
 
-    assert result is not None
-    assert result.status == TaskStatus.STARTED  # status unchanged — worker handles it
-    with pytest.raises(UserCancellationError):
-        await asyncio.wait_for(monitor, timeout=1.0)
+        assert result is not None
+        assert result.status == TaskStatus.STARTED  # status unchanged — worker handles it
+        with pytest.raises(UserCancellationError):
+            await asyncio.wait_for(monitor, timeout=1.0)
+
+        cancel_listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancel_listener
 
 
 @pytest.mark.asyncio
@@ -540,30 +546,44 @@ async def test_task_in_registry(state_manager):
     assert task.id not in state_manager.current_tasks_by_queue[task.queue]
 
 
+# ── cancel_event ──────────────────────────────────────────────────────────────
+
+
+def test_cancel_event_registers_and_deregisters(state_manager):
+    """cancel_event adds the event on enter and removes it on exit."""
+    assert ULID1 not in state_manager._cancel_events
+
+    with state_manager.cancel_event(ULID1):
+        assert ULID1 in state_manager._cancel_events
+
+    assert ULID1 not in state_manager._cancel_events
+
+
 # ── monitor_task_cancellation ──────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_monitor_task_cancellation_raises_on_cancel_message(state_manager, redis):
-    """monitor_task_cancellation raises UserCancellationError when a cancel message is published."""
+async def test_monitor_task_cancellation_raises_on_cancel_message(state_manager):
+    """monitor_task_cancellation raises UserCancellationError when signal_cancel is called."""
     task_id = ULID1
-    monitor = asyncio.create_task(state_manager.monitor_task_cancellation(task_id))
-    await asyncio.sleep(0.05)
-    await redis.publish(f"task_cancel_{task_id}", "cancel")
-    with pytest.raises(UserCancellationError):
-        await monitor
+    with state_manager.cancel_event(task_id):
+        monitor = asyncio.create_task(state_manager.monitor_task_cancellation(task_id))
+        state_manager.signal_cancel(task_id)
+        with pytest.raises(UserCancellationError):
+            await monitor
 
 
 @pytest.mark.asyncio
 async def test_monitor_task_cancellation_does_not_exit_without_message(state_manager):
-    """monitor_task_cancellation keeps running when no cancel message is sent."""
+    """monitor_task_cancellation keeps running when no cancel signal is sent."""
     task_id = ULID1
-    monitor = asyncio.create_task(state_manager.monitor_task_cancellation(task_id))
-    await asyncio.sleep(0.1)
-    assert not monitor.done(), "monitor should still be running when no cancel message is sent"
-    monitor.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await monitor
+    with state_manager.cancel_event(task_id):
+        monitor = asyncio.create_task(state_manager.monitor_task_cancellation(task_id))
+        await asyncio.sleep(0.1)
+        assert not monitor.done(), "monitor should still be running when no cancel signal is sent"
+        monitor.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor
 
 
 # ── schedule_new_task ─────────────────────────────────────────────────────────

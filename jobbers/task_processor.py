@@ -36,18 +36,19 @@ class TaskProcessor:
         self._current_promise: Awaitable[Any] | None = None
 
     async def run(self, task: Task) -> None:
-        try:
-            async with asyncio.TaskGroup() as tg:
-                process_task = tg.create_task(self.process(task))
-                monitor_task = tg.create_task(self.monitor_task_cancellation(task))
-                monitor_task.add_done_callback(lambda t: process_task.cancel())
-                process_task.add_done_callback(lambda t: monitor_task.cancel())
-        except ExceptionGroup as eg:
-            for exc in eg.exceptions:
-                # Treat UserCancellationError as a normal control flow signal to exit the TaskGroup;
-                # re-raise any other exceptions.
-                if not isinstance(exc, UserCancellationError):
-                    raise  # Re-raise to exit the TaskGroup in run()
+        with self.state_manager.cancel_event(task.id):
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    process_task = tg.create_task(self.process(task))
+                    monitor_task = tg.create_task(self.monitor_task_cancellation(task))
+                    monitor_task.add_done_callback(lambda t: process_task.cancel())
+                    process_task.add_done_callback(lambda t: monitor_task.cancel())
+            except ExceptionGroup as eg:
+                for exc in eg.exceptions:
+                    # Treat UserCancellationError as a normal control flow signal to exit the TaskGroup;
+                    # re-raise any other exceptions.
+                    if not isinstance(exc, UserCancellationError):
+                        raise  # Re-raise to exit the TaskGroup in run()
 
     async def process(self, task: Task) -> Task:
         """Process the task and return the result."""

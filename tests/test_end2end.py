@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import importlib
 
 import pytest
@@ -359,13 +360,17 @@ async def test_cancel_running_task(sm: StateManager) -> None:
     _, submitted = await sm.submit_dag(*roots)
     task_id = submitted[0].id
 
+    cancel_listener = asyncio.create_task(sm.run_cancel_listener())
     drain_bg = asyncio.create_task(drain(sm))
     await _wait_for_started(sm, task_id)
-    # Give the monitor coroutine one poll cycle to reach get_message()
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.05)  # let the cancel listener subscribe
 
     await sm.request_task_cancellation(task_id)
     await drain_bg
+
+    cancel_listener.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await cancel_listener
 
     result = await sm.ta.get_task(task_id)
     assert result is not None
@@ -385,12 +390,17 @@ async def test_cancel_dag_root_leaves_downstream_unsubmitted(sm: StateManager) -
     a_node = roots[0]
     b_node = a_node._successors[0][0]
 
+    cancel_listener = asyncio.create_task(sm.run_cancel_listener())
     drain_bg = asyncio.create_task(drain(sm))
     await _wait_for_started(sm, a_node.id)
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.05)  # let the cancel listener subscribe
 
     await sm.request_task_cancellation(a_node.id)
     await drain_bg
+
+    cancel_listener.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await cancel_listener
 
     task_a = await sm.ta.get_task(a_node.id)
     task_b = await sm.ta.get_task(b_node.id)

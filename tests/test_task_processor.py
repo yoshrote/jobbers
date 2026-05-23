@@ -718,13 +718,13 @@ async def test_run_cancels_monitor_when_process_fails():
     assert task.status == TaskStatus.FAILED
 
 
-# ── pubsub cancellation ───────────────────────────────────────────────────────
+# ── event-based cancellation ──────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_task_processor_run_exits_early_on_pubsub_cancel():
+async def test_task_processor_run_exits_early_on_cancel_signal():
     """
-    TaskProcessor.run exits cleanly when a cancel signal is published to the task's pubsub channel.
+    TaskProcessor.run exits cleanly when a cancel signal is delivered to the monitor.
 
     Sequence:
     1. monitor raises UserCancellationError → handle_user_cancelled_task sets CANCELLED.
@@ -742,7 +742,6 @@ async def test_task_processor_run_exits_early_on_pubsub_cancel():
         queue="test_queue",
     )
 
-    fake_store = fakeredis.FakeRedis()
     task_started = asyncio.Event()
 
     async def slow_task():
@@ -753,35 +752,17 @@ async def test_task_processor_run_exits_early_on_pubsub_cancel():
     task_config = TaskConfig(name="test_task", version=1, function=slow_task, timeout=60)
     state_manager = _make_state_manager()
 
-    async def pubsub_monitor(task_id: str) -> None:
-        """Real pubsub listener — loops until a cancel message arrives."""
-        async with fake_store.pubsub() as pubsub:
-            await pubsub.subscribe(f"task_cancel_{task_id}")
-            while True:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True)
-                if msg is not None:
-                    raise UserCancellationError(str(task_id))
-                await asyncio.sleep(0.01)
-
-    state_manager.monitor_task_cancellation.side_effect = pubsub_monitor
-
-    async def publish_cancel() -> None:
+    async def event_monitor(_task_id: ULID) -> None:
         await task_started.wait()
-        await fake_store.publish(f"task_cancel_{task.id}", "cancel")
+        raise UserCancellationError(str(_task_id))
 
-    publisher = asyncio.create_task(publish_cancel())
+    state_manager.monitor_task_cancellation.side_effect = event_monitor
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         # run() catches the ExceptionGroup([UserCancellationError]) raised by the
         # TaskGroup and exits cleanly — no exception should propagate here.
         await processor.run(task)
-
-    publisher.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await publisher
-
-    await fake_store.aclose()
 
     assert task.status == TaskStatus.CANCELLED
     # State was saved at least twice: once when started, once when interrupted.

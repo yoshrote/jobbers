@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib
 import importlib.util
 import logging
@@ -48,6 +49,7 @@ async def main() -> None:
         finally:
             semaphore.release()
 
+    cancel_listener = asyncio.create_task(state_manager.run_cancel_listener())
     try:
         while True:
             await semaphore.acquire()
@@ -62,6 +64,9 @@ async def main() -> None:
         await asyncio.gather(*active, return_exceptions=True)
     finally:
         logger.info("Worker shutting down")
+        cancel_listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancel_listener
         task_generator.stop()
         for t in active:
             t.cancel()

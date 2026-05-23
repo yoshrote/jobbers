@@ -1,5 +1,6 @@
 """Unit tests for jobbers/runners/worker_proc.py."""
 
+import asyncio
 import sys
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -54,8 +55,13 @@ def test_load_task_module_invalid_path_raises():
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
+async def _run_cancel_listener_forever() -> None:
+    await asyncio.sleep(10000)
+
+
 def _make_state_manager() -> MagicMock:
     sm = MagicMock()
+    sm.run_cancel_listener = MagicMock(side_effect=_run_cancel_listener_forever)
     return sm
 
 
