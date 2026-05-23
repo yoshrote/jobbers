@@ -86,8 +86,6 @@ class StateManager:
         try:
             yield
         finally:
-            # TODO: Do we need to clean this up before handle_success?
-            # Need to consider interactions with callbacks of the task
             self.current_tasks_by_queue[task.queue].remove(task.id)
 
     async def clean(
