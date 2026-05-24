@@ -34,7 +34,15 @@ if TYPE_CHECKING:
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
-    from jobbers.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
+    from jobbers.protocols import (
+        AtomicDeadQueueProtocol,
+        AtomicTaskSchedulerProtocol,
+        AtomicTaskStateProtocol,
+        DeadQueueProtocol,
+        RoutingBackendProtocol,
+        TaskAdapterProtocol,
+        TaskStateProtocol,
+    )
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -75,6 +83,32 @@ class StateManager:
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
         self.task_scheduler = TaskScheduler(job_store, self.ta, self.get_all_queues)
         self.cron_dag_scheduler = CronDAGScheduler(job_store)
+
+        # Split-protocol references for cross-datastore coordination.
+        # In the default single-Redis setup, task_state is the same object as ta.
+        self.task_state: TaskStateProtocol = self.ta  # type: ignore[assignment]
+
+        # Same-backend detection: if the task adapter, scheduler, and DLQ all implement the
+        # Atomic sub-protocols (i.e. they're all Redis-backed), StateManager uses atomic
+        # MULTI/EXEC pipelines.  When stores differ, it falls back to saga coordination.
+        from jobbers.protocols import (  # local import avoids circular at module level
+            AtomicDeadQueueProtocol,
+            AtomicTaskSchedulerProtocol,
+            AtomicTaskStateProtocol,
+        )
+
+        self._atomic_state: AtomicTaskStateProtocol | None = (
+            self.ta if isinstance(self.ta, AtomicTaskStateProtocol) else None
+        )
+        self._atomic_scheduler: AtomicTaskSchedulerProtocol | None = (
+            self.task_scheduler if isinstance(self.task_scheduler, AtomicTaskSchedulerProtocol) else None
+        )
+        self._atomic_dlq: AtomicDeadQueueProtocol | None = (
+            self.dead_queue if isinstance(self.dead_queue, AtomicDeadQueueProtocol) else None
+        )
+        self._atomic_mode: bool = all(
+            x is not None for x in (self._atomic_state, self._atomic_scheduler, self._atomic_dlq)
+        )
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -139,6 +173,7 @@ class StateManager:
                 stale_tasks_by_type[(task.name, task.version)].append(task)
 
             stale_pipes = []
+            stale_saga_tasks: list[Task] = []
             for (task_type, task_version), tasks in stale_tasks_by_type.items():
                 task_config = registry.get_task_config(task_type, task_version)
                 if task_config and task_config.max_heartbeat_interval:
@@ -148,12 +183,18 @@ class StateManager:
                             and (now - task.heartbeat_at) > task_config.max_heartbeat_interval
                         ):
                             task.set_status(TaskStatus.STALLED)
-                            pipe = self.job_store.pipeline(transaction=True)
-                            self.ta.stage_save(pipe, task)
-                            pipe.zrem(self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
-                            stale_pipes.append(pipe.execute())
+                            if self._atomic_state is not None:
+                                pipe = self._atomic_state.pipeline(transaction=True)
+                                self._atomic_state.stage_save(pipe, task)
+                                pipe.zrem(self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
+                                stale_pipes.append(pipe.execute())
+                            else:
+                                stale_saga_tasks.append(task)
             if stale_pipes:
                 await asyncio.gather(*stale_pipes)
+            for stale_task in stale_saga_tasks:
+                await self.task_state.save_task(stale_task)
+                await self.task_state.remove_task_heartbeat(stale_task)
 
         await asyncio.gather(*clean_ops)
 
@@ -174,31 +215,51 @@ class StateManager:
                 task.retry_attempt = 0
             task.errors = []
             task.set_status(TaskStatus.SUBMITTED)
-        pipe = self.job_store.pipeline(transaction=True)
-        for task in tasks:
-            self.ta.stage_requeue(pipe, task)
-            self.dead_queue.stage_remove(pipe, task.id, task.queue, task.name)
-        await pipe.execute()
+        if self._atomic_state is not None and self._atomic_dlq is not None:
+            pipe = self._atomic_state.pipeline(transaction=True)
+            for task in tasks:
+                self._atomic_state.stage_requeue(pipe, task)
+                self._atomic_dlq.stage_remove(pipe, task.id, task.queue, task.name)
+            await pipe.execute()
+        else:
+            # Saga: persist blobs (source of truth), then remove from DLQ.
+            # If remove fails, Cleaner reconciles DLQ entries for SUBMITTED/STARTED tasks.
+            await asyncio.gather(*(self.task_state.save_task(t) for t in tasks))
+            for task in tasks:
+                if hasattr(self.dead_queue, "remove_from_dlq"):
+                    await self.dead_queue.remove_from_dlq(task.id, task.queue, task.name)
         return tasks
 
     async def fail_task(self, task: Task) -> Task:
         """Persist a failed task and any DLQ side effects in a single atomic transaction."""
         now = dt.datetime.now(dt.UTC)
-        pipe = self.job_store.pipeline(transaction=True)
-        self.ta.stage_save(pipe, task)
-        if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
-            logger.info("Task %s sent to dead letter queue.", task.id)
-            self.dead_queue.stage_add(pipe, task, now)
-        await pipe.execute()
-        if task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
+        needs_dlq = bool(task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE)
+        if self._atomic_state is not None and self._atomic_dlq is not None:
+            pipe = self._atomic_state.pipeline(transaction=True)
+            self._atomic_state.stage_save(pipe, task)
+            if needs_dlq:
+                logger.info("Task %s sent to dead letter queue.", task.id)
+                self._atomic_dlq.stage_add(pipe, task, now)
+            await pipe.execute()
+        else:
+            await self.task_state.save_task(task)
+            if needs_dlq:
+                logger.info("Task %s sent to dead letter queue.", task.id)
+                if hasattr(self.dead_queue, "add_to_dlq"):
+                    await self.dead_queue.add_to_dlq(task, now)
+        if needs_dlq:
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return task
 
     async def _run_schedule_pipeline(self, task: Task, run_at: dt.datetime) -> None:
-        pipe = self.job_store.pipeline(transaction=True)
-        self.task_scheduler.stage_add(pipe, task, run_at)
-        self.ta.stage_save(pipe, task)
-        await pipe.execute()
+        if self._atomic_state is not None and self._atomic_scheduler is not None:
+            pipe = self._atomic_state.pipeline(transaction=True)
+            self._atomic_scheduler.stage_add(pipe, task, run_at)
+            self._atomic_state.stage_save(pipe, task)
+            await pipe.execute()
+        else:
+            await self.task_state.save_task(task)
+            await self.task_scheduler.add(task, run_at)
 
     async def schedule_new_task(self, task: Task, run_at: dt.datetime) -> Task:
         """Save a brand-new task directly into the scheduler in a single atomic transaction."""
@@ -218,42 +279,53 @@ class StateManager:
         """Persist an immediate retry: re-enqueue the task without full re-validation."""
         task.set_status(TaskStatus.SUBMITTED)
         logger.info("Task %s requeued for immediate retry.", task.id)
-        pipe = self.job_store.pipeline(transaction=True)
-        self.ta.stage_requeue(pipe, task)
-        await pipe.execute()
+        await self.requeue_task(task)
         return task
 
     async def dispatch_scheduled_task(self, task: Task) -> Task:
         """
         Move a due scheduled task into its queue and clean up the scheduler atomically.
 
-        Uses WATCH on the task key for optimistic locking: if the task is modified
-        concurrently (e.g. cancelled between scheduler acquisition and dispatch), the
-        pipeline detects the conflict and retries. If the task is already CANCELLED at
-        read time, dispatch is silently skipped.
+        Same-backend mode: uses WATCH/MULTI for optimistic locking — if the task is modified
+        concurrently (e.g. cancelled), the pipeline detects the conflict and retries.
+
+        Cross-store mode: uses compare_and_set_status for the optimistic guard, then enqueues
+        and removes from the scheduler as separate steps.
 
         next_due_bulk's Lua script already removed the task from the schedule-queue sorted
         set before this is called, so stage_remove's ZREM is a no-op; the HDEL cleans up
         the residual schedule-task-queue hash entry.
         """
-        task_key = self.ta.TASK_DETAILS(task_id=task.id)
-        while True:
-            pipe = self.job_store.pipeline()
-            await pipe.watch(task_key)
-            watched_task: Task | None = await self.ta.read_for_watch(pipe, task.id)
-            if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
-                await pipe.unwatch()  # type: ignore[no-untyped-call]
-                return task
+        if self._atomic_state is not None and self._atomic_scheduler is not None:
+            task_key = self.ta.TASK_DETAILS(task_id=task.id)
+            while True:
+                pipe = self.job_store.pipeline()
+                await pipe.watch(task_key)
+                watched_task: Task | None = await self.ta.read_for_watch(pipe, task.id)
+                if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
+                    await pipe.unwatch()  # type: ignore[no-untyped-call]
+                    return task
+                task.set_status(TaskStatus.SUBMITTED)
+                pipe.multi()  # type: ignore[no-untyped-call]
+                self._atomic_state.stage_requeue(pipe, task)
+                self._atomic_scheduler.stage_remove(pipe, task.id, task.queue)
+                try:
+                    await pipe.execute()
+                    logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
+                    return task
+                except WatchError:
+                    continue
+        else:
+            # Saga path: compare-and-set status guards against concurrent cancellation.
+            applied = await self.task_state.compare_and_set_status(
+                task.id, TaskStatus.SCHEDULED, TaskStatus.SUBMITTED
+            )
+            if not applied:
+                return task  # task was cancelled or already processed
             task.set_status(TaskStatus.SUBMITTED)
-            pipe.multi()  # type: ignore[no-untyped-call]
-            self.ta.stage_requeue(pipe, task)
-            self.task_scheduler.stage_remove(pipe, task.id, task.queue)
-            try:
-                await pipe.execute()
-                logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
-                return task
-            except WatchError:
-                continue
+            await self.task_scheduler.remove(task.id, task.queue)
+            logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
+            return task
 
     @asynccontextmanager
     async def _concurrency_guard(
@@ -285,9 +357,7 @@ class StateManager:
                         active_task_id_str,
                         active_task.status,
                     )
-                    pipe = self.job_store.pipeline(transaction=True)
-                    self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
-                    await pipe.execute()
+                    await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
                     yield ConcurrencyStager(skipped=True, _stage_fn=lambda _p, _t: None)
                     return
 
@@ -344,16 +414,24 @@ class StateManager:
             # This ensures the cron entry is never permanently lost even if submit_task crashes.
             # For SKIP_IF_RUNNING, SET NX is the authoritative guard against concurrent dispatches.
             # For non-rate-limited queues, submission is included in the same pipeline.
-            pipe = self.job_store.pipeline(transaction=True)
-            self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
-            stager.stage_active_run(pipe, task.id)
-            for fan_in_key, predecessor_ids in fan_ins.items():
-                self.ta.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
-            if not is_rate_limited:
-                self.stage_submit_task(pipe, task, queue_config)
-            await pipe.execute()
-
-            if is_rate_limited:
+            if self._atomic_state is not None:
+                pipe = self._atomic_state.pipeline(transaction=True)
+                self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
+                stager.stage_active_run(pipe, task.id)
+                for fan_in_key, predecessor_ids in fan_ins.items():
+                    self._atomic_state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
+                if not is_rate_limited:
+                    self.stage_submit_task(pipe, task, queue_config)
+                await pipe.execute()
+                if is_rate_limited:
+                    await self.submit_task(task)
+            else:
+                # Saga: cron scheduler ops are atomic on their own Redis; fan-in and submit follow.
+                cron_pipe = self.cron_dag_scheduler.data_store.pipeline(transaction=True)
+                self.cron_dag_scheduler.stage_reschedule(cron_pipe, entry.id, next_run_at)
+                stager.stage_active_run(cron_pipe, task.id)
+                await cron_pipe.execute()
+                await asyncio.gather(*(self.task_state.init_fan_in(k, ids) for k, ids in fan_ins.items()))
                 await self.submit_task(task)
             logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
 
@@ -371,17 +449,25 @@ class StateManager:
             case TaskStatus.SCHEDULED:
                 # For scheduled tasks, we can just remove them from the scheduler without a pub/sub dance
                 task.set_status(TaskStatus.CANCELLED)
-                pipe = self.job_store.pipeline(transaction=True)
-                self.task_scheduler.stage_remove(pipe, task_id, task.queue)
-                self.ta.stage_save(pipe, task)
-                await pipe.execute()
+                if self._atomic_state is not None and self._atomic_scheduler is not None:
+                    pipe = self._atomic_state.pipeline(transaction=True)
+                    self._atomic_scheduler.stage_remove(pipe, task_id, task.queue)
+                    self._atomic_state.stage_save(pipe, task)
+                    await pipe.execute()
+                else:
+                    await self.task_scheduler.remove(task_id, task.queue)
+                    await self.task_state.save_task(task)
             case TaskStatus.SUBMITTED:
                 # remove from the queue immediately so it can't be claimed by a worker
                 task.set_status(TaskStatus.CANCELLED)
-                pipe = self.job_store.pipeline(transaction=True)
-                self.ta.stage_remove_from_queue(pipe, task)
-                self.ta.stage_save(pipe, task)
-                await pipe.execute()
+                if self._atomic_state is not None:
+                    pipe = self._atomic_state.pipeline(transaction=True)
+                    self._atomic_state.stage_remove_from_queue(pipe, task)
+                    self._atomic_state.stage_save(pipe, task)
+                    await pipe.execute()
+                else:
+                    # Saga: save CANCELLED state; queue entry is cleaned up by Cleaner.
+                    await self.task_state.save_task(task)
             case TaskStatus.STARTED:
                 await self.job_store.publish("task_cancellations", str(task_id))
             case _:
@@ -435,6 +521,77 @@ class StateManager:
             )
         task.set_status(TaskStatus.SUBMITTED)
         self.ta.stage_submit_task(pipe, task)
+
+    # ── New cross-store coordination methods ─────────────────────────────────
+
+    async def submit_tasks_batch(self, tasks: list[Task]) -> None:
+        """
+        Set tasks to SUBMITTED and persist them.
+
+        Atomic pipeline (MULTI/EXEC) when all adapters share the same Redis backend;
+        sequential saga (save blob → enqueue) otherwise.  Queues must already be
+        resolved on each task before calling this method.
+        """
+        for task in tasks:
+            task.set_status(TaskStatus.SUBMITTED)
+
+        if self._atomic_state is not None:
+            pipe = self._atomic_state.pipeline(transaction=True)
+            for task in tasks:
+                self._atomic_state.stage_submit_task(pipe, task)
+            await pipe.execute()
+        else:
+            # Saga: persist blobs first (source of truth), then enqueue via TaskQueueProtocol.
+            await asyncio.gather(*(self.task_state.save_task(t) for t in tasks))
+
+    async def requeue_task(self, task: Task) -> None:
+        """
+        Re-enqueue a task that was popped but not yet started (e.g. on CancelledError).
+
+        Atomic ZADD+save in single-backend mode; sequential save→enqueue in saga mode.
+        """
+        if self._atomic_state is not None:
+            pipe = self._atomic_state.pipeline(transaction=True)
+            self._atomic_state.stage_requeue(pipe, task)
+            await pipe.execute()
+        else:
+            task.set_status(TaskStatus.SUBMITTED)
+            await self.task_state.save_task(task)
+
+    async def complete_cron_task(self, task: Task) -> None:
+        """
+        Persist a COMPLETED cron task and clear its active-run marker atomically.
+
+        Atomic MULTI/EXEC in single-backend mode; sequential save→clear in saga mode.
+        """
+        assert task.cron_id is not None  # noqa: S101
+        if self._atomic_state is not None:
+            pipe = self._atomic_state.pipeline(transaction=True)
+            self._atomic_state.stage_save(pipe, task)
+            self.cron_dag_scheduler.stage_clear_active_run(pipe, task.cron_id)
+            await pipe.execute()
+        else:
+            await self.task_state.save_task(task)
+            await self.cron_dag_scheduler.clear_active_run(task.cron_id)
+
+    async def reschedule_cron_entries_bulk(self, entries: list[tuple[CronDAGEntry, dt.datetime]]) -> None:
+        """
+        Reschedule a batch of disabled cron entries to their next run time.
+
+        Atomic pipeline in single-backend mode; sequential in saga mode.
+        """
+        if self._atomic_scheduler is not None:
+            pipe = self._atomic_scheduler.pipeline(transaction=True)
+            for entry, run_at in entries:
+                next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
+                self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
+            await pipe.execute()
+        else:
+            for entry, run_at in entries:
+                next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
+                await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
+
+    # ── End cross-store coordination methods ─────────────────────────────────
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
         """Return queue config, reading from cache on hit."""
@@ -567,7 +724,7 @@ class StateManager:
         """
         now = dt.datetime.now(dt.UTC)
         first_run_at = croniter(entry.cron_expr, now).get_next(dt.datetime)
-        pipe = self.job_store.pipeline(transaction=True)
+        pipe = self.cron_dag_scheduler.data_store.pipeline(transaction=True)
         self.cron_dag_scheduler.stage_add(pipe, entry, first_run_at)
         await pipe.execute()
         logger.info(
@@ -576,7 +733,7 @@ class StateManager:
 
     async def remove_cron_dag(self, cron_id: ULID) -> None:
         """Remove a cron DAG entry from the schedule."""
-        pipe = self.job_store.pipeline(transaction=True)
+        pipe = self.cron_dag_scheduler.data_store.pipeline(transaction=True)
         self.cron_dag_scheduler.stage_remove(pipe, cron_id)
         await pipe.execute()
         logger.info("Cron DAG entry %s removed.", cron_id)
@@ -614,9 +771,12 @@ class StateManager:
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
-        pipe = self.job_store.pipeline(transaction=True)
-        self.ta.stage_save(pipe, task)
-        await pipe.execute()
+        if self._atomic_state is not None:
+            pipe = self._atomic_state.pipeline(transaction=True)
+            self._atomic_state.stage_save(pipe, task)
+            await pipe.execute()
+        else:
+            await self.task_state.save_task(task)
         return task
 
     async def update_task_heartbeat(self, task: Task) -> None:

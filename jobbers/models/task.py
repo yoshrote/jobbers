@@ -39,7 +39,7 @@ def _parse_ulid(v: object) -> ULID | None:
     if isinstance(v, str):
         return cast("ULID", ULID.from_str(v))
     if isinstance(v, (bytes, bytearray)):
-        return  cast("ULID", ULID.from_bytes(bytes(v)))
+        return cast("ULID", ULID.from_bytes(bytes(v)))
     raise ValueError(f"Cannot parse ULID: {v!r}")
 
 

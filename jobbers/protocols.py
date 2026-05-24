@@ -7,8 +7,16 @@ Routing:
 - `TaskRoutingConfigProtocol` — interface for task routing configuration.
 - `RoutingBackendProtocol` — interface all routing backends must implement.
 
-Task storage / dead-letter queue:
-- `TaskAdapterProtocol` — interface all task adapters must implement.
+Task storage / dead-letter queue (split-store protocols):
+- `TaskStateProtocol` — task blob persistence, heartbeats, fan-in sets, DAG run index.
+- `TaskQueueProtocol` — active queue membership and rate limiting.
+- `TaskSchedulerProtocol` — scheduled/delayed task queue.
+- `AtomicTaskStateProtocol` — extends TaskStateProtocol with Redis pipeline staging methods.
+- `AtomicTaskSchedulerProtocol` — extends TaskSchedulerProtocol with pipeline staging.
+- `AtomicDeadQueueProtocol` — extends DeadQueueProtocol with pipeline staging.
+
+Legacy combined protocol (kept for backward compatibility):
+- `TaskAdapterProtocol` — combined task storage + queue protocol; use split protocols for new code.
 - `DeadQueueProtocol` — interface all dead-letter queue implementations must implement.
 """
 
@@ -30,6 +38,7 @@ if TYPE_CHECKING:
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
     from jobbers.models.task_routing import RoutingConfig
+    from jobbers.models.task_status import TaskStatus
 
 
 class RoutingBackendReadOnlyError(Exception):
@@ -170,3 +179,174 @@ class DeadQueueProtocol(Protocol):  # pragma: no cover
     ) -> list[Task]: ...
     async def remove_many(self, task_ids: list[str]) -> None: ...
     async def clean(self, earlier_than: dt.datetime) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Split-store protocols — use these for new cross-datastore implementations.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class TaskStateProtocol(Protocol):  # pragma: no cover
+    """
+    Task blob persistence: stores task state, heartbeats, fan-in sets, and DAG run index.
+
+    Does not manage queue membership — that belongs to TaskQueueProtocol.
+    """
+
+    @property
+    def backend_key(self) -> str:
+        """
+        Stable string identifying the backend instance (e.g. Redis URL or SQL DSN).
+
+        Used by StateManager to detect same-backend mode and enable atomic pipelines.
+        """
+        ...
+
+    # Task blob CRUD
+    async def save_task(self, task: Task) -> None: ...
+    async def get_task(self, task_id: ULID) -> Task | None: ...
+    async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]: ...
+    async def task_exists(self, task_id: ULID) -> bool: ...
+    async def get_active_tasks(self, queues: set[str]) -> list[Task]: ...
+    def get_stale_tasks(self, queues: set[str], stale_time: dt.timedelta) -> AsyncGenerator[Task, None]: ...
+    async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]: ...
+
+    async def compare_and_set_status(self, task_id: ULID, expected: TaskStatus, new: TaskStatus) -> bool:
+        """
+        Atomically transition task status only if the current status equals ``expected``.
+
+        Returns True if the transition was applied, False if the current status did not
+        match (e.g. concurrent cancellation changed it first).
+
+        Redis: implemented via WATCH/MULTI on the task key.
+        SQL: implemented via ``UPDATE ... WHERE status = ? RETURNING status``.
+        """
+        ...
+
+    # Heartbeat
+    async def update_task_heartbeat(self, task: Task) -> None: ...
+    async def remove_task_heartbeat(self, task: Task) -> None: ...
+
+    # Fan-in sets (must be co-located with task state for atomic last-writer-wins semantics)
+    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
+    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int: ...
+    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
+
+    # DAG run index
+    async def get_dag_runs(
+        self, pagination: DAGRunPagination
+    ) -> tuple[list[tuple[ULID, dt.datetime]], int]: ...
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None: ...
+    async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
+
+    # Lifecycle
+    async def ensure_index(self) -> None: ...
+    async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
+    async def clean(
+        self,
+        queues: set[bytes],
+        now: dt.datetime,
+        min_queue_age: dt.datetime | None,
+        max_queue_age: dt.datetime | None,
+    ) -> None: ...
+
+
+@runtime_checkable
+class TaskQueueProtocol(Protocol):  # pragma: no cover
+    """
+    Active queue membership: enqueue, dequeue, and rate limiting.
+
+    Operates on task IDs and scores, not task blobs — the blob is the task_state's concern.
+    """
+
+    @property
+    def backend_key(self) -> str: ...
+
+    async def enqueue(self, task_id: ULID, queue: str, score: float) -> bool:
+        """Enqueue task_id into queue with the given score.  Returns False if already queued (NX)."""
+        ...
+
+    async def get_next_task_id(self, queues: set[str], pop_timeout: int = 0) -> tuple[ULID, str] | None:
+        """Blocking pop from the highest-priority queue.  Returns (task_id, queue_name) or None."""
+        ...
+
+    async def remove_from_queue(self, task_id: ULID, queue: str) -> None: ...
+
+    async def check_rate_limit_and_enqueue(
+        self,
+        task_id: ULID,
+        queue: str,
+        score: float,
+        window_start: float,
+        max_count: int,
+    ) -> bool:
+        """Atomically check the sliding window and enqueue if under limit.  Returns False if rate-limited."""
+        ...
+
+    async def clean(self, queues: set[bytes], now: dt.datetime, rate_limit_age: dt.timedelta) -> None: ...
+
+
+@runtime_checkable
+class TaskSchedulerProtocol(Protocol):  # pragma: no cover
+    """Scheduled/delayed task queue — promotes tasks into active queues at their run_at time."""
+
+    @property
+    def backend_key(self) -> str: ...
+
+    async def add(self, task: Task, run_at: dt.datetime) -> None: ...
+    async def remove(self, task_id: ULID, queue: str) -> None: ...
+    async def get_run_at(self, task_id: ULID) -> dt.datetime | None: ...
+    async def next_due_bulk(
+        self, n: int, queues: list[str] | None = None
+    ) -> list[tuple[Task, dt.datetime]]: ...
+    async def get_by_filter(
+        self,
+        queue: str | None,
+        task_name: str | None,
+        task_version: int | None,
+        limit: int,
+        start_after: str | None,
+    ) -> list[tuple[Task, dt.datetime]]: ...
+
+
+# ---------------------------------------------------------------------------
+# Atomic sub-protocols — extend the base protocols with Redis pipeline staging.
+# StateManager uses these when all adapters share the same backend, enabling
+# MULTI/EXEC atomicity instead of saga-style coordination.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class AtomicTaskStateProtocol(TaskStateProtocol, Protocol):  # pragma: no cover
+    """TaskStateProtocol + Redis pipeline staging methods for same-backend atomic operations."""
+
+    def pipeline(self, transaction: bool = True) -> Pipeline: ...
+
+    def stage_save(self, pipe: Pipeline, task: Task) -> None: ...
+    def stage_requeue(self, pipe: Pipeline, task: Task) -> None: ...
+    def stage_submit_task(self, pipe: Pipeline, task: Task) -> None: ...
+    def stage_remove_from_queue(self, pipe: Pipeline, task: Task) -> None: ...
+    def stage_init_fan_in(
+        self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+    ) -> None: ...
+    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None: ...
+
+
+@runtime_checkable
+class AtomicTaskSchedulerProtocol(TaskSchedulerProtocol, Protocol):  # pragma: no cover
+    """TaskSchedulerProtocol + pipeline staging for same-backend atomic operations."""
+
+    def pipeline(self, transaction: bool = True) -> Pipeline: ...
+    def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None: ...
+    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str) -> None: ...
+
+
+@runtime_checkable
+class AtomicDeadQueueProtocol(DeadQueueProtocol, Protocol):  # pragma: no cover
+    """DeadQueueProtocol + a backend_key for same-backend detection."""
+
+    @property
+    def backend_key(self) -> str: ...
+
+    def pipeline(self, transaction: bool = True) -> Pipeline: ...

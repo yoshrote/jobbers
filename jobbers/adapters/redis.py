@@ -508,6 +508,13 @@ class DeadQueue:
         self.data_store = data_store
         self.ta = task_adapter
 
+    @property
+    def backend_key(self) -> str:
+        return str(id(self.data_store))
+
+    def pipeline(self, transaction: bool = True) -> Pipeline:
+        return self.data_store.pipeline(transaction=transaction)
+
     async def ensure_index(self) -> None:
         """No-op: plain-Redis dead queue does not use a search index."""
 
@@ -518,12 +525,24 @@ class DeadQueue:
         pipe.sadd(self.DLQ_NAME(name=task.name), bytes(task.id))
         pipe.hset(self.DLQ_META, str(task.id), f"{task.queue}\0{task.name}\0{task.version}")
 
+    async def add_to_dlq(self, task: Task, failed_at: dt.datetime) -> None:
+        """Add a task to the DLQ (non-pipeline version for saga path)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_add(pipe, task, failed_at)
+        await pipe.execute()
+
     def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str, name: str) -> None:
         """Queue all four DLQ index deletes onto pipe (no execute)."""
         pipe.zrem(self.DLQ, bytes(task_id))
         pipe.srem(self.DLQ_QUEUE(queue=queue), bytes(task_id))
         pipe.srem(self.DLQ_NAME(name=name), bytes(task_id))
         pipe.hdel(self.DLQ_META, str(task_id))
+
+    async def remove_from_dlq(self, task_id: ULID, queue: str, name: str) -> None:
+        """Remove a task from the DLQ (non-pipeline version for saga path)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_remove(pipe, task_id, queue, name)
+        await pipe.execute()
 
     async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return the per-attempt error history for a DLQ task from its stored task blob."""

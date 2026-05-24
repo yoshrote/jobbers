@@ -23,6 +23,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from opentelemetry import metrics
+from redis.exceptions import WatchError
 from ulid import ULID
 
 from jobbers.constants import TIME_ZERO
@@ -73,6 +74,15 @@ class SharedTaskAdapterMixin(ABC):
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
         self._fan_in_script = self.data_store.register_script(self._FAN_IN_SCRIPT)
+
+    @property
+    def backend_key(self) -> str:
+        """Stable identifier for the backend instance — same object → same key."""
+        return str(id(self.data_store))
+
+    def pipeline(self, transaction: bool = True) -> Pipeline:
+        """Return a Redis pipeline for atomic staging (satisfies AtomicTaskStateProtocol)."""
+        return self.data_store.pipeline(transaction=transaction)
 
     # ---------------------------------------------------------------------------
     # Abstract primitives — subclasses must implement these
@@ -207,6 +217,35 @@ class SharedTaskAdapterMixin(ABC):
         if not raw_data:
             return None
         return self.unpack(task_id, raw_data)
+
+    async def compare_and_set_status(
+        self,
+        task_id: ULID,
+        expected: TaskStatus,
+        new: TaskStatus,
+    ) -> bool:
+        """
+        Atomically transition task status if the current status equals ``expected``.
+
+        Uses WATCH/MULTI for optimistic locking: retries on concurrent modification.
+        Returns True if the transition was applied, False if status did not match.
+        """
+        task_key = self.TASK_DETAILS(task_id=task_id)
+        while True:
+            pipe = self.data_store.pipeline()
+            await pipe.watch(task_key)
+            task = await self.read_for_watch(pipe, task_id)
+            if task is None or task.status != expected:
+                await pipe.unwatch()  # type: ignore[no-untyped-call]
+                return False
+            task.set_status(new)
+            pipe.multi()  # type: ignore[no-untyped-call]
+            self.stage_save(pipe, task)
+            try:
+                await pipe.execute()
+                return True
+            except WatchError:
+                continue
 
     async def _fetch_task_data_bulk(self, task_ids: list[ULID]) -> list[Any]:
         pipe = self.data_store.pipeline(transaction=False)

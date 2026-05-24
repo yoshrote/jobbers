@@ -154,6 +154,10 @@ class CronDAGScheduler:
         """Queue ZADD cron-schedule with updated next_run_at score onto pipe (no execute)."""
         pipe.zadd(self.CRON_SCHEDULE, {bytes(cron_id): next_run_at.timestamp()})
 
+    async def reschedule(self, cron_id: ULID, next_run_at: dt.datetime) -> None:
+        """Update the cron entry's next scheduled run time (non-pipeline version for saga path)."""
+        await self.data_store.zadd(self.CRON_SCHEDULE, {bytes(cron_id): next_run_at.timestamp()})
+
     async def get_active_run(self, cron_id: ULID) -> str | None:
         """Return the active root task ID string for a skip_if_running entry, or None."""
         raw: bytes | None = await cast(
@@ -176,6 +180,10 @@ class CronDAGScheduler:
     def stage_clear_active_run(self, pipe: Pipeline, cron_id: ULID) -> None:
         """Queue DEL cron-active:{id} onto pipe (no execute)."""
         pipe.delete(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)))
+
+    async def clear_active_run(self, cron_id: ULID) -> None:
+        """Delete the active-run marker for a cron entry (non-pipeline version for saga path)."""
+        await self.data_store.delete(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)))
 
     async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None:
         """Return the next scheduled run time for a cron entry, or None if not scheduled."""

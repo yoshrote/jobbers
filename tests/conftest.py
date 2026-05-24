@@ -60,16 +60,15 @@ async def state_manager_real_ta(redis, dummy_routing_backend):
 
 class DummyTaskAdapter:
     """
-    In-memory TaskAdapterProtocol stub for use as a test dependency.
+    In-memory AtomicTaskStateProtocol stub for StateManager orchestration tests.
 
-    Implements the subset of the protocol needed for StateManager tests that
-    exercise orchestration logic rather than adapter internals.  Pipeline-staged
-    methods (stage_requeue, stage_remove_from_queue) add real Redis commands to
-    whatever pipeline they receive from the caller, so tests that verify Redis
-    state via the ``redis`` fixture still work as expected.
+    Implements AtomicTaskStateProtocol so StateManager detects it as atomic-capable
+    and uses the MULTI/EXEC pipeline path (same behaviour as in production with a real
+    Redis-backed adapter).  Pipeline-staged methods add real Redis commands to whatever
+    pipeline they receive from the caller, so tests that verify Redis state via the
+    ``redis`` fixture still work as expected.
 
-    ``save_task`` is a test-convenience wrapper (not part of the protocol).
-    Any unimplemented method raises ``NotImplementedError`` immediately so
+    Methods not needed by current tests raise ``NotImplementedError`` immediately so
     accidental use is caught at the call site.
     """
 
@@ -80,10 +79,20 @@ class DummyTaskAdapter:
     QUEUE_RATE_LIMITER = SharedTaskAdapterMixin.QUEUE_RATE_LIMITER
     DLQ_MISSING_DATA = SharedTaskAdapterMixin.DLQ_MISSING_DATA
 
-    def __init__(self) -> None:
+    def __init__(self, data_store: object = None) -> None:
         self._store: dict[ULID, Task] = {}
+        self._data_store = data_store
 
-    # ── read ──────────────────────────────────────────────────────────────────
+    # ── AtomicTaskStateProtocol: backend identity + pipeline ──────────────────
+
+    @property
+    def backend_key(self) -> str:
+        return str(id(self._data_store))
+
+    def pipeline(self, transaction: bool = True) -> object:
+        return self._data_store.pipeline(transaction=transaction)  # type: ignore[union-attr]
+
+    # ── TaskStateProtocol: read ───────────────────────────────────────────────
 
     async def get_task(self, task_id: ULID) -> Task | None:
         return self._store.get(task_id)
@@ -91,15 +100,63 @@ class DummyTaskAdapter:
     async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]:
         return [self._store.get(task_id) for task_id in task_ids]
 
+    async def task_exists(self, task_id: ULID) -> bool:
+        return task_id in self._store
+
+    async def get_active_tasks(self, queues: object) -> list[Task]:
+        raise NotImplementedError("DummyTaskAdapter.get_active_tasks")
+
+    def get_stale_tasks(self, queues: object, stale_time: object) -> object:
+        raise NotImplementedError("DummyTaskAdapter.get_stale_tasks")
+
+    async def get_all_tasks(self, pagination: object) -> list[Task]:
+        raise NotImplementedError("DummyTaskAdapter.get_all_tasks")
+
+    async def compare_and_set_status(self, task_id: ULID, expected: object, new: object) -> bool:
+        task = self._store.get(task_id)
+        if task is None or task.status != expected:
+            return False
+        task.set_status(new)  # type: ignore[arg-type]
+        return True
+
+    async def update_task_heartbeat(self, task: Task) -> None:
+        raise NotImplementedError("DummyTaskAdapter.update_task_heartbeat")
+
+    async def remove_task_heartbeat(self, task: Task) -> None:
+        raise NotImplementedError("DummyTaskAdapter.remove_task_heartbeat")
+
+    async def init_fan_in(self, fan_in_key: str, predecessor_ids: object, ttl: int = 86400) -> None:
+        pass  # no-op: fan-in sets not needed for in-memory orchestration tests
+
+    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
+        raise NotImplementedError("DummyTaskAdapter.fan_in_complete")
+
+    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]:
+        raise NotImplementedError("DummyTaskAdapter.get_fan_in_members")
+
+    async def get_dag_runs(self, pagination: object) -> object:
+        raise NotImplementedError("DummyTaskAdapter.get_dag_runs")
+
+    async def get_dag_run(self, dag_run_id: ULID) -> object:
+        raise NotImplementedError("DummyTaskAdapter.get_dag_run")
+
+    async def clean_dag_runs(self, now: object, max_age: object) -> None:
+        raise NotImplementedError("DummyTaskAdapter.clean_dag_runs")
+
+    async def ensure_index(self) -> None:
+        raise NotImplementedError("DummyTaskAdapter.ensure_index")
+
+    async def clean_terminal_tasks(self, now: object, max_age: object) -> None:
+        raise NotImplementedError("DummyTaskAdapter.clean_terminal_tasks")
+
+    async def clean(self, queues: object, now: object, min_queue_age: object, max_queue_age: object) -> None:
+        raise NotImplementedError("DummyTaskAdapter.clean")
+
+    # ── AtomicTaskStateProtocol: pipeline-staged writes ───────────────────────
+
     async def read_for_watch(self, pipe: object, task_id: ULID) -> Task | None:
         """Read from in-memory store; the pipe is in WATCH mode but is not used here."""
         return self._store.get(task_id)
-
-    # ── write ─────────────────────────────────────────────────────────────────
-
-    async def submit_task(self, task: Task) -> bool:
-        self._store[task.id] = task
-        return True
 
     def stage_save(self, pipe: object, task: Task) -> None:
         self._store[task.id] = task
@@ -107,26 +164,32 @@ class DummyTaskAdapter:
     def stage_requeue(self, pipe: object, task: Task) -> None:
         """Eagerly store the task and add a ZADD to the caller's Redis pipeline."""
         assert task.submitted_at
-        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})  # type: ignore[union-attr]
         self._store[task.id] = task
 
     def stage_submit_task(self, pipe: object, task: Task) -> None:
         """Eagerly store the task and add a ZADD to the caller's Redis pipeline."""
         assert task.submitted_at
-        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})  # type: ignore[union-attr]
         self._store[task.id] = task
 
     def stage_remove_from_queue(self, pipe: object, task: Task) -> None:
         """Add ZREM + SREM commands to the caller's Redis pipeline."""
-        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
-        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))  # type: ignore[union-attr]
+        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))  # type: ignore[union-attr]
 
     def stage_init_fan_in(
         self, pipe: object, fan_in_key: str, predecessor_ids: object, ttl: int = 86400
     ) -> None:
         """No-op stub: fan-in sets are not needed for in-memory orchestration tests."""
 
-    # ── convenience (not part of protocol) ───────────────────────────────────
+    # ── Protocol extras (TaskAdapterProtocol compat) ─────────────────────────
+
+    async def submit_task(self, task: Task) -> bool:
+        self._store[task.id] = task
+        return True
+
+    # ── convenience (not part of any protocol) ────────────────────────────────
 
     async def save_task(self, task: Task) -> None:
         self.stage_save(None, task)
@@ -136,9 +199,9 @@ class DummyTaskAdapter:
 
 
 @pytest.fixture
-def dummy_task_adapter() -> DummyTaskAdapter:
-    """Fixture providing a fresh DummyTaskAdapter for each test."""
-    return DummyTaskAdapter()
+def dummy_task_adapter(redis: object) -> DummyTaskAdapter:
+    """Fixture providing a fresh DummyTaskAdapter backed by the test Redis for each test."""
+    return DummyTaskAdapter(redis)
 
 
 class DummyRoutingBackend:

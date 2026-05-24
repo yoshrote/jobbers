@@ -1,7 +1,7 @@
 import asyncio
 import contextlib
 import datetime as dt
-from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, call, patch
 
 import fakeredis.aioredis as fakeredis
 import pytest
@@ -526,6 +526,7 @@ def _make_state_manager():
 
 def _retryable_config(backoff_strategy=BackoffStrategy.CONSTANT, max_retries=3):
     """Build a TaskConfig with retry_delay=5 for scheduled-retry tests."""
+
     async def task_function(**_):  # pragma: no cover
         pass
 
@@ -832,16 +833,6 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     # Set up get_queue_config to report non-rate-limited queues
     state_manager.get_queue_config = AsyncMock(return_value=None)
 
-    # Set up pipeline: stage_submit_task is sync; execute() is awaitable
-    mock_pipe = AsyncMock()
-    state_manager.job_store = MagicMock()
-    state_manager.job_store.pipeline.return_value = mock_pipe
-
-    # Capture stage_submit_task calls
-    staged_tasks: list[Task] = []
-    state_manager.ta = MagicMock()
-    state_manager.ta.stage_submit_task.side_effect = lambda pipe, task: staged_tasks.append(task)
-
     processor = TaskProcessor(state_manager)
     await processor._handle_dynamic_fanout(parent, fanout)
 
@@ -854,12 +845,13 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     assert saved_task.id == collector.id
     assert set(saved_task.parent_ids) == {c1.id, c2.id}
 
-    # children submitted via pipeline, not submit_task
+    # children submitted via submit_tasks_batch, not submit_task
     state_manager.submit_task.assert_not_awaited()
-    assert {ct.id for ct in staged_tasks} == {c1.id, c2.id}
-    for ct in staged_tasks:
+    state_manager.submit_tasks_batch.assert_awaited_once()
+    child_tasks = state_manager.submit_tasks_batch.call_args[0][0]
+    assert {ct.id for ct in child_tasks} == {c1.id, c2.id}
+    for ct in child_tasks:
         assert ct.parent_ids == [parent.id]
-        assert ct.status == TaskStatus.SUBMITTED
         assert ct.dag_run_id == dag_run_id
     assert saved_task.dag_run_id == dag_run_id
 
@@ -959,7 +951,6 @@ async def test_post_process_triggers_dag_callbacks():
     )
 
     state_manager = _make_state_manager()
-    state_manager.stage_submit_task = MagicMock()
 
     # generate_callbacks now receives state_manager.ta directly
     mock_ta = AsyncMock()
@@ -971,8 +962,8 @@ async def test_post_process_triggers_dag_callbacks():
     await processor.post_process(parent)
 
     # Exactly one child task should have been submitted (one SimpleCallback)
-    state_manager.stage_submit_task.assert_called_once()
-    submitted = state_manager.stage_submit_task.call_args[0][1]
+    state_manager.submit_tasks_batch.assert_awaited_once()
+    submitted = state_manager.submit_tasks_batch.call_args[0][0][0]
     assert submitted.name == child_spec.name
 
 
@@ -1087,13 +1078,12 @@ async def test_post_process_error_submits_error_callbacks():
         dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
     )
     state_manager = _make_state_manager()
-    state_manager.stage_submit_task = MagicMock()
 
     processor = TaskProcessor(state_manager)
     await processor.post_process_error(task)
 
-    state_manager.stage_submit_task.assert_called_once()
-    submitted = state_manager.stage_submit_task.call_args[0][1]
+    state_manager.submit_tasks_batch.assert_awaited_once()
+    submitted = state_manager.submit_tasks_batch.call_args[0][0][0]
     assert submitted.id == error_spec.id
     assert submitted.parent_ids == [task.id]
 
@@ -1114,7 +1104,7 @@ async def test_post_process_error_no_error_callbacks_does_nothing():
     processor = TaskProcessor(state_manager)
     await processor.post_process_error(task)
 
-    state_manager.stage_submit_task.assert_not_called()
+    state_manager.submit_tasks_batch.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1131,7 +1121,6 @@ async def test_failed_task_triggers_error_callback():
         dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
     )
     state_manager = _make_state_manager()
-    state_manager.stage_submit_task = MagicMock()
 
     task_function = AsyncMock(side_effect=RuntimeError("boom"))
     task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10, max_retries=0)
@@ -1141,8 +1130,8 @@ async def test_failed_task_triggers_error_callback():
         result = await processor.process(task)
 
     assert result.status == TaskStatus.FAILED
-    state_manager.stage_submit_task.assert_called_once()
-    submitted = state_manager.stage_submit_task.call_args[0][1]
+    state_manager.submit_tasks_batch.assert_awaited_once()
+    submitted = state_manager.submit_tasks_batch.call_args[0][0][0]
     assert submitted.id == error_spec.id
 
 
@@ -1168,7 +1157,6 @@ async def test_non_failed_terminal_statuses_do_not_trigger_error_callback(trigge
         dag_callbacks=[SimpleCallback(task=child_spec, error_callback=error_spec)],
     )
     state_manager = _make_state_manager()
-    state_manager.stage_submit_task = MagicMock()
 
     if trigger_status == "stalled":
         # CancelledError from the system with STOP policy → STALLED
@@ -1205,7 +1193,7 @@ async def test_non_failed_terminal_statuses_do_not_trigger_error_callback(trigge
             await processor.process(task)
         assert task.status == TaskStatus.DROPPED
 
-    state_manager.stage_submit_task.assert_not_called()
+    state_manager.submit_tasks_batch.assert_not_awaited()
 
 
 # ── handle_success cron_id branch ────────────────────────────────────────────
@@ -1231,8 +1219,8 @@ async def test_handle_success_without_cron_id_calls_save_task():
 
 
 @pytest.mark.asyncio
-async def test_handle_success_with_cron_id_uses_pipeline_not_save_task():
-    """handle_success uses a transactional pipeline (stage_save + stage_clear_active_run) when cron_id is set."""
+async def test_handle_success_with_cron_id_uses_complete_cron_task():
+    """handle_success delegates to complete_cron_task (not save_task) when cron_id is set."""
     cron_id = ULID()
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -1243,20 +1231,12 @@ async def test_handle_success_with_cron_id_uses_pipeline_not_save_task():
         cron_id=cron_id,
     )
     state_manager = _make_state_manager()
-    mock_pipe = AsyncMock()
-    state_manager.job_store = MagicMock()
-    state_manager.job_store.pipeline.return_value = mock_pipe
-    state_manager.ta = MagicMock()
-    state_manager.cron_dag_scheduler = MagicMock()
 
     processor = TaskProcessor(state_manager)
     await processor.handle_success(task)
 
     state_manager.save_task.assert_not_awaited()
-    state_manager.job_store.pipeline.assert_called_once_with(transaction=True)
-    state_manager.ta.stage_save.assert_called_once_with(mock_pipe, task)
-    state_manager.cron_dag_scheduler.stage_clear_active_run.assert_called_once_with(mock_pipe, cron_id)
-    mock_pipe.execute.assert_awaited_once()
+    state_manager.complete_cron_task.assert_awaited_once_with(task)
     assert task.status == TaskStatus.COMPLETED
 
 

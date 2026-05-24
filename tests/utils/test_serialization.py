@@ -18,6 +18,7 @@ def test_default_with_datetime():
 
 def test_default_with_unknown_type():
     """default() raises TypeError for any type it doesn't know how to encode."""
+
     class CustomType:
         pass
 

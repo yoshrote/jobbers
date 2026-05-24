@@ -149,9 +149,7 @@ class TaskGenerator:
                     task = await self.state_manager.get_next_task(task_queues)
                 except asyncio.CancelledError:
                     if task:
-                        pipe = self.state_manager.job_store.pipeline()
-                        self.state_manager.ta.stage_requeue(pipe, task)
-                        await pipe.execute()
+                        await self.state_manager.requeue_task(task)
                     raise
                 if not task:
                     logger.info(

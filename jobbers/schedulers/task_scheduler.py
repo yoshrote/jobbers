@@ -58,15 +58,34 @@ class TaskScheduler:
         self.ta = task_adapter
         self._get_all_queues = get_all_queues
 
+    @property
+    def backend_key(self) -> str:
+        return str(id(self.data_store))
+
+    def pipeline(self, transaction: bool = True) -> Pipeline:
+        return self.data_store.pipeline(transaction=transaction)
+
     def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
         """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
         pipe.zadd(self.SCHEDULE_QUEUE(queue=task.queue), {bytes(task.id): run_at.timestamp()})
         pipe.hset(self.SCHEDULE_TASK_QUEUE, str(task.id), task.queue)
 
+    async def add(self, task: Task, run_at: dt.datetime) -> None:
+        """Add a task to the scheduler (non-pipeline version for saga path)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_add(pipe, task, run_at)
+        await pipe.execute()
+
     def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str) -> None:
         """Queue ZREM schedule-queue + HDEL schedule-task-queue onto pipe (no execute)."""
         pipe.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
         pipe.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
+
+    async def remove(self, task_id: ULID, queue: str) -> None:
+        """Remove a task from the scheduler (non-pipeline version for saga path)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_remove(pipe, task_id, queue)
+        await pipe.execute()
 
     async def get_run_at(self, task_id: ULID) -> dt.datetime | None:
         """Return the scheduled run_at for a single task, or None if not found."""

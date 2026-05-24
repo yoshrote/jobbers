@@ -518,6 +518,13 @@ class JsonDeadQueue:
         self.data_store = data_store
         self.ta = task_adapter
 
+    @property
+    def backend_key(self) -> str:
+        return str(id(self.data_store))
+
+    def pipeline(self, transaction: bool = True) -> Pipeline:
+        return self.data_store.pipeline(transaction=transaction)
+
     async def ensure_index(self) -> None:
         """Create the RediSearch index on DLQ JSON documents if it does not exist."""
         try:
@@ -547,9 +554,19 @@ class JsonDeadQueue:
             },
         )
 
+    async def add_to_dlq(self, task: Task, failed_at: dt.datetime) -> None:
+        """Add a task to the DLQ (non-pipeline version for saga path)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_add(pipe, task, failed_at)
+        await pipe.execute()
+
     def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str, name: str) -> None:
         """Queue DELETE of the DLQ JSON document onto pipe (no execute)."""
         pipe.delete(self.DLQ_KEY(task_id=task_id))
+
+    async def remove_from_dlq(self, task_id: ULID, _queue: str, _name: str) -> None:
+        """Remove a task from the DLQ (non-pipeline version for saga path)."""
+        await self.data_store.delete(self.DLQ_KEY(task_id=task_id))
 
     async def get_history(self, task_id: str) -> list[dict[str, Any]]:
         """Return per-attempt error history for a DLQ task from its stored task blob."""
