@@ -14,16 +14,13 @@ from redis.exceptions import WatchError
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.adapters.redis import DeadQueue
-from jobbers.adapters.redis_json import JsonTaskAdapter
 from jobbers.models.cron_dag import ConcurrencyPolicy
 from jobbers.models.dag import collect_fan_in_keys
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_status import TaskStatus
-from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
-from jobbers.schedulers.task_scheduler import TaskScheduler
+from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -43,6 +40,8 @@ if TYPE_CHECKING:
         TaskAdapterProtocol,
         TaskStateProtocol,
     )
+    from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
+    from jobbers.schedulers.task_scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
@@ -68,21 +67,23 @@ class StateManager:
         self,
         job_store: Redis,
         routing_backend: RoutingBackendProtocol,
-        task_adapter: TaskAdapterProtocol | None = None,
+        task_adapter: TaskAdapterProtocol,
+        *,
+        dead_queue: DeadQueueProtocol,
+        task_scheduler: TaskScheduler,
+        cron_dag_scheduler: CronDAGScheduler,
     ) -> None:
         self.job_store: Redis = job_store
         self.routing: RoutingBackendProtocol = routing_backend
-        self.ta: TaskAdapterProtocol = (
-            task_adapter if task_adapter is not None else JsonTaskAdapter(job_store)
-        )
+        self.ta: TaskAdapterProtocol = task_adapter
         self._queue_config_cache: dict[str, QueueConfig | None] = {}
         self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
         self.submission_limiter = SubmissionRateLimiter(job_store, self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self._cancel_events: dict[ULID, asyncio.Event] = {}
-        self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
-        self.task_scheduler = TaskScheduler(job_store, self.ta, self.get_all_queues)
-        self.cron_dag_scheduler = CronDAGScheduler(job_store)
+        self.dead_queue: DeadQueueProtocol = dead_queue
+        self.task_scheduler = task_scheduler
+        self.cron_dag_scheduler = cron_dag_scheduler
 
         # Split-protocol references for cross-datastore coordination.
         # In the default single-Redis setup, task_state is the same object as ta.

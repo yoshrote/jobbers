@@ -7,11 +7,13 @@ import pytest_asyncio
 from ulid import ULID
 
 import end2end
-from jobbers.adapters.redis import MsgpackTaskAdapter
+from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import clear_registry
+from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
+from jobbers.schedulers.task_scheduler import TaskScheduler
 from jobbers.state_manager import StateManager
 from jobbers.task_processor import TaskProcessor
 from jobbers.utils.mermaid_dag import parse_mermaid_dag
@@ -30,7 +32,16 @@ def register_e2e_tasks():
 @pytest_asyncio.fixture
 async def sm(redis, session_factory):
     await SQLQueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
-    return StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=MsgpackTaskAdapter(redis))
+    routing_backend = SQLRoutingBackend(session_factory)
+    ta = MsgpackTaskAdapter(redis)
+    return StateManager(
+        redis,
+        routing_backend,
+        task_adapter=ta,
+        dead_queue=DeadQueue(redis, ta),
+        task_scheduler=TaskScheduler(redis, ta, routing_backend.get_all_queues),
+        cron_dag_scheduler=CronDAGScheduler(redis),
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
