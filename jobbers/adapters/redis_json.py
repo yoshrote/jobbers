@@ -184,11 +184,11 @@ class RedisJSONQueueConfigAdapter:
     async def get_refresh_tag(self, role: str) -> ULID:
         raw: bytes | None = await self._client.get(self.REFRESH_TAG_KEY(name=role))
         if raw:
-            return ULID.from_str(raw.decode())
+            return cast("ULID", ULID.from_str(raw.decode()))
         init_tag = ULID()
         await self._client.set(self.REFRESH_TAG_KEY(name=role), str(init_tag), nx=True)
         raw = await self._client.get(self.REFRESH_TAG_KEY(name=role))
-        return ULID.from_str(raw.decode()) if raw else init_tag
+        return cast("ULID", ULID.from_str(raw.decode())) if raw else init_tag
 
     async def bump_refresh_tag(self, role: str) -> str:
         new_tag = str(ULID())

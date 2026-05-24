@@ -1,17 +1,16 @@
 import datetime as dt
 import logging
 from enum import StrEnum
-from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, Self, cast, get_args, get_origin, get_type_hints
 
-from pydantic import BaseModel, Field, PrivateAttr, TypeAdapter, field_serializer
-from pydantic.functional_serializers import SerializationInfo
+from pydantic import BaseModel, Field, FieldSerializationInfo, PrivateAttr, TypeAdapter, field_serializer
 from pydantic.functional_validators import BeforeValidator
 from ulid import ULID
 
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.utils.di import get_injected_param_names
 
-from .dag import DAGCallback, FanInCallback, SimpleCallback, TaskResult
+from .dag import DAGCallback, DAGTaskSpec, FanInCallback, SimpleCallback, TaskResult
 from .task_config import TaskConfig
 from .task_status import TaskStatus
 
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 def _parse_timestamp(v: object) -> dt.datetime | None:
     if v is None or isinstance(v, dt.datetime):
-        return v  # type: ignore[return-value]
+        return v
     if isinstance(v, (int, float)):
         return dt.datetime.fromtimestamp(v, dt.UTC)
     if isinstance(v, str):
@@ -36,11 +35,11 @@ def _parse_timestamp(v: object) -> dt.datetime | None:
 
 def _parse_ulid(v: object) -> ULID | None:
     if v is None or isinstance(v, ULID):
-        return v  # type: ignore[return-value]
+        return v
     if isinstance(v, str):
-        return ULID.from_str(v)
+        return cast("ULID", ULID.from_str(v))
     if isinstance(v, (bytes, bytearray)):
-        return ULID.from_bytes(bytes(v))
+        return  cast("ULID", ULID.from_bytes(bytes(v)))
     raise ValueError(f"Cannot parse ULID: {v!r}")
 
 
@@ -90,7 +89,7 @@ class Task(BaseModel):
 
     @field_serializer("submitted_at", "retried_at", "started_at", "heartbeat_at", "completed_at")
     def serialize_timestamp(
-        self, value: dt.datetime | None, info: SerializationInfo
+        self, value: dt.datetime | None, info: FieldSerializationInfo
     ) -> float | str | dt.datetime | None:
         if value is None:
             return None
@@ -102,7 +101,7 @@ class Task(BaseModel):
         return value.isoformat()  # ISO string for SQL columns and API responses
 
     @field_serializer("cron_id", "dag_run_id")
-    def serialize_optional_ulid(self, value: ULID | None, info: SerializationInfo) -> ULID | str | None:
+    def serialize_optional_ulid(self, value: ULID | None, info: FieldSerializationInfo) -> ULID | str | None:
         if value is None:
             return None
         if (info.context or {}).get("mode") == "msgpack":
@@ -110,7 +109,7 @@ class Task(BaseModel):
         return str(value)
 
     @field_serializer("parent_ids")
-    def serialize_parent_ids(self, value: list[ULID], info: SerializationInfo) -> list[ULID] | list[str]:
+    def serialize_parent_ids(self, value: list[ULID], info: FieldSerializationInfo) -> list[ULID] | list[str]:
         if (info.context or {}).get("mode") == "msgpack":
             return list(value)  # msgpack ExtType(3) handles each ULID → binary
         return [str(v) for v in value]
