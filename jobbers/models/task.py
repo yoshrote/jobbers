@@ -177,7 +177,7 @@ class Task(BaseModel):
 
     def _build_callback_task(
         self,
-        spec: "Task",
+        spec: "DAGTaskSpec",
         parent_ids: list[ULID],
         inject_parent_results: bool = False,
     ) -> "Self":
