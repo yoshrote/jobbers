@@ -525,6 +525,7 @@ def _make_state_manager():
 
 
 def _retryable_config(backoff_strategy=BackoffStrategy.CONSTANT, max_retries=3):
+    """Build a TaskConfig with retry_delay=5 for scheduled-retry tests."""
     async def task_function(**_):  # pragma: no cover
         pass
 

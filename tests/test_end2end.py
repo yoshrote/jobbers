@@ -78,6 +78,7 @@ async def run_until_done(sm: StateManager, max_rounds: int = 20) -> None:
 
 @pytest.mark.asyncio
 async def test_single_node_happy_path(sm: StateManager) -> None:
+    """A single-node DAG completes with the correct results and all timestamps set."""
     diagram = """
     flowchart TD
       A["echo_task@1(value=a)"]
@@ -102,6 +103,7 @@ async def test_single_node_happy_path(sm: StateManager) -> None:
 
 @pytest.mark.asyncio
 async def test_linear_chain(sm: StateManager) -> None:
+    """A→B→C chain: each node completes in order and shares the same dag_run_id."""
     diagram = """
     flowchart TD
       A["echo_task@1(value=a)"] --> B["echo_task@1(value=b)"] --> C["echo_task@1(value=c)"]
@@ -139,6 +141,7 @@ async def test_linear_chain(sm: StateManager) -> None:
 
 @pytest.mark.asyncio
 async def test_diamond_fan_out_fan_in(sm: StateManager) -> None:
+    """A→{B,C}→D: D waits for both B and C, then completes with both as parents."""
     diagram = """
     flowchart TD
       A["echo_task@1(value=a)"] --> B["echo_task@1(value=b)"]
@@ -183,6 +186,7 @@ async def test_diamond_fan_out_fan_in(sm: StateManager) -> None:
 
 @pytest.mark.asyncio
 async def test_error_callback_fires_on_failure(sm: StateManager) -> None:
+    """When A fails permanently its error callback (-.-> edge) is submitted; the success callback is not."""
     # A fails permanently; B is the (never-reached) success callback;
     # C is the error callback that should fire when A fails.
     diagram = """
@@ -219,6 +223,7 @@ async def test_error_callback_fires_on_failure(sm: StateManager) -> None:
 
 @pytest.mark.asyncio
 async def test_downstream_not_submitted_on_parent_failure(sm: StateManager) -> None:
+    """A successor linked by --> is never submitted when its parent fails permanently."""
     diagram = """
     flowchart TD
       A["always_fail_task@1"] --> B["echo_task@1(value=b)"]
@@ -243,6 +248,7 @@ async def test_downstream_not_submitted_on_parent_failure(sm: StateManager) -> N
 
 @pytest.mark.asyncio
 async def test_multi_root_dag(sm: StateManager) -> None:
+    """Two independent root nodes share a dag_run_id and both complete."""
     diagram = """
     flowchart TD
       A["echo_task@1(value=a)"]
@@ -272,6 +278,7 @@ async def test_multi_root_dag(sm: StateManager) -> None:
 
 @pytest.mark.asyncio
 async def test_retry_exhaustion_dlq(sm: StateManager) -> None:
+    """A task that fails on every attempt exhausts its retries and lands in the DLQ."""
     diagram = """
     flowchart TD
       A["always_fail_task@1"]
@@ -295,6 +302,7 @@ async def test_retry_exhaustion_dlq(sm: StateManager) -> None:
 
 @pytest.mark.asyncio
 async def test_scheduled_retry_path(sm: StateManager) -> None:
+    """A task configured with a retry delay exercises the scheduler path before landing in the DLQ."""
     diagram = """
     flowchart TD
       A["scheduled_fail_task@1"]
@@ -320,6 +328,7 @@ async def test_scheduled_retry_path(sm: StateManager) -> None:
 
 @pytest.mark.asyncio
 async def test_parameters_passed_and_results(sm: StateManager) -> None:
+    """Task parameters are forwarded to the function and reflected in the stored results."""
     diagram = """
     flowchart TD
       A["echo_task@1(value=hello)"]

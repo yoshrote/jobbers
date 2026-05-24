@@ -24,12 +24,14 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
 
 async def schedule(sm: StateManager, task: Task, run_at: dt.datetime) -> None:
+    """Stage a task into the task scheduler sorted set at the given run_at time."""
     pipe = sm.job_store.pipeline(transaction=True)
     sm.task_scheduler.stage_add(pipe, task, run_at)
     await pipe.execute()
 
 
 async def add_to_dlq(sm: StateManager, task: Task, failed_at: dt.datetime) -> None:
+    """Stage a task into the dead-letter queue at the given failed_at timestamp."""
     pipe = sm.job_store.pipeline(transaction=True)
     sm.dead_queue.stage_add(pipe, task, failed_at)
     await pipe.execute()

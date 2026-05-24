@@ -40,11 +40,7 @@ async def setup(session_factory, state_manager):
 
 @pytest.mark.asyncio
 async def test_main_page():
-    """
-    Test the task submission and status endpoints.
-
-    This task may flake out if there is a worker listening to the queue
-    """
+    """GET / returns a welcome message and an empty task list."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/")
 
@@ -57,11 +53,7 @@ async def test_main_page():
 
 @pytest.mark.asyncio
 async def test_submit_valid_task(state_manager):
-    """
-    Test the task submission and status endpoints.
-
-    This task may flake out if there is a worker listening to the queue
-    """
+    """A valid task is accepted, stored, and returned with SUBMITTED status."""
 
     async def task_function(foo: int) -> None: ...
 
@@ -96,17 +88,13 @@ async def test_submit_valid_task(state_manager):
 
 
 @pytest.mark.asyncio
-# @pytest.mark.skip(reason="Need to add a registered task with a param to hit this error")
 async def test_submit_invalid_task():
-    """Test the task submission fails when given bad input."""
+    """A task whose parameters fail type validation is rejected with a 400."""
 
-    # jobber_registry.register_task("test_task", test_task_function, parameters=["foo"])
-    # add a task config with a function that requires a parameter to the jobber registry
     async def task_function(foo: int) -> None: ...
 
     test_task_config = TaskConfig(name="Test Task", function=task_function)
     task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": "bar"})
-    # try to submit a task without the required parameter
     with patch("jobbers.registry.get_task_config", return_value=test_task_config):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post(

@@ -14,6 +14,7 @@ ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 
 
 def test_valid_params():
+    """valid_task_params validates parameter types against the function signature."""
     task_id = ULID()
     task = Task(
         id=task_id,
@@ -96,6 +97,7 @@ def test_shutdown_resubmit_policy_sets_status_unsubmitted():
 
 
 def test_should_retry_true_when_retries_remain():
+    """should_retry() is True while retry_attempt is still below max_retries."""
     async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
@@ -105,6 +107,7 @@ def test_should_retry_true_when_retries_remain():
 
 
 def test_should_retry_false_when_exhausted():
+    """should_retry() is False once retry_attempt equals max_retries."""
     async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
@@ -114,6 +117,7 @@ def test_should_retry_false_when_exhausted():
 
 
 def test_should_schedule_true_when_retry_delay_set():
+    """should_schedule() is True when the task config has a non-None retry_delay."""
     async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
@@ -122,6 +126,7 @@ def test_should_schedule_true_when_retry_delay_set():
 
 
 def test_should_schedule_false_when_no_retry_delay():
+    """should_schedule() is False when retry_delay is None."""
     async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
@@ -133,6 +138,7 @@ def test_should_schedule_false_when_no_retry_delay():
 
 
 def test_summarized_includes_last_error_when_errors_present():
+    """summarized() includes last_error when the errors list is non-empty."""
     task = Task(
         id=ULID1,
         name="t",
@@ -146,6 +152,7 @@ def test_summarized_includes_last_error_when_errors_present():
 
 
 def test_summarized_omits_last_error_when_no_errors():
+    """summarized() omits last_error when the errors list is empty."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
     summary = task.summarized()
     assert "last_error" not in summary
@@ -183,6 +190,7 @@ def test_set_status_started_sets_retried_at_when_already_started():
 
 
 def test_set_status_scheduled_increments_retry_attempt():
+    """set_status(SCHEDULED) bumps retry_attempt and records the new status."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     before = task.retry_attempt
     task.set_status(TaskStatus.SCHEDULED)
@@ -191,6 +199,7 @@ def test_set_status_scheduled_increments_retry_attempt():
 
 
 def test_set_status_unsubmitted_increments_retry_attempt():
+    """set_status(UNSUBMITTED) bumps retry_attempt (immediate retry path)."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
     before = task.retry_attempt
     task.set_status(TaskStatus.UNSUBMITTED)
