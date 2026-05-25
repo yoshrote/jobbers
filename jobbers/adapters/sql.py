@@ -473,6 +473,10 @@ class SQLTaskAdapter:
         """Stable identifier shared by all SQL adapters pointing to the same database."""
         return self._dsn or str(id(self._sf))
 
+    @property
+    def _use_for_update(self) -> bool:
+        return "sqlite" not in self._dsn
+
     def pipeline(self, transaction: bool = True) -> SQLTransactionBatch:
         """Return a new SQLTransactionBatch for staged atomic writes."""
         return SQLTransactionBatch(self._sf)
@@ -559,22 +563,22 @@ class SQLTaskAdapter:
 
         async def _insert_fan_in(s: AsyncSession) -> None:
             for row in rows:
-                exists = await s.execute(
-                    select(task_fan_in).where(
-                        task_fan_in.c.fan_in_key == row["fan_in_key"],
-                        task_fan_in.c.task_id == row["task_id"],
-                    )
-                )
-                if exists.first() is None:
-                    await s.execute(insert(task_fan_in).values(**row))
+                async with s.begin_nested() as sp:
+                    try:
+                        await s.execute(insert(task_fan_in).values(**row))
+                    except IntegrityError:
+                        await sp.rollback()
 
         pipe.add_op(_insert_fan_in)
 
     async def read_for_watch(self, pipe: TransactionHandle, task_id: ULID) -> Task | None:
-        """Read a task using the batch's open session (SELECT without locking for SQLite)."""
+        """Read a task inside the batch transaction, locking the row on backends that support FOR UPDATE."""
         assert isinstance(pipe, SQLTransactionBatch)  # noqa: S101
         session = await pipe._get_session()
-        result = await session.execute(select(tasks).where(tasks.c.id == str(task_id)))
+        stmt = select(tasks).where(tasks.c.id == str(task_id))
+        if self._use_for_update:
+            stmt = stmt.with_for_update()
+        result = await session.execute(stmt)
         row = result.first()
         return _row_to_task(row) if row is not None else None
 
@@ -686,12 +690,15 @@ class SQLTaskAdapter:
             return None
         async with self._sf() as session:
             async with session.begin():
-                result = await session.execute(
+                stmt = (
                     select(task_queue.c.task_id)
                     .where(task_queue.c.queue.in_(queues))
                     .order_by(task_queue.c.submitted_at)
                     .limit(1)
                 )
+                if self._use_for_update:
+                    stmt = stmt.with_for_update(skip_locked=True)
+                result = await session.execute(stmt)
                 row = result.first()
                 if row is None:
                     return None
@@ -730,18 +737,15 @@ class SQLTaskAdapter:
         async with self._sf() as session:
             async with session.begin():
                 for pid in predecessor_ids:
-                    exists = await session.execute(
-                        select(task_fan_in).where(
-                            task_fan_in.c.fan_in_key == fan_in_key,
-                            task_fan_in.c.task_id == str(pid),
-                        )
-                    )
-                    if exists.first() is None:
-                        await session.execute(
-                            insert(task_fan_in).values(
-                                fan_in_key=fan_in_key, task_id=str(pid), created_at=now
+                    async with session.begin_nested() as sp:
+                        try:
+                            await session.execute(
+                                insert(task_fan_in).values(
+                                    fan_in_key=fan_in_key, task_id=str(pid), created_at=now
+                                )
                             )
-                        )
+                        except IntegrityError:
+                            await sp.rollback()
 
     async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
         """
