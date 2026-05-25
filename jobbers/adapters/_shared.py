@@ -30,7 +30,7 @@ from jobbers.constants import TIME_ZERO
 from jobbers.models.task_status import TaskStatus
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from redis.asyncio.client import Pipeline, Redis
 
@@ -249,6 +249,37 @@ class SharedTaskAdapterMixin(ABC):
             except WatchError:
                 continue
 
+    async def optimistic_dispatch_scheduled(
+        self,
+        task: Task,
+        stage_extra: Callable[[TransactionHandle], None],
+    ) -> bool:
+        """
+        Atomically transition a SCHEDULED task to SUBMITTED using WATCH/MULTI.
+
+        Reads the task under WATCH; if it is missing or CANCELLED, unWATCHes and
+        returns False.  Otherwise sets status to SUBMITTED, stages a requeue, calls
+        stage_extra(pipe) for extra staged operations (e.g. scheduler removal), and
+        commits.  Retries transparently on WatchError.
+        """
+        task_key = self.TASK_DETAILS(task_id=task.id)
+        while True:
+            pipe = self.data_store.pipeline()
+            await pipe.watch(task_key)
+            watched_task = await self.read_for_watch(pipe, task.id)
+            if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
+                await pipe.unwatch()  # type: ignore[no-untyped-call]
+                return False
+            task.set_status(TaskStatus.SUBMITTED)
+            pipe.multi()  # type: ignore[no-untyped-call]
+            self.stage_requeue(pipe, task)
+            stage_extra(pipe)
+            try:
+                await pipe.execute()
+                return True
+            except WatchError:
+                continue
+
     async def _fetch_task_data_bulk(self, task_ids: list[ULID]) -> list[Any]:
         pipe = self.data_store.pipeline(transaction=False)
         for task_id in task_ids:
@@ -341,6 +372,11 @@ class SharedTaskAdapterMixin(ABC):
         p: Any = pipe
         p.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
         p.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+
+    def stage_remove_heartbeat(self, pipe: TransactionHandle, task: Task) -> None:
+        """Queue ZREM heartbeat-scores command onto pipe (no execute)."""
+        p: Any = pipe
+        p.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
 
     async def update_task_heartbeat(self, task: Task) -> None:
         """Update the heartbeat for a task."""

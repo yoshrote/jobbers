@@ -29,7 +29,7 @@ from typing_extensions import Protocol
 
 if TYPE_CHECKING:
     import datetime as dt
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
     from typing import Any
 
     from redis.asyncio.client import Pipeline
@@ -342,10 +342,29 @@ class AtomicTaskStateProtocol(TaskStateProtocol, Protocol):  # pragma: no cover
     def stage_requeue(self, pipe: TransactionHandle, task: Task) -> None: ...
     def stage_submit_task(self, pipe: TransactionHandle, task: Task) -> None: ...
     def stage_remove_from_queue(self, pipe: TransactionHandle, task: Task) -> None: ...
+    def stage_remove_heartbeat(self, pipe: TransactionHandle, task: Task) -> None: ...
     def stage_init_fan_in(
         self, pipe: TransactionHandle, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
     ) -> None: ...
     async def read_for_watch(self, pipe: TransactionHandle, task_id: ULID) -> Task | None: ...
+
+    async def optimistic_dispatch_scheduled(
+        self,
+        task: Task,
+        stage_extra: Callable[[TransactionHandle], None],
+    ) -> bool:
+        """
+        Atomically transition a SCHEDULED task to SUBMITTED.
+
+        Reads the current task state, verifies it is not cancelled or missing, sets
+        status to SUBMITTED, stages a requeue, and calls stage_extra(pipe) for any
+        additional staged operations before committing.
+
+        Returns True if dispatched, False if the task was not found or already cancelled.
+        Implementations choose their locking strategy (WATCH/MULTI for Redis,
+        SELECT FOR UPDATE for SQL).
+        """
+        ...
 
 
 @runtime_checkable

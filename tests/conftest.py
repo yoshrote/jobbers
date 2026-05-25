@@ -13,6 +13,7 @@ from jobbers.migrations.runner import run_migrations
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_routing import RoutingConfig
+from jobbers.models.task_status import TaskStatus
 from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
 from jobbers.schedulers.task_scheduler import TaskScheduler
 from jobbers.state_manager import StateManager
@@ -194,6 +195,22 @@ class DummyTaskAdapter:
         """Add ZREM + SREM commands to the caller's Redis pipeline."""
         pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))  # type: ignore[union-attr]
         pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))  # type: ignore[union-attr]
+
+    def stage_remove_heartbeat(self, pipe: object, task: Task) -> None:
+        """Add ZREM heartbeat command to the caller's Redis pipeline."""
+        pipe.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))  # type: ignore[union-attr]
+
+    async def optimistic_dispatch_scheduled(self, task: Task, stage_extra: object) -> bool:
+        """CAS dispatch: check in-memory store, set SUBMITTED, enqueue via real Redis pipeline."""
+        watched_task = self._store.get(task.id)
+        if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
+            return False
+        task.set_status(TaskStatus.SUBMITTED)
+        pipe = self._data_store.pipeline(transaction=True)  # type: ignore[union-attr]
+        self.stage_requeue(pipe, task)
+        stage_extra(pipe)  # type: ignore[operator]
+        await pipe.execute()
+        return True
 
     def stage_init_fan_in(
         self, pipe: object, fan_in_key: str, predecessor_ids: object, ttl: int = 86400

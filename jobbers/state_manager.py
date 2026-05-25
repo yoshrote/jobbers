@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 from croniter import croniter
 from opentelemetry import metrics
-from redis.exceptions import WatchError
 from ulid import ULID
 
 from jobbers import registry
@@ -189,14 +188,9 @@ class StateManager:
                         ):
                             task.set_status(TaskStatus.STALLED)
                             if self._atomic_state is not None:
-                                from typing import Any
-
                                 pipe = self._atomic_state.pipeline(transaction=True)
                                 self._atomic_state.stage_save(pipe, task)
-                                pipe_any: Any = pipe
-                                pipe_any.zrem(
-                                    self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id)
-                                )
+                                self._atomic_state.stage_remove_heartbeat(pipe, task)
                                 stale_pipes.append(pipe.execute())
                             else:
                                 stale_saga_tasks.append(task)
@@ -307,24 +301,17 @@ class StateManager:
         the residual schedule-task-queue hash entry.
         """
         if self._atomic_state is not None and self._atomic_scheduler is not None:
-            task_key = self.ta.TASK_DETAILS(task_id=task.id)
-            while True:
-                pipe = self.job_store.pipeline()
-                await pipe.watch(task_key)
-                watched_task: Task | None = await self.ta.read_for_watch(pipe, task.id)
-                if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
-                    await pipe.unwatch()  # type: ignore[no-untyped-call]
-                    return task
-                task.set_status(TaskStatus.SUBMITTED)
-                pipe.multi()  # type: ignore[no-untyped-call]
-                self._atomic_state.stage_requeue(pipe, task)
-                self._atomic_scheduler.stage_remove(pipe, task.id, task.queue)
-                try:
-                    await pipe.execute()
-                    logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
-                    return task
-                except WatchError:
-                    continue
+            scheduler = self._atomic_scheduler
+
+            def _stage_scheduler_remove(pipe: TransactionHandle) -> None:
+                scheduler.stage_remove(pipe, task.id, task.queue)
+
+            dispatched = await self._atomic_state.optimistic_dispatch_scheduled(
+                task, _stage_scheduler_remove
+            )
+            if dispatched:
+                logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
+            return task
         else:
             # Saga path: compare-and-set status guards against concurrent cancellation.
             applied = await self.task_state.compare_and_set_status(
