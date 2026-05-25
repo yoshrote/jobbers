@@ -23,6 +23,12 @@ if TYPE_CHECKING:
 TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")
 DEFAULT_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
+# SQL-backend feature flags — each defaults to "redis" for backward compatibility.
+TASK_BACKEND = os.environ.get("TASK_BACKEND", "redis")
+DLQ_BACKEND = os.environ.get("DLQ_BACKEND", "redis")
+TASK_SCHEDULER_BACKEND = os.environ.get("TASK_SCHEDULER_BACKEND", "redis")
+FORCE_SAGA_MODE = os.environ.get("FORCE_SAGA_MODE", "false").lower() == "true"
+
 _client: redis.Redis | None = None
 _state_manager: StateManager | None = None
 _engine: AsyncEngine | None = None
@@ -70,7 +76,7 @@ async def close_sqlite_conn() -> None:
 
 
 def create_task_adapter(client: redis.Redis) -> TaskAdapterProtocol:
-    """Create a TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
+    """Create a Redis TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
     if TASK_ADAPTER_BACKEND == "msgpack":
         return MsgpackTaskAdapter(client)
     return JsonTaskAdapter(client)
@@ -101,10 +107,29 @@ def register_routing_backend(backend: RoutingBackendProtocol) -> None:
     _pre_registered_routing_backend = backend
 
 
+async def _get_or_create_sql(features: set[str]) -> async_sessionmaker[AsyncSession]:
+    """Initialize the shared SQLAlchemy engine and session factory (idempotent)."""
+    global _engine, _session_factory
+    if _session_factory is not None:
+        return _session_factory
+
+    db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
+    _engine = create_async_engine(db_path)
+
+    @event.listens_for(_engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_conn: object, connection_record: object) -> None:
+        if db_path.startswith("sqlite"):
+            cursor = dbapi_conn.cursor()  # type: ignore[attr-defined]
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+    await run_migrations(_engine, features=features)
+    _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
+    return _session_factory
+
+
 async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol:
     """Create the routing backend, initializing SQL only when needed."""
-    global _engine, _session_factory
-
     if _pre_registered_routing_backend is not None:
         return _pre_registered_routing_backend
 
@@ -122,19 +147,8 @@ async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol
         return StaticRoutingBackend.from_env()
 
     # sql (default) — initialize SQLAlchemy
-    db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
-    _engine = create_async_engine(db_path)
-
-    @event.listens_for(_engine.sync_engine, "connect")
-    def set_sqlite_pragma(dbapi_conn: object, connection_record: object) -> None:
-        if db_path.startswith("sqlite"):
-            cursor = dbapi_conn.cursor()  # type: ignore[attr-defined]
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
-
-    await run_migrations(_engine)
-    _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
-    return SQLRoutingBackend(_session_factory)
+    sf = await _get_or_create_sql({"routing"})
+    return SQLRoutingBackend(sf)
 
 
 async def init_state_manager() -> StateManager:
@@ -142,18 +156,63 @@ async def init_state_manager() -> StateManager:
     from jobbers.state_manager import StateManager
 
     client = get_client()
+
+    # Determine which SQL features are needed so we run only the required migrations.
+    needed_sql_features: set[str] = set()
+    routing_backend_type = os.environ.get("ROUTING_BACKEND", "sql")
+    if routing_backend_type == "sql":
+        needed_sql_features.add("routing")
+    if TASK_BACKEND == "sql":
+        needed_sql_features.add("task_state")
+    if DLQ_BACKEND == "sql":
+        needed_sql_features.add("dead_letter")
+    if TASK_SCHEDULER_BACKEND == "sql":
+        needed_sql_features.add("task_schedule")
+
     routing_backend = await _create_routing_backend(client)
-    _task_adapter = create_task_adapter(client)
-    dead_queue = create_dead_queue(client, _task_adapter)
-    task_scheduler = TaskScheduler(client, _task_adapter, routing_backend.get_all_queues)
+
+    # Task adapter
+    if TASK_BACKEND == "sql":
+        from jobbers.adapters.sql import SQLTaskAdapter
+
+        sf = await _get_or_create_sql(needed_sql_features)
+        dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
+        _task_adapter = SQLTaskAdapter(sf, dsn=dsn)
+    else:
+        _task_adapter = create_task_adapter(client)
+
+    # Dead-letter queue
+    if DLQ_BACKEND == "sql":
+        from jobbers.adapters.sql import SQLDeadQueue
+
+        sf = await _get_or_create_sql(needed_sql_features)
+        dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
+        dead_queue: DeadQueueProtocol = SQLDeadQueue(sf, dsn=dsn)
+    else:
+        dead_queue = create_dead_queue(client, _task_adapter)
+
+    # Task scheduler
+    if TASK_SCHEDULER_BACKEND == "sql":
+        from jobbers.schedulers.sql_task_scheduler import SQLTaskScheduler
+
+        sf = await _get_or_create_sql(needed_sql_features)
+        dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
+        task_scheduler: TaskScheduler | SQLTaskScheduler = SQLTaskScheduler(
+            sf, routing_backend.get_all_queues, dsn=dsn
+        )
+    else:
+        task_scheduler = TaskScheduler(client, _task_adapter, routing_backend.get_all_queues)
+
     cron_dag_scheduler = CronDAGScheduler(client)
+
     _state_manager = StateManager(
         client,
         routing_backend,
         task_adapter=_task_adapter,
         dead_queue=dead_queue,
-        task_scheduler=task_scheduler,
+        task_scheduler=task_scheduler,  # type: ignore[arg-type]
         cron_dag_scheduler=cron_dag_scheduler,
+        force_saga=FORCE_SAGA_MODE,
     )
     await _task_adapter.ensure_index()
     await _state_manager.dead_queue.ensure_index()

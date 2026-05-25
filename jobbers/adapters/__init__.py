@@ -5,11 +5,13 @@ Task storage:
 - `TaskAdapterProtocol` — interface all task adapters must satisfy.
 - `JsonTaskAdapter` — Redis Stack (RedisJSON + RediSearch) backend.
 - `MsgpackTaskAdapter` — plain Redis (msgpack binary strings) backend.
+- `SQLTaskAdapter` — SQLAlchemy backend (tasks / task_fan_in / dag_runs tables).
 
 Dead letter queue:
 - `DeadQueueProtocol` — interface all DLQ implementations must satisfy.
 - `DeadQueue` — plain Redis backend (sorted sets + hash indexes).
 - `JsonDeadQueue` — Redis Stack backend (RedisJSON + RediSearch).
+- `SQLDeadQueue` — SQLAlchemy backend (dead_letter_queue table).
 
 Routing backends (queues, roles, task routing config):
 - `RoutingBackendProtocol` — interface all routing backends must satisfy.
@@ -22,7 +24,7 @@ Routing backends (queues, roles, task routing config):
 
 from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter, RedisRoutingBackend
 from jobbers.adapters.redis_json import JsonDeadQueue, JsonTaskAdapter, RedisJSONRoutingBackend
-from jobbers.adapters.sql import SQLRoutingBackend
+from jobbers.adapters.sql import SQLDeadQueue, SQLRoutingBackend, SQLTaskAdapter
 from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.protocols import (
     DeadQueueProtocol,
@@ -36,8 +38,10 @@ __all__ = [
     "DeadQueueProtocol",
     "JsonTaskAdapter",
     "MsgpackTaskAdapter",
+    "SQLTaskAdapter",
     "DeadQueue",
     "JsonDeadQueue",
+    "SQLDeadQueue",
     "RoutingBackendProtocol",
     "RoutingBackendReadOnlyError",
     "SQLRoutingBackend",

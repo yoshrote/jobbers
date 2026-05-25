@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from jobbers.models.dag import DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
+    from jobbers.protocols import TransactionHandle
 
 logger = logging.getLogger(__name__)
 tasks_missing_data = metrics.get_meter(__name__).create_counter("tasks_missing_data", unit="1")
@@ -102,15 +103,15 @@ class SharedTaskAdapterMixin(ABC):
 
     @abstractmethod
     async def _load_raw_watch(self, pipe: Pipeline, key: str) -> Any:
-        """Fetch raw task data via an active WATCH pipeline."""
+        """Fetch raw task data via an active WATCH pipeline (Redis-specific)."""
 
     @abstractmethod
     def _stage_store(self, pipe: Pipeline, key: str, task: Task) -> None:
-        """Stage the backend's write command for task data onto pipe."""
+        """Stage the backend's write command for task data onto pipe (Redis-specific)."""
 
     @abstractmethod
     def _stage_load(self, pipe: Pipeline, key: str) -> None:
-        """Stage the backend's read command for task data onto pipe."""
+        """Stage the backend's read command for task data onto pipe (Redis-specific)."""
 
     @abstractmethod
     def _extra_submit_keys(self, task: Task) -> list[str]:
@@ -191,13 +192,14 @@ class SharedTaskAdapterMixin(ABC):
         )
         return result == 1
 
-    def stage_save(self, pipe: Pipeline, task: Task) -> None:
+    def stage_save(self, pipe: TransactionHandle, task: Task) -> None:
         """Queue task-details write + type-index update onto pipe (no execute)."""
-        self._stage_store(pipe, self.TASK_DETAILS(task_id=task.id), task)
+        p: Any = pipe
+        self._stage_store(p, self.TASK_DETAILS(task_id=task.id), task)
         if task.status in TaskStatus.active_statuses():
-            pipe.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+            p.sadd(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
         else:
-            pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+            p.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
 
     async def get_task(self, task_id: ULID) -> Task | None:
         raw_data = await self._load_raw(self.TASK_DETAILS(task_id=task_id))
@@ -211,9 +213,9 @@ class SharedTaskAdapterMixin(ABC):
             task.heartbeat_at = dt.datetime.fromtimestamp(heartbeat_score, dt.UTC)
         return task
 
-    async def read_for_watch(self, pipe: Pipeline, task_id: ULID) -> Task | None:
+    async def read_for_watch(self, pipe: TransactionHandle, task_id: ULID) -> Task | None:
         """Read task data via a WATCH pipeline."""
-        raw_data = await self._load_raw_watch(pipe, self.TASK_DETAILS(task_id=task_id))
+        raw_data = await self._load_raw_watch(pipe, self.TASK_DETAILS(task_id=task_id))  # type: ignore[arg-type]
         if not raw_data:
             return None
         return self.unpack(task_id, raw_data)
@@ -287,25 +289,28 @@ class SharedTaskAdapterMixin(ABC):
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task_id))
             await pipe.execute()
 
-    def stage_requeue(self, pipe: Pipeline, task: Task) -> None:
+    def stage_requeue(self, pipe: TransactionHandle, task: Task) -> None:
         """Queue ZADD task-queue + save-task commands onto pipe (no execute)."""
         assert task.submitted_at  # noqa: S101
-        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        p: Any = pipe
+        p.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
         self.stage_save(pipe, task)
 
-    def stage_submit_task(self, pipe: Pipeline, task: Task) -> None:
+    def stage_submit_task(self, pipe: TransactionHandle, task: Task) -> None:
         """Queue ZADD + save-task onto pipe for initial submission (no execute)."""
         assert task.submitted_at  # noqa: S101
-        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        p: Any = pipe
+        p.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
         self.stage_save(pipe, task)
         self.stage_register_dag_run(pipe, task)
 
-    def stage_register_dag_run(self, pipe: Pipeline, task: Task) -> None:
+    def stage_register_dag_run(self, pipe: TransactionHandle, task: Task) -> None:
         """Stage DAG run index updates onto pipe if the task belongs to a DAG run."""
         if task.dag_run_id is None or task.submitted_at is None:
             return
         score = task.submitted_at.timestamp()
-        pipe.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): score}, nx=True)
+        p: Any = pipe
+        p.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): score}, nx=True)
 
     async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
         """Return a paginated list of DAG runs ordered by submission time (oldest first)."""
@@ -331,10 +336,11 @@ class SharedTaskAdapterMixin(ABC):
         self.stage_save(pipe, task)
         await pipe.execute()
 
-    def stage_remove_from_queue(self, pipe: Pipeline, task: Task) -> None:
+    def stage_remove_from_queue(self, pipe: TransactionHandle, task: Task) -> None:
         """Queue ZREM task-queue + SREM type-index commands onto pipe (no execute)."""
-        pipe.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
-        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        p: Any = pipe
+        p.zrem(self.TASKS_BY_QUEUE(queue=task.queue), bytes(task.id))
+        p.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
 
     async def update_task_heartbeat(self, task: Task) -> None:
         """Update the heartbeat for a task."""
@@ -399,15 +405,16 @@ class SharedTaskAdapterMixin(ABC):
                 yield task
 
     def stage_init_fan_in(
-        self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+        self, pipe: TransactionHandle, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
     ) -> None:
         """Queue fan-in set initialisation commands onto *pipe* without executing."""
+        p: Any = pipe
         members_key = f"{fan_in_key}:members"
         encoded = [str(pid).encode() for pid in predecessor_ids]
-        pipe.sadd(fan_in_key, *encoded)
-        pipe.expire(fan_in_key, ttl)
-        pipe.sadd(members_key, *encoded)
-        pipe.expire(members_key, ttl * 2)
+        p.sadd(fan_in_key, *encoded)
+        p.expire(fan_in_key, ttl)
+        p.sadd(members_key, *encoded)
+        p.expire(members_key, ttl * 2)
 
     async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
         """Pre-populate a fan-in tracking set in Redis."""

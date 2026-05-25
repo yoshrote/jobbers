@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
+    from jobbers.protocols import TransactionHandle
+
 
 @dataclass
 class ConcurrencyStager:
@@ -37,9 +39,9 @@ class ConcurrencyStager:
     """
 
     skipped: bool
-    _stage_fn: Callable[[Pipeline, ULID], None]
+    _stage_fn: Callable[[TransactionHandle, ULID], None]
 
-    def stage_active_run(self, pipe: Pipeline, task_id: ULID) -> None:
+    def stage_active_run(self, pipe: TransactionHandle, task_id: ULID) -> None:
         self._stage_fn(pipe, task_id)
 
 
@@ -150,9 +152,10 @@ class CronDAGScheduler:
             results.append((entry, run_at))
         return results
 
-    def stage_reschedule(self, pipe: Pipeline, cron_id: ULID, next_run_at: dt.datetime) -> None:
+    def stage_reschedule(self, pipe: TransactionHandle, cron_id: ULID, next_run_at: dt.datetime) -> None:
         """Queue ZADD cron-schedule with updated next_run_at score onto pipe (no execute)."""
-        pipe.zadd(self.CRON_SCHEDULE, {bytes(cron_id): next_run_at.timestamp()})
+        p: Any = pipe
+        p.zadd(self.CRON_SCHEDULE, {bytes(cron_id): next_run_at.timestamp()})
 
     async def reschedule(self, cron_id: ULID, next_run_at: dt.datetime) -> None:
         """Update the cron entry's next scheduled run time (non-pipeline version for saga path)."""
@@ -167,7 +170,7 @@ class CronDAGScheduler:
         return raw.decode() if raw is not None else None
 
     def stage_set_active_run(
-        self, pipe: Pipeline, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
+        self, pipe: TransactionHandle, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
     ) -> None:
         """
         Queue SET cron-active:{id} with TTL onto pipe (no execute).
@@ -175,11 +178,13 @@ class CronDAGScheduler:
         When *nx=True* the SET is conditional (SET NX): it only succeeds if the key
         does not already exist, providing an atomic guard against concurrent dispatches.
         """
-        pipe.set(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)), str(task_id), ex=ttl, nx=nx)
+        p: Any = pipe
+        p.set(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)), str(task_id), ex=ttl, nx=nx)
 
-    def stage_clear_active_run(self, pipe: Pipeline, cron_id: ULID) -> None:
+    def stage_clear_active_run(self, pipe: TransactionHandle, cron_id: ULID) -> None:
         """Queue DEL cron-active:{id} onto pipe (no execute)."""
-        pipe.delete(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)))
+        p: Any = pipe
+        p.delete(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)))
 
     async def clear_active_run(self, cron_id: ULID) -> None:
         """Delete the active-run marker for a cron entry (non-pipeline version for saga path)."""

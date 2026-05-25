@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.protocols import TaskAdapterProtocol
+    from jobbers.protocols import TaskAdapterProtocol, TransactionHandle
 
 
 def _escape_tag(value: str) -> str:
@@ -540,9 +540,10 @@ class JsonDeadQueue:
                 definition=IndexDefinition(prefix=["dlq:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
             )
 
-    def stage_add(self, pipe: Pipeline, task: Task, failed_at: dt.datetime) -> None:
+    def stage_add(self, pipe: TransactionHandle, task: Task, failed_at: dt.datetime) -> None:
         """Queue JSON.SET DLQ entry onto pipe (no execute)."""
-        pipe.json().set(
+        p: Any = pipe
+        p.json().set(
             self.DLQ_KEY(task_id=task.id),
             "$",
             {
@@ -560,9 +561,10 @@ class JsonDeadQueue:
         self.stage_add(pipe, task, failed_at)
         await pipe.execute()
 
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str, name: str) -> None:
+    def stage_remove(self, pipe: TransactionHandle, task_id: ULID, queue: str, name: str) -> None:
         """Queue DELETE of the DLQ JSON document onto pipe (no execute)."""
-        pipe.delete(self.DLQ_KEY(task_id=task_id))
+        p: Any = pipe
+        p.delete(self.DLQ_KEY(task_id=task_id))
 
     async def remove_from_dlq(self, task_id: ULID, _queue: str, _name: str) -> None:
         """Remove a task from the DLQ (non-pipeline version for saga path)."""

@@ -25,7 +25,7 @@ from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
-    from redis.asyncio.client import Pipeline, Redis
+    from redis.asyncio.client import Redis
 
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGNode, DAGRunPagination
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         RoutingBackendProtocol,
         TaskAdapterProtocol,
         TaskStateProtocol,
+        TransactionHandle,
     )
     from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
     from jobbers.schedulers.task_scheduler import TaskScheduler
@@ -72,6 +73,7 @@ class StateManager:
         dead_queue: DeadQueueProtocol,
         task_scheduler: TaskScheduler,
         cron_dag_scheduler: CronDAGScheduler,
+        force_saga: bool = False,
     ) -> None:
         self.job_store: Redis = job_store
         self.routing: RoutingBackendProtocol = routing_backend
@@ -90,8 +92,8 @@ class StateManager:
         self.task_state: TaskStateProtocol = self.ta  # type: ignore[assignment]
 
         # Same-backend detection: if the task adapter, scheduler, and DLQ all implement the
-        # Atomic sub-protocols (i.e. they're all Redis-backed), StateManager uses atomic
-        # MULTI/EXEC pipelines.  When stores differ, it falls back to saga coordination.
+        # Atomic sub-protocols, StateManager uses atomic pipelines.  When stores differ, or
+        # when force_saga=True, it falls back to saga coordination.
         from jobbers.protocols import (  # local import avoids circular at module level
             AtomicDeadQueueProtocol,
             AtomicTaskSchedulerProtocol,
@@ -107,8 +109,10 @@ class StateManager:
         self._atomic_dlq: AtomicDeadQueueProtocol | None = (
             self.dead_queue if isinstance(self.dead_queue, AtomicDeadQueueProtocol) else None
         )
-        self._atomic_mode: bool = all(
-            x is not None for x in (self._atomic_state, self._atomic_scheduler, self._atomic_dlq)
+        self._atomic_mode: bool = (
+            False
+            if force_saga
+            else all(x is not None for x in (self._atomic_state, self._atomic_scheduler, self._atomic_dlq))
         )
 
     @property
@@ -185,9 +189,14 @@ class StateManager:
                         ):
                             task.set_status(TaskStatus.STALLED)
                             if self._atomic_state is not None:
+                                from typing import Any
+
                                 pipe = self._atomic_state.pipeline(transaction=True)
                                 self._atomic_state.stage_save(pipe, task)
-                                pipe.zrem(self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
+                                pipe_any: Any = pipe
+                                pipe_any.zrem(
+                                    self.ta.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id)
+                                )
                                 stale_pipes.append(pipe.execute())
                             else:
                                 stale_saga_tasks.append(task)
@@ -362,7 +371,7 @@ class StateManager:
                     yield ConcurrencyStager(skipped=True, _stage_fn=lambda _p, _t: None)
                     return
 
-            def _stage_skip(pipe: Pipeline, task_id: ULID) -> None:
+            def _stage_skip(pipe: TransactionHandle, task_id: ULID) -> None:
                 self.cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task_id, nx=True)
 
             yield ConcurrencyStager(skipped=False, _stage_fn=_stage_skip)
@@ -503,7 +512,7 @@ class StateManager:
     async def get_refresh_tag(self, role: str) -> ULID:
         return await self.routing.get_refresh_tag(role)
 
-    def stage_submit_task(self, pipe: Pipeline, task: Task, queue_config: QueueConfig | None) -> None:
+    def stage_submit_task(self, pipe: TransactionHandle, task: Task, queue_config: QueueConfig | None) -> None:
         """
         Set task status to SUBMITTED and stage ZADD + save onto pipe (no execute).
 

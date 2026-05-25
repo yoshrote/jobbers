@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.models.task import Task
-    from jobbers.protocols import TaskAdapterProtocol
+    from jobbers.protocols import TaskAdapterProtocol, TransactionHandle
 
 
 class TaskScheduler:
@@ -65,10 +65,11 @@ class TaskScheduler:
     def pipeline(self, transaction: bool = True) -> Pipeline:
         return self.data_store.pipeline(transaction=transaction)
 
-    def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
+    def stage_add(self, pipe: TransactionHandle, task: Task, run_at: dt.datetime) -> None:
         """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
-        pipe.zadd(self.SCHEDULE_QUEUE(queue=task.queue), {bytes(task.id): run_at.timestamp()})
-        pipe.hset(self.SCHEDULE_TASK_QUEUE, str(task.id), task.queue)
+        p: Any = pipe
+        p.zadd(self.SCHEDULE_QUEUE(queue=task.queue), {bytes(task.id): run_at.timestamp()})
+        p.hset(self.SCHEDULE_TASK_QUEUE, str(task.id), task.queue)
 
     async def add(self, task: Task, run_at: dt.datetime) -> None:
         """Add a task to the scheduler (non-pipeline version for saga path)."""
@@ -76,10 +77,11 @@ class TaskScheduler:
         self.stage_add(pipe, task, run_at)
         await pipe.execute()
 
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str) -> None:
+    def stage_remove(self, pipe: TransactionHandle, task_id: ULID, queue: str) -> None:
         """Queue ZREM schedule-queue + HDEL schedule-task-queue onto pipe (no execute)."""
-        pipe.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
-        pipe.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
+        p: Any = pipe
+        p.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
+        p.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
 
     async def remove(self, task_id: ULID, queue: str) -> None:
         """Remove a task from the scheduler (non-pipeline version for saga path)."""

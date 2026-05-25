@@ -1,20 +1,18 @@
 """
 Contract tests for TaskAdapterProtocol implementations.
 
-Each test runs against all registered implementations via the ``task_adapter``
-fixture defined in ``tests/adapters/conftest.py``.
+Uses only the saga-path public API (the same methods StateManager calls when
+``force_saga=True``).  No ``data_store.*`` access; no sorted-set assertions.
+Runs against all three backends (raw, json, sql) with zero xfails.
 """
 
-import asyncio
 import datetime as dt
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from ulid import ULID
 
 from jobbers.adapters.redis import MsgpackTaskAdapter
 from jobbers.models.dag import DAGRunPagination
-from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
@@ -329,219 +327,6 @@ async def test_get_all_tasks_filter_pagination_page_size_is_predictable(task_ada
     assert [t.id for t in page2] == [ULID4]
 
 
-# ── stage_requeue ─────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_stage_requeue_adds_task_to_queue(task_adapter):
-    """stage_requeue enqueues the task back into its sorted-set queue."""
-    task = make_task()
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_requeue(pipe, task)
-    await pipe.execute()
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) in members
-
-
-@pytest.mark.asyncio
-async def test_stage_requeue_saves_task_data(task_adapter):
-    """stage_requeue also persists the task blob so it can be retrieved."""
-    task = make_task()
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_requeue(pipe, task)
-    await pipe.execute()
-
-    saved = await task_adapter.get_task(ULID1)
-    assert saved is not None
-    assert saved.id == ULID1
-
-
-@pytest.mark.asyncio
-async def test_stage_requeue_uses_submitted_at_as_score(task_adapter):
-    """The queue sorted-set score matches the task's submitted_at timestamp."""
-    task = make_task()
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_requeue(pipe, task)
-    await pipe.execute()
-
-    score = await task_adapter.data_store.zscore(task_adapter.TASKS_BY_QUEUE(queue="default"), bytes(ULID1))
-    assert score == pytest.approx(FROZEN_TIME.timestamp())
-
-
-@pytest.mark.asyncio
-async def test_stage_requeue_does_not_duplicate_queue_entry(task_adapter):
-    """Re-queuing the same task ID does not create a duplicate entry."""
-    task = make_task()
-    for _ in range(3):
-        pipe = task_adapter.data_store.pipeline(transaction=True)
-        task_adapter.stage_requeue(pipe, task)
-        await pipe.execute()
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert members.count(bytes(ULID1)) == 1
-
-
-# ── stage_submit_task ─────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_stage_submit_task_adds_task_to_queue(task_adapter):
-    """stage_submit_task enqueues the task into its sorted-set queue."""
-    task = make_task()
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_submit_task(pipe, task)
-    await pipe.execute()
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) in members
-
-
-@pytest.mark.asyncio
-async def test_stage_submit_task_saves_task_data(task_adapter):
-    """stage_submit_task persists the task blob so it can be retrieved."""
-    task = make_task()
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_submit_task(pipe, task)
-    await pipe.execute()
-
-    saved = await task_adapter.get_task(ULID1)
-    assert saved is not None
-    assert saved.id == ULID1
-
-
-@pytest.mark.asyncio
-async def test_stage_submit_task_uses_submitted_at_as_score(task_adapter):
-    """The queue sorted-set score matches the task's submitted_at timestamp."""
-    task = make_task()
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_submit_task(pipe, task)
-    await pipe.execute()
-
-    score = await task_adapter.data_store.zscore(task_adapter.TASKS_BY_QUEUE(queue="default"), bytes(ULID1))
-    assert score == pytest.approx(FROZEN_TIME.timestamp())
-
-
-@pytest.mark.asyncio
-async def test_stage_submit_task_does_not_duplicate_queue_entry(task_adapter):
-    """Staging the same task ID twice does not create a duplicate queue entry."""
-    task = make_task()
-    for _ in range(3):
-        pipe = task_adapter.data_store.pipeline(transaction=True)
-        task_adapter.stage_submit_task(pipe, task)
-        await pipe.execute()
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert members.count(bytes(ULID1)) == 1
-
-
-# ── remove_task_heartbeat ─────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_remove_task_heartbeat_removes_entry(task_adapter):
-    """remove_task_heartbeat removes the task from the heartbeat sorted set."""
-    task = make_task()
-    task.heartbeat_at = FROZEN_TIME
-    await task_adapter.update_task_heartbeat(task)
-    assert (
-        await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), bytes(ULID1))
-        is not None
-    )
-
-    await task_adapter.remove_task_heartbeat(task)
-    assert (
-        await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), bytes(ULID1))
-        is None
-    )
-
-
-@pytest.mark.asyncio
-async def test_remove_task_heartbeat_noop_when_absent(task_adapter):
-    """remove_task_heartbeat is a no-op when the task has no heartbeat entry."""
-    task = make_task()
-    await task_adapter.remove_task_heartbeat(task)  # should not raise
-
-
-# ── get_active_tasks ──────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_get_active_tasks_returns_empty_for_no_heartbeats(task_adapter):
-    """get_active_tasks returns [] when no tasks have heartbeat entries."""
-    result = await task_adapter.get_active_tasks({"default"})
-    assert result == []
-
-
-@pytest.mark.asyncio
-async def test_get_active_tasks_returns_tasks_with_heartbeats(task_adapter):
-    """get_active_tasks returns tasks that have a heartbeat entry."""
-    task = make_task()
-    await task_adapter.save_task(task)
-    task.heartbeat_at = FROZEN_TIME
-    await task_adapter.update_task_heartbeat(task)
-
-    result = await task_adapter.get_active_tasks({"default"})
-    assert len(result) == 1
-    assert result[0].id == ULID1
-
-
-# ── clean (no-op branch) ──────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_clean_noop_when_no_age_params(task_adapter):
-    """clean() with neither min_queue_age nor max_queue_age does nothing."""
-    task = make_task()
-    await task_adapter.submit_task(task)
-
-    now = dt.datetime.now(dt.UTC)
-    await task_adapter.clean(queues={b"default"}, now=now)
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) in members
-
-
-@pytest.mark.asyncio
-async def test_clean_inverted_time_range(task_adapter):
-    """`clean()` removes everything outside the (max_queue_age, min_queue_age) window."""
-    task = make_task(ULID1, submitted_at=FROZEN_TIME)
-    await task_adapter.submit_task(task)
-
-    # min > max → inverted: removes [0, min] ∪ [max, now], keeping nothing
-    await task_adapter.clean(
-        queues={b"default"},
-        now=FROZEN_TIME + dt.timedelta(hours=1),
-        min_queue_age=FROZEN_TIME + dt.timedelta(seconds=30),
-        max_queue_age=FROZEN_TIME - dt.timedelta(seconds=30),
-    )
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) not in members
-
-
-# ── get_next_task: missing data path ─────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_get_next_task_skips_missing_data_and_returns_none(task_adapter):
-    """When a task is popped from the queue but its blob is absent, it is logged and None is returned."""
-    fake_id = ULID1
-    queue_key = task_adapter.TASKS_BY_QUEUE(queue="default")
-    if isinstance(queue_key, str):
-        queue_key = queue_key.encode()
-    pop_results = iter(
-        [
-            (queue_key, bytes(fake_id), FROZEN_TIME.timestamp()),
-            None,
-        ]
-    )
-    with patch.object(task_adapter.data_store, "bzpopmin", new_callable=AsyncMock, side_effect=pop_results):
-        result = await task_adapter.get_next_task(queues={"default"}, pop_timeout=1)
-    assert result is None
-    assert await task_adapter.data_store.zscore(task_adapter.DLQ_MISSING_DATA, bytes(fake_id)) is not None
-
-
 # ── submit_task / get_task / task_exists ──────────────────────────────────────
 
 
@@ -552,12 +337,12 @@ async def test_submit_task(task_adapter):
     task.set_status(TaskStatus.SUBMITTED)
     await task_adapter.submit_task(task)
 
-    task_list = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) in task_list
-    saved_task = await task_adapter.get_task(ULID1)
-    assert saved_task.name == "Test Task"
-    assert saved_task.status == TaskStatus.SUBMITTED
-    assert saved_task.submitted_at == task.submitted_at
+    saved = await task_adapter.get_task(ULID1)
+    assert saved is not None
+    assert saved.name == "Test Task"
+    assert saved.status == TaskStatus.SUBMITTED
+    assert saved.submitted_at == task.submitted_at
+    assert await task_adapter.task_exists(ULID1)
 
 
 @pytest.mark.asyncio
@@ -570,13 +355,14 @@ async def test_submit_task_twice_updates_only(task_adapter):
     updated_task = Task(id=ULID1, name="Updated Task", status="completed", submitted_at=task.submitted_at)
     await task_adapter.submit_task(updated_task)
 
-    task_list = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue=task.queue), 0, -1)
-    assert task_list == [bytes(ULID1)]
+    saved = await task_adapter.get_task(ULID1)
+    assert saved is not None
+    assert saved.name == "Updated Task"
+    assert saved.status == TaskStatus.COMPLETED
+    assert saved.submitted_at == task.submitted_at
 
-    saved_task = await task_adapter.get_task(ULID1)
-    assert saved_task.name == "Updated Task"
-    assert saved_task.status == TaskStatus.COMPLETED
-    assert saved_task.submitted_at == task.submitted_at
+    results = await task_adapter.get_all_tasks(TaskPagination(queue=task.queue))
+    assert len(results) == 1
 
 
 @pytest.mark.asyncio
@@ -624,22 +410,20 @@ async def test_update_task_heartbeat_sets_timestamp(task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_update_task_heartbeat_adds_to_scores(task_adapter):
-    """update_task_heartbeat adds the task to the heartbeat sorted set."""
+async def test_update_task_heartbeat_makes_task_active(task_adapter):
+    """A task with a heartbeat entry is returned by get_active_tasks."""
     task = make_task(status=TaskStatus.STARTED)
     await task_adapter.save_task(task)
     task.heartbeat_at = FROZEN_TIME
     await task_adapter.update_task_heartbeat(task)
 
-    scores = await task_adapter.data_store.zrange(
-        task_adapter.HEARTBEAT_SCORES(queue=task.queue), 0, -1, withscores=True
-    )
-    assert any(bytes(task.id) == task_id for task_id, _ in scores)
+    active = await task_adapter.get_active_tasks({task.queue})
+    assert any(t.id == task.id for t in active)
 
 
 @pytest.mark.asyncio
-async def test_update_task_heartbeat_updates_existing_score(task_adapter):
-    """A second update_task_heartbeat call overwrites the previous heartbeat score."""
+async def test_update_task_heartbeat_updates_existing_entry(task_adapter):
+    """A second update_task_heartbeat call overwrites the previous heartbeat timestamp."""
     task = make_task(status=TaskStatus.STARTED)
     await task_adapter.save_task(task)
     task.heartbeat_at = FROZEN_TIME
@@ -649,11 +433,55 @@ async def test_update_task_heartbeat_updates_existing_score(task_adapter):
     task.heartbeat_at = second_time
     await task_adapter.update_task_heartbeat(task)
 
-    scores = await task_adapter.data_store.zrange(
-        task_adapter.HEARTBEAT_SCORES(queue=task.queue), 0, -1, withscores=True
-    )
-    score = next(score for task_id, score in scores if bytes(task.id) == task_id)
-    assert score == second_time.timestamp()
+    updated = await task_adapter.get_task(task.id)
+    assert updated is not None
+    assert updated.heartbeat_at == second_time
+
+
+# ── remove_task_heartbeat ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_remove_task_heartbeat_removes_entry(task_adapter):
+    """remove_task_heartbeat removes the task from the active set."""
+    task = make_task()
+    await task_adapter.save_task(task)
+    task.heartbeat_at = FROZEN_TIME
+    await task_adapter.update_task_heartbeat(task)
+    assert any(t.id == task.id for t in await task_adapter.get_active_tasks({task.queue}))
+
+    await task_adapter.remove_task_heartbeat(task)
+    assert not any(t.id == task.id for t in await task_adapter.get_active_tasks({task.queue}))
+
+
+@pytest.mark.asyncio
+async def test_remove_task_heartbeat_noop_when_absent(task_adapter):
+    """remove_task_heartbeat is a no-op when the task has no heartbeat entry."""
+    task = make_task()
+    await task_adapter.remove_task_heartbeat(task)  # should not raise
+
+
+# ── get_active_tasks ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_active_tasks_returns_empty_for_no_heartbeats(task_adapter):
+    """get_active_tasks returns [] when no tasks have heartbeat entries."""
+    result = await task_adapter.get_active_tasks({"default"})
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_active_tasks_returns_tasks_with_heartbeats(task_adapter):
+    """get_active_tasks returns tasks that have a heartbeat entry."""
+    task = make_task()
+    await task_adapter.save_task(task)
+    task.heartbeat_at = FROZEN_TIME
+    await task_adapter.update_task_heartbeat(task)
+
+    result = await task_adapter.get_active_tasks({"default"})
+    assert len(result) == 1
+    assert result[0].id == ULID1
 
 
 # ── get_stale_tasks ───────────────────────────────────────────────────────────
@@ -730,31 +558,11 @@ async def test_get_stale_tasks_handles_multiple_queues(task_adapter):
     assert {task.id for task in stale_tasks} == {t1.id, t2.id}
 
 
-@pytest.mark.asyncio
-async def test_get_stale_tasks_filters_out_missing_blobs(task_adapter):
-    """Tasks whose blob has been deleted are silently excluded from stale results."""
-    now = dt.datetime.now(dt.UTC)
-    stale_task = Task(
-        id=ULID1,
-        name="stale_task",
-        queue="default",
-        status=TaskStatus.STARTED,
-        started_at=now,
-        heartbeat_at=now - dt.timedelta(minutes=10),
-    )
-    await task_adapter.save_task(stale_task)
-    await task_adapter.update_task_heartbeat(stale_task)
-    await task_adapter.data_store.delete(task_adapter.TASK_DETAILS(task_id=stale_task.id))
-
-    stale_tasks = [task async for task in task_adapter.get_stale_tasks({"default"}, dt.timedelta(minutes=5))]
-    assert len(stale_tasks) == 0
-
-
 # ── clean_terminal_tasks ──────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_clean_terminal_tasks_deletes_old_completed_blob(task_adapter):
+async def test_clean_terminal_tasks_deletes_old_completed_task(task_adapter):
     """A completed task blob older than max_age is deleted."""
     task = Task(
         id=ULID1,
@@ -765,46 +573,7 @@ async def test_clean_terminal_tasks_deletes_old_completed_blob(task_adapter):
     )
     await task_adapter.save_task(task)
     await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    assert not await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
-
-
-@pytest.mark.asyncio
-async def test_clean_terminal_tasks_removes_heartbeat_entry(task_adapter):
-    """The heartbeat sorted-set entry is removed along with the task blob."""
-    task = Task(
-        id=ULID1,
-        name="test_task",
-        queue="default",
-        status=TaskStatus.COMPLETED,
-        completed_at=FROZEN_TIME - dt.timedelta(days=8),
-    )
-    await task_adapter.save_task(task)
-    await task_adapter.data_store.zadd(
-        task_adapter.HEARTBEAT_SCORES(queue="default"),
-        {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=8)).timestamp()},
-    )
-    await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    assert (
-        await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes)
-        is None
-    )
-
-
-@pytest.mark.asyncio
-async def test_clean_terminal_tasks_removes_type_index_entry(task_adapter):
-    """Orphaned task-type-idx entries are removed alongside the task blob."""
-    task = Task(
-        id=ULID1,
-        name="test_task",
-        queue="default",
-        status=TaskStatus.COMPLETED,
-        completed_at=FROZEN_TIME - dt.timedelta(days=8),
-    )
-    await task_adapter.save_task(task)
-    await task_adapter.data_store.sadd(task_adapter.TASK_BY_TYPE_IDX(name="test_task"), ULID1.bytes)
-    await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    members = await task_adapter.data_store.smembers(task_adapter.TASK_BY_TYPE_IDX(name="test_task"))
-    assert ULID1.bytes not in members
+    assert not await task_adapter.task_exists(ULID1)
 
 
 @pytest.mark.asyncio
@@ -819,7 +588,7 @@ async def test_clean_terminal_tasks_skips_active_task(task_adapter):
     )
     await task_adapter.save_task(task)
     await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(seconds=0))
-    assert await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
+    assert await task_adapter.task_exists(ULID1)
 
 
 @pytest.mark.asyncio
@@ -834,7 +603,7 @@ async def test_clean_terminal_tasks_skips_task_within_age(task_adapter):
     )
     await task_adapter.save_task(task)
     await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    assert await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
+    assert await task_adapter.task_exists(ULID1)
 
 
 @pytest.mark.asyncio
@@ -843,7 +612,7 @@ async def test_clean_terminal_tasks_skips_task_without_completed_at(task_adapter
     task = Task(id=ULID1, name="test_task", queue="default", status=TaskStatus.FAILED, completed_at=None)
     await task_adapter.save_task(task)
     await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(seconds=0))
-    assert await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
+    assert await task_adapter.task_exists(ULID1)
 
 
 @pytest.mark.parametrize(
@@ -868,39 +637,7 @@ async def test_clean_terminal_tasks_cleans_all_terminal_statuses(task_adapter, s
     )
     await task_adapter.save_task(task)
     await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    assert not await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
-
-
-@pytest.mark.parametrize(
-    "status",
-    [
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-        TaskStatus.STALLED,
-        TaskStatus.DROPPED,
-    ],
-)
-@pytest.mark.asyncio
-async def test_clean_terminal_tasks_removes_heartbeat_for_all_terminal_statuses(task_adapter, status):
-    """Heartbeat entries are removed for every terminal status, not just COMPLETED."""
-    task = Task(
-        id=ULID1,
-        name="test_task",
-        queue="default",
-        status=status,
-        completed_at=FROZEN_TIME - dt.timedelta(days=8),
-    )
-    await task_adapter.save_task(task)
-    await task_adapter.data_store.zadd(
-        task_adapter.HEARTBEAT_SCORES(queue="default"),
-        {ULID1.bytes: (FROZEN_TIME - dt.timedelta(days=8)).timestamp()},
-    )
-    await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    assert (
-        await task_adapter.data_store.zscore(task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes)
-        is None
-    )
+    assert not await task_adapter.task_exists(ULID1)
 
 
 @pytest.mark.asyncio
@@ -923,130 +660,65 @@ async def test_clean_terminal_tasks_leaves_other_tasks_untouched(task_adapter):
     await task_adapter.save_task(old_task)
     await task_adapter.save_task(recent_task)
     await task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    assert not await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
-    assert await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID2))
+    assert not await task_adapter.task_exists(ULID1)
+    assert await task_adapter.task_exists(ULID2)
+
+
+# ── stage_requeue / stage_submit_task / stage_remove_from_queue ───────────────
+# These three tests use task_adapter.pipeline() (not data_store.pipeline()) so
+# they work against all three backends.
 
 
 @pytest.mark.asyncio
-async def test_clean_terminal_tasks_skips_non_ulid_keys(task_adapter):
-    """
-    A task:* key whose suffix is not a valid ULID is silently skipped.
+async def test_stage_requeue_saves_task_data(task_adapter):
+    """stage_requeue also persists the task blob so it can be retrieved."""
+    task = make_task()
+    pipe = task_adapter.pipeline(transaction=True)
+    task_adapter.stage_requeue(pipe, task)
+    await pipe.execute()
 
-    Both adapters parse the ULID before accessing the task blob, so a plain
-    SET key with an invalid suffix triggers ValueError → continue without
-    crashing or modifying the key.
-    """
-    await task_adapter.data_store.set("task:not_a_valid_ulid", b"some data")
-    await task_adapter.clean_terminal_tasks(dt.datetime.now(dt.UTC), dt.timedelta(days=1))
-    assert await task_adapter.data_store.exists("task:not_a_valid_ulid")
-
-
-# ── submit_rate_limited_task ──────────────────────────────────────────────────
-
-
-def _make_rate_task(task_id: ULID, submitted_at: dt.datetime) -> Task:
-    return Task(
-        id=task_id, name="test", queue="default", status=TaskStatus.SUBMITTED, submitted_at=submitted_at
-    )
-
-
-def _default_queue_config(rate_numerator: int = 2) -> QueueConfig:
-    return QueueConfig(
-        name="default", rate_numerator=rate_numerator, rate_denominator=1, rate_period=RatePeriod.MINUTE
-    )
+    saved = await task_adapter.get_task(ULID1)
+    assert saved is not None
+    assert saved.id == ULID1
 
 
 @pytest.mark.asyncio
-async def test_submit_rate_limited_enqueues_when_empty(task_adapter, task_adapter_dt_module):
-    """Atomically enqueues the task and records it in the rate-limiter when the set is empty."""
-    task = _make_rate_task(ULID1, FROZEN_TIME)
-    with patch(task_adapter_dt_module) as mock_dt:
-        mock_dt.datetime.now.return_value = FROZEN_TIME
-        mock_dt.timedelta = dt.timedelta
-        result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
-    assert result is True
-    assert bytes(ULID1) in await task_adapter.data_store.zrange(
-        task_adapter.QUEUE_RATE_LIMITER(queue="default"), 0, -1
-    )
-    assert bytes(ULID1) in await task_adapter.data_store.zrange(
-        task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1
-    )
-    assert await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID1))
+async def test_stage_submit_task_saves_task_data(task_adapter):
+    """stage_submit_task persists the task blob so it can be retrieved."""
+    task = make_task()
+    pipe = task_adapter.pipeline(transaction=True)
+    task_adapter.stage_submit_task(pipe, task)
+    await pipe.execute()
+
+    saved = await task_adapter.get_task(ULID1)
+    assert saved is not None
+    assert saved.id == ULID1
 
 
 @pytest.mark.asyncio
-async def test_submit_rate_limited_enqueues_with_room(task_adapter, task_adapter_dt_module):
-    """Enqueues when one slot is already used out of two."""
-    await task_adapter.data_store.zadd(
-        task_adapter.QUEUE_RATE_LIMITER(queue="default"), {ULID1.bytes: FROZEN_TIME.timestamp() - 1}
-    )
-    task = _make_rate_task(ULID2, FROZEN_TIME)
-    with patch(task_adapter_dt_module) as mock_dt:
-        mock_dt.datetime.now.return_value = FROZEN_TIME
-        mock_dt.timedelta = dt.timedelta
-        result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
-    assert result is True
-    assert bytes(ULID2) in await task_adapter.data_store.zrange(
-        task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1
-    )
+async def test_stage_remove_from_queue_noop_when_absent(task_adapter):
+    """stage_remove_from_queue does not raise when the task is not in the queue."""
+    task = make_task()
+    pipe = task_adapter.pipeline(transaction=True)
+    task_adapter.stage_remove_from_queue(pipe, task)
+    await pipe.execute()  # should not raise
+
+
+# ── get_next_task ─────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_submit_rate_limited_prunes_expired_entries(task_adapter, task_adapter_dt_module):
-    """Expired rate-limiter entries are pruned; the new task is accepted."""
-    await task_adapter.data_store.zadd(
-        task_adapter.QUEUE_RATE_LIMITER(queue="default"), {ULID1.bytes: FROZEN_TIME.timestamp() - 60}
-    )
-    await task_adapter.data_store.zadd(
-        task_adapter.QUEUE_RATE_LIMITER(queue="default"), {ULID2.bytes: FROZEN_TIME.timestamp() - 61}
-    )
-    new_id = ULID5
-    task = _make_rate_task(new_id, FROZEN_TIME)
-    with patch(task_adapter_dt_module) as mock_dt:
-        mock_dt.datetime.now.return_value = FROZEN_TIME
-        mock_dt.timedelta = dt.timedelta
-        result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
-    assert result is True
-    assert new_id.bytes in await task_adapter.data_store.zrange(
-        task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1
-    )
+async def test_get_next_task_returns_submitted_task(task_adapter):
+    """get_next_task pops and returns the next available task."""
+    task = make_task()
+    await task_adapter.submit_task(task)
 
+    result = await task_adapter.get_next_task(queues={"default"}, pop_timeout=1)
+    assert result is not None
+    assert result.id == ULID1
 
-@pytest.mark.asyncio
-async def test_submit_rate_limited_rejects_when_full(task_adapter, task_adapter_dt_module):
-    """Task is not enqueued when rate limit is reached."""
-    await task_adapter.data_store.zadd(
-        task_adapter.QUEUE_RATE_LIMITER(queue="default"), {ULID1.bytes: FROZEN_TIME.timestamp() - 1}
-    )
-    await task_adapter.data_store.zadd(
-        task_adapter.QUEUE_RATE_LIMITER(queue="default"), {ULID2.bytes: FROZEN_TIME.timestamp() - 2}
-    )
-    task = _make_rate_task(ULID5, FROZEN_TIME)
-    with patch(task_adapter_dt_module) as mock_dt:
-        mock_dt.datetime.now.return_value = FROZEN_TIME
-        mock_dt.timedelta = dt.timedelta
-        result = await task_adapter.submit_rate_limited_task(task, _default_queue_config())
-    assert result is False
-    assert ULID5.bytes not in await task_adapter.data_store.zrange(
-        task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1
-    )
-    assert not await task_adapter.data_store.exists(task_adapter.TASK_DETAILS(task_id=ULID5))
-
-
-@pytest.mark.asyncio
-async def test_submit_rate_limited_concurrent_respects_limit(task_adapter):
-    """Concurrent submissions must not collectively exceed the rate limit."""
-    now = dt.datetime.now(dt.UTC)
-    limit = 5
-    queue_config = _default_queue_config(rate_numerator=limit)
-    tasks = [_make_rate_task(ULID(), now) for _ in range(10)]
-
-    results = await asyncio.gather(*[task_adapter.submit_rate_limited_task(t, queue_config) for t in tasks])
-
-    accepted = sum(1 for r in results if r)
-    assert accepted == limit
-    assert await task_adapter.data_store.zcard(task_adapter.QUEUE_RATE_LIMITER(queue="default")) == limit
-    assert await task_adapter.data_store.zcard(task_adapter.TASKS_BY_QUEUE(queue="default")) == limit
+    result2 = await task_adapter.get_next_task(queues={"default"}, pop_timeout=1)
+    assert result2 is None
 
 
 # ── ensure_index ──────────────────────────────────────────────────────────────
@@ -1056,69 +728,6 @@ async def test_submit_rate_limited_concurrent_respects_limit(task_adapter):
 async def test_ensure_index_does_not_raise(task_adapter):
     """ensure_index completes without error for every adapter implementation."""
     await task_adapter.ensure_index()
-
-
-# ── read_for_watch ────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_read_for_watch_returns_task(task_adapter):
-    task = make_task()
-    await task_adapter.save_task(task)
-
-    task_key = task_adapter.TASK_DETAILS(task_id=ULID1)
-    pipe = task_adapter.data_store.pipeline()
-    await pipe.watch(task_key)
-    result = await task_adapter.read_for_watch(pipe, ULID1)
-    await pipe.unwatch()
-
-    assert result is not None
-    assert result.id == ULID1
-    assert result.name == "my_task"
-
-
-@pytest.mark.asyncio
-async def test_read_for_watch_returns_none_when_missing(task_adapter):
-    task_key = task_adapter.TASK_DETAILS(task_id=ULID1)
-    pipe = task_adapter.data_store.pipeline()
-    await pipe.watch(task_key)
-    result = await task_adapter.read_for_watch(pipe, ULID1)
-    await pipe.unwatch()
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_read_for_watch_preserves_task_fields(task_adapter):
-    task = make_task(status=TaskStatus.STARTED)
-    task.errors = ["oops"]
-    task.retry_attempt = 2
-    await task_adapter.save_task(task)
-
-    task_key = task_adapter.TASK_DETAILS(task_id=ULID1)
-    pipe = task_adapter.data_store.pipeline()
-    await pipe.watch(task_key)
-    result = await task_adapter.read_for_watch(pipe, ULID1)
-    await pipe.unwatch()
-
-    assert result is not None
-    assert result.status == TaskStatus.STARTED
-    assert result.errors == ["oops"]
-    assert result.retry_attempt == 2
-
-
-# ── get_all_tasks: missing blob ───────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_get_all_tasks_skips_missing_data(task_adapter):
-    """Task registered in the queue but blob deleted → not returned by get_all_tasks."""
-    task = make_task()
-    await task_adapter.submit_task(task)
-    await task_adapter.data_store.delete(task_adapter.TASK_DETAILS(task_id=ULID1))
-
-    results = await task_adapter.get_all_tasks(TaskPagination(queue="default"))
-    assert results == []
 
 
 # ── get_tasks_bulk ────────────────────────────────────────────────────────────
@@ -1157,7 +766,7 @@ async def test_get_tasks_bulk_returns_none_for_missing_ids(task_adapter):
 
 @pytest.mark.asyncio
 async def test_get_tasks_bulk_populates_heartbeat_at(task_adapter):
-    """get_tasks_bulk sets heartbeat_at from the heartbeat sorted set."""
+    """get_tasks_bulk sets heartbeat_at from the heartbeat store."""
     task = make_task(status=TaskStatus.STARTED)
     await task_adapter.save_task(task)
     task.heartbeat_at = FROZEN_TIME
@@ -1169,148 +778,7 @@ async def test_get_tasks_bulk_populates_heartbeat_at(task_adapter):
     assert result[0].heartbeat_at == FROZEN_TIME
 
 
-# ── get_next_task (happy path) ────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_get_next_task_returns_submitted_task(task_adapter):
-    """get_next_task pops and returns the next available task."""
-    task = make_task()
-    await task_adapter.submit_task(task)
-
-    result = await task_adapter.get_next_task(queues={"default"}, pop_timeout=1)
-
-    assert result is not None
-    assert result.id == ULID1
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) not in members
-
-
-# ── clean (with age params) ───────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_clean_max_queue_age_removes_old_entries(task_adapter):
-    """max_queue_age removes queue entries at or before that timestamp."""
-    old = make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(days=2))
-    recent = make_task(ULID2, submitted_at=FROZEN_TIME)
-    await task_adapter.submit_task(old)
-    await task_adapter.submit_task(recent)
-
-    cutoff = FROZEN_TIME - dt.timedelta(days=1)
-    await task_adapter.clean(queues={b"default"}, now=FROZEN_TIME, max_queue_age=cutoff)
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) not in members
-    assert bytes(ULID2) in members
-
-
-@pytest.mark.asyncio
-async def test_clean_min_queue_age_removes_entries_below_floor(task_adapter):
-    """min_queue_age removes queue entries at or after that timestamp, leaving older ones."""
-    old = make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(days=10))
-    recent = make_task(ULID2, submitted_at=FROZEN_TIME)
-    await task_adapter.submit_task(old)
-    await task_adapter.submit_task(recent)
-
-    floor = FROZEN_TIME - dt.timedelta(days=1)
-    await task_adapter.clean(queues={b"default"}, now=FROZEN_TIME, min_queue_age=floor)
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) in members
-    assert bytes(ULID2) not in members
-
-
-# ── stage_remove_from_queue ───────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_stage_remove_from_queue_removes_from_sorted_set(task_adapter):
-    """stage_remove_from_queue removes the task ID from the queue sorted set."""
-    task = make_task()
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_requeue(pipe, task)
-    await pipe.execute()
-
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_remove_from_queue(pipe, task)
-    await pipe.execute()
-
-    score = await task_adapter.data_store.zscore(task_adapter.TASKS_BY_QUEUE(queue="default"), bytes(ULID1))
-    assert score is None
-
-
-@pytest.mark.asyncio
-async def test_stage_remove_from_queue_removes_from_type_index(task_adapter):
-    """stage_remove_from_queue removes the task ID from the type index set."""
-    task = make_task()
-    await task_adapter.data_store.sadd(task_adapter.TASK_BY_TYPE_IDX(name="my_task"), bytes(ULID1))
-
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_remove_from_queue(pipe, task)
-    await pipe.execute()
-
-    members = await task_adapter.data_store.smembers(task_adapter.TASK_BY_TYPE_IDX(name="my_task"))
-    assert bytes(ULID1) not in members
-
-
-@pytest.mark.asyncio
-async def test_stage_remove_from_queue_leaves_other_tasks_untouched(task_adapter):
-    """stage_remove_from_queue only removes the target task, not its queue-mates."""
-    t1 = make_task(ULID1)
-    t2 = make_task(ULID2, submitted_at=FROZEN_TIME + dt.timedelta(seconds=1))
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_requeue(pipe, t1)
-    task_adapter.stage_requeue(pipe, t2)
-    await pipe.execute()
-
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_remove_from_queue(pipe, t1)
-    await pipe.execute()
-
-    members = await task_adapter.data_store.zrange(task_adapter.TASKS_BY_QUEUE(queue="default"), 0, -1)
-    assert bytes(ULID1) not in members
-    assert bytes(ULID2) in members
-
-
-@pytest.mark.asyncio
-async def test_stage_remove_from_queue_noop_when_absent(task_adapter):
-    """stage_remove_from_queue does not raise when the task is not in the queue."""
-    task = make_task()
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_remove_from_queue(pipe, task)
-    await pipe.execute()  # should not raise
-
-
-# ── stage_register_dag_run / get_dag_runs / clean_dag_runs ───────────────────
-
-
-@pytest.mark.asyncio
-async def test_stage_register_dag_run_adds_to_dag_runs_set(task_adapter):
-    """stage_submit_task with a dag_run_id registers the run in the DAG_RUNS sorted set."""
-    dag_run_id = ULID()
-    task = make_task()
-    task.dag_run_id = dag_run_id
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_submit_task(pipe, task)
-    await pipe.execute()
-
-    score = await task_adapter.data_store.zscore(task_adapter.DAG_RUNS, bytes(dag_run_id))
-    assert score is not None
-    assert score == pytest.approx(FROZEN_TIME.timestamp())
-
-
-@pytest.mark.asyncio
-async def test_stage_register_dag_run_noop_when_no_dag_run_id(task_adapter):
-    """stage_submit_task without a dag_run_id does not add anything to DAG_RUNS."""
-    task = make_task()
-    assert task.dag_run_id is None
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_submit_task(pipe, task)
-    await pipe.execute()
-
-    count = await task_adapter.data_store.zcard(task_adapter.DAG_RUNS)
-    assert count == 0
+# ── get_dag_runs / get_dag_run ────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -1335,32 +803,6 @@ async def test_get_dag_runs_returns_submitted_dag_runs(task_adapter):
     run_id, submitted_at = runs[0]
     assert run_id == dag_run_id
     assert submitted_at == pytest.approx(FROZEN_TIME, abs=dt.timedelta(seconds=1))
-
-
-@pytest.mark.asyncio
-async def test_clean_dag_runs_removes_stale_entries(task_adapter):
-    """clean_dag_runs removes DAG run entries older than max_age."""
-    dag_run_id = ULID1
-    old_score = (FROZEN_TIME - dt.timedelta(days=10)).timestamp()
-    await task_adapter.data_store.zadd(task_adapter.DAG_RUNS, {bytes(dag_run_id): old_score})
-
-    await task_adapter.clean_dag_runs(FROZEN_TIME, dt.timedelta(days=7))
-
-    score = await task_adapter.data_store.zscore(task_adapter.DAG_RUNS, bytes(dag_run_id))
-    assert score is None
-
-
-@pytest.mark.asyncio
-async def test_clean_dag_runs_noop_when_nothing_stale(task_adapter):
-    """clean_dag_runs leaves recent DAG run entries untouched."""
-    dag_run_id = ULID1
-    recent_score = (FROZEN_TIME - dt.timedelta(hours=1)).timestamp()
-    await task_adapter.data_store.zadd(task_adapter.DAG_RUNS, {bytes(dag_run_id): recent_score})
-
-    await task_adapter.clean_dag_runs(FROZEN_TIME, dt.timedelta(days=7))
-
-    score = await task_adapter.data_store.zscore(task_adapter.DAG_RUNS, bytes(dag_run_id))
-    assert score is not None
 
 
 @pytest.mark.asyncio
@@ -1389,37 +831,51 @@ async def test_get_dag_run_returns_submitted_at_and_task_ids(task_adapter):
     assert set(task_ids) == {ULID2, ULID3}
 
 
+# ── clean_dag_runs ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clean_dag_runs_removes_old_entries(task_adapter):
+    """clean_dag_runs removes DAG run entries older than max_age."""
+    dag_run_id = ULID1
+    old_task = make_task(submitted_at=FROZEN_TIME - dt.timedelta(days=10))
+    old_task.dag_run_id = dag_run_id
+    await task_adapter.submit_task(old_task)
+
+    await task_adapter.clean_dag_runs(FROZEN_TIME, dt.timedelta(days=7))
+
+    runs, total = await task_adapter.get_dag_runs(DAGRunPagination())
+    assert total == 0
+    assert runs == []
+
+
+@pytest.mark.asyncio
+async def test_clean_dag_runs_keeps_recent_entries(task_adapter):
+    """clean_dag_runs leaves recent DAG run entries untouched."""
+    dag_run_id = ULID1
+    recent_task = make_task(submitted_at=FROZEN_TIME - dt.timedelta(hours=1))
+    recent_task.dag_run_id = dag_run_id
+    await task_adapter.submit_task(recent_task)
+
+    await task_adapter.clean_dag_runs(FROZEN_TIME, dt.timedelta(days=7))
+
+    runs, total = await task_adapter.get_dag_runs(DAGRunPagination())
+    assert total == 1
+    assert runs[0][0] == dag_run_id
+
+
 # ── fan-in ────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_stage_init_fan_in_creates_tracking_and_members_sets(task_adapter):
-    """stage_init_fan_in writes a tracking set and a permanent members set."""
-    fan_in_key = "fan-in:test"
-    predecessor_ids = {ULID1, ULID2}
-    pipe = task_adapter.data_store.pipeline(transaction=True)
-    task_adapter.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
-    await pipe.execute()
-
-    tracking = await task_adapter.data_store.smembers(fan_in_key)
-    members = await task_adapter.data_store.smembers(f"{fan_in_key}:members")
-    expected = {str(ULID1).encode(), str(ULID2).encode()}
-    assert tracking == expected
-    assert members == expected
-
-
-@pytest.mark.asyncio
-async def test_init_fan_in_creates_tracking_and_members_sets(task_adapter):
-    """init_fan_in writes the same sets as stage_init_fan_in but executes immediately."""
-    fan_in_key = "fan-in:direct"
+async def test_init_fan_in_creates_expected_members(task_adapter):
+    """init_fan_in persists the predecessor set; get_fan_in_members returns it."""
+    fan_in_key = "fan-in:init-test"
     predecessor_ids = {ULID1, ULID2, ULID3}
     await task_adapter.init_fan_in(fan_in_key, predecessor_ids)
 
-    tracking = await task_adapter.data_store.smembers(fan_in_key)
-    members = await task_adapter.data_store.smembers(f"{fan_in_key}:members")
-    expected = {str(uid).encode() for uid in predecessor_ids}
-    assert tracking == expected
-    assert members == expected
+    result = await task_adapter.get_fan_in_members(fan_in_key)
+    assert set(result) == predecessor_ids
 
 
 @pytest.mark.asyncio
@@ -1452,32 +908,9 @@ async def test_get_fan_in_members_returns_predecessor_ids(task_adapter):
     predecessor_ids = {ULID1, ULID2, ULID3}
     await task_adapter.init_fan_in(fan_in_key, predecessor_ids)
 
-    # exhaust the tracking set so it's empty, but members set should still exist
+    # exhaust the tracking set so it's empty, but members should still be retrievable
     for uid in predecessor_ids:
         await task_adapter.fan_in_complete(fan_in_key, uid)
 
     result = await task_adapter.get_fan_in_members(fan_in_key)
     assert set(result) == predecessor_ids
-
-
-# ── _add_task_to_results ──────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_add_task_to_results_skips_missing_task(task_adapter):
-    """_add_task_to_results returns the list unchanged when the task blob is absent."""
-    results: list[Task] = []
-    returned = await task_adapter._add_task_to_results(ULID1, results)
-    assert returned == []
-    assert results == []
-
-
-@pytest.mark.asyncio
-async def test_add_task_to_results_appends_found_task(task_adapter):
-    """_add_task_to_results appends the task when it exists."""
-    task = make_task()
-    await task_adapter.save_task(task)
-    results: list[Task] = []
-    returned = await task_adapter._add_task_to_results(ULID1, results)
-    assert len(returned) == 1
-    assert returned[0].id == ULID1

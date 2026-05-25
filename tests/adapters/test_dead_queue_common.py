@@ -11,6 +11,7 @@ import pytest
 from ulid import ULID
 
 from jobbers.adapters.redis import DeadQueue
+from jobbers.adapters.sql import SQLDeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 
@@ -37,7 +38,7 @@ def make_task(
 
 
 async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
-    pipe = dq.data_store.pipeline(transaction=True)
+    pipe = dq.pipeline()
     dq.stage_add(pipe, task, failed_at)
     await pipe.execute()
 
@@ -257,8 +258,10 @@ async def test_get_by_filter_respects_limit_with_version_filter(dead_queue):
 async def test_get_by_filter_skips_missing_task_data(dead_queue):
     """If a task is in the DLQ index but its blob is gone, it is skipped."""
     dq, _ = dead_queue
+    if isinstance(dq, SQLDeadQueue):
+        pytest.xfail("SQLDeadQueue stores full task data in the DLQ table; a missing-blob scenario cannot occur")
     task = make_task()
-    pipe = dq.data_store.pipeline(transaction=True)
+    pipe = dq.pipeline()
     dq.stage_add(pipe, task, FAILED_AT)
     await pipe.execute()
 

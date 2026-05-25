@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.protocols import TaskAdapterProtocol
+    from jobbers.protocols import TaskAdapterProtocol, TransactionHandle
 
 
 def _pack(obj: BaseModel, exclude: set[str] | None = None) -> bytes:
@@ -236,7 +236,7 @@ class RedisTaskRoutingConfigAdapter:
 
 
 class RedisRoutingBackend:
-    """RoutingBackendProtocol backed by Redis. Delegates to RedisQueueConfigAdapter and RedisTaskRoutingConfigAdapter."""
+    """RoutingBackendProtocol backed by Redis. Delegates to sub-adapters."""
 
     def __init__(self, client: Redis) -> None:
         self._qca = RedisQueueConfigAdapter(client)
@@ -448,13 +448,14 @@ class MsgpackTaskAdapter(SharedTaskAdapterMixin):
             results.append(task)
         return results
 
-    def stage_register_dag_run(self, pipe: Pipeline, task: Task) -> None:
+    def stage_register_dag_run(self, pipe: TransactionHandle, task: Task) -> None:
         """Stage DAG run index updates, including the per-run task set for the raw adapter."""
         super().stage_register_dag_run(pipe, task)
         if task.dag_run_id is None or task.submitted_at is None:
             return
         score = task.submitted_at.timestamp()
-        pipe.zadd(self.DAG_RUN_TASKS(dag_run_id=task.dag_run_id), {bytes(task.id): score})
+        p: Any = pipe
+        p.zadd(self.DAG_RUN_TASKS(dag_run_id=task.dag_run_id), {bytes(task.id): score})
 
     async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
         """Return (submitted_at, task_ids) for a DAG run using the per-run tasks sorted set."""
@@ -518,12 +519,13 @@ class DeadQueue:
     async def ensure_index(self) -> None:
         """No-op: plain-Redis dead queue does not use a search index."""
 
-    def stage_add(self, pipe: Pipeline, task: Task, failed_at: dt.datetime) -> None:
+    def stage_add(self, pipe: TransactionHandle, task: Task, failed_at: dt.datetime) -> None:
         """Queue all four DLQ index writes onto pipe (no execute)."""
-        pipe.zadd(self.DLQ, {bytes(task.id): failed_at.timestamp()})
-        pipe.sadd(self.DLQ_QUEUE(queue=task.queue), bytes(task.id))
-        pipe.sadd(self.DLQ_NAME(name=task.name), bytes(task.id))
-        pipe.hset(self.DLQ_META, str(task.id), f"{task.queue}\0{task.name}\0{task.version}")
+        p: Any = pipe
+        p.zadd(self.DLQ, {bytes(task.id): failed_at.timestamp()})
+        p.sadd(self.DLQ_QUEUE(queue=task.queue), bytes(task.id))
+        p.sadd(self.DLQ_NAME(name=task.name), bytes(task.id))
+        p.hset(self.DLQ_META, str(task.id), f"{task.queue}\0{task.name}\0{task.version}")
 
     async def add_to_dlq(self, task: Task, failed_at: dt.datetime) -> None:
         """Add a task to the DLQ (non-pipeline version for saga path)."""
@@ -531,12 +533,13 @@ class DeadQueue:
         self.stage_add(pipe, task, failed_at)
         await pipe.execute()
 
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str, name: str) -> None:
+    def stage_remove(self, pipe: TransactionHandle, task_id: ULID, queue: str, name: str) -> None:
         """Queue all four DLQ index deletes onto pipe (no execute)."""
-        pipe.zrem(self.DLQ, bytes(task_id))
-        pipe.srem(self.DLQ_QUEUE(queue=queue), bytes(task_id))
-        pipe.srem(self.DLQ_NAME(name=name), bytes(task_id))
-        pipe.hdel(self.DLQ_META, str(task_id))
+        p: Any = pipe
+        p.zrem(self.DLQ, bytes(task_id))
+        p.srem(self.DLQ_QUEUE(queue=queue), bytes(task_id))
+        p.srem(self.DLQ_NAME(name=name), bytes(task_id))
+        p.hdel(self.DLQ_META, str(task_id))
 
     async def remove_from_dlq(self, task_id: ULID, queue: str, name: str) -> None:
         """Remove a task from the DLQ (non-pipeline version for saga path)."""
