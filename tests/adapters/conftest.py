@@ -165,6 +165,54 @@ async def task_routing_config_adapter(request, session_factory, redis):
         await r.aclose()
 
 
+@pytest_asyncio.fixture(params=["redis", "sql", "static"], ids=["redis", "sql", "static"])
+async def cron_dag_scheduler(request, session_factory, redis):
+    """
+    Parameterized fixture yielding a CronDAGSchedulerProtocol implementation for each backend.
+
+    - ``"redis"``: RedisCronDAGScheduler backed by FakeAsyncRedis
+    - ``"sql"``: SQLCronDAGScheduler backed by in-memory SQLite
+    - ``"static"``: StaticCronDAGScheduler with a single pre-seeded entry (read-only admin ops)
+    """
+    from jobbers.adapters.sql import SQLCronDAGScheduler
+    from jobbers.adapters.static import StaticCronDAGScheduler
+    from jobbers.schedulers.cron_dag_scheduler import RedisCronDAGScheduler
+
+    if request.param == "redis":
+        yield RedisCronDAGScheduler(redis)
+    elif request.param == "sql":
+        yield SQLCronDAGScheduler(session_factory)
+    else:
+        from jobbers.models.cron_dag import CronDAGEntry
+        from jobbers.models.dag import DAGTaskSpec
+
+        entry = CronDAGEntry(
+            name="static_test_cron",
+            cron_expr="0 * * * *",
+            dag_spec=DAGTaskSpec(name="task"),
+        )
+        yield StaticCronDAGScheduler(entries=[entry])
+
+
+@pytest_asyncio.fixture(params=["redis", "sql"], ids=["redis", "sql"])
+async def mutable_cron_dag_scheduler(request, session_factory, redis):
+    """
+    Parameterized fixture yielding a mutable CronDAGSchedulerProtocol implementation.
+
+    - ``"redis"``: RedisCronDAGScheduler backed by FakeAsyncRedis
+    - ``"sql"``: SQLCronDAGScheduler backed by in-memory SQLite
+
+    Use this fixture for tests that exercise ``add()`` and ``remove()``.
+    """
+    from jobbers.adapters.sql import SQLCronDAGScheduler
+    from jobbers.schedulers.cron_dag_scheduler import RedisCronDAGScheduler
+
+    if request.param == "redis":
+        yield RedisCronDAGScheduler(redis)
+    else:
+        yield SQLCronDAGScheduler(session_factory)
+
+
 @pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])
 async def dead_queue(request, dummy_task_adapter):
     """

@@ -11,6 +11,7 @@ Task storage / dead-letter queue / scheduling:
 - `TaskAdapterProtocol` — interface all task adapters must implement.
 - `DeadQueueProtocol` — interface all dead-letter queue implementations must implement.
 - `TaskSchedulerProtocol` — interface all task scheduler implementations must implement.
+- `CronDAGSchedulerProtocol` — interface all cron DAG scheduler implementations must implement.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from redis.asyncio.client import Pipeline
     from ulid import ULID
 
+    from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
@@ -191,3 +193,22 @@ class TaskSchedulerProtocol(Protocol):  # pragma: no cover
     async def next_due_bulk(
         self, n: int, queues: list[str] | None = None
     ) -> list[tuple[Task, dt.datetime]]: ...
+
+
+class CronDAGSchedulerProtocol(Protocol):  # pragma: no cover
+    """Interface all cron DAG scheduler implementations must implement."""
+
+    async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None: ...
+    async def remove(self, cron_id: ULID) -> None: ...
+    async def get(self, cron_id: ULID) -> CronDAGEntry | None: ...
+    async def next_due_bulk(self, n: int) -> list[tuple[CronDAGEntry, dt.datetime]]: ...
+    async def reschedule(self, cron_id: ULID, next_run_at: dt.datetime) -> None: ...
+    async def get_active_run(self, cron_id: ULID) -> str | None: ...
+    async def set_active_run(
+        self, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
+    ) -> bool: ...
+    async def clear_active_run(self, cron_id: ULID) -> None: ...
+    async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None: ...
+    async def list(
+        self, offset: int = 0, limit: int = 50
+    ) -> tuple[list[tuple[CronDAGEntry, dt.datetime]], int]: ...

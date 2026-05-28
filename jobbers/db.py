@@ -10,12 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from jobbers.adapters import JsonTaskAdapter, MsgpackTaskAdapter
 from jobbers.adapters.redis import RedisRoutingBackend, RedisTaskScheduler
 from jobbers.adapters.redis_json import RedisJSONRoutingBackend
-from jobbers.adapters.sql import SQLRoutingBackend
-from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.adapters.sql import SQLCronDAGScheduler, SQLRoutingBackend
+from jobbers.adapters.static import StaticCronDAGScheduler, StaticRoutingBackend
 from jobbers.migrations.runner import run_migrations
+from jobbers.schedulers.cron_dag_scheduler import RedisCronDAGScheduler
 
 if TYPE_CHECKING:
-    from jobbers.protocols import RoutingBackendProtocol, TaskAdapterProtocol
+    from jobbers.protocols import CronDAGSchedulerProtocol, RoutingBackendProtocol, TaskAdapterProtocol
     from jobbers.state_manager import StateManager
 
 TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")
@@ -27,6 +28,7 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _task_adapter: TaskAdapterProtocol | None = None
 _pre_registered_routing_backend: RoutingBackendProtocol | None = None
+_pre_registered_cron_scheduler: CronDAGSchedulerProtocol | None = None
 
 
 def get_client() -> redis.Redis:
@@ -92,6 +94,17 @@ def register_routing_backend(backend: RoutingBackendProtocol) -> None:
     _pre_registered_routing_backend = backend
 
 
+def register_cron_scheduler(scheduler: CronDAGSchedulerProtocol) -> None:
+    """
+    Pre-register a cron DAG scheduler for library/programmatic use.
+
+    Call this before init_state_manager(). When set, it takes priority over
+    the CRON_BACKEND environment variable.
+    """
+    global _pre_registered_cron_scheduler
+    _pre_registered_cron_scheduler = scheduler
+
+
 async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol:
     """Create the routing backend, initializing SQL only when needed."""
     global _engine, _session_factory
@@ -128,6 +141,34 @@ async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol
     return SQLRoutingBackend(_session_factory)
 
 
+async def _create_cron_scheduler(client: redis.Redis) -> CronDAGSchedulerProtocol:
+    """
+    Create the cron DAG scheduler.
+
+    Defaults to ROUTING_BACKEND if CRON_BACKEND is unset, so users only need one variable.
+    Call _create_routing_backend first when SQL is used, so _session_factory is initialized.
+    """
+    if _pre_registered_cron_scheduler is not None:
+        return _pre_registered_cron_scheduler
+
+    cron_backend = os.environ.get("CRON_BACKEND", os.environ.get("ROUTING_BACKEND", "sql"))
+
+    if cron_backend in ("redis", "redis_json"):
+        return RedisCronDAGScheduler(client)
+
+    if cron_backend == "static":
+        return StaticCronDAGScheduler.from_env()
+
+    # sql (default) — reuse session factory initialized by _create_routing_backend
+    if _session_factory is None:
+        raise RuntimeError(
+            "SQL session factory not initialized. "
+            "Ensure _create_routing_backend() runs before _create_cron_scheduler() "
+            "when CRON_BACKEND=sql."
+        )
+    return SQLCronDAGScheduler(_session_factory)
+
+
 async def init_state_manager() -> StateManager:
     global _state_manager, _task_adapter
     from jobbers.state_manager import StateManager
@@ -135,9 +176,14 @@ async def init_state_manager() -> StateManager:
     client = get_client()
     _task_adapter = create_task_adapter(client)
     routing_backend = await _create_routing_backend(client)
+    cron_scheduler = await _create_cron_scheduler(client)
     task_scheduler = RedisTaskScheduler(client, _task_adapter, routing_backend.get_all_queues)
     _state_manager = StateManager(
-        client, routing_backend, task_scheduler=task_scheduler, task_adapter=_task_adapter
+        client,
+        routing_backend,
+        task_scheduler=task_scheduler,
+        task_adapter=_task_adapter,
+        cron_dag_scheduler=cron_scheduler,
     )
     await _task_adapter.ensure_index()
     await _state_manager.dead_queue.ensure_index()

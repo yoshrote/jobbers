@@ -22,7 +22,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_status import TaskStatus
-from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
+from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager, RedisCronDAGScheduler
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
     from jobbers.protocols import (
+        CronDAGSchedulerProtocol,
         DeadQueueProtocol,
         RoutingBackendProtocol,
         TaskAdapterProtocol,
@@ -43,6 +44,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
+
+
+async def _noop_set_fn(_task_id: ULID) -> None:
+    """No-op async callable used as ConcurrencyStager._set_fn for ALWAYS concurrency policy."""
 
 
 class TaskException(Exception):
@@ -66,6 +71,7 @@ class StateManager:
         routing_backend: RoutingBackendProtocol,
         task_scheduler: TaskSchedulerProtocol,
         task_adapter: TaskAdapterProtocol | None = None,
+        cron_dag_scheduler: CronDAGSchedulerProtocol | None = None,
     ) -> None:
         self.job_store: Redis = job_store
         self.routing: RoutingBackendProtocol = routing_backend
@@ -79,7 +85,9 @@ class StateManager:
         self._cancel_events: dict[ULID, asyncio.Event] = {}
         self.dead_queue: DeadQueueProtocol = DeadQueue(job_store, self.ta)
         self.task_scheduler: TaskSchedulerProtocol = task_scheduler
-        self.cron_dag_scheduler = CronDAGScheduler(job_store)
+        self.cron_dag_scheduler: CronDAGSchedulerProtocol = (
+            cron_dag_scheduler if cron_dag_scheduler is not None else RedisCronDAGScheduler(job_store)
+        )
 
     @property
     def active_tasks_per_queue(self) -> dict[str, int]:
@@ -270,11 +278,11 @@ class StateManager:
         Async context manager encapsulating all ConcurrencyPolicy logic for a cron dispatch.
 
         Yields a ``ConcurrencyStager`` with:
-        - ``skipped=True`` if the previous run is still active (reschedule-only pipeline
-          already fired internally; caller should return immediately).
-        - ``skipped=False`` and a ``stage_active_run(pipe, task_id)`` callable otherwise.
-          Call it unconditionally during pipeline construction; it is a no-op for ALWAYS
-          policy and stages the NX guard for SKIP_IF_RUNNING.
+        - ``skipped=True`` if the previous run is still active (entry already rescheduled
+          internally; caller should return immediately).
+        - ``skipped=False`` and an async ``set_active_run(task_id)`` callable otherwise.
+          Call it unconditionally before building the fan-in pipeline; it is a no-op for
+          ALWAYS policy and sets the NX guard for SKIP_IF_RUNNING.
         """
         if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
             active_task_id_str = await self.cron_dag_scheduler.get_active_run(entry.id)
@@ -290,18 +298,16 @@ class StateManager:
                         active_task_id_str,
                         active_task.status,
                     )
-                    pipe = self.job_store.pipeline(transaction=True)
-                    self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
-                    await pipe.execute()
-                    yield ConcurrencyStager(skipped=True, _stage_fn=lambda _p, _t: None)
+                    await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
+                    yield ConcurrencyStager(skipped=True, _set_fn=_noop_set_fn)
                     return
 
-            def _stage_skip(pipe: Pipeline, task_id: ULID) -> None:
-                self.cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task_id, nx=True)
+            async def _set_skip(task_id: ULID) -> None:
+                await self.cron_dag_scheduler.set_active_run(entry.id, task_id, nx=True)
 
-            yield ConcurrencyStager(skipped=False, _stage_fn=_stage_skip)
+            yield ConcurrencyStager(skipped=False, _set_fn=_set_skip)
         else:
-            yield ConcurrencyStager(skipped=False, _stage_fn=lambda _p, _t: None)
+            yield ConcurrencyStager(skipped=False, _set_fn=_noop_set_fn)
 
     async def dispatch_cron_dag(self, entry: CronDAGEntry, run_at: dt.datetime) -> None:
         """
@@ -312,10 +318,10 @@ class StateManager:
         is SKIP_IF_RUNNING and the previous root task is still active, the run is skipped
         but the entry is still rescheduled.
 
-        Ordering guarantee: reschedule + fan-in init are written atomically in a single
-        pipeline *before* the root task is submitted.  A crash after the pipeline but
-        before submit means the entry fires again on the next poll (tolerable duplicate),
-        but the cron schedule is never permanently lost.
+        Ordering guarantee: reschedule is written before the fan-in + submit pipeline so
+        the cron schedule is never permanently lost even if a crash occurs mid-dispatch.
+        A crash after reschedule but before submit results in a tolerable duplicate fire on
+        the next poll — this trade-off is explicitly acceptable (see original design notes).
         """
         next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
 
@@ -345,13 +351,13 @@ class StateManager:
                 and queue_config.rate_period
             )
 
-            # Write reschedule + fan-in sets atomically BEFORE submitting the root task.
-            # This ensures the cron entry is never permanently lost even if submit_task crashes.
-            # For SKIP_IF_RUNNING, SET NX is the authoritative guard against concurrent dispatches.
-            # For non-rate-limited queues, submission is included in the same pipeline.
+            # Reschedule and set active-run BEFORE the task pipeline so the cron entry
+            # is never permanently lost even if the subsequent pipeline crashes.
+            await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
+            await stager.set_active_run(task.id)
+
+            # Fan-in init and (optionally) task submission in one Redis pipeline.
             pipe = self.job_store.pipeline(transaction=True)
-            self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
-            stager.stage_active_run(pipe, task.id)
             for fan_in_key, predecessor_ids in fan_ins.items():
                 self.ta.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
             if not is_rate_limited:
@@ -572,18 +578,14 @@ class StateManager:
         """
         now = dt.datetime.now(dt.UTC)
         first_run_at = croniter(entry.cron_expr, now).get_next(dt.datetime)
-        pipe = self.job_store.pipeline(transaction=True)
-        self.cron_dag_scheduler.stage_add(pipe, entry, first_run_at)
-        await pipe.execute()
+        await self.cron_dag_scheduler.add(entry, first_run_at)
         logger.info(
             "Cron DAG entry '%s' (%s) registered, first run at %s.", entry.name, entry.id, first_run_at
         )
 
     async def remove_cron_dag(self, cron_id: ULID) -> None:
         """Remove a cron DAG entry from the schedule."""
-        pipe = self.job_store.pipeline(transaction=True)
-        self.cron_dag_scheduler.stage_remove(pipe, cron_id)
-        await pipe.execute()
+        await self.cron_dag_scheduler.remove(cron_id)
         logger.info("Cron DAG entry %s removed.", cron_id)
 
     async def submit_dag(self, *roots: DAGNode) -> tuple[ULID, list[Task]]:

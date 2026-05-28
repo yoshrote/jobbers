@@ -1,19 +1,28 @@
-"""SQLAlchemy-backed routing sub-adapters and routing backend (the default)."""
+"""SQLAlchemy-backed routing sub-adapters, routing backend, and cron DAG scheduler."""
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
-from jobbers.migrations.schema import queues, role_queues, roles, task_routing
+from jobbers.migrations.schema import (
+    cron_dag_active_runs,
+    cron_dag_entries,
+    queues,
+    role_queues,
+    roles,
+    task_routing,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+    from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
 
@@ -253,6 +262,212 @@ class SQLTaskRoutingConfigAdapter:
                 )
             )
         return True
+
+
+class SQLCronDAGScheduler:
+    """CronDAGSchedulerProtocol backed by SQLAlchemy (shares the SQL routing session factory)."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self.session_factory = session_factory
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _row_to_entry(row: object) -> CronDAGEntry:
+        from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+        from jobbers.models.dag import DAGTaskSpec
+
+        return CronDAGEntry(
+            id=ULID.from_str(row.id),  # type: ignore[attr-defined]
+            name=row.name,  # type: ignore[attr-defined]
+            cron_expr=row.cron_expr,  # type: ignore[attr-defined]
+            dag_spec=DAGTaskSpec.model_validate(json.loads(row.dag_spec)),  # type: ignore[attr-defined]
+            enabled=bool(row.enabled),  # type: ignore[attr-defined]
+            concurrency_policy=ConcurrencyPolicy(row.concurrency_policy),  # type: ignore[attr-defined]
+            created_at=dt.datetime.fromisoformat(row.created_at),  # type: ignore[attr-defined]
+        )
+
+    # ── protocol methods ──────────────────────────────────────────────────────
+
+    async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
+        """Insert or replace a cron entry and set its next_run_at."""
+        async with self.session_factory.begin() as session:
+            existing = await session.execute(
+                select(cron_dag_entries.c.id).where(cron_dag_entries.c.id == str(entry.id))
+            )
+            values = {
+                "name": entry.name,
+                "cron_expr": entry.cron_expr,
+                "dag_spec": entry.dag_spec.model_dump_json(),
+                "enabled": entry.enabled,
+                "concurrency_policy": entry.concurrency_policy.value,
+                "created_at": entry.created_at.isoformat(),
+                "next_run_at": next_run_at.isoformat(),
+            }
+            if existing.fetchone():
+                await session.execute(
+                    update(cron_dag_entries).where(cron_dag_entries.c.id == str(entry.id)).values(**values)
+                )
+            else:
+                await session.execute(insert(cron_dag_entries).values(id=str(entry.id), **values))
+
+    async def remove(self, cron_id: ULID) -> None:
+        """Delete a cron entry (cascades to active_runs)."""
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                delete(cron_dag_entries).where(cron_dag_entries.c.id == str(cron_id))
+            )
+
+    async def get(self, cron_id: ULID) -> CronDAGEntry | None:
+        """Fetch a single CronDAGEntry by ID, or None if missing."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(cron_dag_entries).where(cron_dag_entries.c.id == str(cron_id))
+            )
+            row = result.fetchone()
+        return self._row_to_entry(row) if row is not None else None
+
+    async def next_due_bulk(self, n: int) -> list[tuple[CronDAGEntry, dt.datetime]]:
+        """
+        Atomically acquire up to n due entries by clearing their next_run_at.
+
+        Returns (entry, run_at) pairs.  Caller is responsible for rescheduling.
+        """
+        now_iso = dt.datetime.now(dt.UTC).isoformat()
+        async with self.session_factory.begin() as session:
+            result = await session.execute(
+                select(cron_dag_entries)
+                .where(cron_dag_entries.c.next_run_at.isnot(None))
+                .where(cron_dag_entries.c.next_run_at <= now_iso)
+                .order_by(cron_dag_entries.c.next_run_at)
+                .limit(n)
+            )
+            rows = result.fetchall()
+            if rows:
+                ids = [r.id for r in rows]
+                await session.execute(
+                    update(cron_dag_entries)
+                    .where(cron_dag_entries.c.id.in_(ids))
+                    .values(next_run_at=None)
+                )
+
+        results: list[tuple[CronDAGEntry, dt.datetime]] = []
+        for row in rows:
+            entry = self._row_to_entry(row)
+            run_at = dt.datetime.fromisoformat(row.next_run_at).replace(tzinfo=dt.UTC)
+            results.append((entry, run_at))
+        return results
+
+    async def reschedule(self, cron_id: ULID, next_run_at: dt.datetime) -> None:
+        """Update next_run_at for a cron entry."""
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                update(cron_dag_entries)
+                .where(cron_dag_entries.c.id == str(cron_id))
+                .values(next_run_at=next_run_at.isoformat())
+            )
+
+    async def get_active_run(self, cron_id: ULID) -> str | None:
+        """Return the active root task ID string, or None if absent/expired."""
+        now_iso = dt.datetime.now(dt.UTC).isoformat()
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(cron_dag_active_runs.c.task_id)
+                .where(cron_dag_active_runs.c.cron_id == str(cron_id))
+                .where(cron_dag_active_runs.c.expires_at > now_iso)
+            )
+            row = result.fetchone()
+        return row[0] if row is not None else None
+
+    async def set_active_run(
+        self, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
+    ) -> bool:
+        """
+        Persist the active root task ID with expiry.
+
+        When nx=True, only inserts if no non-expired row exists; returns False on conflict.
+        """
+        now_iso = dt.datetime.now(dt.UTC).isoformat()
+        expires_at = (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=ttl)).isoformat()
+        cid = str(cron_id)
+        async with self.session_factory.begin() as session:
+            # Clean up any expired entry first
+            await session.execute(
+                delete(cron_dag_active_runs)
+                .where(cron_dag_active_runs.c.cron_id == cid)
+                .where(cron_dag_active_runs.c.expires_at <= now_iso)
+            )
+            if nx:
+                existing = await session.execute(
+                    select(cron_dag_active_runs.c.cron_id).where(
+                        cron_dag_active_runs.c.cron_id == cid
+                    )
+                )
+                if existing.fetchone() is not None:
+                    return False
+            try:
+                await session.execute(
+                    insert(cron_dag_active_runs).values(
+                        cron_id=cid,
+                        task_id=str(task_id),
+                        expires_at=expires_at,
+                    )
+                )
+            except IntegrityError:
+                if nx:
+                    return False
+                await session.execute(
+                    update(cron_dag_active_runs)
+                    .where(cron_dag_active_runs.c.cron_id == cid)
+                    .values(task_id=str(task_id), expires_at=expires_at)
+                )
+        return True
+
+    async def clear_active_run(self, cron_id: ULID) -> None:
+        """Delete the active run record for a cron entry."""
+        async with self.session_factory.begin() as session:
+            await session.execute(
+                delete(cron_dag_active_runs).where(cron_dag_active_runs.c.cron_id == str(cron_id))
+            )
+
+    async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None:
+        """Return the next scheduled run time, or None if not scheduled."""
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(cron_dag_entries.c.next_run_at).where(cron_dag_entries.c.id == str(cron_id))
+            )
+            row = result.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return dt.datetime.fromisoformat(row[0]).replace(tzinfo=dt.UTC)
+
+    async def list(
+        self, offset: int = 0, limit: int = 50
+    ) -> tuple[list[tuple[CronDAGEntry, dt.datetime]], int]:
+        """Return a page of scheduled entries ordered by next_run_at ascending."""
+        async with self.session_factory() as session:
+            count_result = await session.execute(
+                select(func.count()).select_from(cron_dag_entries).where(
+                    cron_dag_entries.c.next_run_at.isnot(None)
+                )
+            )
+            total: int = count_result.scalar() or 0
+
+            result = await session.execute(
+                select(cron_dag_entries)
+                .where(cron_dag_entries.c.next_run_at.isnot(None))
+                .order_by(cron_dag_entries.c.next_run_at)
+                .offset(offset)
+                .limit(limit)
+            )
+            rows = result.fetchall()
+
+        entries: list[tuple[CronDAGEntry, dt.datetime]] = []
+        for row in rows:
+            entry = self._row_to_entry(row)
+            next_run_at = dt.datetime.fromisoformat(row.next_run_at).replace(tzinfo=dt.UTC)
+            entries.append((entry, next_run_at))
+        return entries, total
 
 
 class SQLRoutingBackend:

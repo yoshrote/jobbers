@@ -279,7 +279,7 @@
                   "type": "string",
                   "minLength": 26,
                   "maxLength": 26,
-                  "pattern": "[A-Z0-9]{26}"
+                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
                 },
                 {
                   "type": "string",
@@ -988,7 +988,7 @@
                   "type": "string",
                   "minLength": 26,
                   "maxLength": 26,
-                  "pattern": "[A-Z0-9]{26}"
+                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
                 },
                 {
                   "type": "string",
@@ -1266,6 +1266,48 @@
                   "type": "object",
                   "additionalProperties": true,
                   "title": "Response Delete Role Roles  Role Name  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role_name}/refresh": {
+      "post": {
+        "summary": "Refresh Role",
+        "description": "Bump the refresh tag for a role, causing workers to reload their queue list on the next poll.",
+        "operationId": "refresh_role_roles__role_name__refresh_post",
+        "parameters": [
+          {
+            "name": "role_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Role Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Refresh Role Roles  Role Name  Refresh Post"
                 }
               }
             }
@@ -1892,7 +1934,7 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[A-Z0-9]{26}"
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
               },
               {
                 "type": "string",
@@ -2371,7 +2413,7 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[A-Z0-9]{26}"
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
               },
               {
                 "type": "string",
@@ -2523,7 +2565,7 @@
                   "type": "string",
                   "maxLength": 26,
                   "minLength": 26,
-                  "pattern": "[A-Z0-9]{26}"
+                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
                 },
                 {
                   "type": "string",
@@ -2547,7 +2589,7 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[A-Z0-9]{26}"
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
               },
               {
                 "type": "string",
@@ -2567,7 +2609,7 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[A-Z0-9]{26}"
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
               },
               {
                 "type": "string",
@@ -2689,6 +2731,11 @@
               }
             ],
             "title": "Expected Exceptions"
+          },
+          "dependency_graph": {
+            "type": "array",
+            "title": "Dependency Graph",
+            "readOnly": true
           }
         },
         "type": "object",
@@ -2748,6 +2795,13 @@
           "type": {
             "type": "string",
             "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
           }
         },
         "type": "object",

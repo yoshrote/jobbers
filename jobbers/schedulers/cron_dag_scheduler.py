@@ -31,19 +31,18 @@ class ConcurrencyStager:
     run is still active.  Return immediately without building or submitting a
     new task.
 
-    ``stage_active_run(pipe, task_id)`` stages the SET NX for
-    SKIP_IF_RUNNING policy, or is a no-op for ALWAYS policy.
-    Call it unconditionally during pipeline construction.
+    ``set_active_run(task_id)`` sets the active run for SKIP_IF_RUNNING policy,
+    or is a no-op for ALWAYS policy.  Call it unconditionally after pipeline construction.
     """
 
     skipped: bool
-    _stage_fn: Callable[[Pipeline, ULID], None]
+    _set_fn: Callable[[ULID], Awaitable[None]]
 
-    def stage_active_run(self, pipe: Pipeline, task_id: ULID) -> None:
-        self._stage_fn(pipe, task_id)
+    async def set_active_run(self, task_id: ULID) -> None:
+        await self._set_fn(task_id)
 
 
-class CronDAGScheduler:
+class RedisCronDAGScheduler:
     """
     Manages recurring cron-scheduled DAG entries in Redis.
 
@@ -75,7 +74,48 @@ class CronDAGScheduler:
     def __init__(self, data_store: Redis) -> None:
         self.data_store = data_store
 
-    def stage_add(self, pipe: Pipeline, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
+    # ── Protocol-compliant public async methods ────────────────────────────────
+
+    async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
+        """Add (or replace) a cron entry and schedule its first run atomically."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self._stage_add(pipe, entry, next_run_at)
+        await pipe.execute()
+
+    async def remove(self, cron_id: ULID) -> None:
+        """Remove a cron entry from the hash and sorted set atomically."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self._stage_remove(pipe, cron_id)
+        await pipe.execute()
+
+    async def reschedule(self, cron_id: ULID, next_run_at: dt.datetime) -> None:
+        """Update next_run_at for a cron entry in the sorted set."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self._stage_reschedule(pipe, cron_id, next_run_at)
+        await pipe.execute()
+
+    async def set_active_run(
+        self, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
+    ) -> bool:
+        """
+        Set the active root task ID for a skip_if_running entry.
+
+        Returns True on success; False when nx=True and the key already existed.
+        """
+        pipe = self.data_store.pipeline(transaction=True)
+        self._stage_set_active_run(pipe, cron_id, task_id, ttl=ttl, nx=nx)
+        result = await pipe.execute()
+        return bool(result[0]) if nx else True
+
+    async def clear_active_run(self, cron_id: ULID) -> None:
+        """Delete the active run key for a cron entry."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self._stage_clear_active_run(pipe, cron_id)
+        await pipe.execute()
+
+    # ── Internal pipeline-staging helpers (Redis-specific) ────────────────────
+
+    def _stage_add(self, pipe: Pipeline, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
         """Queue HSET cron-dag:{id} + ZADD cron-schedule onto pipe (no execute)."""
         cron_id_str = str(entry.id)
         cron_id_bytes = bytes(entry.id)
@@ -92,10 +132,31 @@ class CronDAGScheduler:
         )
         pipe.zadd(self.CRON_SCHEDULE, {cron_id_bytes: next_run_at.timestamp()})
 
-    def stage_remove(self, pipe: Pipeline, cron_id: ULID) -> None:
+    def _stage_remove(self, pipe: Pipeline, cron_id: ULID) -> None:
         """Queue DEL cron-dag:{id} + ZREM cron-schedule onto pipe (no execute)."""
         pipe.delete(self.CRON_DAG_KEY(cron_id=str(cron_id)))
         pipe.zrem(self.CRON_SCHEDULE, bytes(cron_id))
+
+    def _stage_reschedule(self, pipe: Pipeline, cron_id: ULID, next_run_at: dt.datetime) -> None:
+        """Queue ZADD cron-schedule with updated next_run_at score onto pipe (no execute)."""
+        pipe.zadd(self.CRON_SCHEDULE, {bytes(cron_id): next_run_at.timestamp()})
+
+    def _stage_set_active_run(
+        self, pipe: Pipeline, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
+    ) -> None:
+        """
+        Queue SET cron-active:{id} with TTL onto pipe (no execute).
+
+        When *nx=True* the SET is conditional (SET NX): it only succeeds if the key
+        does not already exist, providing an atomic guard against concurrent dispatches.
+        """
+        pipe.set(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)), str(task_id), ex=ttl, nx=nx)
+
+    def _stage_clear_active_run(self, pipe: Pipeline, cron_id: ULID) -> None:
+        """Queue DEL cron-active:{id} onto pipe (no execute)."""
+        pipe.delete(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)))
+
+    # ── Read / acquire methods (unchanged) ────────────────────────────────────
 
     async def get(self, cron_id: ULID) -> CronDAGEntry | None:
         """Fetch and deserialize a single CronDAGEntry from its hash, or None if missing."""
@@ -120,7 +181,7 @@ class CronDAGScheduler:
         Atomically acquire and return up to n due cron entries paired with their scheduled run_at.
 
         Entries are removed from `cron-schedule` atomically; caller is responsible for
-        rescheduling via `stage_reschedule` after dispatching.
+        rescheduling via `reschedule` after dispatching.
         """
         now = dt.datetime.now(dt.UTC).timestamp()
         raw: list[Any] = await cast(
@@ -150,10 +211,6 @@ class CronDAGScheduler:
             results.append((entry, run_at))
         return results
 
-    def stage_reschedule(self, pipe: Pipeline, cron_id: ULID, next_run_at: dt.datetime) -> None:
-        """Queue ZADD cron-schedule with updated next_run_at score onto pipe (no execute)."""
-        pipe.zadd(self.CRON_SCHEDULE, {bytes(cron_id): next_run_at.timestamp()})
-
     async def get_active_run(self, cron_id: ULID) -> str | None:
         """Return the active root task ID string for a skip_if_running entry, or None."""
         raw: bytes | None = await cast(
@@ -161,21 +218,6 @@ class CronDAGScheduler:
             self.data_store.get(self.CRON_ACTIVE_KEY(cron_id=str(cron_id))),
         )
         return raw.decode() if raw is not None else None
-
-    def stage_set_active_run(
-        self, pipe: Pipeline, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
-    ) -> None:
-        """
-        Queue SET cron-active:{id} with TTL onto pipe (no execute).
-
-        When *nx=True* the SET is conditional (SET NX): it only succeeds if the key
-        does not already exist, providing an atomic guard against concurrent dispatches.
-        """
-        pipe.set(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)), str(task_id), ex=ttl, nx=nx)
-
-    def stage_clear_active_run(self, pipe: Pipeline, cron_id: ULID) -> None:
-        """Queue DEL cron-active:{id} onto pipe (no execute)."""
-        pipe.delete(self.CRON_ACTIVE_KEY(cron_id=str(cron_id)))
 
     async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None:
         """Return the next scheduled run time for a cron entry, or None if not scheduled."""
@@ -205,3 +247,7 @@ class CronDAGScheduler:
                 next_run_at = dt.datetime.fromtimestamp(score, dt.UTC)
                 results.append((entry, next_run_at))
         return results, total
+
+
+# Backwards-compatible alias so existing imports keep working during migration.
+CronDAGScheduler = RedisCronDAGScheduler

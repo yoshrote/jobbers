@@ -38,6 +38,7 @@ def make_state_manager_with_tasks(tasks: list[Task], cron_entries: list | None =
         state_manager.cron_dag_scheduler.next_due_bulk = AsyncMock(side_effect=[cron_entries, []])
     else:
         state_manager.cron_dag_scheduler.next_due_bulk = AsyncMock(return_value=[])
+    state_manager.cron_dag_scheduler.reschedule = AsyncMock()
     state_manager.get_queues = AsyncMock(return_value={"default"})
     state_manager.dispatch_scheduled_task = AsyncMock(side_effect=lambda t: t)
     state_manager.dispatch_cron_dag = AsyncMock()
@@ -184,9 +185,7 @@ async def test_scheduler_dispatches_enabled_cron_entry():
 async def test_scheduler_reschedules_disabled_cron_entry():
     """Disabled cron entries are rescheduled without being dispatched."""
     entry = make_cron_entry(enabled=False, cron_expr="0 * * * *")
-    mock_pipe = AsyncMock()
     state_manager = make_state_manager_with_tasks([], cron_entries=[(entry, PAST)])
-    state_manager.job_store.pipeline.return_value = mock_pipe
 
     async def fake_sleep(_: float) -> None:
         raise asyncio.CancelledError
@@ -203,8 +202,7 @@ async def test_scheduler_reschedules_disabled_cron_entry():
             pass
 
     state_manager.dispatch_cron_dag.assert_not_called()
-    state_manager.cron_dag_scheduler.stage_reschedule.assert_called_once()
-    mock_pipe.execute.assert_awaited_once()
+    state_manager.cron_dag_scheduler.reschedule.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -212,11 +210,9 @@ async def test_scheduler_handles_mixed_enabled_and_disabled_cron_entries():
     """Enabled entries are dispatched and disabled entries are rescheduled in one iteration."""
     enabled_entry = make_cron_entry(enabled=True)
     disabled_entry = make_cron_entry(enabled=False, cron_expr="0 * * * *")
-    mock_pipe = AsyncMock()
     state_manager = make_state_manager_with_tasks(
         [], cron_entries=[(enabled_entry, PAST), (disabled_entry, PAST)]
     )
-    state_manager.job_store.pipeline.return_value = mock_pipe
 
     async def fake_sleep(_: float) -> None:
         raise asyncio.CancelledError
@@ -233,5 +229,4 @@ async def test_scheduler_handles_mixed_enabled_and_disabled_cron_entries():
             pass
 
     state_manager.dispatch_cron_dag.assert_called_once_with(enabled_entry, PAST)
-    state_manager.cron_dag_scheduler.stage_reschedule.assert_called_once()
-    mock_pipe.execute.assert_awaited_once()
+    state_manager.cron_dag_scheduler.reschedule.assert_awaited_once()

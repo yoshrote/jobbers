@@ -294,7 +294,7 @@ class TaskProcessor:
         if task.cron_id is not None:
             pipe = self.state_manager.job_store.pipeline(transaction=True)
             self.state_manager.ta.stage_save(pipe, task)
-            self.state_manager.cron_dag_scheduler.stage_clear_active_run(pipe, task.cron_id)
             await pipe.execute()
+            await self.state_manager.cron_dag_scheduler.clear_active_run(task.cron_id)
         else:
             await self.state_manager.save_task(task)

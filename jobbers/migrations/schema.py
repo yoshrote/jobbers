@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Column, ForeignKey, Index, Integer, MetaData, String, Table
+from sqlalchemy import Boolean, Column, ForeignKey, Index, Integer, MetaData, String, Table
 
 metadata = MetaData()
 
@@ -54,3 +54,26 @@ task_routing = Table(
 
 Index("idx_roles_refresh_tag", roles.c.refresh_tag)
 Index("idx_role_queues_role_queue", role_queues.c.role, role_queues.c.queue)
+
+cron_dag_entries = Table(
+    "cron_dag_entries",
+    metadata,
+    Column("id", String, primary_key=True),              # str(ULID)
+    Column("name", String, nullable=False),
+    Column("cron_expr", String, nullable=False),
+    Column("dag_spec", String, nullable=False),           # JSON text
+    Column("enabled", Boolean, nullable=False),
+    Column("concurrency_policy", String, nullable=False),
+    Column("created_at", String, nullable=False),         # ISO 8601
+    Column("next_run_at", String, nullable=True),         # ISO 8601; NULL when acquired
+)
+
+cron_dag_active_runs = Table(
+    "cron_dag_active_runs",
+    metadata,
+    Column("cron_id", String, primary_key=True),
+    Column("task_id", String, nullable=False),
+    Column("expires_at", String, nullable=False),         # ISO 8601
+)
+
+Index("idx_cron_dag_entries_next_run_at", cron_dag_entries.c.next_run_at)

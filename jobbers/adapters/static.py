@@ -1,17 +1,23 @@
-"""Read-only in-process routing backend — no database required."""
+"""Read-only in-process routing backend and cron DAG scheduler — no database required."""
 
 from __future__ import annotations
 
+import asyncio
+import datetime as dt
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from croniter import croniter
 from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.protocols import RoutingBackendReadOnlyError
+
+if TYPE_CHECKING:
+    from jobbers.models.cron_dag import CronDAGEntry
 
 _DEFAULT_QUEUE = QueueConfig(name="default", max_concurrent=10)
 _DEFAULT_ROLES: dict[str, set[str]] = {"default": {"default"}}
@@ -186,3 +192,145 @@ class StaticRoutingBackend:
 
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
         return False
+
+
+def _parse_cron_dags(raw: list[dict[str, Any]]) -> list[CronDAGEntry]:
+    from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    entries = []
+    for item in raw:
+        dag_spec_raw = item["dag_spec"]
+        dag_spec = DAGTaskSpec.model_validate(dag_spec_raw)
+        entry = CronDAGEntry(
+            name=item["name"],
+            cron_expr=item["cron_expr"],
+            dag_spec=dag_spec,
+            enabled=item.get("enabled", True),
+            concurrency_policy=ConcurrencyPolicy(item.get("concurrency_policy", "always")),
+        )
+        entries.append(entry)
+    return entries
+
+
+class StaticCronDAGScheduler:
+    """
+    Read-only cron DAG scheduler with entries fixed at startup.
+
+    ``add()`` and ``remove()`` raise ``RoutingBackendReadOnlyError`` — entries can only
+    be defined in the static config file or passed at construction.  The runtime scheduler
+    state (next_run_at, active runs) is held in memory and reset on process restart.
+
+    Configuration priority (highest to lowest):
+      1. Constructor arguments (list of CronDAGEntry)
+      2. STATIC_CONFIG_FILE env var → JSON or YAML file (``cron_dags`` key)
+      3. Empty (no cron entries)
+    """
+
+    def __init__(self, entries: list[CronDAGEntry] | None = None) -> None:
+        now = dt.datetime.now(dt.UTC)
+        self._lock = asyncio.Lock()
+        # All entries by id — never mutated after init
+        self._entries: dict[ULID, CronDAGEntry] = {}
+        # next_run_at per entry; None means "acquired, awaiting reschedule"
+        self._next_run_at: dict[ULID, dt.datetime | None] = {}
+        # active runs: cron_id → (task_id_str, expires_at)
+        self._active_runs: dict[ULID, tuple[str, dt.datetime]] = {}
+
+        for entry in entries or []:
+            next_run_at = croniter(entry.cron_expr, now).get_next(dt.datetime).replace(tzinfo=dt.UTC)
+            self._entries[entry.id] = entry
+            self._next_run_at[entry.id] = next_run_at
+
+    # ── Factory methods ───────────────────────────────────────────────────────
+
+    @classmethod
+    def from_file(cls, path: str) -> StaticCronDAGScheduler:
+        data = _load_file(path)
+        entries = _parse_cron_dags(data.get("cron_dags", []))
+        return cls(entries=entries)
+
+    @classmethod
+    def from_env(cls) -> StaticCronDAGScheduler:
+        config_file = os.environ.get("STATIC_CONFIG_FILE")
+        if config_file:
+            return cls.from_file(config_file)
+        return cls()
+
+    # ── Protocol methods ──────────────────────────────────────────────────────
+
+    async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
+        raise RoutingBackendReadOnlyError(
+            "Static cron DAG scheduler is read-only. Use CRON_BACKEND=sql or CRON_BACKEND=redis for dynamic entries."
+        )
+
+    async def remove(self, cron_id: ULID) -> None:
+        raise RoutingBackendReadOnlyError(
+            "Static cron DAG scheduler is read-only. Use CRON_BACKEND=sql or CRON_BACKEND=redis for dynamic entries."
+        )
+
+    async def get(self, cron_id: ULID) -> CronDAGEntry | None:
+        return self._entries.get(cron_id)
+
+    async def next_due_bulk(self, n: int) -> list[tuple[CronDAGEntry, dt.datetime]]:
+        now = dt.datetime.now(dt.UTC)
+        results: list[tuple[CronDAGEntry, dt.datetime]] = []
+        async with self._lock:
+            due = [
+                (cid, run_at)
+                for cid, run_at in self._next_run_at.items()
+                if run_at is not None and run_at <= now
+            ]
+            due.sort(key=lambda x: x[1])
+            for cid, run_at in due[:n]:
+                # Mark as acquired; caller must call reschedule() to restore.
+                self._next_run_at[cid] = None
+                results.append((self._entries[cid], run_at))
+        return results
+
+    async def reschedule(self, cron_id: ULID, next_run_at: dt.datetime) -> None:
+        async with self._lock:
+            if cron_id in self._next_run_at:
+                self._next_run_at[cron_id] = next_run_at
+
+    async def get_active_run(self, cron_id: ULID) -> str | None:
+        now = dt.datetime.now(dt.UTC)
+        async with self._lock:
+            item = self._active_runs.get(cron_id)
+        if item is None or item[1] <= now:
+            return None
+        return item[0]
+
+    async def set_active_run(
+        self, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
+    ) -> bool:
+        now = dt.datetime.now(dt.UTC)
+        expires_at = now + dt.timedelta(seconds=ttl)
+        async with self._lock:
+            existing = self._active_runs.get(cron_id)
+            if nx and existing is not None and existing[1] > now:
+                return False
+            self._active_runs[cron_id] = (str(task_id), expires_at)
+        return True
+
+    async def clear_active_run(self, cron_id: ULID) -> None:
+        async with self._lock:
+            self._active_runs.pop(cron_id, None)
+
+    async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None:
+        async with self._lock:
+            return self._next_run_at.get(cron_id)
+
+    async def list(
+        self, offset: int = 0, limit: int = 50
+    ) -> tuple[list[tuple[CronDAGEntry, dt.datetime]], int]:
+        async with self._lock:
+            scheduled = [
+                (self._entries[cid], run_at)
+                for cid, run_at in self._next_run_at.items()
+                if run_at is not None
+            ]
+        scheduled.sort(key=lambda x: x[1])
+        total = len(scheduled)
+        page = scheduled[offset : offset + limit]
+        return list(page), total

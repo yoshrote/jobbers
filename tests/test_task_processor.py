@@ -1232,7 +1232,7 @@ async def test_handle_success_without_cron_id_calls_save_task():
 
 @pytest.mark.asyncio
 async def test_handle_success_with_cron_id_uses_pipeline_not_save_task():
-    """handle_success uses a transactional pipeline (stage_save + stage_clear_active_run) when cron_id is set."""
+    """handle_success stages the task save in a pipeline then clears the active run when cron_id is set."""
     cron_id = ULID()
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
@@ -1248,6 +1248,7 @@ async def test_handle_success_with_cron_id_uses_pipeline_not_save_task():
     state_manager.job_store.pipeline.return_value = mock_pipe
     state_manager.ta = MagicMock()
     state_manager.cron_dag_scheduler = MagicMock()
+    state_manager.cron_dag_scheduler.clear_active_run = AsyncMock()
 
     processor = TaskProcessor(state_manager)
     await processor.handle_success(task)
@@ -1255,8 +1256,8 @@ async def test_handle_success_with_cron_id_uses_pipeline_not_save_task():
     state_manager.save_task.assert_not_awaited()
     state_manager.job_store.pipeline.assert_called_once_with(transaction=True)
     state_manager.ta.stage_save.assert_called_once_with(mock_pipe, task)
-    state_manager.cron_dag_scheduler.stage_clear_active_run.assert_called_once_with(mock_pipe, cron_id)
     mock_pipe.execute.assert_awaited_once()
+    state_manager.cron_dag_scheduler.clear_active_run.assert_awaited_once_with(cron_id)
     assert task.status == TaskStatus.COMPLETED
 
 
