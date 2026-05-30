@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.protocols import TaskAdapterProtocol, TransactionHandle
+    from jobbers.protocols import TaskStateProtocol, TransactionHandle
 
 
 def _escape_tag(value: str) -> str:
@@ -514,7 +514,7 @@ class JsonDeadQueue:
     INDEX_NAME = "dlq-json-idx"
     DLQ_KEY = "dlq:{task_id}".format
 
-    def __init__(self, data_store: Redis, task_adapter: TaskAdapterProtocol) -> None:
+    def __init__(self, data_store: Redis, task_adapter: TaskStateProtocol) -> None:
         self.data_store = data_store
         self.ta = task_adapter
 

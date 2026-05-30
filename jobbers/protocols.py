@@ -9,15 +9,13 @@ Routing:
 
 Task storage / dead-letter queue (split-store protocols):
 - `TaskStateProtocol` — task blob persistence, heartbeats, fan-in sets, DAG run index.
+- `TaskSubmitProtocol` — composite submit/pop operations requiring co-located state and queue.
 - `TaskQueueProtocol` — active queue membership and rate limiting.
 - `TaskSchedulerProtocol` — scheduled/delayed task queue.
 - `TransactionHandle` — opaque write batch accepted by all Atomic protocol stage_* methods.
 - `AtomicTaskStateProtocol` — extends TaskStateProtocol with pipeline staging methods.
 - `AtomicTaskSchedulerProtocol` — extends TaskSchedulerProtocol with pipeline staging.
 - `AtomicDeadQueueProtocol` — extends DeadQueueProtocol with pipeline staging.
-
-Legacy combined protocol (kept for backward compatibility):
-- `TaskAdapterProtocol` — combined task storage + queue protocol; use split protocols for new code.
 - `DeadQueueProtocol` — interface all dead-letter queue implementations must implement.
 """
 
@@ -32,7 +30,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
     from typing import Any
 
-    from redis.asyncio.client import Pipeline
     from ulid import ULID
 
     from jobbers.models.dag import DAGRunPagination
@@ -112,69 +109,6 @@ class RoutingBackendProtocol(Protocol):
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
 
 
-@runtime_checkable
-class TaskAdapterProtocol(Protocol):  # pragma: no cover
-    """Interface for task storage and querying."""
-
-    # -- key helpers (both implementations use the same Redis key names) ----
-    TASKS_BY_QUEUE: Any
-    TASK_DETAILS: Any
-    HEARTBEAT_SCORES: Any
-    TASK_BY_TYPE_IDX: Any
-    QUEUE_RATE_LIMITER: Any
-    DLQ_MISSING_DATA: str
-    DAG_RUNS: str
-    DAG_RUN_TASKS: Any
-
-    # -- write path ----------------------------------------------------------
-    async def submit_task(self, task: Task) -> bool: ...
-    async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool: ...
-    def stage_save(self, pipe: TransactionHandle, task: Task) -> None: ...
-    def stage_requeue(self, pipe: TransactionHandle, task: Task) -> None: ...
-    def stage_submit_task(self, pipe: TransactionHandle, task: Task) -> None: ...
-
-    # -- read path -----------------------------------------------------------
-    async def get_task(self, task_id: ULID) -> Task | None: ...
-    async def get_tasks_bulk(self, task_ids: list[ULID]) -> list[Task | None]: ...
-    async def read_for_watch(self, pipe: TransactionHandle, task_id: ULID) -> Task | None: ...
-    async def task_exists(self, task_id: ULID) -> bool: ...
-    async def get_active_tasks(self, queues: set[str]) -> list[Task]: ...
-    def get_stale_tasks(self, queues: set[str], stale_time: dt.timedelta) -> AsyncGenerator[Task, None]: ...
-    async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]: ...
-    async def get_next_task(self, queues: set[str], pop_timeout: int) -> Task | None: ...
-
-    # -- queue management ----------------------------------------------------
-    def stage_remove_from_queue(self, pipe: TransactionHandle, task: Task) -> None: ...
-    async def update_task_heartbeat(self, task: Task) -> None: ...
-    async def remove_task_heartbeat(self, task: Task) -> None: ...
-
-    # -- dag fan-in ----------------------------------------------------------
-    def stage_init_fan_in(
-        self, pipe: Pipeline, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
-    ) -> None: ...
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
-    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int: ...
-    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
-
-    # -- dag run index -------------------------------------------------------
-    async def get_dag_runs(
-        self, pagination: DAGRunPagination
-    ) -> tuple[list[tuple[ULID, dt.datetime]], int]: ...
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None: ...
-    async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
-
-    # -- lifecycle -----------------------------------------------------------
-    async def ensure_index(self) -> None: ...
-    async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
-    async def clean(
-        self,
-        queues: set[bytes],
-        now: dt.datetime,
-        min_queue_age: dt.datetime | None,
-        max_queue_age: dt.datetime | None,
-    ) -> None: ...
-
-
 class DeadQueueProtocol(Protocol):  # pragma: no cover
     """Interface for dead letter queue operations."""
 
@@ -199,6 +133,34 @@ class DeadQueueProtocol(Protocol):  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Split-store protocols — use these for new cross-datastore implementations.
 # ---------------------------------------------------------------------------
+
+
+class TaskSubmitProtocol(Protocol):  # pragma: no cover
+    """
+    Composite submit and pop operations that require co-located task state and queue.
+
+    These three operations span both ``TaskStateProtocol`` (blob persistence) and
+    ``TaskQueueProtocol`` (queue membership).  Redis adapters implement them via
+    atomic Lua scripts; SQL adapters implement them with a transaction that writes
+    to both the tasks and task_queue tables.
+
+    ``StateManager`` uses this protocol for all submission and dequeue operations.
+    When state and queue live on the same backend, the same adapter object satisfies
+    both ``TaskStateProtocol`` and ``TaskSubmitProtocol``.  In a split-store
+    deployment (e.g. SQL state + Redis queue), a separate adapter can be supplied.
+    """
+
+    async def submit_task(self, task: Task) -> bool:
+        """Persist the task blob and enqueue it atomically.  Returns True on success."""
+        ...
+
+    async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
+        """Check the sliding rate-limit window and enqueue only if under the limit."""
+        ...
+
+    async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
+        """Blocking pop the next task from any of the given queues.  Returns None on timeout."""
+        ...
 
 
 @runtime_checkable

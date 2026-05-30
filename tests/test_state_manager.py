@@ -96,7 +96,7 @@ async def test_get_next_task_skips_missing_data_and_returns_valid(redis, state_m
 
     # missing_id has score=1 so it is popped first; FROZEN_TIME >> 1 so valid_task is popped second
     await redis.zadd("task-queues:queue1", {missing_id.bytes: 1})
-    await state_manager_real_ta.ta.submit_task(valid_task)
+    await state_manager_real_ta.task_state.submit_task(valid_task)
 
     task = await state_manager_real_ta.get_next_task(["queue1"], pop_timeout=1)
 
@@ -218,7 +218,7 @@ async def test_clean_stale_time_skips_terminal_tasks(redis, state_manager_real_t
         completed_at=two_hours_ago + dt.timedelta(minutes=30),
         heartbeat_at=two_hours_ago,
     )
-    await state_manager_real_ta.ta.save_task(completed)
+    await state_manager_real_ta.task_state.save_task(completed)
     await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
     await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
 
@@ -228,7 +228,7 @@ async def test_clean_stale_time_skips_terminal_tasks(redis, state_manager_real_t
     with patch.object(registry, "get_task_config", return_value=stale_config):
         await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
 
-    saved = await state_manager_real_ta.ta.get_task(ULID1)
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
     assert saved is not None
     assert saved.status == TaskStatus.COMPLETED
 
@@ -245,7 +245,7 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager_
         started_at=two_hours_ago,
         heartbeat_at=two_hours_ago,
     )
-    await state_manager_real_ta.ta.save_task(started)
+    await state_manager_real_ta.task_state.save_task(started)
     await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
     await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
 
@@ -255,7 +255,7 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager_
     with patch.object(registry, "get_task_config", return_value=stale_config):
         await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
 
-    saved = await state_manager_real_ta.ta.get_task(ULID1)
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
     assert saved is not None
     assert saved.status == TaskStatus.STALLED
     assert await redis.zscore("task-heartbeats:default", ULID1.bytes) is None
@@ -280,7 +280,7 @@ async def test_fail_task_no_dlq_writes_redis_only(redis, state_manager):
 
     await state_manager.fail_task(task)
 
-    saved = await state_manager.ta.get_task(ULID1)
+    saved = await state_manager.task_state.get_task(ULID1)
     assert saved.status == TaskStatus.FAILED
     assert await state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
 
@@ -293,7 +293,7 @@ async def test_fail_task_with_dlq_writes_both_stores(redis, state_manager):
 
     await state_manager.fail_task(task)
 
-    saved = await state_manager.ta.get_task(ULID1)
+    saved = await state_manager.task_state.get_task(ULID1)
     assert saved.status == TaskStatus.FAILED
     dlq = await state_manager.dead_queue.get_by_ids([str(ULID1)])
     assert len(dlq) == 1
@@ -308,8 +308,8 @@ async def test_resubmit_dead_tasks_requeues_and_clears_dlq(redis, state_manager)
     """All tasks are enqueued in Redis and removed from the DLQ."""
     task1 = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
     task2 = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e2"])
-    await state_manager.ta.save_task(task1)
-    await state_manager.ta.save_task(task2)
+    await state_manager.task_state.save_task(task1)
+    await state_manager.task_state.save_task(task2)
     await add_to_dlq(state_manager, task1, FROZEN_TIME)
     await add_to_dlq(state_manager, task2, FROZEN_TIME)
 
@@ -325,7 +325,7 @@ async def test_resubmit_dead_tasks_requeues_and_clears_dlq(redis, state_manager)
 async def test_resubmit_dead_tasks_is_idempotent(redis, state_manager):
     """Re-running resubmit for a task already in Redis does not raise and clears the DLQ."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e1"])
-    await state_manager.ta.save_task(task)
+    await state_manager.task_state.save_task(task)
     await add_to_dlq(state_manager, task, FROZEN_TIME)
 
     await state_manager.resubmit_dead_tasks([task])
@@ -347,7 +347,7 @@ async def test_dispatch_scheduled_task(redis, state_manager):
     """dispatch_scheduled_task moves a due task from the scheduler into its Redis queue."""
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
     run_at = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
-    await state_manager.ta.save_task(task)
+    await state_manager.task_state.save_task(task)
     await schedule(state_manager, task, run_at)
 
     due = await state_manager.task_scheduler.next_due(["default"])
@@ -365,14 +365,14 @@ async def test_dispatch_scheduled_task_skips_cancelled(redis, state_manager):
     cancelled = Task(
         id=ULID1, name="retry_task", queue="default", status=TaskStatus.CANCELLED, retry_attempt=1
     )
-    await state_manager.ta.save_task(cancelled)
+    await state_manager.task_state.save_task(cancelled)
 
     stale = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
     await state_manager.dispatch_scheduled_task(stale)
 
     queue_members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) not in queue_members
-    saved = await state_manager.ta.get_task(ULID1)
+    saved = await state_manager.task_state.get_task(ULID1)
     assert saved is not None
     assert saved.status == TaskStatus.CANCELLED
 
@@ -381,7 +381,7 @@ async def test_dispatch_scheduled_task_skips_cancelled(redis, state_manager):
 async def test_dispatch_scheduled_task_skips_cancelled_task(redis, state_manager):
     """dispatch_scheduled_task silently skips tasks that are already CANCELLED."""
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.CANCELLED)
-    await state_manager.ta.save_task(task)
+    await state_manager.task_state.save_task(task)
 
     result = await state_manager.dispatch_scheduled_task(task)
 
@@ -399,7 +399,7 @@ async def test_schedule_retry_task_self_heals_via_dispatch(redis, state_manager)
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.STARTED, retry_attempt=1)
     run_at = FROZEN_TIME
 
-    await state_manager.ta.save_task(task)
+    await state_manager.task_state.save_task(task)
     await schedule(state_manager, task, run_at)
 
     due = await state_manager.task_scheduler.next_due(["default"])
@@ -417,7 +417,7 @@ async def test_dispatch_acquired_record_not_requeued(redis, state_manager):
     task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SUBMITTED, retry_attempt=1)
     run_at = FROZEN_TIME
 
-    await state_manager.ta.save_task(task)
+    await state_manager.task_state.save_task(task)
     await schedule(state_manager, task, run_at)
     await state_manager.task_scheduler.next_due(["default"])
 
@@ -440,7 +440,7 @@ async def test_cancel_scheduled_task(redis, state_manager):
     assert result is not None
     assert result.status == TaskStatus.CANCELLED
     assert await state_manager.task_scheduler.next_due(["default"]) is None
-    saved = await state_manager.ta.get_task(ULID1)
+    saved = await state_manager.task_state.get_task(ULID1)
     assert saved.status == TaskStatus.CANCELLED
 
 
@@ -458,9 +458,9 @@ async def test_cancel_submitted_task(redis, state_manager):
         id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME
     )
     pipe = state_manager.job_store.pipeline()
-    state_manager.ta.stage_requeue(pipe, task)
+    state_manager.task_state.stage_requeue(pipe, task)
     await pipe.execute()
-    await state_manager.ta.save_task(task)
+    await state_manager.task_state.save_task(task)
 
     result = await state_manager.request_task_cancellation(ULID1)
 
@@ -468,7 +468,7 @@ async def test_cancel_submitted_task(redis, state_manager):
     assert result.status == TaskStatus.CANCELLED
     members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) not in members
-    saved = await state_manager.ta.get_task(ULID1)
+    saved = await state_manager.task_state.get_task(ULID1)
     assert saved.status == TaskStatus.CANCELLED
 
 
@@ -476,7 +476,7 @@ async def test_cancel_submitted_task(redis, state_manager):
 async def test_cancel_started_task_publishes_message(state_manager):
     """Cancelling a STARTED task signals the cancel event via the shared pubsub channel."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
-    await state_manager.ta.save_task(task)
+    await state_manager.task_state.save_task(task)
 
     with state_manager.cancel_event(ULID1):
         cancel_listener = asyncio.create_task(state_manager.run_cancel_listener())
@@ -498,7 +498,7 @@ async def test_cancel_started_task_publishes_message(state_manager):
 async def test_cancel_terminal_task_raises(state_manager):
     """Cancelling a task in a terminal status raises TaskException."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED)
-    await state_manager.ta.save_task(task)
+    await state_manager.task_state.save_task(task)
 
     with pytest.raises(TaskException, match="cannot be cancelled"):
         await state_manager.request_task_cancellation(ULID1)
@@ -523,7 +523,7 @@ async def test_submit_task_rate_limited_branch(redis, state_manager_real_ta):
     await state_manager_real_ta.submit_task(task)
 
     assert task.status == TaskStatus.SUBMITTED
-    count = await redis.zcard(state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default"))
+    count = await redis.zcard(state_manager_real_ta.task_state.QUEUE_RATE_LIMITER(queue="default"))
     assert count == 1
     members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in members
@@ -656,14 +656,14 @@ async def test_schedule_retry_task_adds_to_scheduler(redis, state_manager):
 async def test_update_task_heartbeat_sets_timestamp(state_manager_real_ta):
     """update_task_heartbeat stamps heartbeat_at on the task and persists it."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
-    await state_manager_real_ta.ta.save_task(task)
+    await state_manager_real_ta.task_state.save_task(task)
     assert task.heartbeat_at is None
 
     await state_manager_real_ta.update_task_heartbeat(task)
 
     assert task.heartbeat_at is not None
     score = await state_manager_real_ta.job_store.zscore(
-        state_manager_real_ta.ta.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)
+        state_manager_real_ta.task_state.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)
     )
     assert score is not None
 
@@ -672,13 +672,13 @@ async def test_update_task_heartbeat_sets_timestamp(state_manager_real_ta):
 async def test_remove_task_heartbeat_clears_entry(state_manager_real_ta):
     """remove_task_heartbeat removes the task from the heartbeat sorted set."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
-    await state_manager_real_ta.ta.save_task(task)
+    await state_manager_real_ta.task_state.save_task(task)
     await state_manager_real_ta.update_task_heartbeat(task)
 
     await state_manager_real_ta.remove_task_heartbeat(task)
 
     score = await state_manager_real_ta.job_store.zscore(
-        state_manager_real_ta.ta.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)
+        state_manager_real_ta.task_state.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)
     )
     assert score is None
 
@@ -687,7 +687,7 @@ async def test_remove_task_heartbeat_clears_entry(state_manager_real_ta):
 async def test_get_active_tasks_returns_heartbeating_tasks(state_manager_real_ta):
     """get_active_tasks returns tasks currently registered in any heartbeat sorted set."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
-    await state_manager_real_ta.ta.save_task(task)
+    await state_manager_real_ta.task_state.save_task(task)
     await state_manager_real_ta.update_task_heartbeat(task)
 
     active = await state_manager_real_ta.get_active_tasks({"default"})
@@ -723,7 +723,7 @@ async def test_queue_retry_task_bypasses_rate_limit(redis, state_manager_real_ta
     await state_manager_real_ta.routing.save_queue_config(
         QueueConfig(name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE)
     )
-    rate_key = state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default")
+    rate_key = state_manager_real_ta.task_state.QUEUE_RATE_LIMITER(queue="default")
     await redis.zadd(rate_key, {ULID2.bytes: FROZEN_TIME.timestamp()})
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
@@ -747,7 +747,7 @@ async def test_schedule_retry_task_bypasses_rate_limit(redis, state_manager_real
     await state_manager_real_ta.routing.save_queue_config(
         QueueConfig(name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE)
     )
-    rate_key = state_manager_real_ta.ta.QUEUE_RATE_LIMITER(queue="default")
+    rate_key = state_manager_real_ta.task_state.QUEUE_RATE_LIMITER(queue="default")
     await redis.zadd(rate_key, {ULID2.bytes: FROZEN_TIME.timestamp()})
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SCHEDULED)
@@ -859,7 +859,7 @@ async def test_dispatch_cron_dag_submits_task_and_reschedules(state_manager):
     await state_manager.dispatch_cron_dag(entry, run_at)
 
     # A task should now exist in the DummyTaskAdapter store
-    stored = state_manager.ta._store
+    stored = state_manager.task_state._store
     assert len(stored) == 1
     task = next(iter(stored.values()))
     assert task.name == "my_job"
@@ -883,14 +883,14 @@ async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager
 
     # Plant an active task that the skip-guard will find
     active_task = Task(id=ULID1, name="my_job", queue="default", status=TaskStatus.STARTED)
-    await state_manager.ta.save_task(active_task)
+    await state_manager.task_state.save_task(active_task)
     await state_manager.job_store.set(f"cron-active:{entry.id}", str(ULID1))
 
     run_at = FROZEN_TIME
     await state_manager.dispatch_cron_dag(entry, run_at)
 
     # No new tasks should have been submitted (only the pre-planted active one)
-    stored = state_manager.ta._store
+    stored = state_manager.task_state._store
     assert len(stored) == 1
     assert ULID1 in stored
 
@@ -915,7 +915,7 @@ async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_sk
     await state_manager.dispatch_cron_dag(entry, run_at)
 
     # The new root task should have been submitted
-    stored = state_manager.ta._store
+    stored = state_manager.task_state._store
     assert len(stored) == 1
 
     # The active-run key should now record the new task ID
@@ -944,7 +944,7 @@ async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
     )
 
     run_at = FROZEN_TIME
-    with patch.object(state_manager.ta, "stage_init_fan_in") as mock_stage_init:
+    with patch.object(state_manager.task_state, "stage_init_fan_in") as mock_stage_init:
         await state_manager.dispatch_cron_dag(entry, run_at)
 
     # stage_init_fan_in must have been called for the collector's fan-in key
@@ -964,7 +964,7 @@ async def test_dispatch_cron_dag_stages_submission_in_pipeline_for_non_rate_limi
 
     with (
         patch.object(
-            state_manager.ta, "stage_submit_task", wraps=state_manager.ta.stage_submit_task
+            state_manager.task_state, "stage_submit_task", wraps=state_manager.task_state.stage_submit_task
         ) as mock_stage,
         patch.object(state_manager, "submit_task", new_callable=AsyncMock) as mock_submit,
     ):
@@ -990,7 +990,7 @@ async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queu
     )
 
     with (
-        patch.object(state_manager.ta, "stage_submit_task") as mock_stage,
+        patch.object(state_manager.task_state, "stage_submit_task") as mock_stage,
         patch.object(state_manager, "submit_task", new_callable=AsyncMock) as mock_submit,
     ):
         await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
@@ -1066,7 +1066,8 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
     sm = StateManager(
         redis,
         routing_backend,
-        task_adapter=dummy_task_adapter,
+        task_state=dummy_task_adapter,
+        task_submit=dummy_task_adapter,
         dead_queue=DeadQueue(redis, dummy_task_adapter),
         task_scheduler=TaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=CronDAGScheduler(redis),
@@ -1089,7 +1090,8 @@ async def test_get_routing_config_caches_result(redis, session_factory, dummy_ta
     sm = StateManager(
         redis,
         routing_backend,
-        task_adapter=dummy_task_adapter,
+        task_state=dummy_task_adapter,
+        task_submit=dummy_task_adapter,
         dead_queue=DeadQueue(redis, dummy_task_adapter),
         task_scheduler=TaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=CronDAGScheduler(redis),
@@ -1122,7 +1124,8 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
     sm = StateManager(
         redis,
         routing_backend,
-        task_adapter=dummy_task_adapter,
+        task_state=dummy_task_adapter,
+        task_submit=dummy_task_adapter,
         dead_queue=DeadQueue(redis, dummy_task_adapter),
         task_scheduler=TaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=CronDAGScheduler(redis),
@@ -1159,7 +1162,8 @@ async def test_save_routing_config_invalidates_cache_and_bumps_version(
     sm = StateManager(
         redis,
         routing_backend,
-        task_adapter=dummy_task_adapter,
+        task_state=dummy_task_adapter,
+        task_submit=dummy_task_adapter,
         dead_queue=DeadQueue(redis, dummy_task_adapter),
         task_scheduler=TaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=CronDAGScheduler(redis),
@@ -1201,7 +1205,8 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
     sm = StateManager(
         redis,
         routing_backend,
-        task_adapter=dummy_task_adapter,
+        task_state=dummy_task_adapter,
+        task_submit=dummy_task_adapter,
         dead_queue=DeadQueue(redis, dummy_task_adapter),
         task_scheduler=TaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=CronDAGScheduler(redis),
@@ -1232,7 +1237,8 @@ async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_
     sm = StateManager(
         redis,
         routing_backend,
-        task_adapter=dummy_task_adapter,
+        task_state=dummy_task_adapter,
+        task_submit=dummy_task_adapter,
         dead_queue=DeadQueue(redis, dummy_task_adapter),
         task_scheduler=TaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=CronDAGScheduler(redis),

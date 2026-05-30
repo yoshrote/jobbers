@@ -29,7 +29,7 @@ async def setup(session_factory, state_manager):
     patches = [
         patch("jobbers.task_routes.db.get_session_factory", return_value=session_factory),
         patch("jobbers.task_routes.db.get_state_manager", return_value=state_manager),
-        patch("jobbers.db.get_task_adapter", return_value=state_manager.ta),
+        patch("jobbers.db.get_task_adapter", return_value=state_manager.task_state),
     ]
     for p in patches:
         p.start()
@@ -84,7 +84,7 @@ async def test_submit_valid_task(state_manager):
 
     assert simplify(response_task) == simplify(task_data)
     # Check that it actually exists in redis
-    assert simplify(task_data) == simplify(await state_manager.ta.get_task(task_data.id))
+    assert simplify(task_data) == simplify(await state_manager.task_state.get_task(task_data.id))
 
 
 @pytest.mark.asyncio
@@ -111,7 +111,7 @@ async def test_get_task_status_found(state_manager):
     task_data = Task(
         id=ULID1, name="Test Task", status="submitted", submitted_at=dt.datetime.now(dt.UTC), parameters={}
     )
-    await state_manager.ta.submit_task(task_data)
+    await state_manager.task_state.submit_task(task_data)
 
     # Check that it exists via API
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

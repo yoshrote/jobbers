@@ -17,7 +17,7 @@ from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
 from jobbers.schedulers.task_scheduler import TaskScheduler
 
 if TYPE_CHECKING:
-    from jobbers.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskAdapterProtocol
+    from jobbers.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskStateProtocol, TaskSubmitProtocol
     from jobbers.state_manager import StateManager
 
 TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")
@@ -33,7 +33,7 @@ _client: redis.Redis | None = None
 _state_manager: StateManager | None = None
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
-_task_adapter: TaskAdapterProtocol | None = None
+_task_adapter: TaskStateProtocol | None = None
 _pre_registered_routing_backend: RoutingBackendProtocol | None = None
 
 
@@ -75,21 +75,21 @@ async def close_sqlite_conn() -> None:
         _session_factory = None
 
 
-def create_task_adapter(client: redis.Redis) -> TaskAdapterProtocol:
+def create_task_adapter(client: redis.Redis) -> MsgpackTaskAdapter | JsonTaskAdapter:
     """Create a Redis TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
     if TASK_ADAPTER_BACKEND == "msgpack":
         return MsgpackTaskAdapter(client)
     return JsonTaskAdapter(client)
 
 
-def create_dead_queue(client: redis.Redis, task_adapter: TaskAdapterProtocol) -> DeadQueueProtocol:
+def create_dead_queue(client: redis.Redis, task_adapter: TaskStateProtocol) -> DeadQueueProtocol:
     """Create a DeadQueue matched to the task adapter backend."""
     if TASK_ADAPTER_BACKEND == "msgpack":
         return DeadQueue(client, task_adapter)
     return JsonDeadQueue(client, task_adapter)
 
 
-def get_task_adapter() -> TaskAdapterProtocol:
+def get_task_adapter() -> TaskStateProtocol:
     """Return the singleton task adapter (must call init_state_manager first)."""
     if _task_adapter is None:
         raise RuntimeError("Task adapter not initialized. Call init_state_manager() first.")
@@ -171,15 +171,20 @@ async def init_state_manager() -> StateManager:
 
     routing_backend = await _create_routing_backend(client)
 
-    # Task adapter
+    # Task state adapter (blob persistence)
+    task_submit: TaskSubmitProtocol
     if TASK_BACKEND == "sql":
         from jobbers.adapters.sql import SQLTaskAdapter
 
         sf = await _get_or_create_sql(needed_sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         _task_adapter = SQLTaskAdapter(sf, dsn=dsn)
+        # SQL adapter handles its own submit/pop; Redis adapter used only for routing/queue ops
+        task_submit = _task_adapter
     else:
-        _task_adapter = create_task_adapter(client)
+        redis_adapter = create_task_adapter(client)
+        _task_adapter = redis_adapter
+        task_submit = redis_adapter
 
     # Dead-letter queue
     if DLQ_BACKEND == "sql":
@@ -208,7 +213,8 @@ async def init_state_manager() -> StateManager:
     _state_manager = StateManager(
         client,
         routing_backend,
-        task_adapter=_task_adapter,
+        task_state=_task_adapter,
+        task_submit=task_submit,
         dead_queue=dead_queue,
         task_scheduler=task_scheduler,  # type: ignore[arg-type]
         cron_dag_scheduler=cron_dag_scheduler,

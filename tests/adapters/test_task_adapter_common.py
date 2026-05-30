@@ -1,5 +1,5 @@
 """
-Contract tests for TaskAdapterProtocol implementations.
+Contract tests for TaskStateProtocol + TaskSubmitProtocol implementations.
 
 Uses only the saga-path public API (the same methods StateManager calls when
 ``force_saga=True``).  No ``data_store.*`` access; no sorted-set assertions.

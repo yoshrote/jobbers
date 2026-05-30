@@ -67,6 +67,16 @@ If your operational workflow involves browsing the DLQ by recency while filterin
 
 ---
 
+## Consistency mode
+
+Both adapters implement `AtomicTaskStateProtocol`, so `StateManager` operates in **atomic pipeline mode** by default: related state mutations (save blob + enqueue, save blob + add to DLQ, etc.) are grouped into a single Redis MULTI/EXEC transaction. This is the only consistency mode that currently ships.
+
+`StateManager` also supports a **saga mode** for cross-backend deployments where task state and the task queue live on different backends. In saga mode, writes are sequenced with the blob always written first, and the Cleaner reconciles any orphans left by mid-sequence crashes. This mode is activated automatically when any of the task adapter, scheduler, or dead letter queue does not implement its Atomic sub-protocol, or when `force_saga=True` is passed to `StateManager`.
+
+See [datastore-architecture.md](datastore-architecture.md) for details on the consistency model, what each mode guarantees, and what would be required to implement task state on SQL or queuing on RabbitMQ.
+
+---
+
 ## Summary: which adapter to choose
 
 **Choose the msgpack adapter when:**

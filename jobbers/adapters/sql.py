@@ -452,8 +452,9 @@ class SQLTaskAdapter:
     the Redis-specific code paths in the atomic pipeline.
     """
 
-    # Key-helper stubs kept for interface compatibility with TaskAdapterProtocol.
-    # These string-format callables are only used by the Redis adapters' Lua scripts
+    # Key-helper stubs: present for structural compatibility with AtomicTaskStateProtocol
+    # (used by DummyTaskAdapter and shared test helpers that reference these names).
+    # These string-format callables are only meaningful in the Redis adapters' Lua scripts
     # and the heartbeat sorted-set; SQL stores heartbeat in the tasks table itself.
     TASKS_BY_QUEUE = "task-queues:{queue}".format
     TASK_DETAILS = "task:{task_id}".format
@@ -868,7 +869,7 @@ class SQLTaskAdapter:
                     )
                 )
 
-    # ── TaskAdapterProtocol extras (submit path) ────────────────────────────
+    # ── TaskSubmitProtocol: submit and pop ──────────────────────────────────
 
     async def submit_task(self, task: Task) -> bool:
         """Submit a task directly (non-staged)."""

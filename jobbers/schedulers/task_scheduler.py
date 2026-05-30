@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.models.task import Task
-    from jobbers.protocols import TaskAdapterProtocol, TransactionHandle
+    from jobbers.protocols import TaskStateProtocol, TransactionHandle
 
 
 class TaskScheduler:
@@ -51,7 +51,7 @@ class TaskScheduler:
     def __init__(
         self,
         data_store: Redis,
-        task_adapter: TaskAdapterProtocol,
+        task_adapter: TaskStateProtocol,
         get_all_queues: Callable[[], Awaitable[list[str]]],
     ) -> None:
         self.data_store = data_store

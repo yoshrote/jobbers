@@ -65,7 +65,7 @@ class TaskProcessor:
 
             with self.state_manager.task_in_registry(task):
                 await self.state_manager.update_task_heartbeat(task)
-                task._adapter = self.state_manager.ta
+                task._adapter = self.state_manager.task_state
                 _token = _current_task_cv.set(task)
                 kwargs = dict(task.parameters)
                 if task.inject_parent_results and task.parent_ids:
@@ -169,7 +169,7 @@ class TaskProcessor:
         if dynamic_fanout is not None:
             await self._handle_dynamic_fanout(task, dynamic_fanout)
         if task.has_callbacks():
-            callbacks = await task.generate_callbacks(self.state_manager.ta)
+            callbacks = await task.generate_callbacks(self.state_manager.task_state)
             for cb in callbacks:
                 cb.queue = await self.state_manager.resolve_queue(cb)
             await self.state_manager.submit_tasks_batch(callbacks)

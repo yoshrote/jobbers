@@ -2,7 +2,8 @@
 Pluggable adapters for task storage, dead letter queue, and routing config.
 
 Task storage:
-- `TaskAdapterProtocol` — interface all task adapters must satisfy.
+- `TaskStateProtocol` — task blob persistence interface.
+- `TaskSubmitProtocol` — composite submit/pop interface (requires co-located state + queue).
 - `JsonTaskAdapter` — Redis Stack (RedisJSON + RediSearch) backend.
 - `MsgpackTaskAdapter` — plain Redis (msgpack binary strings) backend.
 - `SQLTaskAdapter` — SQLAlchemy backend (tasks / task_fan_in / dag_runs tables).
@@ -30,11 +31,13 @@ from jobbers.protocols import (
     DeadQueueProtocol,
     RoutingBackendProtocol,
     RoutingBackendReadOnlyError,
-    TaskAdapterProtocol,
+    TaskStateProtocol,
+    TaskSubmitProtocol,
 )
 
 __all__ = [
-    "TaskAdapterProtocol",
+    "TaskStateProtocol",
+    "TaskSubmitProtocol",
     "DeadQueueProtocol",
     "JsonTaskAdapter",
     "MsgpackTaskAdapter",

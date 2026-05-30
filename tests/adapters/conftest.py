@@ -53,7 +53,7 @@ def msgpack_dead_queue(redis, dummy_task_adapter) -> DeadQueue:
 @pytest_asyncio.fixture(params=["raw", "json", "sql"], ids=["raw", "json", "sql"])
 async def task_adapter(request, redis, session_factory):
     """
-    Parameterized fixture yielding a TaskAdapterProtocol implementation for each backend.
+    Parameterized fixture yielding a TaskStateProtocol + TaskSubmitProtocol implementation for each backend.
 
     - ``"raw"``: MsgpackTaskAdapter backed by FakeAsyncRedis
     - ``"json"``: JsonTaskAdapter backed by real Redis Stack; skips if unavailable
@@ -88,7 +88,7 @@ async def task_adapter(request, redis, session_factory):
 @pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])
 async def redis_task_adapter(request, redis):
     """
-    Parameterized fixture yielding a Redis-backed TaskAdapterProtocol for each Redis backend.
+    Parameterized fixture yielding a Redis-backed task adapter for each Redis backend.
 
     - ``"raw"``: MsgpackTaskAdapter backed by FakeAsyncRedis
     - ``"json"``: JsonTaskAdapter backed by real Redis Stack; skips if unavailable

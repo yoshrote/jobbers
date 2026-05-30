@@ -36,8 +36,8 @@ if TYPE_CHECKING:
         AtomicTaskStateProtocol,
         DeadQueueProtocol,
         RoutingBackendProtocol,
-        TaskAdapterProtocol,
         TaskStateProtocol,
+        TaskSubmitProtocol,
         TransactionHandle,
     )
     from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
@@ -67,7 +67,8 @@ class StateManager:
         self,
         job_store: Redis,
         routing_backend: RoutingBackendProtocol,
-        task_adapter: TaskAdapterProtocol,
+        task_state: TaskStateProtocol,
+        task_submit: TaskSubmitProtocol,
         *,
         dead_queue: DeadQueueProtocol,
         task_scheduler: TaskScheduler,
@@ -76,7 +77,8 @@ class StateManager:
     ) -> None:
         self.job_store: Redis = job_store
         self.routing: RoutingBackendProtocol = routing_backend
-        self.ta: TaskAdapterProtocol = task_adapter
+        self.task_state: TaskStateProtocol = task_state
+        self.task_submit: TaskSubmitProtocol = task_submit
         self._queue_config_cache: dict[str, QueueConfig | None] = {}
         self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
         self.submission_limiter = SubmissionRateLimiter(job_store, self.get_queue_config)
@@ -85,10 +87,6 @@ class StateManager:
         self.dead_queue: DeadQueueProtocol = dead_queue
         self.task_scheduler = task_scheduler
         self.cron_dag_scheduler = cron_dag_scheduler
-
-        # Split-protocol references for cross-datastore coordination.
-        # In the default single-Redis setup, task_state is the same object as ta.
-        self.task_state: TaskStateProtocol = self.ta  # type: ignore[assignment]
 
         # Same-backend detection: if the task adapter, scheduler, and DLQ all implement the
         # Atomic sub-protocols, StateManager uses atomic pipelines.  When stores differ, or
@@ -100,7 +98,7 @@ class StateManager:
         )
 
         self._atomic_state: AtomicTaskStateProtocol | None = (
-            self.ta if isinstance(self.ta, AtomicTaskStateProtocol) else None
+            task_state if isinstance(task_state, AtomicTaskStateProtocol) else None
         )
         self._atomic_scheduler: AtomicTaskSchedulerProtocol | None = (
             self.task_scheduler if isinstance(self.task_scheduler, AtomicTaskSchedulerProtocol) else None
@@ -160,18 +158,18 @@ class StateManager:
             clean_ops.append(self.submission_limiter.clean(queues, now, rate_limit_age))
 
         if max_queue_age or min_queue_age:
-            clean_ops.append(self.ta.clean(queues, now, min_queue_age, max_queue_age))
+            clean_ops.append(self.task_state.clean(queues, now, min_queue_age, max_queue_age))
 
         if dlq_age:
             clean_ops.append(self.dead_queue.clean(now - dlq_age))
 
         if completed_task_age:
-            clean_ops.append(self.ta.clean_terminal_tasks(now, completed_task_age))
-            clean_ops.append(self.ta.clean_dag_runs(now, completed_task_age))
+            clean_ops.append(self.task_state.clean_terminal_tasks(now, completed_task_age))
+            clean_ops.append(self.task_state.clean_dag_runs(now, completed_task_age))
 
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
-            async for task in self.ta.get_stale_tasks({q.decode() for q in queues}, stale_time):
+            async for task in self.task_state.get_stale_tasks({q.decode() for q in queues}, stale_time):
                 if task.status != TaskStatus.STARTED:
                     continue
                 stale_tasks_by_type[(task.name, task.version)].append(task)
@@ -210,7 +208,7 @@ class StateManager:
 
         queues = await self.submission_limiter.concurrency_limits(queues, self.current_tasks_by_queue)
 
-        return await self.ta.get_next_task(queues, pop_timeout)
+        return await self.task_submit.get_next_task(queues, pop_timeout)
 
     async def resubmit_dead_tasks(self, tasks: list[Task], reset_retry_count: bool = True) -> list[Task]:
         """Re-enqueue DLQ tasks and remove them from the DLQ in a single atomic transaction."""
@@ -343,7 +341,7 @@ class StateManager:
         if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
             active_task_id_str = await self.cron_dag_scheduler.get_active_run(entry.id)
             if active_task_id_str is not None:
-                active_task = await self.ta.get_task(ULID.from_str(active_task_id_str))
+                active_task = await self.task_state.get_task(ULID.from_str(active_task_id_str))
                 if active_task is not None and active_task.status in {
                     TaskStatus.SUBMITTED,
                     TaskStatus.STARTED,
@@ -439,7 +437,7 @@ class StateManager:
         Returns None if the task does not exist.
         Raises TaskException if the task status does not permit cancellation.
         """
-        task = await self.ta.get_task(task_id)
+        task = await self.task_state.get_task(task_id)
         if task is None:
             return None
         match task.status:
@@ -517,7 +515,8 @@ class StateManager:
                 f"Queue '{task.queue}' is rate-limited; use submit_task() instead of stage_submit_task()."
             )
         task.set_status(TaskStatus.SUBMITTED)
-        self.ta.stage_submit_task(pipe, task)
+        assert self._atomic_state is not None  # noqa: S101
+        self._atomic_state.stage_submit_task(pipe, task)
 
     # ── New cross-store coordination methods ─────────────────────────────────
 
@@ -704,12 +703,12 @@ class StateManager:
             and queue_config.rate_denominator
             and queue_config.rate_period
         ):
-            await self.ta.submit_rate_limited_task(task=task, queue_config=queue_config)
+            await self.task_submit.submit_rate_limited_task(task=task, queue_config=queue_config)
         else:
-            await self.ta.submit_task(task=task)
+            await self.task_submit.submit_task(task=task)
 
     async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
-        await self.ta.init_fan_in(fan_in_key, predecessor_ids, ttl)
+        await self.task_state.init_fan_in(fan_in_key, predecessor_ids, ttl)
 
     async def add_cron_dag(self, entry: CronDAGEntry) -> None:
         """
@@ -760,11 +759,11 @@ class StateManager:
 
     async def list_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
         """Return a paginated list of DAG runs ordered by submission time."""
-        return await self.ta.get_dag_runs(pagination)
+        return await self.task_state.get_dag_runs(pagination)
 
     async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
         """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
-        return await self.ta.get_dag_run(dag_run_id)
+        return await self.task_state.get_dag_run(dag_run_id)
 
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
@@ -779,15 +778,15 @@ class StateManager:
     async def update_task_heartbeat(self, task: Task) -> None:
         """Update the heartbeat timestamp for a task."""
         task.heartbeat_at = dt.datetime.now(dt.UTC)
-        await self.ta.update_task_heartbeat(task)
+        await self.task_state.update_task_heartbeat(task)
 
     async def remove_task_heartbeat(self, task: Task) -> None:
         """Remove a task from the heartbeat sorted set."""
-        await self.ta.remove_task_heartbeat(task)
+        await self.task_state.remove_task_heartbeat(task)
 
     async def get_active_tasks(self, queues: set[str]) -> list[Task]:
         """Return all tasks currently present in any heartbeat sorted set."""
-        return await self.ta.get_active_tasks(queues)
+        return await self.task_state.get_active_tasks(queues)
 
 
 class SubmissionRateLimiter:

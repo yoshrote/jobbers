@@ -45,7 +45,8 @@ async def state_manager(redis, dummy_routing_backend, dummy_task_adapter):
     sm = StateManager(
         redis,
         dummy_routing_backend,
-        task_adapter=dummy_task_adapter,
+        task_state=dummy_task_adapter,
+        task_submit=dummy_task_adapter,
         dead_queue=DeadQueue(redis, dummy_task_adapter),
         task_scheduler=TaskScheduler(redis, dummy_task_adapter, dummy_routing_backend.get_all_queues),
         cron_dag_scheduler=CronDAGScheduler(redis),
@@ -64,7 +65,8 @@ async def state_manager_real_ta(redis, dummy_routing_backend):
     sm = StateManager(
         redis,
         dummy_routing_backend,
-        task_adapter=ta,
+        task_state=ta,
+        task_submit=ta,
         dead_queue=DeadQueue(redis, ta),
         task_scheduler=TaskScheduler(redis, ta, dummy_routing_backend.get_all_queues),
         cron_dag_scheduler=CronDAGScheduler(redis),
@@ -78,7 +80,7 @@ async def state_manager_real_ta(redis, dummy_routing_backend):
 
 class DummyTaskAdapter:
     """
-    In-memory AtomicTaskStateProtocol stub for StateManager orchestration tests.
+    In-memory AtomicTaskStateProtocol + TaskSubmitProtocol stub for StateManager orchestration tests.
 
     Implements AtomicTaskStateProtocol so StateManager detects it as atomic-capable
     and uses the MULTI/EXEC pipeline path (same behaviour as in production with a real
@@ -86,8 +88,9 @@ class DummyTaskAdapter:
     pipeline they receive from the caller, so tests that verify Redis state via the
     ``redis`` fixture still work as expected.
 
-    Methods not needed by current tests raise ``NotImplementedError`` immediately so
-    accidental use is caught at the call site.
+    Also satisfies TaskSubmitProtocol: submit_task stores eagerly in the in-memory dict;
+    submit_rate_limited_task and get_next_task raise NotImplementedError so accidental
+    use is caught at the call site.
     """
 
     TASKS_BY_QUEUE = SharedTaskAdapterMixin.TASKS_BY_QUEUE
@@ -217,11 +220,17 @@ class DummyTaskAdapter:
     ) -> None:
         """No-op stub: fan-in sets are not needed for in-memory orchestration tests."""
 
-    # ── Protocol extras (TaskAdapterProtocol compat) ─────────────────────────
+    # ── TaskSubmitProtocol ────────────────────────────────────────────────────
 
     async def submit_task(self, task: Task) -> bool:
         self._store[task.id] = task
         return True
+
+    async def submit_rate_limited_task(self, task: Task, queue_config: object) -> bool:
+        raise NotImplementedError("DummyTaskAdapter.submit_rate_limited_task")
+
+    async def get_next_task(self, queues: object, pop_timeout: int = 0) -> Task | None:
+        raise NotImplementedError("DummyTaskAdapter.get_next_task")
 
     # ── convenience (not part of any protocol) ────────────────────────────────
 

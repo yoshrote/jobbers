@@ -16,7 +16,7 @@ from .task_status import TaskStatus
 
 if TYPE_CHECKING:
     from jobbers.models.dag import DynamicFanOut
-    from jobbers.protocols import TaskAdapterProtocol
+    from jobbers.protocols import TaskStateProtocol
 
 _dag_callback_adapter: TypeAdapter[list[DAGCallback]] = TypeAdapter(list[DAGCallback])
 
@@ -206,7 +206,7 @@ class Task(BaseModel):
             if cb.error_callback is not None
         ]
 
-    async def generate_callbacks(self, ta: "TaskAdapterProtocol") -> list[Self]:
+    async def generate_callbacks(self, ta: "TaskStateProtocol") -> list[Self]:
         """
         Generate tasks to submit after this task completes.
 
@@ -266,7 +266,7 @@ class Task(BaseModel):
             summary["last_error"] = self.errors[-1]
         return summary
 
-    _adapter: "TaskAdapterProtocol | None" = PrivateAttr(default=None)
+    _adapter: "TaskStateProtocol | None" = PrivateAttr(default=None)
 
     async def heartbeat(self) -> None:
         if self._adapter is None:

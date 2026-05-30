@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.protocols import TaskAdapterProtocol, TransactionHandle
+    from jobbers.protocols import TaskStateProtocol, TransactionHandle
 
 
 def _pack(obj: BaseModel, exclude: set[str] | None = None) -> bytes:
@@ -505,7 +505,7 @@ class DeadQueue:
     DLQ_NAME = "dlq-name:{name}".format
     DLQ_META = "dlq-meta"
 
-    def __init__(self, data_store: Redis, task_adapter: TaskAdapterProtocol) -> None:
+    def __init__(self, data_store: Redis, task_adapter: TaskStateProtocol) -> None:
         self.data_store = data_store
         self.ta = task_adapter
 

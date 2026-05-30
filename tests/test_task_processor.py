@@ -509,7 +509,7 @@ def _make_state_manager():
     state_manager = AsyncMock(spec=StateManager)
     state_manager.task_scheduler = AsyncMock(spec=TaskScheduler)
     state_manager.job_store = fakeredis.FakeRedis()
-    state_manager.ta = AsyncMock()
+    state_manager.task_state = AsyncMock()
 
     async def _schedule_retry_task(task: Task, run_at: dt.datetime) -> Task:
         return task
@@ -952,11 +952,10 @@ async def test_post_process_triggers_dag_callbacks():
 
     state_manager = _make_state_manager()
 
-    # generate_callbacks now receives state_manager.ta directly
     mock_ta = AsyncMock()
     mock_ta.fan_in_complete.return_value = 0
     mock_ta.get_fan_in_members.return_value = []
-    state_manager.ta = mock_ta
+    state_manager.task_state = mock_ta
 
     processor = TaskProcessor(state_manager)
     await processor.post_process(parent)
