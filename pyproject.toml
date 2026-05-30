@@ -39,7 +39,7 @@ dependencies = [
     "opentelemetry-exporter-otlp",
     "opentelemetry-instrumentation-fastapi",    
     "pydantic>=2.13.3",
-    "redis",
+    "redis<8",
     "python_on_whales",
     "msgpack",
     "aiosqlite",
