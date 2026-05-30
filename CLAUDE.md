@@ -115,12 +115,12 @@ All metrics use the OTLP exporter (configured in `jobbers/utils/otel.py`) and ar
 
 ## Adapter Architecture
 
-All pluggable storage is expressed as `@runtime_checkable Protocol` classes in `protocols.py`. The five protocols and their concrete implementations are:
+All pluggable storage is expressed as `@runtime_checkable Protocol` classes in `protocols.py`. The protocols and their concrete implementations are:
+
+### Routing protocols
 
 | Protocol | sql | redis | redis_json | static |
 | --- | --- | --- | --- | --- |
-| `TaskAdapterProtocol` | — | `MsgpackTaskAdapter` | `JsonTaskAdapter` | — |
-| `DeadQueueProtocol` | — | `DeadQueue` | `JsonDeadQueue` | — |
 | `QueueConfigProtocol` | `SQLQueueConfigAdapter` | `RedisQueueConfigAdapter` | `RedisJSONQueueConfigAdapter` | — |
 | `TaskRoutingConfigProtocol` | `SQLTaskRoutingConfigAdapter` | `RedisTaskRoutingConfigAdapter` | `RedisJSONTaskRoutingConfigAdapter` | — |
 | `RoutingBackendProtocol` | `SQLRoutingBackend` | `RedisRoutingBackend` | `RedisJSONRoutingBackend` | `StaticRoutingBackend` |
@@ -128,6 +128,32 @@ All pluggable storage is expressed as `@runtime_checkable Protocol` classes in `
 `RoutingBackendProtocol` is a composite of `QueueConfigProtocol` + `TaskRoutingConfigProtocol` (minus `get_queue_limits`). The `sql`, `redis`, and `redis_json` routing backends are thin delegation wrappers that compose a `_qca` (`QueueConfigProtocol`) and `_rca` (`TaskRoutingConfigProtocol`) sub-adapter internally. `StaticRoutingBackend` is a monolith (no sub-adapters) and raises `RoutingBackendReadOnlyError` on all write operations.
 
 `get_queue_limits` exists on `QueueConfigProtocol` and all three dynamic implementations but is absent from `StaticRoutingBackend` (which is not expected to implement `QueueConfigProtocol`).
+
+### Task storage protocols (split-store design)
+
+Task storage is split across three independent protocols so each concern can use a different backend:
+
+| Protocol | Responsibility | Current implementations |
+| --- | --- | --- |
+| `TaskStateProtocol` | Task blob persistence, heartbeats, fan-in sets, DAG run index | `MsgpackTaskAdapter`, `JsonTaskAdapter`, `SQLTaskAdapter` |
+| `TaskSubmitProtocol` | Composite submit/pop operations that require co-located state and queue (Lua scripts in Redis) | `MsgpackTaskAdapter`, `JsonTaskAdapter`, `SQLTaskAdapter` |
+| `TaskQueueProtocol` | Active queue membership, enqueue/pop, rate limiting | (Redis sorted-set logic embedded in adapters above) |
+| `TaskSchedulerProtocol` | Delayed/scheduled task queue | `TaskScheduler` |
+| `DeadQueueProtocol` | Dead letter queue | `DeadQueue`, `JsonDeadQueue` |
+
+Each protocol has an **Atomic sub-protocol** that extends it with pipeline-staging methods (`stage_*`) and a `pipeline()` factory. `StateManager` checks whether the task adapter, scheduler, and DLQ all implement their Atomic sub-protocols at construction time and selects between **atomic pipeline mode** (MULTI/EXEC across all stores) and **saga mode** (sequential writes with Cleaner compensation):
+
+| Atomic sub-protocol | Adds over base |
+| --- | --- |
+| `AtomicTaskStateProtocol` | `pipeline()`, `stage_save()`, `stage_requeue()`, `stage_submit_task()`, `stage_remove_from_queue()`, `stage_remove_heartbeat()`, `stage_init_fan_in()`, `read_for_watch()`, `optimistic_dispatch_scheduled()` |
+| `AtomicTaskSchedulerProtocol` | `pipeline()`, `stage_add()`, `stage_remove()` |
+| `AtomicDeadQueueProtocol` | `backend_key`, `pipeline()` |
+
+`optimistic_dispatch_scheduled(task, stage_extra)` encapsulates the optimistic-locking dispatch loop: read under WATCH, check status, set SUBMITTED, stage requeue, call `stage_extra` for additional staged ops (e.g., scheduler removal), commit. Redis implementations use WATCH/MULTI; SQL implementations use `SELECT FOR UPDATE`.
+
+`stage_remove_heartbeat(pipe, task)` stages a heartbeat sorted-set removal onto an existing pipeline, so `StateManager` does not need to reference any Redis key name constants directly.
+
+`StateManager` holds `task_state: TaskStateProtocol` and `task_submit: TaskSubmitProtocol` as two separate constructor parameters. In the common Redis case, both are the same adapter object; the split allows future configurations where state and queue live on different backends. See [docs/datastore-architecture.md](docs/datastore-architecture.md) for a full treatment of consistency modes and what alternative datastores (SQL task state, RabbitMQ queuing) would require.
 
 ## Routing Backends
 
