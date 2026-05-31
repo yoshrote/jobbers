@@ -287,8 +287,8 @@ The test suite follows a layered approach designed for speed and systematic prot
 - **Prefer common tests.** If a behaviour belongs to the protocol, put it in the common file and run it against all implementations.
 - **xfail, don't skip, for known limitations.** If one implementation cannot satisfy a contract test, mark it `@pytest.mark.xfail(strict=True)` with a reason. This keeps the test discoverable and will alert you when the limitation is fixed.
 - **Adapter fixtures**
-  - `task_adapter` (parametrized `["raw", "json", "sql"]`) — `RedisTaskAdapter` via FakeRedis + `RedisJSONTaskAdapter` via real Redis Stack (skipped if unavailable) + `SQLTaskAdapter` via in-memory SQLite.
-  - `dead_queue` (parametrized `["raw", "json", "sql"]`) — same pattern, yields `(dq, task_adapter)`.
+  - `task_adapter` (parametrized `["redis", "redis_json", "sql"]`) — `RedisTaskAdapter` via FakeRedis + `RedisJSONTaskAdapter` via real Redis Stack (skipped if unavailable) + `SQLTaskAdapter` via in-memory SQLite.
+  - `dead_queue` (parametrized `["redis", "redis_json", "sql"]`) — same pattern, yields `(dq, task_adapter)`.
   - `queue_config_adapter` (parametrized `["sql", "redis", "redis_json"]`) — SQL via in-memory SQLite, Redis via FakeRedis, Redis JSON via real Redis Stack (skipped if unavailable).
   - `task_routing_config_adapter` (parametrized `["sql", "redis", "redis_json"]`) — same pattern.
   - `scheduler` (parametrized `["redis", "sql"]`) — `RedisTaskScheduler` via FakeRedis + `SQLTaskScheduler` via in-memory SQLite; in `tests/schedulers/`.

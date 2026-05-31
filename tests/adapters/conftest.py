@@ -50,20 +50,20 @@ def msgpack_dead_queue(redis, dummy_task_adapter) -> RedisDeadQueue:
     return RedisDeadQueue(redis, dummy_task_adapter)
 
 
-@pytest_asyncio.fixture(params=["raw", "json", "sql"], ids=["raw", "json", "sql"])
+@pytest_asyncio.fixture(params=["redis", "redis_json", "sql"], ids=["redis", "redis_json", "sql"])
 async def task_adapter(request, redis, session_factory):
     """
     Parameterized fixture yielding a TaskStateProtocol + TaskSubmitProtocol implementation for each backend.
 
-    - ``"raw"``: RedisTaskAdapter backed by FakeAsyncRedis
-    - ``"json"``: RedisJSONTaskAdapter backed by real Redis Stack; skips if unavailable
+    - ``"redis"``: RedisTaskAdapter backed by FakeAsyncRedis
+    - ``"redis_json"``: RedisJSONTaskAdapter backed by real Redis Stack; skips if unavailable
     - ``"sql"``: SQLTaskAdapter backed by in-memory SQLite
 
     Each variant manages its own connection inline. request.getfixturevalue cannot
     lazily resolve async fixtures (json_adapter, real_redis) in pytest-asyncio strict
     mode — it tries to create a new Runner inside an already-running event loop.
     """
-    if request.param == "raw":
+    if request.param == "redis":
         yield RedisTaskAdapter(redis)
     elif request.param == "sql":
         yield SQLTaskAdapter(session_factory)
@@ -85,17 +85,17 @@ async def task_adapter(request, redis, session_factory):
         await r.aclose()
 
 
-@pytest_asyncio.fixture(params=["raw", "json"], ids=["raw", "json"])
+@pytest_asyncio.fixture(params=["redis", "redis_json"], ids=["redis", "redis_json"])
 async def redis_task_adapter(request, redis):
     """
     Parameterized fixture yielding a Redis-backed task adapter for each Redis backend.
 
-    - ``"raw"``: RedisTaskAdapter backed by FakeAsyncRedis
-    - ``"json"``: RedisJSONTaskAdapter backed by real Redis Stack; skips if unavailable
+    - ``"redis"``: RedisTaskAdapter backed by FakeAsyncRedis
+    - ``"redis_json"``: RedisJSONTaskAdapter backed by real Redis Stack; skips if unavailable
 
     Use this for Redis-atomic-pipeline tests that inspect data_store internals directly.
     """
-    if request.param == "raw":
+    if request.param == "redis":
         yield RedisTaskAdapter(redis)
     else:
         r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
@@ -209,13 +209,13 @@ async def task_routing_config_adapter(request, session_factory, redis):
         await r.aclose()
 
 
-@pytest_asyncio.fixture(params=["raw", "json", "sql"], ids=["raw", "json", "sql"])
+@pytest_asyncio.fixture(params=["redis", "redis_json", "sql"], ids=["redis", "redis_json", "sql"])
 async def dead_queue(request, dummy_task_adapter, session_factory):
     """
     Parameterized fixture yielding (dq, task_adapter) for each DeadQueueProtocol implementation.
 
-    - ``"raw"``: RedisDeadQueue backed by FakeAsyncRedis + DummyTaskAdapter
-    - ``"json"``: RedisJSONDeadQueue backed by real Redis Stack; skips if unavailable
+    - ``"redis"``: RedisDeadQueue backed by FakeAsyncRedis + DummyTaskAdapter
+    - ``"redis_json"``: RedisJSONDeadQueue backed by real Redis Stack; skips if unavailable
     - ``"sql"``: SQLDeadQueue backed by in-memory SQLite + SQLTaskAdapter
 
     SQLDeadQueue stores full task data in the dead_letter_queue table, so the
@@ -224,7 +224,7 @@ async def dead_queue(request, dummy_task_adapter, session_factory):
 
     Each variant manages its own connection inline for the same reason as task_adapter.
     """
-    if request.param == "raw":
+    if request.param == "redis":
         r = fakeredis.FakeAsyncRedis()
         dq = RedisDeadQueue(r, dummy_task_adapter)
         yield dq, dummy_task_adapter

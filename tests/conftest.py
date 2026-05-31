@@ -25,7 +25,7 @@ async def redis():
     await fake_store.close()
 
 
-@pytest.fixture(params=[RedisJSONTaskAdapter, RedisTaskAdapter], ids=["json", "msgpack"])
+@pytest.fixture(params=[RedisJSONTaskAdapter, RedisTaskAdapter], ids=["redis_json", "redis"])
 def task_adapter(redis, request):
     """Fixture providing a task adapter instance parametrized over all implementations."""
     return request.param(redis)

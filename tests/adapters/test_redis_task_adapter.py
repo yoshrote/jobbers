@@ -1,7 +1,7 @@
 """
 Redis-specific tests for RedisTaskAdapter and RedisJSONTaskAdapter.
 
-Uses the ``redis_task_adapter`` fixture (parametrized over ["raw", "json"]).
+Uses the ``redis_task_adapter`` fixture (parametrized over ["redis", "redis_json"]).
 Tests the atomic pipeline path (data_store.pipeline(), stage_* methods) and
 verify Redis-internal state (sorted sets, hashes, sets, keys).
 """
