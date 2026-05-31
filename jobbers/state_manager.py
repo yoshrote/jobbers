@@ -855,9 +855,7 @@ class StateManager:
 class SubmissionRateLimiter:
     """Concurrency guard: filters task queues down to those below their max_concurrent limit."""
 
-    def __init__(
-        self, get_queue_config: Callable[[str], Awaitable[QueueConfig | None]]
-    ) -> None:
+    def __init__(self, get_queue_config: Callable[[str], Awaitable[QueueConfig | None]]) -> None:
         self._get_queue_config = get_queue_config
 
     async def concurrency_limits(
