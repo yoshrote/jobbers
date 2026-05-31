@@ -14,8 +14,8 @@ Task storage:
   implements ``TaskSubmitProtocol``.
 
 Dead-letter queue:
-- `RedisJSONDeadQueue` — stores dead-letter entries as RedisJSON documents with a
-  RediSearch index for server-side filtering and sorting.
+- `RedisJSONDeadQueue` — implements ``DeadQueueProtocol`` and ``AtomicDeadQueueProtocol``;
+  stores entries as RedisJSON documents with a RediSearch index for server-side filtering.
 
 All classes require a Redis Stack instance with the RedisJSON and RediSearch modules.
 """
@@ -516,7 +516,7 @@ class RedisJSONTaskSubmit(_SharedRedisTaskSubmitBase):
 
 class RedisJSONDeadQueue:
     """
-    Dead letter queue using Redis JSON documents and RediSearch for filtering/sorting.
+    DeadQueueProtocol and AtomicDeadQueueProtocol backed by Redis Stack (JSON encoding).
 
     Each entry is stored as a JSON document at `dlq:{task_id}` with fields:
 

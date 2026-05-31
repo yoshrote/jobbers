@@ -230,8 +230,8 @@ Jobbers ships with two interchangeable storage backends selected at startup:
 
 | `TASK_ADAPTER` | Adapter | Redis requirement |
 | --- | --- | --- |
-| `json` (default) | `JsonTaskAdapter` + `JsonDeadQueue` | Redis Stack (JSON + RediSearch modules) |
-| `msgpack` | `MsgpackTaskAdapter` + `DeadQueue` | Plain Redis |
+| `json` (default) | `RedisJSONTaskState` / `RedisJSONTaskSubmit` + `RedisJSONDeadQueue` | Redis Stack (JSON + RediSearch modules) |
+| `msgpack` | `RedisTaskState` / `RedisTaskSubmit` + `RedisDeadQueue` | Plain Redis |
 
 See [adapter selection](adapter-selection.md) for guidance on which to choose.
 

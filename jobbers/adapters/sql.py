@@ -7,13 +7,16 @@ Routing sub-adapters:
 - `SQLRoutingBackend` — composes the two sub-adapters to satisfy RoutingBackendProtocol.
 
 Task storage:
-- `SQLTaskState` — stores tasks in the ``tasks`` / ``task_queue`` / ``task_fan_in`` / ``dag_runs`` tables;
-  implements ``TaskStateProtocol`` and ``AtomicTaskStateProtocol``.
-- `SQLTaskSubmit` — submit/pop operations backed by the ``tasks`` and ``task_queue`` tables;
-  implements ``TaskSubmitProtocol``.
+- `SQLTaskState` — implements ``TaskStateProtocol``; does **not** implement
+  ``AtomicTaskStateProtocol`` (missing ``stage_remove_heartbeat`` and
+  ``optimistic_dispatch_scheduled`` — StateManager always uses saga mode with this adapter).
+  Tables: ``tasks`` / ``task_queue`` / ``task_fan_in`` / ``dag_runs``.
+- `SQLTaskSubmit` — implements ``TaskSubmitProtocol``; submit/pop operations backed by
+  the ``tasks`` and ``task_queue`` tables.
 
 Dead-letter queue:
-- `SQLDeadQueue` — dead-letter queue backed by the ``dead_letter_queue`` table.
+- `SQLDeadQueue` — implements ``DeadQueueProtocol`` and ``AtomicDeadQueueProtocol``;
+  backed by the ``dead_letter_queue`` table.
 
 Task scheduler:
 - `SQLTaskScheduler` — scheduled/delayed task queue in the ``task_schedule`` table;
@@ -243,7 +246,7 @@ class SQLQueueConfigAdapter:
 
 
 class SQLTaskRoutingConfigAdapter:
-    """Manages task routing configuration in the SQL data store."""
+    """TaskRoutingConfigProtocol backed by SQLAlchemy (``task_routing`` table)."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -463,11 +466,12 @@ async def _upsert_task(session: AsyncSession, row: dict[str, Any]) -> None:
 
 class SQLTaskState:
     """
-    TaskStateProtocol + AtomicTaskStateProtocol backed by SQLAlchemy.
+    TaskStateProtocol backed by SQLAlchemy.
 
     Tables: ``tasks`` / ``task_fan_in`` / ``dag_runs``.  Uses ``SQLTransactionBatch``
-    for the atomic pipeline path.  Pass ``force_saga=True`` to ``StateManager`` when
-    using this adapter to avoid Redis-specific code paths in the atomic pipeline.
+    for staged writes.  Does **not** implement ``AtomicTaskStateProtocol`` — missing
+    ``stage_remove_heartbeat`` and ``optimistic_dispatch_scheduled``; ``StateManager``
+    always uses saga mode with this adapter.
     """
 
     # Key-helper stubs: present for structural compatibility with AtomicTaskStateProtocol
@@ -953,7 +957,7 @@ def _dlq_row_to_task(row: Any) -> Task:
 
 
 class SQLDeadQueue:
-    """Dead-letter queue backed by SQLAlchemy (``dead_letter_queue`` table)."""
+    """DeadQueueProtocol and AtomicDeadQueueProtocol backed by SQLAlchemy (``dead_letter_queue`` table)."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], dsn: str = "") -> None:
         self._sf = session_factory

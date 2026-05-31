@@ -13,15 +13,16 @@ Task storage:
   implements ``TaskSubmitProtocol``.
 
 Dead-letter queue:
-- `RedisDeadQueue` — dead letter queue backed by Redis sorted sets, sets, and a
-  hash for secondary indexes.
+- `RedisDeadQueue` — implements ``DeadQueueProtocol`` and ``AtomicDeadQueueProtocol``;
+  backed by Redis sorted sets, sets, and a hash for secondary indexes.
 
 Task scheduler:
-- `RedisTaskScheduler` — scheduled/delayed task queue stored in Redis sorted sets;
-  implements ``AtomicTaskSchedulerProtocol``.
+- `RedisTaskScheduler` — implements ``TaskSchedulerProtocol`` and
+  ``AtomicTaskSchedulerProtocol``; scheduled/delayed task queue in Redis sorted sets.
 
 Cron DAG scheduler:
-- `RedisCronDAGScheduler` — recurring cron-scheduled DAG entries stored in Redis
+- `RedisCronDAGScheduler` — implements ``CronDAGSchedulerProtocol`` and
+  ``AtomicCronDAGSchedulerProtocol``; recurring cron-scheduled DAG entries in Redis
   hashes and sorted sets.
 """
 
@@ -530,7 +531,9 @@ class RedisTaskSubmit(_SharedRedisTaskSubmitBase):
 
 class RedisDeadQueue:
     r"""
-    Dead letter queue backed by Redis, reusing task:<task_id> keys for task data.
+    DeadQueueProtocol and AtomicDeadQueueProtocol backed by plain Redis.
+
+    Reuses ``task:<task_id>`` keys for task data rather than duplicating blobs.
 
     Keys:
     - `dlq` sorted set — member: task_id bytes, score: failed_at Unix timestamp.
@@ -703,7 +706,9 @@ class RedisDeadQueue:
 
 class RedisTaskScheduler:
     """
-    Manages scheduled tasks in Redis, reusing task:<task_id> keys for task data.
+    TaskSchedulerProtocol and AtomicTaskSchedulerProtocol backed by plain Redis (sorted sets).
+
+    Reuses ``task:<task_id>`` keys for task data; stores schedules in sorted sets.
 
     Keys:
     - `schedule-queue:{queue}` sorted set — member: task_id bytes, score: run_at Unix timestamp.
@@ -888,7 +893,7 @@ class RedisTaskScheduler:
 
 class RedisCronDAGScheduler:
     """
-    Manages recurring cron-scheduled DAG entries in Redis.
+    CronDAGSchedulerProtocol and AtomicCronDAGSchedulerProtocol backed by plain Redis.
 
     Keys:
     - `cron-dag:{cron_id}` hash — serialised CronDAGEntry fields.

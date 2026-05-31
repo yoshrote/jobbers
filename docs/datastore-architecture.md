@@ -42,6 +42,7 @@ The Atomic sub-protocols extend their base protocols with pipeline staging metho
 | `TaskStateProtocol` | `AtomicTaskStateProtocol` | `pipeline()`, `stage_save()`, `stage_requeue()`, `stage_submit_task()`, `stage_remove_from_queue()`, `stage_remove_heartbeat()`, `stage_init_fan_in()`, `read_for_watch()`, `optimistic_dispatch_scheduled()` |
 | `TaskSchedulerProtocol` | `AtomicTaskSchedulerProtocol` | `pipeline()`, `stage_add()`, `stage_remove()` |
 | `DeadQueueProtocol` | `AtomicDeadQueueProtocol` | `backend_key`, `pipeline()` |
+| `CronDAGSchedulerProtocol` | `AtomicCronDAGSchedulerProtocol` | `backend_key`, `pipeline()`, `stage_reschedule()`, `stage_set_active_run()`, `stage_clear_active_run()` |
 
 `pipeline()` returns a `TransactionHandle` — an opaque write batch with a single `async def execute() -> list[object]` method. For Redis, this is a `Pipeline`. For SQL, it could be a list of deferred statements that commit in one transaction.
 
@@ -136,4 +137,4 @@ A RabbitMQ-backed `TaskQueueProtocol` could be built if the above constraints ar
 
 `backend_key` is a stable string property on all Atomic adapters that identifies the backend instance. For Redis adapters, `SharedTaskAdapterMixin` returns `str(id(self.data_store))` — the Python object identity of the Redis client. Two adapters backed by the same Redis client object therefore share a `backend_key` and will be detected as same-backend.
 
-`StateManager` currently does not use `backend_key` for comparison at runtime — it relies instead on the `isinstance(adapter, AtomicXxxProtocol)` check to determine the consistency mode. The `backend_key` property is available for future use where cross-adapter backend matching is needed (for example, asserting that task state and the dead letter queue are on the same physical Redis instance before enabling atomic pipelines across them).
+`StateManager` uses `backend_key` at construction time for cron-specific same-backend detection: `_atomic_cron` is set only when the cron scheduler implements `AtomicCronDAGSchedulerProtocol` **and** its `backend_key` matches the task-state adapter's `backend_key`. When this condition is met, cron ops (`stage_reschedule`, `stage_set_active_run`, `stage_clear_active_run`) are folded into the same atomic pipeline as task-state ops during dispatch and completion. The three-way atomic mode check (task state + scheduler + DLQ) uses `isinstance` alone, without `backend_key` comparison, since those three adapters are always co-located on the same Redis instance in the current deployment model.

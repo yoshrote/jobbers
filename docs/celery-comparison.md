@@ -151,7 +151,7 @@ All results are capped at `max_retry_delay`. When a delay is configured, the tas
 | `POST /dead-letter-queue/resubmit` | Bulk resubmit by task name with optional retry count reset |
 | `DELETE /dead-letter-queue/{id}` | Remove a single entry |
 
-Two DLQ implementations are available: `DeadQueue` (plain Redis sorted set) and `JsonDeadQueue` (Redis Stack JSON, supports richer filtering).
+Two DLQ implementations are available: `RedisDeadQueue` (plain Redis sorted set) and `RedisJSONDeadQueue` (Redis Stack JSON, supports richer filtering).
 
 **Verdict:** Jobbers wins. A production-ready DLQ with a management API is significantly more useful than building one from signals.
 
@@ -352,9 +352,9 @@ Both frameworks handle graceful restarts safely.
 
 - **Broker:** Redis only
 - **Task adapters** (`TASK_ADAPTER`): how task state is stored in Redis
-  - `MsgpackTaskAdapter` — plain Redis + msgpack; works with any standard Redis instance
-  - `JsonTaskAdapter` — Redis Stack with JSON module + RediSearch; enables richer query filtering
-- **Dead letter adapters:** `DeadQueue` (plain Redis sorted set) or `JsonDeadQueue` (Redis Stack JSON; supports richer DLQ filtering). Selection follows the task adapter.
+  - `RedisTaskState` / `RedisTaskSubmit` — plain Redis + msgpack; works with any standard Redis instance
+  - `RedisJSONTaskState` / `RedisJSONTaskSubmit` — Redis Stack with JSON module + RediSearch; enables richer query filtering
+- **Dead letter adapters:** `RedisDeadQueue` (plain Redis sorted set) or `RedisJSONDeadQueue` (Redis Stack JSON; supports richer DLQ filtering). Selection follows the task adapter.
 - **Routing backends** (`ROUTING_BACKEND`): where queue, role, and task-routing config is stored
 
   | Backend | Storage | SQL? | Redis Stack? | Dynamic CRUD? |
@@ -364,7 +364,7 @@ Both frameworks handle graceful restarts safely.
   | `redis` | Plain Redis keys | No | No | Yes |
   | `redis_json` | RedisJSON + RediSearch | No | Yes | Yes |
 
-  The `static` backend is notable: it eliminates the SQL dependency entirely, loading routing config once from a JSON/YAML file (`STATIC_CONFIG_FILE`) or inline env vars (`STATIC_QUEUES`, `STATIC_ROLES`). With `static` + `MsgpackTaskAdapter`, Jobbers runs on a single plain Redis instance with no other database — analogous to Celery's Redis-only setup. The `redis` and `redis_json` backends add live CRUD without introducing SQL.
+  The `static` backend is notable: it eliminates the SQL dependency entirely, loading routing config once from a JSON/YAML file (`STATIC_CONFIG_FILE`) or inline env vars (`STATIC_QUEUES`, `STATIC_ROLES`). With `static` + `RedisTaskState` / `RedisTaskSubmit`, Jobbers runs on a single plain Redis instance with no other database — analogous to Celery's Redis-only setup. The `redis` and `redis_json` backends add live CRUD without introducing SQL.
 
 - **Results:** Stored as part of task state in Redis; no separate result backend. Cleanup is handled by Cleaner's `--completed-task-age`.
 
