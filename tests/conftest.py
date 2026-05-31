@@ -6,7 +6,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from ulid import ULID
 
 from jobbers.adapters._shared import SharedTaskAdapterMixin
-from jobbers.adapters.redis import RedisCronDAGScheduler, RedisDeadQueue, RedisTaskScheduler, RedisTaskState, RedisTaskSubmit
+from jobbers.adapters.redis import (
+    RedisCronDAGScheduler,
+    RedisDeadQueue,
+    RedisTaskScheduler,
+    RedisTaskState,
+    RedisTaskSubmit,
+)
 from jobbers.adapters.redis_json import RedisJSONTaskState, RedisJSONTaskSubmit
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.migrations.runner import run_migrations

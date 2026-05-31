@@ -1,0 +1,87 @@
+"""
+Contract tests for TaskSubmitProtocol implementations.
+
+Runs against all three backends via the ``task_adapter`` fixture (yields a
+``(state, submit)`` pair).  Assertions use ``state`` only to verify that the
+submit operation left the expected data; the operations under test are always
+called on ``submit``.
+"""
+
+import datetime as dt
+
+import pytest
+from ulid import ULID
+
+from jobbers.models.task import Task, TaskPagination
+from jobbers.models.task_status import TaskStatus
+
+FROZEN_TIME = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
+ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG01")
+
+
+def make_task(
+    task_id: ULID = ULID1,
+    name: str = "my_task",
+    version: int = 1,
+    queue: str = "default",
+    status: TaskStatus = TaskStatus.SUBMITTED,
+    submitted_at: dt.datetime = FROZEN_TIME,
+) -> Task:
+    task = Task(id=task_id, name=name, version=version, queue=queue, status=status)
+    task.submitted_at = submitted_at
+    return task
+
+
+# ── submit_task ───────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_submit_task(task_adapter):
+    """submit_task enqueues the task and persists its data."""
+    state, submit = task_adapter
+    task = Task(id=ULID1, name="Test Task", status=TaskStatus.UNSUBMITTED, queue="default")
+    task.set_status(TaskStatus.SUBMITTED)
+    await submit.submit_task(task)
+
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.name == "Test Task"
+    assert saved.status == TaskStatus.SUBMITTED
+    assert saved.submitted_at == task.submitted_at
+    assert await state.task_exists(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_submit_task_twice_updates_only(task_adapter):
+    """Submitting the same task ID twice updates the data without duplicating the queue entry."""
+    state, submit = task_adapter
+    task = Task(id=ULID1, name="Initial Task", status="unsubmitted")
+    task.set_status(TaskStatus.SUBMITTED)
+    await submit.submit_task(task)
+
+    updated = Task(id=ULID1, name="Updated Task", status="completed", submitted_at=task.submitted_at)
+    await submit.submit_task(updated)
+
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.name == "Updated Task"
+    assert saved.status == TaskStatus.COMPLETED
+    assert saved.submitted_at == task.submitted_at
+    assert len(await state.get_all_tasks(TaskPagination(queue=task.queue))) == 1
+
+
+# ── get_next_task ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_next_task_returns_submitted_task(task_adapter):
+    """get_next_task pops and returns the next available task, leaving the queue empty."""
+    state, submit = task_adapter
+    await submit.submit_task(make_task())
+
+    result = await submit.get_next_task(queues={"default"}, pop_timeout=1)
+    assert result is not None
+    assert result.id == ULID1
+
+    result2 = await submit.get_next_task(queues={"default"}, pop_timeout=1)
+    assert result2 is None

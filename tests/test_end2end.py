@@ -7,7 +7,13 @@ import pytest_asyncio
 from ulid import ULID
 
 import end2end
-from jobbers.adapters.redis import RedisCronDAGScheduler, RedisDeadQueue, RedisTaskScheduler, RedisTaskState, RedisTaskSubmit
+from jobbers.adapters.redis import (
+    RedisCronDAGScheduler,
+    RedisDeadQueue,
+    RedisTaskScheduler,
+    RedisTaskState,
+    RedisTaskSubmit,
+)
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_status import TaskStatus
