@@ -1164,6 +1164,4 @@ class RedisRoutingNotifications:
             ps = self._client.pubsub()
             await ps.subscribe(self.REFRESH_CHANNEL(role=role))
             self._pubsubs[role] = ps
-        return bool(
-            await self._pubsubs[role].get_message(ignore_subscribe_messages=True, timeout=0.0)
-        )
+        return bool(await self._pubsubs[role].get_message(ignore_subscribe_messages=True, timeout=0.0))
