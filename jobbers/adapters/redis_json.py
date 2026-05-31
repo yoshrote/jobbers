@@ -8,8 +8,8 @@ Routing sub-adapters:
 - `RedisJSONRoutingBackend` — composes the two sub-adapters to satisfy RoutingBackendProtocol.
 
 Task storage / dead-letter queue:
-- `JsonTaskAdapter` — stores tasks as RedisJSON documents, queries via RediSearch.
-- `JsonDeadQueue` — stores dead-letter entries as RedisJSON documents with a
+- `RedisJSONTaskAdapter` — stores tasks as RedisJSON documents, queries via RediSearch.
+- `RedisJSONDeadQueue` — stores dead-letter entries as RedisJSON documents with a
   RediSearch index for server-side filtering and sorting.
 
 All classes require a Redis Stack instance with the RedisJSON and RediSearch modules.
@@ -304,11 +304,11 @@ class RedisJSONRoutingBackend:
 
 
 # ---------------------------------------------------------------------------
-# JsonTaskAdapter  (Redis Stack: RedisJSON + RediSearch)
+# RedisJSONTaskAdapter  (Redis Stack: RedisJSON + RediSearch)
 # ---------------------------------------------------------------------------
 
 
-class JsonTaskAdapter(SharedTaskAdapterMixin):
+class RedisJSONTaskAdapter(SharedTaskAdapterMixin):
     """
     Stores tasks as RedisJSON documents; queries via RediSearch.
 
@@ -490,11 +490,11 @@ class JsonTaskAdapter(SharedTaskAdapterMixin):
 
 
 # ---------------------------------------------------------------------------
-# JsonDeadQueue  (Redis Stack: RedisJSON + RediSearch)
+# RedisJSONDeadQueue  (Redis Stack: RedisJSON + RediSearch)
 # ---------------------------------------------------------------------------
 
 
-class JsonDeadQueue:
+class RedisJSONDeadQueue:
     """
     Dead letter queue using Redis JSON documents and RediSearch for filtering/sorting.
 

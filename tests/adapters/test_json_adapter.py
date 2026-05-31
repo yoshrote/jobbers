@@ -1,5 +1,5 @@
 """
-JsonTaskAdapter- and JsonDeadQueue-specific edge cases not covered by protocol contract tests.
+RedisJSONTaskAdapter- and RedisJSONDeadQueue-specific edge cases not covered by protocol contract tests.
 
 Contract tests live in test_task_adapter_common.py and test_dead_queue_common.py
 and run against all adapter implementations via parametrized fixtures.
@@ -64,7 +64,7 @@ async def test_clean_terminal_tasks_skips_none_json_blob(json_adapter):
     """
     A task:* key whose JSON document is null is silently skipped.
 
-    Covers the ``if task_data is None: continue`` guard in JsonTaskAdapter.clean_terminal_tasks.
+    Covers the ``if task_data is None: continue`` guard in RedisJSONTaskAdapter.clean_terminal_tasks.
     In production this guard protects against race conditions (key deleted between scan and
     JSON.GET), but can be triggered deterministically by storing a null root document.
     """
@@ -95,7 +95,7 @@ async def test_get_all_tasks_missing_blob_is_skipped(json_adapter):
     assert results == []
 
 
-# ── JsonDeadQueue.get_by_filter: limit break and null task ────────────────────
+# ── RedisJSONDeadQueue.get_by_filter: limit break and null task ────────────────────
 
 
 @pytest.mark.asyncio
@@ -103,7 +103,7 @@ async def test_get_by_filter_skips_missing_task_blob(json_dead_queue):
     """
     get_by_filter silently skips a DLQ entry whose task blob is absent.
 
-    Covers the ``if task is None: continue`` branch in JsonDeadQueue.get_by_filter.
+    Covers the ``if task is None: continue`` branch in RedisJSONDeadQueue.get_by_filter.
     """
     task = make_failed_task()
     # Add to DLQ without saving the task blob — get_tasks_bulk will return [None]
@@ -113,12 +113,12 @@ async def test_get_by_filter_skips_missing_task_blob(json_dead_queue):
     assert results == []
 
 
-# ── JsonDeadQueue: ordering ───────────────────────────────────────────────────
+# ── RedisJSONDeadQueue: ordering ───────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_get_by_filter_sorted_by_failed_at_desc(json_dead_queue, json_adapter):
-    """JsonDeadQueue returns get_by_filter results sorted by failed_at descending (most recent first)."""
+    """RedisJSONDeadQueue returns get_by_filter results sorted by failed_at descending (most recent first)."""
     earlier = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
     later = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
     t1 = make_failed_task(task_id=ULID1)

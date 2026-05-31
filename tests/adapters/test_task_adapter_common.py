@@ -11,7 +11,7 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.redis import MsgpackTaskAdapter
+from jobbers.adapters.redis import RedisTaskAdapter
 from jobbers.models.dag import DAGRunPagination
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
@@ -187,9 +187,9 @@ async def test_get_all_tasks_order_by_task_id(task_adapter):
     order_by=TASK_ID returns tasks sorted by ULID.
 
     Tasks are submitted with ULID order matching submitted_at order so the test
-    passes for all adapter implementations (MsgpackTaskAdapter sorts by
+    passes for all adapter implementations (RedisTaskAdapter sorts by
     submitted_at regardless of order_by, which coincides here).
-    Covers the non-SUBMITTED_AT code path in JsonTaskAdapter.get_all_tasks.
+    Covers the non-SUBMITTED_AT code path in RedisJSONTaskAdapter.get_all_tasks.
     """
     t1 = make_task(ULID1, submitted_at=FROZEN_TIME)
     t2 = make_task(ULID2, submitted_at=FROZEN_TIME + dt.timedelta(seconds=1))
@@ -287,13 +287,13 @@ async def test_get_all_tasks_filter_pagination_page_size_is_predictable(task_ada
       page 1 (offset=0) → exactly 1 result (A1)
       page 2 (offset=1) → exactly 1 result (A2, not A1 again)
 
-    Known limitation: MsgpackTaskAdapter applies offset to raw queue positions before
+    Known limitation: RedisTaskAdapter applies offset to raw queue positions before
     Python-side filtering, so offset-based pagination over a filtered result set is
     unpredictable (pages may overlap).
     """
-    if isinstance(task_adapter, MsgpackTaskAdapter):
+    if isinstance(task_adapter, RedisTaskAdapter):
         pytest.xfail(
-            "MsgpackTaskAdapter applies offset before Python-side filtering; "
+            "RedisTaskAdapter applies offset before Python-side filtering; "
             "page 2 backs up into queue-space and returns the same task as page 1"
         )
 

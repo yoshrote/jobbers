@@ -6,6 +6,7 @@ import logging
 import random
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from croniter import croniter
@@ -19,33 +20,54 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_status import TaskStatus
-from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
     from redis.asyncio.client import Redis
 
+    from jobbers.adapters.redis import RedisTaskScheduler
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
     from jobbers.protocols import (
+        AtomicCronDAGSchedulerProtocol,
         AtomicDeadQueueProtocol,
         AtomicTaskSchedulerProtocol,
         AtomicTaskStateProtocol,
+        CronDAGSchedulerProtocol,
         DeadQueueProtocol,
         RoutingBackendProtocol,
         TaskStateProtocol,
         TaskSubmitProtocol,
         TransactionHandle,
     )
-    from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
-    from jobbers.schedulers.task_scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
+
+
+@dataclass
+class ConcurrencyStager:
+    """
+    Yielded by ``StateManager._concurrency_guard``.
+
+    ``skipped`` is True when the cron entry was suppressed because a previous
+    run is still active.  Return immediately without building or submitting a
+    new task.
+
+    ``stage_active_run(pipe, task_id)`` stages the SET NX for
+    SKIP_IF_RUNNING policy, or is a no-op for ALWAYS policy.
+    Call it unconditionally during pipeline construction.
+    """
+
+    skipped: bool
+    _stage_fn: Callable[[TransactionHandle, ULID], None]
+
+    def stage_active_run(self, pipe: TransactionHandle, task_id: ULID) -> None:
+        self._stage_fn(pipe, task_id)
 
 
 class TaskException(Exception):
@@ -71,8 +93,8 @@ class StateManager:
         task_submit: TaskSubmitProtocol,
         *,
         dead_queue: DeadQueueProtocol,
-        task_scheduler: TaskScheduler,
-        cron_dag_scheduler: CronDAGScheduler,
+        task_scheduler: RedisTaskScheduler,
+        cron_dag_scheduler: CronDAGSchedulerProtocol,
         force_saga: bool = False,
     ) -> None:
         self.job_store: Redis = job_store
@@ -92,6 +114,7 @@ class StateManager:
         # Atomic sub-protocols, StateManager uses atomic pipelines.  When stores differ, or
         # when force_saga=True, it falls back to saga coordination.
         from jobbers.protocols import (  # local import avoids circular at module level
+            AtomicCronDAGSchedulerProtocol,
             AtomicDeadQueueProtocol,
             AtomicTaskSchedulerProtocol,
             AtomicTaskStateProtocol,
@@ -110,6 +133,19 @@ class StateManager:
             False
             if force_saga
             else all(x is not None for x in (self._atomic_state, self._atomic_scheduler, self._atomic_dlq))
+        )
+        # Cron-specific same-backend detection: True when the cron scheduler shares a
+        # backend with the task-state adapter, enabling cron ops to be folded into the
+        # same atomic pipeline as task-state ops.
+        self._atomic_cron: AtomicCronDAGSchedulerProtocol | None = (
+            cron_dag_scheduler
+            if (
+                not force_saga
+                and isinstance(cron_dag_scheduler, AtomicCronDAGSchedulerProtocol)
+                and self._atomic_state is not None
+                and cron_dag_scheduler.backend_key == self._atomic_state.backend_key
+            )
+            else None
         )
 
     @property
@@ -304,9 +340,7 @@ class StateManager:
             def _stage_scheduler_remove(pipe: TransactionHandle) -> None:
                 scheduler.stage_remove(pipe, task.id, task.queue)
 
-            dispatched = await self._atomic_state.optimistic_dispatch_scheduled(
-                task, _stage_scheduler_remove
-            )
+            dispatched = await self._atomic_state.optimistic_dispatch_scheduled(task, _stage_scheduler_remove)
             if dispatched:
                 logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
             return task
@@ -338,6 +372,8 @@ class StateManager:
           Call it unconditionally during pipeline construction; it is a no-op for ALWAYS
           policy and stages the NX guard for SKIP_IF_RUNNING.
         """
+        from jobbers.protocols import AtomicCronDAGSchedulerProtocol
+
         if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
             active_task_id_str = await self.cron_dag_scheduler.get_active_run(entry.id)
             if active_task_id_str is not None:
@@ -356,10 +392,18 @@ class StateManager:
                     yield ConcurrencyStager(skipped=True, _stage_fn=lambda _p, _t: None)
                     return
 
-            def _stage_skip(pipe: TransactionHandle, task_id: ULID) -> None:
-                self.cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task_id, nx=True)
+            if isinstance(self.cron_dag_scheduler, AtomicCronDAGSchedulerProtocol):
+                # Scheduler supports pipeline staging: NX guard goes into the pipeline.
+                _atomic_sched = self.cron_dag_scheduler  # narrow for mypy
 
-            yield ConcurrencyStager(skipped=False, _stage_fn=_stage_skip)
+                def _stage_skip(pipe: TransactionHandle, task_id: ULID) -> None:
+                    _atomic_sched.stage_set_active_run(pipe, entry.id, task_id, nx=True)
+
+                yield ConcurrencyStager(skipped=False, _stage_fn=_stage_skip)
+            else:
+                # No pipeline (e.g. StaticCronDAGScheduler): set_active_run called
+                # directly in dispatch_cron_dag; stager is a no-op here.
+                yield ConcurrencyStager(skipped=False, _stage_fn=lambda _p, _t: None)
         else:
             yield ConcurrencyStager(skipped=False, _stage_fn=lambda _p, _t: None)
 
@@ -409,23 +453,33 @@ class StateManager:
             # This ensures the cron entry is never permanently lost even if submit_task crashes.
             # For SKIP_IF_RUNNING, SET NX is the authoritative guard against concurrent dispatches.
             # For non-rate-limited queues, submission is included in the same pipeline.
-            if self._atomic_state is not None:
-                pipe = self._atomic_state.pipeline(transaction=True)
-                self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
+            from jobbers.protocols import AtomicCronDAGSchedulerProtocol
+
+            if self._atomic_cron is not None:
+                # Same-backend: cron + task-state ops in one atomic pipeline.
+                pipe = self._atomic_state.pipeline(transaction=True)  # type: ignore[union-attr]
+                self._atomic_cron.stage_reschedule(pipe, entry.id, next_run_at)
                 stager.stage_active_run(pipe, task.id)
                 for fan_in_key, predecessor_ids in fan_ins.items():
-                    self._atomic_state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
+                    self._atomic_state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)  # type: ignore[union-attr]
                 if not is_rate_limited:
                     self.stage_submit_task(pipe, task, queue_config)
                 await pipe.execute()
                 if is_rate_limited:
                     await self.submit_task(task)
-            else:
-                # Saga: cron scheduler ops are atomic on their own Redis; fan-in and submit follow.
-                cron_pipe = self.cron_dag_scheduler.data_store.pipeline(transaction=True)
+            elif isinstance(self.cron_dag_scheduler, AtomicCronDAGSchedulerProtocol):
+                # Cross-backend: cron ops are atomic internally; task-state ops follow.
+                cron_pipe = self.cron_dag_scheduler.pipeline(transaction=True)
                 self.cron_dag_scheduler.stage_reschedule(cron_pipe, entry.id, next_run_at)
                 stager.stage_active_run(cron_pipe, task.id)
                 await cron_pipe.execute()
+                await asyncio.gather(*(self.task_state.init_fan_in(k, ids) for k, ids in fan_ins.items()))
+                await self.submit_task(task)
+            else:
+                # No pipeline support (e.g. StaticCronDAGScheduler): sequential calls.
+                await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
+                if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
+                    await self.cron_dag_scheduler.set_active_run(entry.id, task.id, nx=True)
                 await asyncio.gather(*(self.task_state.init_fan_in(k, ids) for k, ids in fan_ins.items()))
                 await self.submit_task(task)
             logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
@@ -497,7 +551,9 @@ class StateManager:
     async def get_refresh_tag(self, role: str) -> ULID:
         return await self.routing.get_refresh_tag(role)
 
-    def stage_submit_task(self, pipe: TransactionHandle, task: Task, queue_config: QueueConfig | None) -> None:
+    def stage_submit_task(
+        self, pipe: TransactionHandle, task: Task, queue_config: QueueConfig | None
+    ) -> None:
         """
         Set task status to SUBMITTED and stage ZADD + save onto pipe (no execute).
 
@@ -558,14 +614,24 @@ class StateManager:
         """
         Persist a COMPLETED cron task and clear its active-run marker atomically.
 
-        Atomic MULTI/EXEC in single-backend mode; sequential save→clear in saga mode.
+        When cron and task-state share a backend, both ops go in one pipeline.
+        When task-state is atomic but cron is on a separate backend, task save is
+        atomic and the active-run clear is a sequential follow-up call.
+        Falls back to sequential saga when neither adapter supports atomic staging.
         """
         assert task.cron_id is not None  # noqa: S101
-        if self._atomic_state is not None:
+        if self._atomic_cron is not None:
+            # Same-backend: save + clear-active-run in one pipeline.
+            pipe = self._atomic_state.pipeline(transaction=True)  # type: ignore[union-attr]
+            self._atomic_state.stage_save(pipe, task)  # type: ignore[union-attr]
+            self._atomic_cron.stage_clear_active_run(pipe, task.cron_id)
+            await pipe.execute()
+        elif self._atomic_state is not None:
+            # Task-state atomic, cron is on a separate backend.
             pipe = self._atomic_state.pipeline(transaction=True)
             self._atomic_state.stage_save(pipe, task)
-            self.cron_dag_scheduler.stage_clear_active_run(pipe, task.cron_id)
             await pipe.execute()
+            await self.cron_dag_scheduler.clear_active_run(task.cron_id)
         else:
             await self.task_state.save_task(task)
             await self.cron_dag_scheduler.clear_active_run(task.cron_id)
@@ -574,10 +640,13 @@ class StateManager:
         """
         Reschedule a batch of disabled cron entries to their next run time.
 
-        Atomic pipeline in single-backend mode; sequential in saga mode.
+        Uses the cron scheduler's own pipeline when it supports atomic staging;
+        falls back to sequential calls otherwise.
         """
-        if self._atomic_scheduler is not None:
-            pipe = self._atomic_scheduler.pipeline(transaction=True)
+        from jobbers.protocols import AtomicCronDAGSchedulerProtocol
+
+        if isinstance(self.cron_dag_scheduler, AtomicCronDAGSchedulerProtocol):
+            pipe = self.cron_dag_scheduler.pipeline(transaction=True)
             for entry, run_at in entries:
                 next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
                 self.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
@@ -720,18 +789,14 @@ class StateManager:
         """
         now = dt.datetime.now(dt.UTC)
         first_run_at = croniter(entry.cron_expr, now).get_next(dt.datetime)
-        pipe = self.cron_dag_scheduler.data_store.pipeline(transaction=True)
-        self.cron_dag_scheduler.stage_add(pipe, entry, first_run_at)
-        await pipe.execute()
+        await self.cron_dag_scheduler.add(entry, first_run_at)
         logger.info(
             "Cron DAG entry '%s' (%s) registered, first run at %s.", entry.name, entry.id, first_run_at
         )
 
     async def remove_cron_dag(self, cron_id: ULID) -> None:
         """Remove a cron DAG entry from the schedule."""
-        pipe = self.cron_dag_scheduler.data_store.pipeline(transaction=True)
-        self.cron_dag_scheduler.stage_remove(pipe, cron_id)
-        await pipe.execute()
+        await self.cron_dag_scheduler.remove(cron_id)
         logger.info("Cron DAG entry %s removed.", cron_id)
 
     async def submit_dag(self, *roots: DAGNode) -> tuple[ULID, list[Task]]:

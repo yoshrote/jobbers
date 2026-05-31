@@ -1,4 +1,4 @@
-"""Tests for CronDAGScheduler."""
+"""Tests for RedisCronDAGScheduler."""
 
 import datetime as dt
 
@@ -6,9 +6,10 @@ import pytest
 import pytest_asyncio
 from ulid import ULID
 
+from jobbers.adapters.redis import RedisCronDAGScheduler
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGTaskSpec
-from jobbers.schedulers.cron_dag_scheduler import ConcurrencyStager, CronDAGScheduler
+from jobbers.state_manager import ConcurrencyStager
 
 PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 FUTURE = dt.datetime(2099, 1, 1, tzinfo=dt.UTC)
@@ -25,10 +26,10 @@ def make_entry(name: str = "test_cron", cron_expr: str = "0 * * * *", **kwargs) 
 
 @pytest_asyncio.fixture
 async def scheduler(redis):
-    yield CronDAGScheduler(redis)
+    yield RedisCronDAGScheduler(redis)
 
 
-async def add_entry(s: CronDAGScheduler, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
+async def add_entry(s: RedisCronDAGScheduler, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
     pipe = s.data_store.pipeline(transaction=True)
     s.stage_add(pipe, entry, next_run_at)
     await pipe.execute()

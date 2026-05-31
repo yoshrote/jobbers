@@ -1,5 +1,5 @@
 """
-MsgpackTaskAdapter- and DeadQueue-specific edge cases not covered by protocol contract tests.
+RedisTaskAdapter- and RedisRedisDeadQueue-specific edge cases not covered by protocol contract tests.
 
 Both implementations live in ``jobbers/adapters/redis.py`` and share a FakeAsyncRedis fixture.
 
@@ -40,7 +40,7 @@ def make_task(
 
 @pytest.mark.xfail(
     reason=(
-        "MsgpackTaskAdapter applies offset to queue positions before Python-side filtering, "
+        "RedisTaskAdapter applies offset to queue positions before Python-side filtering, "
         "so offset=1 skips one *queue entry* (task_b), not one *filtered result* (task_a). "
         "Page 2 therefore returns the same task as page 1 — page size appears correct (1) "
         "but the pages overlap, making pagination over a filtered result set unpredictable."
@@ -52,7 +52,7 @@ async def test_get_all_tasks_filter_pagination_page_size_is_unpredictable(
     msgpack_adapter,
 ):
     """
-    Tripwire: documents the known offset-before-filter limitation in MsgpackTaskAdapter.
+    Tripwire: documents the known offset-before-filter limitation in RedisTaskAdapter.
 
     Because offset counts raw queue positions (before Python-side filtering), page 2 does
     not advance past the last result of page 1 — it backs up into queue-space and returns
@@ -64,7 +64,7 @@ async def test_get_all_tasks_filter_pagination_page_size_is_unpredictable(
       page 2 (offset=1) → expected A2, actual A1 again  ✗
 
     If this test unexpectedly passes, the limitation has been fixed — update
-    ``test_task_adapter_common.py`` to remove the xfail for MsgpackTaskAdapter.
+    ``test_task_adapter_common.py`` to remove the xfail for RedisTaskAdapter.
     """
     b1 = make_task(ULID1, name="task_b", submitted_at=FROZEN_TIME)
     b2 = make_task(ULID2, name="task_b", submitted_at=FROZEN_TIME + dt.timedelta(seconds=1))
@@ -98,7 +98,7 @@ async def test_get_all_tasks_filter_pagination_page_size_is_unpredictable(
 
 @pytest.mark.xfail(
     reason=(
-        "MsgpackTaskAdapter does not sort by task ID. "
+        "RedisTaskAdapter does not sort by task ID. "
         "order_by=TASK_ID uses zrange, which sorts by the queue sorted-set score "
         "(submitted_at timestamp), not by ULID. Results are returned in submitted_at "
         "order regardless of which PaginationOrder is requested."
@@ -108,7 +108,7 @@ async def test_get_all_tasks_filter_pagination_page_size_is_unpredictable(
 @pytest.mark.asyncio
 async def test_get_all_tasks_task_id_order(msgpack_adapter):
     """
-    Tripwire: MsgpackTaskAdapter ignores order_by=TASK_ID and sorts by submitted_at instead.
+    Tripwire: RedisTaskAdapter ignores order_by=TASK_ID and sorts by submitted_at instead.
 
     Tasks are given submitted_at values that are the reverse of their ULID order so
     that submitted_at order and task-ID order point in opposite directions.
@@ -154,7 +154,7 @@ async def test_clean_terminal_tasks_skips_non_ulid_keys(msgpack_adapter, redis):
     assert await redis.exists("task:not_a_valid_ulid_at_all")
 
 
-# ── DeadQueue: edge cases ─────────────────────────────────────────────────────
+# ── RedisDeadQueue: edge cases ─────────────────────────────────────────────────────
 
 EARLIER = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 LATER = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
@@ -171,7 +171,7 @@ async def test_clean_handles_missing_meta(msgpack_dead_queue):
     """
     clean() removes the sorted-set entry even when the meta hash entry is absent.
 
-    DeadQueue stores DLQ membership in a sorted set (``dlq``) and queue/name metadata
+    RedisDeadQueue stores DLQ membership in a sorted set (``dlq``) and queue/name metadata
     in a separate hash (``dlq-meta``).  If the meta entry is missing (e.g. written by
     an older code version), clean() must still remove the sorted-set entry without error.
     """
@@ -189,7 +189,7 @@ async def test_clean_handles_missing_meta(msgpack_dead_queue):
     assert score is None
 
 
-# ── MsgpackTaskAdapter: serialization edge cases ──────────────────────────────
+# ── RedisTaskAdapter: serialization edge cases ──────────────────────────────
 
 
 @pytest.mark.asyncio

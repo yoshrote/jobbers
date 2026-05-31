@@ -4,10 +4,9 @@ import datetime as dt
 
 import pytest
 
-from jobbers.adapters.sql import SQLQueueConfigAdapter
+from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLTaskScheduler
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
-from jobbers.schedulers.sql_task_scheduler import SQLTaskScheduler
 
 PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 TASK_ID = "01JQC31AJP7TSA9X8AEP64XG01"

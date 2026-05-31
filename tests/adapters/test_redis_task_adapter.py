@@ -1,5 +1,5 @@
 """
-Redis-specific tests for MsgpackTaskAdapter and JsonTaskAdapter.
+Redis-specific tests for RedisTaskAdapter and RedisJSONTaskAdapter.
 
 Uses the ``redis_task_adapter`` fixture (parametrized over ["raw", "json"]).
 Tests the atomic pipeline path (data_store.pipeline(), stage_* methods) and
@@ -315,10 +315,15 @@ async def test_get_next_task_skips_missing_data_and_returns_none(redis_task_adap
             None,
         ]
     )
-    with patch.object(redis_task_adapter.data_store, "bzpopmin", new_callable=AsyncMock, side_effect=pop_results):
+    with patch.object(
+        redis_task_adapter.data_store, "bzpopmin", new_callable=AsyncMock, side_effect=pop_results
+    ):
         result = await redis_task_adapter.get_next_task(queues={"default"}, pop_timeout=1)
     assert result is None
-    assert await redis_task_adapter.data_store.zscore(redis_task_adapter.DLQ_MISSING_DATA, bytes(fake_id)) is not None
+    assert (
+        await redis_task_adapter.data_store.zscore(redis_task_adapter.DLQ_MISSING_DATA, bytes(fake_id))
+        is not None
+    )
 
 
 # ── get_all_tasks: missing blob ───────────────────────────────────────────────
@@ -354,7 +359,9 @@ async def test_get_stale_tasks_filters_out_missing_blobs(redis_task_adapter):
     await redis_task_adapter.update_task_heartbeat(stale_task)
     await redis_task_adapter.data_store.delete(redis_task_adapter.TASK_DETAILS(task_id=stale_task.id))
 
-    stale_tasks = [task async for task in redis_task_adapter.get_stale_tasks({"default"}, dt.timedelta(minutes=5))]
+    stale_tasks = [
+        task async for task in redis_task_adapter.get_stale_tasks({"default"}, dt.timedelta(minutes=5))
+    ]
     assert len(stale_tasks) == 0
 
 
@@ -467,7 +474,9 @@ async def test_clean_terminal_tasks_removes_heartbeat_entry(redis_task_adapter):
     )
     await redis_task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
     assert (
-        await redis_task_adapter.data_store.zscore(redis_task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes)
+        await redis_task_adapter.data_store.zscore(
+            redis_task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes
+        )
         is None
     )
 
@@ -483,9 +492,13 @@ async def test_clean_terminal_tasks_removes_type_index_entry(redis_task_adapter)
         completed_at=FROZEN_TIME - dt.timedelta(days=8),
     )
     await redis_task_adapter.save_task(task)
-    await redis_task_adapter.data_store.sadd(redis_task_adapter.TASK_BY_TYPE_IDX(name="test_task"), ULID1.bytes)
+    await redis_task_adapter.data_store.sadd(
+        redis_task_adapter.TASK_BY_TYPE_IDX(name="test_task"), ULID1.bytes
+    )
     await redis_task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
-    members = await redis_task_adapter.data_store.smembers(redis_task_adapter.TASK_BY_TYPE_IDX(name="test_task"))
+    members = await redis_task_adapter.data_store.smembers(
+        redis_task_adapter.TASK_BY_TYPE_IDX(name="test_task")
+    )
     assert ULID1.bytes not in members
 
 
@@ -580,7 +593,9 @@ async def test_clean_terminal_tasks_removes_heartbeat_for_all_terminal_statuses(
     )
     await redis_task_adapter.clean_terminal_tasks(FROZEN_TIME, dt.timedelta(days=7))
     assert (
-        await redis_task_adapter.data_store.zscore(redis_task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes)
+        await redis_task_adapter.data_store.zscore(
+            redis_task_adapter.HEARTBEAT_SCORES(queue="default"), ULID1.bytes
+        )
         is None
     )
 
@@ -868,12 +883,19 @@ async def test_submit_rate_limited_concurrent_respects_limit(redis_task_adapter)
     queue_config = _default_queue_config(rate_numerator=limit)
     tasks = [_make_rate_task(ULID(), now) for _ in range(10)]
 
-    results = await asyncio.gather(*[redis_task_adapter.submit_rate_limited_task(t, queue_config) for t in tasks])
+    results = await asyncio.gather(
+        *[redis_task_adapter.submit_rate_limited_task(t, queue_config) for t in tasks]
+    )
 
     accepted = sum(1 for r in results if r)
     assert accepted == limit
-    assert await redis_task_adapter.data_store.zcard(redis_task_adapter.QUEUE_RATE_LIMITER(queue="default")) == limit
-    assert await redis_task_adapter.data_store.zcard(redis_task_adapter.TASKS_BY_QUEUE(queue="default")) == limit
+    assert (
+        await redis_task_adapter.data_store.zcard(redis_task_adapter.QUEUE_RATE_LIMITER(queue="default"))
+        == limit
+    )
+    assert (
+        await redis_task_adapter.data_store.zcard(redis_task_adapter.TASKS_BY_QUEUE(queue="default")) == limit
+    )
 
 
 # ── _add_task_to_results ──────────────────────────────────────────────────────

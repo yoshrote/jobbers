@@ -6,15 +6,15 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from jobbers.adapters.redis import (
-    DeadQueue,
-    MsgpackTaskAdapter,
+    RedisDeadQueue,
     RedisQueueConfigAdapter,
+    RedisTaskAdapter,
     RedisTaskRoutingConfigAdapter,
 )
 from jobbers.adapters.redis_json import (
-    JsonDeadQueue,
-    JsonTaskAdapter,
+    RedisJSONDeadQueue,
     RedisJSONQueueConfigAdapter,
+    RedisJSONTaskAdapter,
     RedisJSONTaskRoutingConfigAdapter,
 )
 from jobbers.adapters.sql import (
@@ -39,15 +39,15 @@ def redis_task_adapter_dt_module(redis_task_adapter: object) -> str:
 
 
 @pytest.fixture
-def msgpack_adapter(redis) -> MsgpackTaskAdapter:
-    """Fixture providing a MsgpackTaskAdapter instance."""
-    return MsgpackTaskAdapter(redis)
+def msgpack_adapter(redis) -> RedisTaskAdapter:
+    """Fixture providing a RedisTaskAdapter instance."""
+    return RedisTaskAdapter(redis)
 
 
 @pytest.fixture
-def msgpack_dead_queue(redis, dummy_task_adapter) -> DeadQueue:
-    """DeadQueue backed by FakeAsyncRedis + DummyTaskAdapter; for raw-adapter-specific edge cases."""
-    return DeadQueue(redis, dummy_task_adapter)
+def msgpack_dead_queue(redis, dummy_task_adapter) -> RedisDeadQueue:
+    """RedisDeadQueue backed by FakeAsyncRedis + DummyTaskAdapter; for raw-adapter-specific edge cases."""
+    return RedisDeadQueue(redis, dummy_task_adapter)
 
 
 @pytest_asyncio.fixture(params=["raw", "json", "sql"], ids=["raw", "json", "sql"])
@@ -55,8 +55,8 @@ async def task_adapter(request, redis, session_factory):
     """
     Parameterized fixture yielding a TaskStateProtocol + TaskSubmitProtocol implementation for each backend.
 
-    - ``"raw"``: MsgpackTaskAdapter backed by FakeAsyncRedis
-    - ``"json"``: JsonTaskAdapter backed by real Redis Stack; skips if unavailable
+    - ``"raw"``: RedisTaskAdapter backed by FakeAsyncRedis
+    - ``"json"``: RedisJSONTaskAdapter backed by real Redis Stack; skips if unavailable
     - ``"sql"``: SQLTaskAdapter backed by in-memory SQLite
 
     Each variant manages its own connection inline. request.getfixturevalue cannot
@@ -64,7 +64,7 @@ async def task_adapter(request, redis, session_factory):
     mode — it tries to create a new Runner inside an already-running event loop.
     """
     if request.param == "raw":
-        yield MsgpackTaskAdapter(redis)
+        yield RedisTaskAdapter(redis)
     elif request.param == "sql":
         yield SQLTaskAdapter(session_factory)
     else:
@@ -74,7 +74,7 @@ async def task_adapter(request, redis, session_factory):
         except RedisConnectionError as exc:  # pragma: no cover
             await r.aclose()
             pytest.skip(f"Redis not available: {exc}")
-        adapter = JsonTaskAdapter(r)
+        adapter = RedisJSONTaskAdapter(r)
         try:
             await adapter.ensure_index()
         except ResponseError as exc:  # pragma: no cover
@@ -90,13 +90,13 @@ async def redis_task_adapter(request, redis):
     """
     Parameterized fixture yielding a Redis-backed task adapter for each Redis backend.
 
-    - ``"raw"``: MsgpackTaskAdapter backed by FakeAsyncRedis
-    - ``"json"``: JsonTaskAdapter backed by real Redis Stack; skips if unavailable
+    - ``"raw"``: RedisTaskAdapter backed by FakeAsyncRedis
+    - ``"json"``: RedisJSONTaskAdapter backed by real Redis Stack; skips if unavailable
 
     Use this for Redis-atomic-pipeline tests that inspect data_store internals directly.
     """
     if request.param == "raw":
-        yield MsgpackTaskAdapter(redis)
+        yield RedisTaskAdapter(redis)
     else:
         r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
         try:
@@ -104,7 +104,7 @@ async def redis_task_adapter(request, redis):
         except RedisConnectionError as exc:  # pragma: no cover
             await r.aclose()
             pytest.skip(f"Redis not available: {exc}")
-        adapter = JsonTaskAdapter(r)
+        adapter = RedisJSONTaskAdapter(r)
         try:
             await adapter.ensure_index()
         except ResponseError as exc:  # pragma: no cover
@@ -118,7 +118,7 @@ async def redis_task_adapter(request, redis):
 @pytest_asyncio.fixture
 async def json_adapter():
     """
-    JsonTaskAdapter backed by real Redis Stack; skips if unavailable.
+    RedisJSONTaskAdapter backed by real Redis Stack; skips if unavailable.
 
     Use this for json-specific edge case tests that cannot be expressed as
     protocol contract tests (e.g., null JSON blob, missing RediSearch doc).
@@ -129,7 +129,7 @@ async def json_adapter():
     except RedisConnectionError as exc:  # pragma: no cover
         await r.aclose()
         pytest.skip(f"Redis not available: {exc}")
-    adapter = JsonTaskAdapter(r)
+    adapter = RedisJSONTaskAdapter(r)
     try:
         await adapter.ensure_index()
     except ResponseError as exc:  # pragma: no cover
@@ -143,11 +143,11 @@ async def json_adapter():
 @pytest_asyncio.fixture
 async def json_dead_queue(json_adapter):
     """
-    JsonDeadQueue backed by real Redis Stack; skips if unavailable (via json_adapter).
+    RedisJSONDeadQueue backed by real Redis Stack; skips if unavailable (via json_adapter).
 
-    Use this for JsonDeadQueue-specific edge case tests.
+    Use this for RedisJSONDeadQueue-specific edge case tests.
     """
-    dq = JsonDeadQueue(json_adapter.data_store, json_adapter)
+    dq = RedisJSONDeadQueue(json_adapter.data_store, json_adapter)
     await dq.ensure_index()
     yield dq
 
@@ -214,8 +214,8 @@ async def dead_queue(request, dummy_task_adapter, session_factory):
     """
     Parameterized fixture yielding (dq, task_adapter) for each DeadQueueProtocol implementation.
 
-    - ``"raw"``: DeadQueue backed by FakeAsyncRedis + DummyTaskAdapter
-    - ``"json"``: JsonDeadQueue backed by real Redis Stack; skips if unavailable
+    - ``"raw"``: RedisDeadQueue backed by FakeAsyncRedis + DummyTaskAdapter
+    - ``"json"``: RedisJSONDeadQueue backed by real Redis Stack; skips if unavailable
     - ``"sql"``: SQLDeadQueue backed by in-memory SQLite + SQLTaskAdapter
 
     SQLDeadQueue stores full task data in the dead_letter_queue table, so the
@@ -226,7 +226,7 @@ async def dead_queue(request, dummy_task_adapter, session_factory):
     """
     if request.param == "raw":
         r = fakeredis.FakeAsyncRedis()
-        dq = DeadQueue(r, dummy_task_adapter)
+        dq = RedisDeadQueue(r, dummy_task_adapter)
         yield dq, dummy_task_adapter
         await r.aclose()
     elif request.param == "sql":
@@ -238,8 +238,8 @@ async def dead_queue(request, dummy_task_adapter, session_factory):
         except RedisConnectionError as exc:  # pragma: no cover
             await r.aclose()
             pytest.skip(f"Redis not available: {exc}")
-        adapter = JsonTaskAdapter(r)
-        jdq = JsonDeadQueue(r, adapter)
+        adapter = RedisJSONTaskAdapter(r)
+        jdq = RedisJSONDeadQueue(r, adapter)
         try:
             await adapter.ensure_index()
             await jdq.ensure_index()

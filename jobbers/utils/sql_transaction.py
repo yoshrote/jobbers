@@ -10,7 +10,7 @@ Usage::
     batch = SQLTransactionBatch(session_factory)
     adapter.stage_save(batch, task)
     adapter.stage_submit_task(batch, task)
-    await batch.execute()          # commits atomically; rollback on any error
+    await batch.execute()  # commits atomically; rollback on any error
 """
 
 from __future__ import annotations

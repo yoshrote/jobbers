@@ -10,7 +10,7 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.redis import DeadQueue
+from jobbers.adapters.redis import RedisDeadQueue
 from jobbers.adapters.sql import SQLDeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
@@ -208,9 +208,9 @@ async def test_get_by_filter_no_criteria_sorted_by_failed_at_desc(dead_queue):
 async def test_get_by_filter_with_criteria_sorted_by_failed_at_desc(dead_queue):
     """get_by_filter returns results newest-first when a queue or task_name filter is applied."""
     dq, adapter = dead_queue
-    if isinstance(dq, DeadQueue):
+    if isinstance(dq, RedisDeadQueue):
         pytest.xfail(
-            "DeadQueue uses Redis sets for filtered lookups (sinter/smembers), "
+            "RedisDeadQueue uses Redis sets for filtered lookups (sinter/smembers), "
             "which have no ordering guarantee; results are not sorted by failed_at."
         )
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1")
@@ -259,7 +259,9 @@ async def test_get_by_filter_skips_missing_task_data(dead_queue):
     """If a task is in the DLQ index but its blob is gone, it is skipped."""
     dq, _ = dead_queue
     if isinstance(dq, SQLDeadQueue):
-        pytest.xfail("SQLDeadQueue stores full task data in the DLQ table; a missing-blob scenario cannot occur")
+        pytest.xfail(
+            "SQLDeadQueue stores full task data in the DLQ table; a missing-blob scenario cannot occur"
+        )
     task = make_task()
     pipe = dq.pipeline()
     dq.stage_add(pipe, task, FAILED_AT)

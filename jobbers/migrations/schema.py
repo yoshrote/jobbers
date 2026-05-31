@@ -168,6 +168,38 @@ Index("idx_task_schedule_queue_run_at", task_schedule.c.queue, task_schedule.c.r
 Index("idx_task_schedule_run_at", task_schedule.c.run_at)
 
 # ---------------------------------------------------------------------------
+# Cron DAG scheduler tables (feature: "cron_dag")
+# ---------------------------------------------------------------------------
+
+cron_dag_entries = Table(
+    "cron_dag_entries",
+    metadata,
+    Column("id", String(26), primary_key=True),
+    Column("name", String, nullable=False),
+    Column("cron_expr", String, nullable=False),
+    Column("dag_spec", Text, nullable=False),  # CronDAGEntry.dag_spec as JSON
+    Column("enabled", Boolean, nullable=False),
+    Column("concurrency_policy", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("next_run_at", DateTime(timezone=True), nullable=True),  # NULL = acquired by scheduler
+)
+
+Index("idx_cron_dag_entries_next_run_at", cron_dag_entries.c.next_run_at)
+
+cron_dag_active_runs = Table(
+    "cron_dag_active_runs",
+    metadata,
+    Column(
+        "cron_id",
+        String(26),
+        ForeignKey("cron_dag_entries.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("task_id", String(26), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+)
+
+# ---------------------------------------------------------------------------
 # TABLE_GROUPS — maps feature name → list of tables for selective migrations
 # ---------------------------------------------------------------------------
 
@@ -176,4 +208,5 @@ TABLE_GROUPS: dict[str, list[Table]] = {
     "task_state": [tasks, task_queue, task_fan_in, dag_runs],
     "dead_letter": [dead_letter_queue],
     "task_schedule": [task_schedule],
+    "cron_dag": [cron_dag_entries, cron_dag_active_runs],
 }

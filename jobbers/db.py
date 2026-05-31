@@ -7,17 +7,20 @@ import redis.asyncio as redis
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
-from jobbers.adapters import DeadQueue, JsonDeadQueue, JsonTaskAdapter, MsgpackTaskAdapter
-from jobbers.adapters.redis import RedisRoutingBackend
+from jobbers.adapters import RedisDeadQueue, RedisJSONDeadQueue, RedisJSONTaskAdapter, RedisTaskAdapter
+from jobbers.adapters.redis import RedisCronDAGScheduler, RedisRoutingBackend, RedisTaskScheduler
 from jobbers.adapters.redis_json import RedisJSONRoutingBackend
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.migrations.runner import run_migrations
-from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
-from jobbers.schedulers.task_scheduler import TaskScheduler
 
 if TYPE_CHECKING:
-    from jobbers.protocols import DeadQueueProtocol, RoutingBackendProtocol, TaskStateProtocol, TaskSubmitProtocol
+    from jobbers.protocols import (
+        DeadQueueProtocol,
+        RoutingBackendProtocol,
+        TaskStateProtocol,
+        TaskSubmitProtocol,
+    )
     from jobbers.state_manager import StateManager
 
 TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")
@@ -75,18 +78,18 @@ async def close_sqlite_conn() -> None:
         _session_factory = None
 
 
-def create_task_adapter(client: redis.Redis) -> MsgpackTaskAdapter | JsonTaskAdapter:
+def create_task_adapter(client: redis.Redis) -> RedisTaskAdapter | RedisJSONTaskAdapter:
     """Create a Redis TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
     if TASK_ADAPTER_BACKEND == "msgpack":
-        return MsgpackTaskAdapter(client)
-    return JsonTaskAdapter(client)
+        return RedisTaskAdapter(client)
+    return RedisJSONTaskAdapter(client)
 
 
 def create_dead_queue(client: redis.Redis, task_adapter: TaskStateProtocol) -> DeadQueueProtocol:
-    """Create a DeadQueue matched to the task adapter backend."""
+    """Create a dead-queue adapter matched to the task adapter backend."""
     if TASK_ADAPTER_BACKEND == "msgpack":
-        return DeadQueue(client, task_adapter)
-    return JsonDeadQueue(client, task_adapter)
+        return RedisDeadQueue(client, task_adapter)
+    return RedisJSONDeadQueue(client, task_adapter)
 
 
 def get_task_adapter() -> TaskStateProtocol:
@@ -198,17 +201,17 @@ async def init_state_manager() -> StateManager:
 
     # Task scheduler
     if TASK_SCHEDULER_BACKEND == "sql":
-        from jobbers.schedulers.sql_task_scheduler import SQLTaskScheduler
+        from jobbers.adapters.sql import SQLTaskScheduler
 
         sf = await _get_or_create_sql(needed_sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
-        task_scheduler: TaskScheduler | SQLTaskScheduler = SQLTaskScheduler(
+        task_scheduler: RedisTaskScheduler | SQLTaskScheduler = SQLTaskScheduler(
             sf, routing_backend.get_all_queues, dsn=dsn
         )
     else:
-        task_scheduler = TaskScheduler(client, _task_adapter, routing_backend.get_all_queues)
+        task_scheduler = RedisTaskScheduler(client, _task_adapter, routing_backend.get_all_queues)
 
-    cron_dag_scheduler = CronDAGScheduler(client)
+    cron_dag_scheduler = RedisCronDAGScheduler(client)
 
     _state_manager = StateManager(
         client,

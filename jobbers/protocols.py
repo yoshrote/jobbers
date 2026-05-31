@@ -12,10 +12,12 @@ Task storage / dead-letter queue (split-store protocols):
 - `TaskSubmitProtocol` — composite submit/pop operations requiring co-located state and queue.
 - `TaskQueueProtocol` — active queue membership and rate limiting.
 - `TaskSchedulerProtocol` — scheduled/delayed task queue.
+- `CronDAGSchedulerProtocol` — recurring cron-scheduled DAG entries.
 - `TransactionHandle` — opaque write batch accepted by all Atomic protocol stage_* methods.
 - `AtomicTaskStateProtocol` — extends TaskStateProtocol with pipeline staging methods.
 - `AtomicTaskSchedulerProtocol` — extends TaskSchedulerProtocol with pipeline staging.
 - `AtomicDeadQueueProtocol` — extends DeadQueueProtocol with pipeline staging.
+- `AtomicCronDAGSchedulerProtocol` — extends CronDAGSchedulerProtocol with pipeline staging.
 - `DeadQueueProtocol` — interface all dead-letter queue implementations must implement.
 """
 
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
 
     from ulid import ULID
 
+    from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
@@ -346,3 +349,53 @@ class AtomicDeadQueueProtocol(DeadQueueProtocol, Protocol):  # pragma: no cover
     def backend_key(self) -> str: ...
 
     def pipeline(self, transaction: bool = True) -> TransactionHandle: ...
+
+
+class CronDAGSchedulerProtocol(Protocol):  # pragma: no cover
+    """Interface for recurring cron-scheduled DAG entries."""
+
+    async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None: ...
+    async def remove(self, cron_id: ULID) -> None: ...
+    async def get(self, cron_id: ULID) -> CronDAGEntry | None: ...
+    async def next_due_bulk(self, n: int) -> list[tuple[CronDAGEntry, dt.datetime]]: ...
+    async def reschedule(self, cron_id: ULID, next_run_at: dt.datetime) -> None: ...
+    async def get_active_run(self, cron_id: ULID) -> str | None: ...
+    async def set_active_run(
+        self, cron_id: ULID, task_id: ULID, ttl: int = 86400, nx: bool = False
+    ) -> bool: ...
+    async def clear_active_run(self, cron_id: ULID) -> None: ...
+    async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None: ...
+    async def list(
+        self, offset: int = 0, limit: int = 50
+    ) -> tuple[list[tuple[CronDAGEntry, dt.datetime]], int]: ...
+
+
+@runtime_checkable
+class AtomicCronDAGSchedulerProtocol(CronDAGSchedulerProtocol, Protocol):  # pragma: no cover
+    """
+    CronDAGSchedulerProtocol + pipeline staging for same-backend atomic operations.
+
+    ``backend_key`` allows ``StateManager`` to detect when the cron scheduler shares
+    a backend with the task-state adapter and fold cron ops into the same pipeline.
+    The three ``stage_*`` methods cover the two hot dispatch-path touch points:
+    - ``dispatch_cron_dag``: ``stage_reschedule`` + ``stage_set_active_run`` (+ fan-in)
+    - ``complete_cron_task``: ``stage_clear_active_run`` (+ task save)
+    """
+
+    @property
+    def backend_key(self) -> str: ...
+
+    def pipeline(self, transaction: bool = True) -> TransactionHandle: ...
+
+    def stage_reschedule(self, pipe: TransactionHandle, cron_id: ULID, next_run_at: dt.datetime) -> None: ...
+
+    def stage_set_active_run(
+        self,
+        pipe: TransactionHandle,
+        cron_id: ULID,
+        task_id: ULID,
+        ttl: int = 86400,
+        nx: bool = False,
+    ) -> None: ...
+
+    def stage_clear_active_run(self, pipe: TransactionHandle, cron_id: ULID) -> None: ...

@@ -6,16 +6,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from ulid import ULID
 
 from jobbers.adapters._shared import SharedTaskAdapterMixin
-from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter
-from jobbers.adapters.redis_json import JsonTaskAdapter
+from jobbers.adapters.redis import RedisCronDAGScheduler, RedisDeadQueue, RedisTaskAdapter, RedisTaskScheduler
+from jobbers.adapters.redis_json import RedisJSONTaskAdapter
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.migrations.runner import run_migrations
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
-from jobbers.schedulers.cron_dag_scheduler import CronDAGScheduler
-from jobbers.schedulers.task_scheduler import TaskScheduler
 from jobbers.state_manager import StateManager
 
 
@@ -27,7 +25,7 @@ async def redis():
     await fake_store.close()
 
 
-@pytest.fixture(params=[JsonTaskAdapter, MsgpackTaskAdapter], ids=["json", "msgpack"])
+@pytest.fixture(params=[RedisJSONTaskAdapter, RedisTaskAdapter], ids=["json", "msgpack"])
 def task_adapter(redis, request):
     """Fixture providing a task adapter instance parametrized over all implementations."""
     return request.param(redis)
@@ -47,9 +45,9 @@ async def state_manager(redis, dummy_routing_backend, dummy_task_adapter):
         dummy_routing_backend,
         task_state=dummy_task_adapter,
         task_submit=dummy_task_adapter,
-        dead_queue=DeadQueue(redis, dummy_task_adapter),
-        task_scheduler=TaskScheduler(redis, dummy_task_adapter, dummy_routing_backend.get_all_queues),
-        cron_dag_scheduler=CronDAGScheduler(redis),
+        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, dummy_routing_backend.get_all_queues),
+        cron_dag_scheduler=RedisCronDAGScheduler(redis),
     )
     sm.get_queue_config = sm.routing.get_queue_config
     sm.get_routing_config = sm.routing.get_routing_config
@@ -60,16 +58,16 @@ async def state_manager(redis, dummy_routing_backend, dummy_task_adapter):
 
 @pytest_asyncio.fixture
 async def state_manager_real_ta(redis, dummy_routing_backend):
-    """StateManager backed by MsgpackTaskAdapter + DummyRoutingBackend for tests that exercise the full adapter call path."""
-    ta = MsgpackTaskAdapter(redis)
+    """StateManager backed by RedisTaskAdapter + DummyRoutingBackend for tests that exercise the full adapter call path."""
+    ta = RedisTaskAdapter(redis)
     sm = StateManager(
         redis,
         dummy_routing_backend,
         task_state=ta,
         task_submit=ta,
-        dead_queue=DeadQueue(redis, ta),
-        task_scheduler=TaskScheduler(redis, ta, dummy_routing_backend.get_all_queues),
-        cron_dag_scheduler=CronDAGScheduler(redis),
+        dead_queue=RedisDeadQueue(redis, ta),
+        task_scheduler=RedisTaskScheduler(redis, ta, dummy_routing_backend.get_all_queues),
+        cron_dag_scheduler=RedisCronDAGScheduler(redis),
     )
     sm.get_queue_config = sm.routing.get_queue_config
     sm.get_routing_config = sm.routing.get_routing_config
