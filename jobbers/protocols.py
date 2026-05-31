@@ -6,6 +6,8 @@ Routing:
 - `QueueConfigProtocol` — interface for queue/role configuration and refresh-tag management.
 - `TaskRoutingConfigProtocol` — interface for task routing configuration.
 - `RoutingBackendProtocol` — interface all routing backends must implement.
+- `CancellationBusProtocol` — pub/sub channel for in-flight task cancellation signals.
+- `RoutingNotificationProtocol` — routing version key and per-role queue-config refresh signals.
 
 Task storage / dead-letter queue (split-store protocols):
 - `TaskStateProtocol` — task blob persistence, heartbeats, fan-in sets, DAG run index.
@@ -29,7 +31,7 @@ from typing_extensions import Protocol
 
 if TYPE_CHECKING:
     import datetime as dt
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable
     from typing import Any
 
     from ulid import ULID
@@ -110,6 +112,22 @@ class RoutingBackendProtocol(Protocol):
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None: ...
     async def save_routing_config(self, routing_config: RoutingConfig) -> None: ...
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
+
+
+class CancellationBusProtocol(Protocol):  # pragma: no cover
+    """Pub/sub channel for in-flight task cancellation signals."""
+
+    async def publish_cancellation(self, task_id: ULID) -> None: ...
+    def listen_cancellations(self) -> AsyncIterator[ULID]: ...
+
+
+class RoutingNotificationProtocol(Protocol):  # pragma: no cover
+    """Routing version key and per-role queue-config refresh signals."""
+
+    async def get_routing_version(self) -> ULID | None: ...
+    async def bump_routing_version(self) -> None: ...
+    async def notify_refresh(self, role: str, tag: str) -> None: ...
+    async def poll_refresh_signal(self, role: str) -> bool: ...
 
 
 class DeadQueueProtocol(Protocol):  # pragma: no cover

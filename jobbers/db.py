@@ -15,7 +15,13 @@ from jobbers.adapters import (
     RedisTaskState,
     RedisTaskSubmit,
 )
-from jobbers.adapters.redis import RedisCronDAGScheduler, RedisRoutingBackend, RedisTaskScheduler
+from jobbers.adapters.redis import (
+    RedisCancellationBus,
+    RedisCronDAGScheduler,
+    RedisRoutingBackend,
+    RedisRoutingNotifications,
+    RedisTaskScheduler,
+)
 from jobbers.adapters.redis_json import RedisJSONRoutingBackend
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.adapters.static import StaticRoutingBackend
@@ -235,6 +241,8 @@ async def init_state_manager() -> StateManager:
         dead_queue=dead_queue,
         task_scheduler=task_scheduler,  # type: ignore[arg-type]
         cron_dag_scheduler=cron_dag_scheduler,
+        cancellation_bus=RedisCancellationBus(client),
+        routing_notifications=RedisRoutingNotifications(client),
         force_saga=FORCE_SAGA_MODE,
     )
     await _task_adapter.ensure_index()

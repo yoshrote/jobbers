@@ -34,12 +34,20 @@ Cron DAG schedulers:
 - `RedisCronDAGScheduler` — plain Redis backend.
 - `SQLCronDAGScheduler` — SQLAlchemy backend (cron_dag_entries / cron_dag_active_runs tables).
 - `StaticCronDAGScheduler` — read-only in-memory backend.
+
+Signaling:
+- `CancellationBusProtocol` — interface for task cancellation pub/sub.
+- `RoutingNotificationProtocol` — interface for routing version and refresh signals.
+- `RedisCancellationBus` — Redis-backed CancellationBusProtocol.
+- `RedisRoutingNotifications` — Redis-backed RoutingNotificationProtocol.
 """
 
 from jobbers.adapters.redis import (
+    RedisCancellationBus,
     RedisCronDAGScheduler,
     RedisDeadQueue,
     RedisRoutingBackend,
+    RedisRoutingNotifications,
     RedisTaskScheduler,
     RedisTaskState,
     RedisTaskSubmit,
@@ -60,10 +68,12 @@ from jobbers.adapters.sql import (
 )
 from jobbers.adapters.static import StaticCronDAGScheduler, StaticRoutingBackend
 from jobbers.protocols import (
+    CancellationBusProtocol,
     CronDAGSchedulerProtocol,
     DeadQueueProtocol,
     RoutingBackendProtocol,
     RoutingBackendReadOnlyError,
+    RoutingNotificationProtocol,
     TaskStateProtocol,
     TaskSubmitProtocol,
 )
@@ -93,4 +103,8 @@ __all__ = [
     "RedisCronDAGScheduler",
     "SQLCronDAGScheduler",
     "StaticCronDAGScheduler",
+    "CancellationBusProtocol",
+    "RoutingNotificationProtocol",
+    "RedisCancellationBus",
+    "RedisRoutingNotifications",
 ]

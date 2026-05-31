@@ -8,7 +8,13 @@ import pytest
 from ulid import ULID
 
 from jobbers import registry
-from jobbers.adapters.redis import RedisCronDAGScheduler, RedisDeadQueue, RedisTaskScheduler
+from jobbers.adapters.redis import (
+    RedisCancellationBus,
+    RedisCronDAGScheduler,
+    RedisDeadQueue,
+    RedisRoutingNotifications,
+    RedisTaskScheduler,
+)
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGNode, DAGTaskSpec
@@ -1069,6 +1075,8 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
     )
     await sm.routing.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
     r1 = await sm.get_queue_config("q1")
@@ -1093,6 +1101,8 @@ async def test_get_routing_config_caches_result(redis, session_factory, dummy_ta
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
     )
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["routed"])
     await sm.routing.save_routing_config(config)
@@ -1127,6 +1137,8 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
     )
     qca = SQLQueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
@@ -1165,6 +1177,8 @@ async def test_save_routing_config_invalidates_cache_and_bumps_version(
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
     )
 
     config_v1 = RoutingConfig(
@@ -1208,6 +1222,8 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
     )
     config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
     await sm.routing.save_routing_config(config)
@@ -1240,6 +1256,8 @@ async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
     )
     for i in range(3):
         cfg = RoutingConfig(task_name=f"t{i}", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])

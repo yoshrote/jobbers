@@ -8,8 +8,10 @@ from ulid import ULID
 
 import end2end
 from jobbers.adapters.redis import (
+    RedisCancellationBus,
     RedisCronDAGScheduler,
     RedisDeadQueue,
+    RedisRoutingNotifications,
     RedisTaskScheduler,
     RedisTaskState,
     RedisTaskSubmit,
@@ -47,6 +49,8 @@ async def sm(redis, session_factory):
         dead_queue=RedisDeadQueue(redis, task_state),
         task_scheduler=RedisTaskScheduler(redis, task_state, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
     )
 
 

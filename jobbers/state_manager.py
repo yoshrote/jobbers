@@ -36,9 +36,11 @@ if TYPE_CHECKING:
         AtomicDeadQueueProtocol,
         AtomicTaskSchedulerProtocol,
         AtomicTaskStateProtocol,
+        CancellationBusProtocol,
         CronDAGSchedulerProtocol,
         DeadQueueProtocol,
         RoutingBackendProtocol,
+        RoutingNotificationProtocol,
         TaskStateProtocol,
         TaskSubmitProtocol,
         TransactionHandle,
@@ -95,10 +97,14 @@ class StateManager:
         dead_queue: DeadQueueProtocol,
         task_scheduler: RedisTaskScheduler,
         cron_dag_scheduler: CronDAGSchedulerProtocol,
+        cancellation_bus: CancellationBusProtocol,
+        routing_notifications: RoutingNotificationProtocol,
         force_saga: bool = False,
     ) -> None:
         self.job_store: Redis = job_store
         self.routing: RoutingBackendProtocol = routing_backend
+        self.cancellation_bus: CancellationBusProtocol = cancellation_bus
+        self.routing_notifications: RoutingNotificationProtocol = routing_notifications
         self.task_state: TaskStateProtocol = task_state
         self.task_submit: TaskSubmitProtocol = task_submit
         self._queue_config_cache: dict[str, QueueConfig | None] = {}
@@ -518,7 +524,7 @@ class StateManager:
                     # Saga: save CANCELLED state; queue entry is cleaned up by Cleaner.
                     await self.task_state.save_task(task)
             case TaskStatus.STARTED:
-                await self.job_store.publish("task_cancellations", str(task_id))
+                await self.cancellation_bus.publish_cancellation(task_id)
             case _:
                 raise TaskException(f"Task has status '{task.status}' and cannot be cancelled.")
         return task
@@ -534,22 +540,15 @@ class StateManager:
 
     async def run_cancel_listener(self) -> None:
         """Subscribe to the shared cancellations channel and signal matching active tasks."""
-        async with self.job_store.pubsub() as pubsub:
-            await pubsub.subscribe("task_cancellations")
-            while True:
-                message = await pubsub.get_message(ignore_subscribe_messages=True)
-                if message is not None:
-                    raw = message["data"]
-                    task_id_str = raw.decode() if isinstance(raw, bytes) else raw
-                    try:
-                        self.signal_cancel(ULID.from_str(task_id_str))
-                    except Exception:
-                        logger.warning("Invalid task_id in cancellations channel: %r", task_id_str)
-                await asyncio.sleep(0.01)
+        async for task_id in self.cancellation_bus.listen_cancellations():
+            self.signal_cancel(task_id)
 
     # Proxy methods
     async def get_refresh_tag(self, role: str) -> ULID:
         return await self.routing.get_refresh_tag(role)
+
+    async def poll_refresh_signal(self, role: str) -> bool:
+        return await self.routing_notifications.poll_refresh_signal(role)
 
     def stage_submit_task(
         self, pipe: TransactionHandle, task: Task, queue_config: QueueConfig | None
@@ -681,15 +680,14 @@ class StateManager:
         self._routing_config_cache.clear()
 
     async def get_routing_version(self) -> ULID | None:
-        raw: bytes | None = await self.job_store.get("routing:version")
-        return ULID.from_bytes(raw) if raw else None
+        return await self.routing_notifications.get_routing_version()
 
     async def bump_routing_version(self) -> None:
-        await self.job_store.set("routing:version", ULID().bytes)
+        await self.routing_notifications.bump_routing_version()
 
     async def bump_refresh_tag(self, role: str) -> str:
         new_tag = await self.routing.bump_refresh_tag(role)
-        await self.job_store.publish(f"queue-config-refresh:{role}", new_tag)
+        await self.routing_notifications.notify_refresh(role, new_tag)
         return new_tag
 
     async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
@@ -732,7 +730,7 @@ class StateManager:
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
         new_tag = await self.routing.save_role(role, queues_set)
-        await self.job_store.publish(f"queue-config-refresh:{role}", new_tag)
+        await self.routing_notifications.notify_refresh(role, new_tag)
 
     async def delete_queue(self, queue_name: str) -> None:
         self.invalidate_queue_config(queue_name)

@@ -24,10 +24,17 @@ Cron DAG scheduler:
 - `RedisCronDAGScheduler` — implements ``CronDAGSchedulerProtocol`` and
   ``AtomicCronDAGSchedulerProtocol``; recurring cron-scheduled DAG entries in Redis
   hashes and sorted sets.
+
+Signaling:
+- `RedisCancellationBus` — implements ``CancellationBusProtocol``; pub/sub channel for
+  in-flight task cancellation signals.
+- `RedisRoutingNotifications` — implements ``RoutingNotificationProtocol``; routing version
+  key and per-role queue-config refresh signals via Redis pub/sub.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -44,7 +51,7 @@ from jobbers.models.task_routing import RoutingConfig
 from jobbers.utils.serialization import deserialize, serialize
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from pydantic import BaseModel
     from redis.asyncio.client import Pipeline, Redis
@@ -1091,3 +1098,72 @@ class RedisCronDAGScheduler:
                 next_run_at = dt.datetime.fromtimestamp(score, dt.UTC)
                 results.append((entry, next_run_at))
         return results, total
+
+
+# ---------------------------------------------------------------------------
+# RedisCancellationBus — CancellationBusProtocol backed by Redis pub/sub
+# ---------------------------------------------------------------------------
+
+
+class RedisCancellationBus:
+    """CancellationBusProtocol backed by a Redis pub/sub channel."""
+
+    CHANNEL = "task_cancellations"
+
+    def __init__(self, client: Redis) -> None:
+        self._client = client
+
+    async def publish_cancellation(self, task_id: ULID) -> None:
+        await self._client.publish(self.CHANNEL, str(task_id))
+
+    def listen_cancellations(self) -> AsyncGenerator[ULID, None]:
+        return self._listen_gen()
+
+    async def _listen_gen(self) -> AsyncGenerator[ULID, None]:
+        async with self._client.pubsub() as pubsub:
+            await pubsub.subscribe(self.CHANNEL)
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True)
+                if message is not None:
+                    raw = message["data"]
+                    task_id_str = raw.decode() if isinstance(raw, bytes) else raw
+                    try:
+                        yield ULID.from_str(task_id_str)
+                    except Exception:
+                        logger.warning("Invalid task_id in cancellations channel: %r", task_id_str)
+                await asyncio.sleep(0.01)
+
+
+# ---------------------------------------------------------------------------
+# RedisRoutingNotifications — RoutingNotificationProtocol backed by Redis
+# ---------------------------------------------------------------------------
+
+
+class RedisRoutingNotifications:
+    """RoutingNotificationProtocol backed by a Redis key and pub/sub channels."""
+
+    ROUTING_VERSION_KEY = "routing:version"
+    REFRESH_CHANNEL = "queue-config-refresh:{role}".format
+
+    def __init__(self, client: Redis) -> None:
+        self._client = client
+        self._pubsubs: dict[str, Any] = {}
+
+    async def get_routing_version(self) -> ULID | None:
+        raw: bytes | None = await self._client.get(self.ROUTING_VERSION_KEY)
+        return ULID.from_bytes(raw) if raw else None
+
+    async def bump_routing_version(self) -> None:
+        await self._client.set(self.ROUTING_VERSION_KEY, ULID().bytes)
+
+    async def notify_refresh(self, role: str, tag: str) -> None:
+        await self._client.publish(self.REFRESH_CHANNEL(role=role), tag)
+
+    async def poll_refresh_signal(self, role: str) -> bool:
+        if role not in self._pubsubs:
+            ps = self._client.pubsub()
+            await ps.subscribe(self.REFRESH_CHANNEL(role=role))
+            self._pubsubs[role] = ps
+        return bool(
+            await self._pubsubs[role].get_message(ignore_subscribe_messages=True, timeout=0.0)
+        )

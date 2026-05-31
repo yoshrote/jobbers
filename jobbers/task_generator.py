@@ -2,7 +2,7 @@ import asyncio
 import datetime as dt
 import logging
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from opentelemetry import metrics
 
@@ -75,13 +75,6 @@ class TaskGenerator:
         self.refresh_tag: ULID | None = None
         self.routing_version: ULID | None = None
         self._run: bool = True
-        self._refresh_pubsub: Any | None = None
-
-    async def _get_refresh_pubsub(self) -> Any:
-        if self._refresh_pubsub is None:
-            self._refresh_pubsub = self.state_manager.job_store.pubsub()
-            await self._refresh_pubsub.subscribe(f"queue-config-refresh:{self.role}")
-        return self._refresh_pubsub
 
     async def find_queues(self) -> set[str]:
         """Find all queues we should listen to via Redis."""
@@ -114,8 +107,7 @@ class TaskGenerator:
             self.state_manager.invalidate_all_routing_config()
             logger.info("Routing config invalidated at version %s", new_routing_version)
 
-        pubsub = await self._get_refresh_pubsub()
-        if await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.0):
+        if await self.state_manager.poll_refresh_signal(self.role):
             self.refresh_tag = None  # force tag re-read below
 
         new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
@@ -132,7 +124,6 @@ class TaskGenerator:
 
     def stop(self) -> None:
         self._run = False
-        self._refresh_pubsub = None
 
     def __aiter__(self) -> AsyncIterator[Task]:
         return self
