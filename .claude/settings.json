@@ -6,14 +6,15 @@
       "Bash(ruff:*)",
       "Bash(docker-compose ps:*)",
       "Bash(docker run:*)",
-      "Bash(gh issue create:*)",
       "Bash(grep:*)",
-      "Bash(gh api:*)",
       "Bash(git checkout:*)",
-      "Bash(pip install:*)",
       "Bash(python -m pytest:*)",
       "Bash(python -m ruff:*)",
-      "Bash(python -m mypy:*)"
+      "Bash(python -m mypy:*)",
+      "Bash(gh issue create:*)",
+      "Bash(gh api:*)",
+      "Bash(gh pr *)",
+      "Bash(pip list *)"
     ]
   }
 }

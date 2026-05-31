@@ -1,7 +1,6 @@
 {
   "permissions": {
-    "allow": [
-      "Bash(python -m pytest:*)",
+    "allow": [        
       "WebFetch(domain:github.com)",
       "Bash(ls:*)",
       "Bash(dir:*)"
