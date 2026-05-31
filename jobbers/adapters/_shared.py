@@ -1,18 +1,24 @@
 """
-Shared base class for Redis-backed task adapters.
+Shared base classes for Redis-backed task adapters.
 
-`SharedTaskAdapterMixin` is an internal ABC that implements all adapter logic
-identical across the plain-Redis and RedisJSON backends.  It is not part of the
-public adapter API — import concrete classes from `redis` or `redis_json` instead.
+``SharedTaskAdapterMixin`` is an internal ABC that implements all ``TaskStateProtocol``
+and ``AtomicTaskStateProtocol`` logic identical across the plain-Redis and RedisJSON
+backends.  It is not part of the public adapter API.
 
-Concrete adapters implement:
+``_SharedRedisTaskSubmitBase`` is an internal base that implements ``TaskSubmitProtocol``
+(submit_task, submit_rate_limited_task, get_next_task) shared across both Redis backends.
+It requires a ``pack`` callable and a ``get_task`` callable supplied at construction time,
+so the state and submit classes remain independent objects.
+
+Concrete adapters inherit ``SharedTaskAdapterMixin`` and implement:
   - Storage primitives: ``_load_raw``, ``_load_raw_watch``, ``_stage_store``,
     ``_stage_load``
   - Serialization: ``pack``, ``unpack``
-  - Lua script key helpers: ``_extra_submit_keys``, ``_extra_rate_limited_keys``
-  - Lua scripts as class attributes: ``SUBMIT_SCRIPT``,
-    ``SUBMIT_RATE_LIMITED_SCRIPT``
   - Backend-specific queries: ``ensure_index``, ``get_all_tasks``, ``get_dag_run``
+
+Concrete submit classes inherit ``_SharedRedisTaskSubmitBase`` and define:
+  - Lua script class attributes: ``SUBMIT_SCRIPT``, ``SUBMIT_RATE_LIMITED_SCRIPT``
+  - ``_extra_submit_keys``, ``_extra_rate_limited_keys`` if needed
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ tasks_missing_data = metrics.get_meter(__name__).create_counter("tasks_missing_d
 
 
 class SharedTaskAdapterMixin(ABC):
-    """ABC mixin implementing all adapter logic that is identical across backends."""
+    """ABC mixin implementing all TaskStateProtocol/AtomicTaskStateProtocol logic identical across backends."""
 
     # -- key helpers (both implementations use the same Redis key names) ----
     TASKS_BY_QUEUE = "task-queues:{queue}".format
@@ -55,10 +61,6 @@ class SharedTaskAdapterMixin(ABC):
     DLQ_MISSING_DATA = "dlq-missing-data"
     DAG_RUNS = "dag-runs"
     DAG_RUN_TASKS = "dag-run:{dag_run_id}:tasks".format
-
-    # Declared without assignment — mypy requires subclasses to define them.
-    SUBMIT_SCRIPT: ClassVar[str]
-    SUBMIT_RATE_LIMITED_SCRIPT: ClassVar[str]
 
     # Atomically remove task_id from fan-in set and return remaining count.
     # Returns {removed=0, remaining=-1} if the ID was not a member (already
@@ -114,14 +116,6 @@ class SharedTaskAdapterMixin(ABC):
         """Stage the backend's read command for task data onto pipe (Redis-specific)."""
 
     @abstractmethod
-    def _extra_submit_keys(self, task: Task) -> list[str]:
-        """Extra KEYS[] args for SUBMIT_SCRIPT beyond the base 4 keys."""
-
-    @abstractmethod
-    def _extra_rate_limited_keys(self, task: Task) -> list[str]:
-        """Extra KEYS[] args for SUBMIT_RATE_LIMITED_SCRIPT beyond the base 5 keys."""
-
-    @abstractmethod
     async def ensure_index(self) -> None:
         """Create or update any backend search index."""
 
@@ -136,61 +130,6 @@ class SharedTaskAdapterMixin(ABC):
     # ---------------------------------------------------------------------------
     # Shared implementations (identical across all backends)
     # ---------------------------------------------------------------------------
-
-    async def submit_task(self, task: Task) -> bool:
-        """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
-        assert task.submitted_at  # noqa: S101
-        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
-        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
-        extra_keys = self._extra_submit_keys(task)
-        result: int = await cast(
-            "Awaitable[int]",
-            self.data_store.eval(
-                self.SUBMIT_SCRIPT,
-                4 + len(extra_keys),
-                self.TASKS_BY_QUEUE(queue=task.queue),
-                self.TASK_DETAILS(task_id=task.id),
-                self.TASK_BY_TYPE_IDX(name=task.name),
-                self.DAG_RUNS,
-                *extra_keys,
-                task.submitted_at.timestamp(),
-                bytes(task.id),
-                is_active,
-                self.pack(task),
-                dag_run_id_bytes,
-            ),
-        )
-        return result == 1
-
-    async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
-        """Atomically check the rate limit and enqueue the task if there is room."""
-        assert task.submitted_at  # noqa: S101
-        now = dt.datetime.now(dt.UTC)
-        earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
-        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
-        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
-        extra_keys = self._extra_rate_limited_keys(task)
-        result: int = await cast(
-            "Awaitable[int]",
-            self.data_store.eval(
-                self.SUBMIT_RATE_LIMITED_SCRIPT,
-                5 + len(extra_keys),
-                self.QUEUE_RATE_LIMITER(queue=task.queue),
-                self.TASKS_BY_QUEUE(queue=task.queue),
-                self.TASK_DETAILS(task_id=task.id),
-                self.TASK_BY_TYPE_IDX(name=task.name),
-                self.DAG_RUNS,
-                *extra_keys,
-                earliest_time.timestamp(),
-                queue_config.rate_numerator or 0,
-                task.submitted_at.timestamp(),
-                bytes(task.id),
-                is_active,
-                self.pack(task),
-                dag_run_id_bytes,
-            ),
-        )
-        return result == 1
 
     def stage_save(self, pipe: TransactionHandle, task: Task) -> None:
         """Queue task-details write + type-index update onto pipe (no execute)."""
@@ -473,26 +412,6 @@ class SharedTaskAdapterMixin(ABC):
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
         return does_exists == 1
 
-    async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
-        """Get the next task from the queues in order of priority."""
-        task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
-        while pop_result := await self.data_store.bzpopmin(task_queues, timeout=pop_timeout):
-            queue_name, task_id_bytes, _ = pop_result
-            logger.debug("Popped task %s from %s", task_id_bytes, queue_name)
-            task = await self.get_task(ULID.from_bytes(task_id_bytes))
-            if task:
-                return task
-            logger.error(
-                "Task %s popped from queue but data not found; adding to %s",
-                task_id_bytes,
-                self.DLQ_MISSING_DATA,
-            )
-            tasks_missing_data.add(1)
-            now = dt.datetime.now(dt.UTC)
-            await self.data_store.zadd(self.DLQ_MISSING_DATA, {task_id_bytes: now.timestamp()})
-        logger.info("task query timed out")
-        return None
-
     async def clean(
         self,
         queues: set[bytes],
@@ -530,3 +449,118 @@ class SharedTaskAdapterMixin(ABC):
         if task:
             results.append(task)
         return results
+
+
+class _SharedRedisTaskSubmitBase:
+    """
+    Shared TaskSubmitProtocol implementation for both Redis backends.
+
+    Concrete submit classes define ``SUBMIT_SCRIPT`` and ``SUBMIT_RATE_LIMITED_SCRIPT``
+    as class attributes and override ``_extra_submit_keys`` / ``_extra_rate_limited_keys``
+    when the backend needs additional Lua KEYS arguments.
+    """
+
+    SUBMIT_SCRIPT: ClassVar[str]
+    SUBMIT_RATE_LIMITED_SCRIPT: ClassVar[str]
+
+    # Key constants — identical to SharedTaskAdapterMixin's constants.
+    TASKS_BY_QUEUE = "task-queues:{queue}".format
+    TASK_DETAILS = "task:{task_id}".format
+    TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
+    QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
+    DAG_RUNS = "dag-runs"
+    DAG_RUN_TASKS = "dag-run:{dag_run_id}:tasks".format
+    DLQ_MISSING_DATA = "dlq-missing-data"
+
+    def __init__(
+        self,
+        data_store: Redis,
+        pack: Callable[[Task], str | bytes],
+        get_task: Callable[[ULID], Awaitable[Task | None]],
+    ) -> None:
+        self._data_store = data_store
+        self._pack_fn = pack
+        self._get_task_fn = get_task
+
+    def _extra_submit_keys(self, task: Task) -> list[str]:
+        """Extra KEYS[] args for SUBMIT_SCRIPT beyond the base 4 keys."""
+        return []
+
+    def _extra_rate_limited_keys(self, task: Task) -> list[str]:
+        """Extra KEYS[] args for SUBMIT_RATE_LIMITED_SCRIPT beyond the base 5 keys."""
+        return []
+
+    async def submit_task(self, task: Task) -> bool:
+        """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
+        assert task.submitted_at  # noqa: S101
+        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
+        extra_keys = self._extra_submit_keys(task)
+        result: int = await cast(
+            "Awaitable[int]",
+            self._data_store.eval(
+                self.SUBMIT_SCRIPT,
+                4 + len(extra_keys),
+                self.TASKS_BY_QUEUE(queue=task.queue),
+                self.TASK_DETAILS(task_id=task.id),
+                self.TASK_BY_TYPE_IDX(name=task.name),
+                self.DAG_RUNS,
+                *extra_keys,
+                task.submitted_at.timestamp(),
+                bytes(task.id),
+                is_active,
+                self._pack_fn(task),
+                dag_run_id_bytes,
+            ),
+        )
+        return result == 1
+
+    async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
+        """Atomically check the rate limit and enqueue the task if there is room."""
+        assert task.submitted_at  # noqa: S101
+        now = dt.datetime.now(dt.UTC)
+        earliest_time = now - dt.timedelta(seconds=queue_config.period_in_seconds() or 0)
+        is_active = "1" if task.status in TaskStatus.active_statuses() else "0"
+        dag_run_id_bytes = bytes(task.dag_run_id) if task.dag_run_id is not None else b""
+        extra_keys = self._extra_rate_limited_keys(task)
+        result: int = await cast(
+            "Awaitable[int]",
+            self._data_store.eval(
+                self.SUBMIT_RATE_LIMITED_SCRIPT,
+                5 + len(extra_keys),
+                self.QUEUE_RATE_LIMITER(queue=task.queue),
+                self.TASKS_BY_QUEUE(queue=task.queue),
+                self.TASK_DETAILS(task_id=task.id),
+                self.TASK_BY_TYPE_IDX(name=task.name),
+                self.DAG_RUNS,
+                *extra_keys,
+                earliest_time.timestamp(),
+                queue_config.rate_numerator or 0,
+                task.submitted_at.timestamp(),
+                bytes(task.id),
+                is_active,
+                self._pack_fn(task),
+                dag_run_id_bytes,
+            ),
+        )
+        return result == 1
+
+    async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
+        """Get the next task from the queues in order of priority."""
+        task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
+        while pop_result := await self._data_store.bzpopmin(task_queues, timeout=pop_timeout):
+            queue_name, task_id_bytes, _ = pop_result
+            logger.debug("Popped task %s from %s", task_id_bytes, queue_name)
+            task = await self._get_task_fn(ULID.from_bytes(task_id_bytes))
+            if task:
+                return task
+            logger.error(
+                "Task %s popped from queue but data not found; adding to %s",
+                task_id_bytes,
+                self.DLQ_MISSING_DATA,
+            )
+            tasks_missing_data.add(1)
+            now = dt.datetime.now(dt.UTC)
+            await self._data_store.zadd(self.DLQ_MISSING_DATA, {task_id_bytes: now.timestamp()})
+        logger.info("task query timed out")
+        return None

@@ -7,7 +7,14 @@ import redis.asyncio as redis
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
-from jobbers.adapters import RedisDeadQueue, RedisJSONDeadQueue, RedisJSONTaskAdapter, RedisTaskAdapter
+from jobbers.adapters import (
+    RedisDeadQueue,
+    RedisJSONDeadQueue,
+    RedisJSONTaskState,
+    RedisJSONTaskSubmit,
+    RedisTaskState,
+    RedisTaskSubmit,
+)
 from jobbers.adapters.redis import RedisCronDAGScheduler, RedisRoutingBackend, RedisTaskScheduler
 from jobbers.adapters.redis_json import RedisJSONRoutingBackend
 from jobbers.adapters.sql import SQLRoutingBackend
@@ -78,11 +85,20 @@ async def close_sqlite_conn() -> None:
         _session_factory = None
 
 
-def create_task_adapter(client: redis.Redis) -> RedisTaskAdapter | RedisJSONTaskAdapter:
-    """Create a Redis TaskAdapter based on the TASK_ADAPTER_BACKEND variable."""
+def create_redis_task_state(client: redis.Redis) -> RedisTaskState | RedisJSONTaskState:
+    """Create the Redis task state adapter for the configured backend."""
     if TASK_ADAPTER_BACKEND == "msgpack":
-        return RedisTaskAdapter(client)
-    return RedisJSONTaskAdapter(client)
+        return RedisTaskState(client)
+    return RedisJSONTaskState(client)
+
+
+def create_redis_task_submit(
+    client: redis.Redis, state: RedisTaskState | RedisJSONTaskState
+) -> RedisTaskSubmit | RedisJSONTaskSubmit:
+    """Create the Redis task submit adapter paired with the given state adapter."""
+    if isinstance(state, RedisTaskState):
+        return RedisTaskSubmit(client, state)
+    return RedisJSONTaskSubmit(client, state)
 
 
 def create_dead_queue(client: redis.Redis, task_adapter: TaskStateProtocol) -> DeadQueueProtocol:
@@ -174,20 +190,18 @@ async def init_state_manager() -> StateManager:
 
     routing_backend = await _create_routing_backend(client)
 
-    # Task state adapter (blob persistence)
+    # Task state adapter (blob persistence) + submit adapter (enqueue/pop)
     task_submit: TaskSubmitProtocol
     if TASK_BACKEND == "sql":
-        from jobbers.adapters.sql import SQLTaskAdapter
+        from jobbers.adapters.sql import SQLTaskState, SQLTaskSubmit
 
         sf = await _get_or_create_sql(needed_sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
-        _task_adapter = SQLTaskAdapter(sf, dsn=dsn)
-        # SQL adapter handles its own submit/pop; Redis adapter used only for routing/queue ops
-        task_submit = _task_adapter
+        _task_adapter = SQLTaskState(sf, dsn=dsn)
+        task_submit = SQLTaskSubmit(sf, dsn=dsn)
     else:
-        redis_adapter = create_task_adapter(client)
-        _task_adapter = redis_adapter
-        task_submit = redis_adapter
+        _task_adapter = create_redis_task_state(client)
+        task_submit = create_redis_task_submit(client, _task_adapter)
 
     # Dead-letter queue
     if DLQ_BACKEND == "sql":

@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from ulid import ULID
 
 from jobbers.adapters._shared import SharedTaskAdapterMixin
-from jobbers.adapters.redis import RedisCronDAGScheduler, RedisDeadQueue, RedisTaskAdapter, RedisTaskScheduler
-from jobbers.adapters.redis_json import RedisJSONTaskAdapter
+from jobbers.adapters.redis import RedisCronDAGScheduler, RedisDeadQueue, RedisTaskScheduler, RedisTaskState, RedisTaskSubmit
+from jobbers.adapters.redis_json import RedisJSONTaskState, RedisJSONTaskSubmit
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.migrations.runner import run_migrations
 from jobbers.models.queue_config import QueueConfig
@@ -25,10 +25,14 @@ async def redis():
     await fake_store.close()
 
 
-@pytest.fixture(params=[RedisJSONTaskAdapter, RedisTaskAdapter], ids=["redis_json", "redis"])
+@pytest.fixture(params=["redis_json", "redis"], ids=["redis_json", "redis"])
 def task_adapter(redis, request):
-    """Fixture providing a task adapter instance parametrized over all implementations."""
-    return request.param(redis)
+    """Fixture providing a (state, submit) pair parametrized over both Redis implementations."""
+    if request.param == "redis":
+        state = RedisTaskState(redis)
+        return state, RedisTaskSubmit(redis, state)
+    state_json = RedisJSONTaskState(redis)
+    return state_json, RedisJSONTaskSubmit(redis, state_json)
 
 
 @pytest_asyncio.fixture
@@ -58,15 +62,16 @@ async def state_manager(redis, dummy_routing_backend, dummy_task_adapter):
 
 @pytest_asyncio.fixture
 async def state_manager_real_ta(redis, dummy_routing_backend):
-    """StateManager backed by RedisTaskAdapter + DummyRoutingBackend for tests that exercise the full adapter call path."""
-    ta = RedisTaskAdapter(redis)
+    """StateManager backed by RedisTaskState/RedisTaskSubmit + DummyRoutingBackend for tests that exercise the full adapter call path."""
+    task_state = RedisTaskState(redis)
+    task_submit = RedisTaskSubmit(redis, task_state)
     sm = StateManager(
         redis,
         dummy_routing_backend,
-        task_state=ta,
-        task_submit=ta,
-        dead_queue=RedisDeadQueue(redis, ta),
-        task_scheduler=RedisTaskScheduler(redis, ta, dummy_routing_backend.get_all_queues),
+        task_state=task_state,
+        task_submit=task_submit,
+        dead_queue=RedisDeadQueue(redis, task_state),
+        task_scheduler=RedisTaskScheduler(redis, task_state, dummy_routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
     )
     sm.get_queue_config = sm.routing.get_queue_config

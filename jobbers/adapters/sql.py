@@ -1,13 +1,18 @@
 """
-SQLAlchemy-backed routing sub-adapters, routing backend, task adapter, dead-letter queue, and cron DAG scheduler.
+SQLAlchemy-backed routing sub-adapters, routing backend, task adapters, dead-letter queue, and cron DAG scheduler.
 
 Routing sub-adapters:
 - `SQLQueueConfigAdapter` — queue/role config and refresh tags in SQL tables.
 - `SQLTaskRoutingConfigAdapter` — task routing config in the ``task_routing`` table.
 - `SQLRoutingBackend` — composes the two sub-adapters to satisfy RoutingBackendProtocol.
 
-Task storage / dead-letter queue:
-- `SQLTaskAdapter` — stores tasks in the ``tasks`` / ``task_queue`` / ``task_fan_in`` / ``dag_runs`` tables.
+Task storage:
+- `SQLTaskState` — stores tasks in the ``tasks`` / ``task_queue`` / ``task_fan_in`` / ``dag_runs`` tables;
+  implements ``TaskStateProtocol`` and ``AtomicTaskStateProtocol``.
+- `SQLTaskSubmit` — submit/pop operations backed by the ``tasks`` and ``task_queue`` tables;
+  implements ``TaskSubmitProtocol``.
+
+Dead-letter queue:
 - `SQLDeadQueue` — dead-letter queue backed by the ``dead_letter_queue`` table.
 
 Task scheduler:
@@ -369,7 +374,7 @@ class SQLRoutingBackend:
 
 
 # ---------------------------------------------------------------------------
-# SQLTaskAdapter  (SQLAlchemy: tasks / task_fan_in / dag_runs tables)
+# SQLTaskState  (SQLAlchemy: tasks / task_fan_in / dag_runs tables)
 # ---------------------------------------------------------------------------
 
 _TERMINAL_STATUSES = frozenset(
@@ -456,13 +461,13 @@ async def _upsert_task(session: AsyncSession, row: dict[str, Any]) -> None:
         await session.execute(insert(tasks).values(**row))
 
 
-class SQLTaskAdapter:
+class SQLTaskState:
     """
-    Task adapter backed by SQLAlchemy (``tasks`` / ``task_fan_in`` / ``dag_runs``).
+    TaskStateProtocol + AtomicTaskStateProtocol backed by SQLAlchemy.
 
-    Implements ``AtomicTaskStateProtocol`` using ``SQLTransactionBatch``.  Pass
-    ``force_saga=True`` to ``StateManager`` when using this adapter to avoid
-    the Redis-specific code paths in the atomic pipeline.
+    Tables: ``tasks`` / ``task_fan_in`` / ``dag_runs``.  Uses ``SQLTransactionBatch``
+    for the atomic pipeline path.  Pass ``force_saga=True`` to ``StateManager`` when
+    using this adapter to avoid Redis-specific code paths in the atomic pipeline.
     """
 
     # Key-helper stubs: present for structural compatibility with AtomicTaskStateProtocol
@@ -682,35 +687,6 @@ class SQLTaskAdapter:
             result = await session.execute(stmt)
             return [_row_to_task(row) for row in result.all()]
 
-    async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
-        """
-        Atomically pop and return the oldest queued task from any of the given queues.
-
-        Non-blocking: ``pop_timeout`` is ignored.  Removes the entry from ``task_queue``
-        so subsequent calls will not return the same task.
-        """
-        if not queues:
-            return None
-        async with self._sf() as session:
-            async with session.begin():
-                stmt = (
-                    select(task_queue.c.task_id)
-                    .where(task_queue.c.queue.in_(queues))
-                    .order_by(task_queue.c.submitted_at)
-                    .limit(1)
-                )
-                if self._use_for_update:
-                    stmt = stmt.with_for_update(skip_locked=True)
-                result = await session.execute(stmt)
-                row = result.first()
-                if row is None:
-                    return None
-                task_id_str = row.task_id
-                await session.execute(delete(task_queue).where(task_queue.c.task_id == task_id_str))
-                task_result = await session.execute(select(tasks).where(tasks.c.id == task_id_str))
-                task_row = task_result.first()
-                return _row_to_task(task_row) if task_row is not None else None
-
     async def update_task_heartbeat(self, task: Task) -> None:
         assert task.heartbeat_at  # noqa: S101
         async with self._sf() as session:
@@ -863,7 +839,60 @@ class SQLTaskAdapter:
                     )
                 )
 
-    # ── TaskSubmitProtocol: submit and pop ──────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# SQLTaskSubmit  (SQLAlchemy: tasks + task_queue tables — TaskSubmitProtocol)
+# ---------------------------------------------------------------------------
+
+
+class SQLTaskSubmit:
+    """
+    TaskSubmitProtocol backed by SQLAlchemy.
+
+    Tables: ``tasks`` and ``task_queue``.  Each submit/pop is a single transaction.
+    Requires the same session factory as the paired ``SQLTaskState``.
+    """
+
+    # Key-helper stubs for structural compatibility with RedisTaskState.
+    TASKS_BY_QUEUE = "task-queues:{queue}".format
+    TASK_DETAILS = "task:{task_id}".format
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], dsn: str = "") -> None:
+        self._sf = session_factory
+        self._dsn = dsn
+
+    @property
+    def _use_for_update(self) -> bool:
+        return "sqlite" not in self._dsn
+
+    async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
+        """
+        Atomically pop and return the oldest queued task from any of the given queues.
+
+        Non-blocking: ``pop_timeout`` is ignored.  Removes the entry from ``task_queue``
+        so subsequent calls will not return the same task.
+        """
+        if not queues:
+            return None
+        async with self._sf() as session:
+            async with session.begin():
+                stmt = (
+                    select(task_queue.c.task_id)
+                    .where(task_queue.c.queue.in_(queues))
+                    .order_by(task_queue.c.submitted_at)
+                    .limit(1)
+                )
+                if self._use_for_update:
+                    stmt = stmt.with_for_update(skip_locked=True)
+                result = await session.execute(stmt)
+                row = result.first()
+                if row is None:
+                    return None
+                task_id_str = row.task_id
+                await session.execute(delete(task_queue).where(task_queue.c.task_id == task_id_str))
+                task_result = await session.execute(select(tasks).where(tasks.c.id == task_id_str))
+                task_row = task_result.first()
+                return _row_to_task(task_row) if task_row is not None else None
 
     async def submit_task(self, task: Task) -> bool:
         """Submit a task directly (non-staged)."""
@@ -899,7 +928,7 @@ class SQLTaskAdapter:
 
     async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
         """Rate-limited submit is not implemented for the SQL adapter."""
-        raise NotImplementedError("SQLTaskAdapter does not support rate-limited submission")
+        raise NotImplementedError("SQLTaskSubmit does not support rate-limited submission")
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 """
-RedisTaskAdapter- and RedisRedisDeadQueue-specific edge cases not covered by protocol contract tests.
+RedisTaskState- and RedisDeadQueue-specific edge cases not covered by protocol contract tests.
 
 Both implementations live in ``jobbers/adapters/redis.py`` and share a FakeAsyncRedis fixture.
 
@@ -70,10 +70,11 @@ async def test_get_all_tasks_filter_pagination_page_size_is_unpredictable(
     b2 = make_task(ULID2, name="task_b", submitted_at=FROZEN_TIME + dt.timedelta(seconds=1))
     a1 = make_task(ULID3, name="task_a", submitted_at=FROZEN_TIME + dt.timedelta(seconds=2))
     a2 = make_task(ULID4, name="task_a", submitted_at=FROZEN_TIME + dt.timedelta(seconds=3))
+    state, submit = msgpack_adapter
     for t in (b1, b2, a1, a2):
-        await msgpack_adapter.submit_task(t)
+        await submit.submit_task(t)
 
-    page1 = await msgpack_adapter.get_all_tasks(
+    page1 = await state.get_all_tasks(
         TaskPagination(
             queue="default",
             task_name="task_a",
@@ -82,7 +83,7 @@ async def test_get_all_tasks_filter_pagination_page_size_is_unpredictable(
             order_by=PaginationOrder.SUBMITTED_AT,
         )
     )
-    page2 = await msgpack_adapter.get_all_tasks(
+    page2 = await state.get_all_tasks(
         TaskPagination(
             queue="default",
             task_name="task_a",
@@ -119,15 +120,16 @@ async def test_get_all_tasks_task_id_order(msgpack_adapter):
     t1 = make_task(ULID1, submitted_at=FROZEN_TIME + dt.timedelta(seconds=2))
     t2 = make_task(ULID2, submitted_at=FROZEN_TIME + dt.timedelta(seconds=1))
     t3 = make_task(ULID3, submitted_at=FROZEN_TIME)
+    state, submit = msgpack_adapter
     for t in (t1, t2, t3):
-        await msgpack_adapter.submit_task(t)
+        await submit.submit_task(t)
 
-    results = await msgpack_adapter.get_all_tasks(
+    results = await state.get_all_tasks(
         TaskPagination(queue="default", order_by=PaginationOrder.SUBMITTED_AT)
     )
     assert [r.id for r in results] == [ULID3, ULID2, ULID1]
 
-    results = await msgpack_adapter.get_all_tasks(
+    results = await state.get_all_tasks(
         TaskPagination(queue="default", order_by=PaginationOrder.TASK_ID)
     )
     assert [r.id for r in results] == [ULID1, ULID2, ULID3]
@@ -139,18 +141,20 @@ async def test_get_all_tasks_task_id_order(msgpack_adapter):
 @pytest.mark.asyncio
 async def test_clean_terminal_tasks_skips_none_blob(msgpack_adapter, redis):
     """A task:* key that returns no data is silently skipped."""
+    state, submit = msgpack_adapter
     await redis.set("task:ghost", b"")
     await redis.delete("task:ghost")
     await redis.set("task:placeholder", b"data")
     await redis.delete("task:placeholder")
-    await msgpack_adapter.clean_terminal_tasks(dt.datetime.now(dt.UTC), dt.timedelta(days=1))
+    await state.clean_terminal_tasks(dt.datetime.now(dt.UTC), dt.timedelta(days=1))
 
 
 @pytest.mark.asyncio
 async def test_clean_terminal_tasks_skips_non_ulid_keys(msgpack_adapter, redis):
     """A task:* key whose suffix is not a valid ULID is skipped without error."""
+    state, submit = msgpack_adapter
     await redis.set("task:not_a_valid_ulid_at_all", b"some data")
-    await msgpack_adapter.clean_terminal_tasks(dt.datetime.now(dt.UTC), dt.timedelta(days=1))
+    await state.clean_terminal_tasks(dt.datetime.now(dt.UTC), dt.timedelta(days=1))
     assert await redis.exists("task:not_a_valid_ulid_at_all")
 
 
@@ -195,23 +199,25 @@ async def test_clean_handles_missing_meta(msgpack_dead_queue):
 @pytest.mark.asyncio
 async def test_pack_includes_cron_id(msgpack_adapter):
     """pack() includes cron_id when set; unpack() round-trips it correctly."""
+    state, submit = msgpack_adapter
     task = make_task(task_id=ULID1)
     cron_id = ULID()
     task.cron_id = cron_id
-    packed = msgpack_adapter.pack(task)
-    unpacked = msgpack_adapter.unpack(task.id, packed)
+    packed = state.pack(task)
+    unpacked = state.unpack(task.id, packed)
     assert unpacked.cron_id == cron_id
 
 
 @pytest.mark.asyncio
 async def test_clean_dag_runs_skips_invalid_ulid_bytes(msgpack_adapter):
     """clean_dag_runs silently skips sorted-set entries whose bytes cannot be parsed as a ULID."""
+    state, submit = msgpack_adapter
     # ULID.from_bytes() expects exactly 16 bytes; use fewer to guarantee a ValueError
     invalid_bytes = b"bad"
     old_score = (FROZEN_TIME - dt.timedelta(days=10)).timestamp()
-    await msgpack_adapter.data_store.zadd(msgpack_adapter.DAG_RUNS, {invalid_bytes: old_score})
+    await state.data_store.zadd(state.DAG_RUNS, {invalid_bytes: old_score})
 
-    await msgpack_adapter.clean_dag_runs(FROZEN_TIME, dt.timedelta(seconds=1))
+    await state.clean_dag_runs(FROZEN_TIME, dt.timedelta(seconds=1))
 
-    score = await msgpack_adapter.data_store.zscore(msgpack_adapter.DAG_RUNS, invalid_bytes)
+    score = await state.data_store.zscore(state.DAG_RUNS, invalid_bytes)
     assert score is None

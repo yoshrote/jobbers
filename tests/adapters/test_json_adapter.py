@@ -1,5 +1,5 @@
 """
-RedisJSONTaskAdapter- and RedisJSONDeadQueue-specific edge cases not covered by protocol contract tests.
+RedisJSONTaskState- and RedisJSONDeadQueue-specific edge cases not covered by protocol contract tests.
 
 Contract tests live in test_task_adapter_common.py and test_dead_queue_common.py
 and run against all adapter implementations via parametrized fixtures.
@@ -64,14 +64,15 @@ async def test_clean_terminal_tasks_skips_none_json_blob(json_adapter):
     """
     A task:* key whose JSON document is null is silently skipped.
 
-    Covers the ``if task_data is None: continue`` guard in RedisJSONTaskAdapter.clean_terminal_tasks.
+    Covers the ``if task_data is None: continue`` guard in RedisJSONTaskState.clean_terminal_tasks.
     In production this guard protects against race conditions (key deleted between scan and
     JSON.GET), but can be triggered deterministically by storing a null root document.
     """
+    state, submit = json_adapter
     key = f"task:{ULID1}"
-    await json_adapter.data_store.json().set(key, "$", None)
+    await state.data_store.json().set(key, "$", None)
     # Should not raise even though the JSON value is null
-    await json_adapter.clean_terminal_tasks(dt.datetime.now(dt.UTC), dt.timedelta(days=1))
+    await state.clean_terminal_tasks(dt.datetime.now(dt.UTC), dt.timedelta(days=1))
 
 
 # ── get_all_tasks: missing blob (race-condition guard) ────────────────────────
@@ -86,11 +87,12 @@ async def test_get_all_tasks_missing_blob_is_skipped(json_adapter):
     document reference but the underlying key has been deleted.  We simulate it
     by patching get_task to return None after the search index has been populated.
     """
+    state, submit = json_adapter
     task = make_task()
-    await json_adapter.submit_task(task)
+    await submit.submit_task(task)
 
-    with patch.object(json_adapter, "get_task", new_callable=AsyncMock, return_value=None):
-        results = await json_adapter.get_all_tasks(TaskPagination(queue="default"))
+    with patch.object(state, "get_task", new_callable=AsyncMock, return_value=None):
+        results = await state.get_all_tasks(TaskPagination(queue="default"))
 
     assert results == []
 
@@ -119,12 +121,13 @@ async def test_get_by_filter_skips_missing_task_blob(json_dead_queue):
 @pytest.mark.asyncio
 async def test_get_by_filter_sorted_by_failed_at_desc(json_dead_queue, json_adapter):
     """RedisJSONDeadQueue returns get_by_filter results sorted by failed_at descending (most recent first)."""
+    state, submit = json_adapter
     earlier = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
     later = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
     t1 = make_failed_task(task_id=ULID1)
     t2 = make_failed_task(task_id=ULID2)
-    await json_adapter.save_task(t1)
-    await json_adapter.save_task(t2)
+    await state.save_task(t1)
+    await state.save_task(t2)
     await add_to_dlq(json_dead_queue, t1, earlier)
     await add_to_dlq(json_dead_queue, t2, later)
 
@@ -139,10 +142,11 @@ async def test_get_by_filter_sorted_by_failed_at_desc(json_dead_queue, json_adap
 @pytest.mark.asyncio
 async def test_ensure_index_reraises_non_duplicate_error(json_adapter):
     """ensure_index re-raises ResponseError from alter_schema_add when the message is not 'duplicate'."""
+    state, submit = json_adapter
     mock_search = MagicMock()
     mock_search.info = AsyncMock(return_value={"attributes": []})
     mock_search.alter_schema_add = AsyncMock(side_effect=ResponseError("ERR: unknown field type"))
 
-    with patch.object(json_adapter.data_store, "ft", return_value=mock_search):
+    with patch.object(state.data_store, "ft", return_value=mock_search):
         with pytest.raises(ResponseError, match="unknown field type"):
-            await json_adapter.ensure_index()
+            await state.ensure_index()

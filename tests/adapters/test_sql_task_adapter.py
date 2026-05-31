@@ -1,5 +1,5 @@
 """
-SQL-specific tests for SQLTaskAdapter.
+SQL-specific tests for SQLTaskState and SQLTaskSubmit.
 
 Tests the atomic pipeline path (stage_* methods via SQLTransactionBatch),
 verified through the public saga API rather than raw DB queries.
@@ -10,7 +10,7 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.sql import SQLTaskAdapter
+from jobbers.adapters.sql import SQLTaskState, SQLTaskSubmit
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
@@ -38,7 +38,8 @@ def make_task(
 @pytest.mark.asyncio
 async def test_stage_submit_task_persists_and_retrieves(session_factory):
     """stage_submit_task inside a SQLTransactionBatch persists the task."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     task = make_task()
     pipe = adapter.pipeline(transaction=True)
     adapter.stage_submit_task(pipe, task)
@@ -53,7 +54,8 @@ async def test_stage_submit_task_persists_and_retrieves(session_factory):
 @pytest.mark.asyncio
 async def test_stage_submit_task_appears_in_queue(session_factory):
     """A task staged via stage_submit_task is returned by get_all_tasks."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     task = make_task()
     pipe = adapter.pipeline(transaction=True)
     adapter.stage_submit_task(pipe, task)
@@ -69,7 +71,8 @@ async def test_stage_submit_task_appears_in_queue(session_factory):
 @pytest.mark.asyncio
 async def test_stage_requeue_persists_and_retrieves(session_factory):
     """stage_requeue inside a SQLTransactionBatch persists the task."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     task = make_task()
     pipe = adapter.pipeline(transaction=True)
     adapter.stage_requeue(pipe, task)
@@ -86,16 +89,17 @@ async def test_stage_requeue_persists_and_retrieves(session_factory):
 @pytest.mark.asyncio
 async def test_stage_remove_from_queue_removes_from_queue(session_factory):
     """stage_remove_from_queue removes the task from task_queue; tasks record is preserved."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     task = make_task()
-    await adapter.submit_task(task)
+    await adapter_submit.submit_task(task)
 
     pipe = adapter.pipeline(transaction=True)
     adapter.stage_remove_from_queue(pipe, task)
     await pipe.execute()
 
     assert await adapter.task_exists(ULID1)  # historic record survives
-    assert await adapter.get_next_task(queues={"default"}, pop_timeout=1) is None  # no longer queued
+    assert await adapter_submit.get_next_task(queues={"default"}, pop_timeout=1) is None  # no longer queued
 
 
 # ── stage_save ────────────────────────────────────────────────────────────────
@@ -104,7 +108,8 @@ async def test_stage_remove_from_queue_removes_from_queue(session_factory):
 @pytest.mark.asyncio
 async def test_stage_save_upserts(session_factory):
     """stage_save called twice with an updated name reflects the latest version."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     task = make_task()
     pipe = adapter.pipeline(transaction=True)
     adapter.stage_save(pipe, task)
@@ -126,7 +131,8 @@ async def test_stage_save_upserts(session_factory):
 @pytest.mark.asyncio
 async def test_stage_init_fan_in_creates_members(session_factory):
     """stage_init_fan_in via SQLTransactionBatch → get_fan_in_members returns the set."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     fan_in_key = "fan-in:sql-test"
     predecessor_ids = {ULID1, ULID2, ULID3}
 
@@ -147,11 +153,12 @@ async def test_stage_init_fan_in_creates_members(session_factory):
 @pytest.mark.asyncio
 async def test_clean_max_queue_age_removes_old_tasks(session_factory):
     """clean(max_queue_age) removes tasks submitted at or before the cutoff."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     old = make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(days=2))
     recent = make_task(ULID2, submitted_at=FROZEN_TIME)
-    await adapter.submit_task(old)
-    await adapter.submit_task(recent)
+    await adapter_submit.submit_task(old)
+    await adapter_submit.submit_task(recent)
 
     cutoff = FROZEN_TIME - dt.timedelta(days=1)
     await adapter.clean(queues={b"default"}, now=FROZEN_TIME, max_queue_age=cutoff)
@@ -164,11 +171,12 @@ async def test_clean_max_queue_age_removes_old_tasks(session_factory):
 @pytest.mark.asyncio
 async def test_clean_min_queue_age_removes_recent_tasks(session_factory):
     """clean(min_queue_age) removes tasks submitted at or after the floor."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     old = make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(days=10))
     recent = make_task(ULID2, submitted_at=FROZEN_TIME)
-    await adapter.submit_task(old)
-    await adapter.submit_task(recent)
+    await adapter_submit.submit_task(old)
+    await adapter_submit.submit_task(recent)
 
     floor = FROZEN_TIME - dt.timedelta(days=1)
     await adapter.clean(queues={b"default"}, now=FROZEN_TIME, min_queue_age=floor)
@@ -181,9 +189,10 @@ async def test_clean_min_queue_age_removes_recent_tasks(session_factory):
 @pytest.mark.asyncio
 async def test_clean_noop_when_no_age_params(session_factory):
     """clean() with no age params is a no-op; all tasks remain."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     task = make_task()
-    await adapter.submit_task(task)
+    await adapter_submit.submit_task(task)
 
     await adapter.clean(queues={b"default"}, now=dt.datetime.now(dt.UTC))
 
@@ -196,7 +205,8 @@ async def test_clean_noop_when_no_age_params(session_factory):
 @pytest.mark.asyncio
 async def test_multiple_stages_commit_atomically(session_factory):
     """All ops staged in one pipeline are committed together."""
-    adapter = SQLTaskAdapter(session_factory)
+    adapter = SQLTaskState(session_factory)
+    adapter_submit = SQLTaskSubmit(session_factory)
     t1 = make_task(ULID1, name="task_a")
     t2 = make_task(ULID2, name="task_b")
 

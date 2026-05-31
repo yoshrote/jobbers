@@ -7,7 +7,7 @@ import pytest_asyncio
 from ulid import ULID
 
 import end2end
-from jobbers.adapters.redis import RedisCronDAGScheduler, RedisDeadQueue, RedisTaskAdapter, RedisTaskScheduler
+from jobbers.adapters.redis import RedisCronDAGScheduler, RedisDeadQueue, RedisTaskScheduler, RedisTaskState, RedisTaskSubmit
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_status import TaskStatus
@@ -31,14 +31,15 @@ def register_e2e_tasks():
 async def sm(redis, session_factory):
     await SQLQueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
     routing_backend = SQLRoutingBackend(session_factory)
-    ta = RedisTaskAdapter(redis)
+    task_state = RedisTaskState(redis)
+    task_submit = RedisTaskSubmit(redis, task_state)
     return StateManager(
         redis,
         routing_backend,
-        task_state=ta,
-        task_submit=ta,
-        dead_queue=RedisDeadQueue(redis, ta),
-        task_scheduler=RedisTaskScheduler(redis, ta, routing_backend.get_all_queues),
+        task_state=task_state,
+        task_submit=task_submit,
+        dead_queue=RedisDeadQueue(redis, task_state),
+        task_scheduler=RedisTaskScheduler(redis, task_state, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
     )
 

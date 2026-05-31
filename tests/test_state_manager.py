@@ -94,7 +94,7 @@ async def test_get_next_task_skips_missing_data_and_returns_valid(redis, state_m
 
     # missing_id has score=1 so it is popped first; FROZEN_TIME >> 1 so valid_task is popped second
     await redis.zadd("task-queues:queue1", {missing_id.bytes: 1})
-    await state_manager_real_ta.task_state.submit_task(valid_task)
+    await state_manager_real_ta.task_submit.submit_task(valid_task)
 
     task = await state_manager_real_ta.get_next_task(["queue1"], pop_timeout=1)
 

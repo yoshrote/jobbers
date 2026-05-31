@@ -4,9 +4,12 @@ Pluggable adapters for task storage, dead letter queue, routing config, and cron
 Task storage:
 - `TaskStateProtocol` — task blob persistence interface.
 - `TaskSubmitProtocol` — composite submit/pop interface (requires co-located state + queue).
-- `RedisTaskAdapter` — plain Redis backend (msgpack binary strings).
-- `RedisJSONTaskAdapter` — Redis Stack backend (RedisJSON + RediSearch).
-- `SQLTaskAdapter` — SQLAlchemy backend (tasks / task_fan_in / dag_runs tables).
+- `RedisTaskState` — plain Redis backend (msgpack); implements TaskStateProtocol + AtomicTaskStateProtocol.
+- `RedisTaskSubmit` — plain Redis backend (msgpack); implements TaskSubmitProtocol.
+- `RedisJSONTaskState` — Redis Stack backend (RedisJSON + RediSearch); implements TaskStateProtocol + AtomicTaskStateProtocol.
+- `RedisJSONTaskSubmit` — Redis Stack backend (RedisJSON + RediSearch); implements TaskSubmitProtocol.
+- `SQLTaskState` — SQLAlchemy backend (tasks / task_fan_in / dag_runs tables); implements TaskStateProtocol + AtomicTaskStateProtocol.
+- `SQLTaskSubmit` — SQLAlchemy backend (tasks / task_queue tables); implements TaskSubmitProtocol.
 
 Dead letter queue:
 - `DeadQueueProtocol` — interface all DLQ implementations must satisfy.
@@ -37,16 +40,23 @@ from jobbers.adapters.redis import (
     RedisCronDAGScheduler,
     RedisDeadQueue,
     RedisRoutingBackend,
-    RedisTaskAdapter,
     RedisTaskScheduler,
+    RedisTaskState,
+    RedisTaskSubmit,
 )
-from jobbers.adapters.redis_json import RedisJSONDeadQueue, RedisJSONRoutingBackend, RedisJSONTaskAdapter
+from jobbers.adapters.redis_json import (
+    RedisJSONDeadQueue,
+    RedisJSONRoutingBackend,
+    RedisJSONTaskState,
+    RedisJSONTaskSubmit,
+)
 from jobbers.adapters.sql import (
     SQLCronDAGScheduler,
     SQLDeadQueue,
     SQLRoutingBackend,
-    SQLTaskAdapter,
     SQLTaskScheduler,
+    SQLTaskState,
+    SQLTaskSubmit,
 )
 from jobbers.adapters.static import StaticCronDAGScheduler, StaticRoutingBackend
 from jobbers.protocols import (
@@ -61,9 +71,12 @@ from jobbers.protocols import (
 __all__ = [
     "TaskStateProtocol",
     "TaskSubmitProtocol",
-    "RedisTaskAdapter",
-    "RedisJSONTaskAdapter",
-    "SQLTaskAdapter",
+    "RedisTaskState",
+    "RedisTaskSubmit",
+    "RedisJSONTaskState",
+    "RedisJSONTaskSubmit",
+    "SQLTaskState",
+    "SQLTaskSubmit",
     "DeadQueueProtocol",
     "RedisDeadQueue",
     "RedisJSONDeadQueue",
