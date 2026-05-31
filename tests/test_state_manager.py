@@ -161,8 +161,9 @@ async def test_concurrency_limits_empty_queues(state_manager, rate_limiter):
 
 
 @pytest.mark.asyncio
-async def test_clean_rate_limit_age(redis, state_manager):
+async def test_clean_rate_limit_age(redis, state_manager_real_ta):
     """Test cleaning tasks from the rate limiter based on rate_limit_age."""
+    state_manager = state_manager_real_ta
     await state_manager.routing.save_queue_config(QueueConfig(name="queue1"))
     await state_manager.routing.save_queue_config(QueueConfig(name="queue2"))
     await redis.zadd("rate-limiter:queue1", {ULID1.bytes: FROZEN_TIME.timestamp() - 3600})

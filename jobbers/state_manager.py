@@ -109,7 +109,7 @@ class StateManager:
         self.task_submit: TaskSubmitProtocol = task_submit
         self._queue_config_cache: dict[str, QueueConfig | None] = {}
         self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
-        self.submission_limiter = SubmissionRateLimiter(job_store, self.get_queue_config)
+        self.submission_limiter = SubmissionRateLimiter(self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self._cancel_events: dict[ULID, asyncio.Event] = {}
         self.dead_queue: DeadQueueProtocol = dead_queue
@@ -197,7 +197,7 @@ class StateManager:
 
         clean_ops = []
         if rate_limit_age:
-            clean_ops.append(self.submission_limiter.clean(queues, now, rate_limit_age))
+            clean_ops.append(self.task_submit.clean_rate_limiter(queues, now, rate_limit_age))
 
         if max_queue_age or min_queue_age:
             clean_ops.append(self.task_state.clean(queues, now, min_queue_age, max_queue_age))
@@ -853,21 +853,11 @@ class StateManager:
 
 
 class SubmissionRateLimiter:
-    """
-    Rate limiter for tasks in a Redis data store.
-
-    The rate limiter is stored in a sorted set with the following key:
-    - `rate-limiter:<queue>`: Sorted set of task id => task name/hash key. This should be updated when the task-queues are updated.
-        - ZADD/ZREM by task id: O(log(N))
-        - ZCOUNT by hash key: O(log(N)) to get the current number of tasks with that hash key
-    """
-
-    QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
+    """Concurrency guard: filters task queues down to those below their max_concurrent limit."""
 
     def __init__(
-        self, job_store: Redis, get_queue_config: Callable[[str], Awaitable[QueueConfig | None]]
+        self, get_queue_config: Callable[[str], Awaitable[QueueConfig | None]]
     ) -> None:
-        self.job_store = job_store
         self._get_queue_config = get_queue_config
 
     async def concurrency_limits(
@@ -885,13 +875,3 @@ class SubmissionRateLimiter:
                 queues_to_use.add(queue)
 
         return queues_to_use
-
-    async def clean(self, queues: set[bytes], now: dt.datetime, rate_limit_age: dt.timedelta) -> None:
-        """Clean up the tasks from the rate limiter that are older than the rate limit age."""
-        earliest_time = now - rate_limit_age
-        pipe = self.job_store.pipeline(transaction=True)
-        for queue in queues:
-            pipe.zremrangebyscore(
-                self.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp()
-            )
-        await pipe.execute()

@@ -183,6 +183,12 @@ class TaskSubmitProtocol(Protocol):  # pragma: no cover
         """Blocking pop the next task from any of the given queues.  Returns None on timeout."""
         ...
 
+    async def clean_rate_limiter(
+        self, queues: set[bytes], now: dt.datetime, rate_limit_age: dt.timedelta
+    ) -> None:
+        """Remove rate-limiter sorted-set entries older than ``rate_limit_age``."""
+        ...
+
 
 @runtime_checkable
 class TaskStateProtocol(Protocol):  # pragma: no cover

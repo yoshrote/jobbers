@@ -934,6 +934,11 @@ class SQLTaskSubmit:
         """Rate-limited submit is not implemented for the SQL adapter."""
         raise NotImplementedError("SQLTaskSubmit does not support rate-limited submission")
 
+    async def clean_rate_limiter(
+        self, queues: set[bytes], now: dt.datetime, rate_limit_age: dt.timedelta
+    ) -> None:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # SQLDeadQueue  (SQLAlchemy: dead_letter_queue table)

@@ -244,6 +244,9 @@ class DummyTaskAdapter:
     async def submit_rate_limited_task(self, task: Task, queue_config: object) -> bool:
         raise NotImplementedError("DummyTaskAdapter.submit_rate_limited_task")
 
+    async def clean_rate_limiter(self, queues: object, now: object, rate_limit_age: object) -> None:
+        pass
+
     async def get_next_task(self, queues: object, pop_timeout: int = 0) -> Task | None:
         raise NotImplementedError("DummyTaskAdapter.get_next_task")
 
