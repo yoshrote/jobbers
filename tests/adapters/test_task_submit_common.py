@@ -143,7 +143,7 @@ async def test_clean_rate_limiter_removes_expired_entries(task_adapter):
     """clean_rate_limiter removes rate-limit entries older than the configured age."""
     state, submit = task_adapter
     if isinstance(submit, SQLTaskSubmit):
-        pytest.xfail("SQLTaskSubmit.clean_rate_limiter is a no-op")
+        pytest.skip("SQLTaskSubmit.clean_rate_limiter is a no-op")
     queue_config = _rate_limited_queue()
     task = make_task()
     task.set_status(TaskStatus.SUBMITTED)

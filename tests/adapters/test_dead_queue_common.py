@@ -259,7 +259,7 @@ async def test_get_by_filter_skips_missing_task_data(dead_queue):
     """If a task is in the DLQ index but its blob is gone, it is skipped."""
     dq, _ = dead_queue
     if isinstance(dq, SQLDeadQueue):
-        pytest.xfail(
+        pytest.skip(
             "SQLDeadQueue stores full task data in the DLQ table; a missing-blob scenario cannot occur"
         )
     task = make_task()
