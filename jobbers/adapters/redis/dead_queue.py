@@ -6,18 +6,17 @@ Plain Redis dead-letter queue adapter.
 
 from __future__ import annotations
 
-import datetime as dt
 from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
 
-from jobbers.models.task import Task
-
 if TYPE_CHECKING:
+    import datetime as dt
     from collections.abc import Awaitable
 
     from redis.asyncio.client import Pipeline, Redis
 
+    from jobbers.models.task import Task
     from jobbers.protocols import TaskStateProtocol, TransactionHandle
 
 

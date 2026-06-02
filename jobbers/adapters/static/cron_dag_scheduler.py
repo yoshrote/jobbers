@@ -6,11 +6,11 @@ import asyncio
 import datetime as dt
 from typing import TYPE_CHECKING
 
-from ulid import ULID
-
 from jobbers.protocols import RoutingBackendReadOnlyError
 
 if TYPE_CHECKING:
+    from ulid import ULID
+
     from jobbers.models.cron_dag import CronDAGEntry
 
 

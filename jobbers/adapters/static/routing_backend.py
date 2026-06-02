@@ -5,16 +5,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ulid import ULID
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.protocols import RoutingBackendReadOnlyError
-
-if TYPE_CHECKING:
-    pass
 
 _DEFAULT_QUEUE = QueueConfig(name="default", max_concurrent=10)
 _DEFAULT_ROLES: dict[str, set[str]] = {"default": {"default"}}

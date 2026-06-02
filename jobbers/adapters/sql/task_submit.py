@@ -6,19 +6,20 @@ SQLAlchemy task submit adapter.
 
 from __future__ import annotations
 
-import datetime as dt
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, insert, select, update
 
 from jobbers.adapters.sql.task_state import _row_to_task, _task_to_row, _upsert_task
 from jobbers.migrations.schema import dag_runs, task_queue, tasks
-from jobbers.models.queue_config import QueueConfig
-from jobbers.models.task import Task
-from jobbers.utils.sql_transaction import SQLTransactionBatch
 
 if TYPE_CHECKING:
+    import datetime as dt
+
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from jobbers.models.queue_config import QueueConfig
+    from jobbers.models.task import Task
 
 
 class SQLTaskSubmit:

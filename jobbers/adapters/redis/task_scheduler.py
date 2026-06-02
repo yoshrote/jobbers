@@ -11,13 +11,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
 
-from jobbers.models.task import Task
-
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from redis.asyncio.client import Pipeline, Redis
 
+    from jobbers.models.task import Task
     from jobbers.protocols import TaskStateProtocol, TransactionHandle
 
 

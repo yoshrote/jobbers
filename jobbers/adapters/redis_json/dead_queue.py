@@ -6,7 +6,6 @@ Redis Stack (RedisJSON + RediSearch) dead-letter queue adapter.
 
 from __future__ import annotations
 
-import datetime as dt
 from typing import TYPE_CHECKING, Any
 
 from redis.commands.search.field import NumericField, TagField
@@ -16,11 +15,13 @@ from redis.exceptions import ResponseError
 from ulid import ULID
 
 from jobbers.adapters.redis_json._helpers import _escape_tag
-from jobbers.models.task import Task
 
 if TYPE_CHECKING:
+    import datetime as dt
+
     from redis.asyncio.client import Pipeline, Redis
 
+    from jobbers.models.task import Task
     from jobbers.protocols import TaskStateProtocol, TransactionHandle
 
 

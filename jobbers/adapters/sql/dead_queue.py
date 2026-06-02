@@ -6,18 +6,18 @@ SQLAlchemy dead-letter queue adapter.
 
 from __future__ import annotations
 
-import datetime as dt
 import json
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import delete, insert, select, update
-from sqlalchemy.exc import IntegrityError
 
 from jobbers.migrations.schema import dead_letter_queue
 from jobbers.models.task import Task
 from jobbers.utils.sql_transaction import SQLTransactionBatch
 
 if TYPE_CHECKING:
+    import datetime as dt
+
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from jobbers.protocols import TransactionHandle

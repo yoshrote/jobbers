@@ -9,11 +9,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from jobbers.adapters._shared import _SharedRedisTaskSubmitBase
-from jobbers.adapters.redis.task_state import RedisTaskState
-from jobbers.models.task import Task
 
 if TYPE_CHECKING:
     from redis.asyncio.client import Redis
+
+    from jobbers.adapters.redis.task_state import RedisTaskState
+    from jobbers.models.task import Task
 
 
 _MSGPACK_SUBMIT_SCRIPT = """
