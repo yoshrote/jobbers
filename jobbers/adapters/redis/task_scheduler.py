@@ -7,9 +7,14 @@ Plain Redis task scheduler adapter.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
+
+from jobbers.models.task_status import TaskStatus
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -161,6 +166,60 @@ class RedisTaskScheduler:
             results.append((task, run_at))
 
         return results
+
+    async def recover_orphans(self, now: dt.datetime) -> None:
+        """
+        Re-add tasks that were acquired by the Lua script but never dispatched.
+
+        Detection: task_id in schedule-task-queue hash + SCHEDULED blob + absent from sorted set.
+        Also cleans up stale hash entries for tasks that are no longer SCHEDULED (dispatch
+        completed but saga HDEL failed).
+        """
+        raw_hash: dict[bytes, bytes] = await cast(
+            "Awaitable[dict[bytes, bytes]]",
+            self.data_store.hgetall(self.SCHEDULE_TASK_QUEUE),
+        )
+        if not raw_hash:
+            return
+
+        task_id_strs = [k.decode() for k in raw_hash]
+        queue_names = [v.decode() for v in raw_hash.values()]
+        task_ids = [ULID.from_str(s) for s in task_id_strs]
+
+        tasks: list[Any] = await self.ta.get_tasks_bulk(task_ids)
+
+        scheduled: list[tuple[str, str, bytes]] = []  # (task_id_str, queue, task_id_bytes)
+        stale_ids: list[str] = []
+        for task_id_str, queue, task_id, task in zip(task_id_strs, queue_names, task_ids, tasks):
+            if task is None or task.status != TaskStatus.SCHEDULED:
+                stale_ids.append(task_id_str)
+            else:
+                scheduled.append((task_id_str, queue, bytes(task_id)))
+
+        orphan_entries: list[tuple[str, bytes]] = []  # (queue, task_id_bytes)
+        if scheduled:
+            pipe = self.data_store.pipeline(transaction=False)
+            for _, queue, task_id_bytes in scheduled:
+                pipe.zscore(self.SCHEDULE_QUEUE(queue=queue), task_id_bytes)
+            scores: list[float | None] = await pipe.execute()
+            for (_, queue, task_id_bytes), score in zip(scheduled, scores):
+                if score is None:
+                    orphan_entries.append((queue, task_id_bytes))
+
+        if orphan_entries:
+            pipe = self.data_store.pipeline(transaction=False)
+            ts = now.timestamp()
+            for queue, task_id_bytes in orphan_entries:
+                pipe.zadd(self.SCHEDULE_QUEUE(queue=queue), {task_id_bytes: ts})
+            await pipe.execute()
+            logger.info("Recovered %d orphaned scheduled task(s).", len(orphan_entries))
+
+        if stale_ids:
+            pipe = self.data_store.pipeline(transaction=False)
+            for task_id_str in stale_ids:
+                pipe.hdel(self.SCHEDULE_TASK_QUEUE, task_id_str)
+            await pipe.execute()
+            logger.info("Removed %d stale schedule-task-queue hash entry/entries.", len(stale_ids))
 
     async def next_due(self, queues: list[str] | None = None) -> Task | None:
         """

@@ -193,3 +193,6 @@ class SQLTaskScheduler:
                 continue
             results.append((task, _task_schedule_ensure_utc_nn(row.run_at)))
         return results
+
+    async def recover_orphans(self, _now: dt.datetime) -> None:
+        """No-op: SQL scheduler acquires within a transaction, so no orphan window exists."""

@@ -61,6 +61,7 @@ _JSON_SUBMIT_RATE_LIMITED_SCRIPT = """
     return enqueued
 """
 
+
 class RedisJSONTaskSubmit(_SharedRedisTaskSubmitBase):
     """
     TaskSubmitProtocol backed by Redis Stack (JSON encoding).

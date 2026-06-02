@@ -313,6 +313,8 @@ class TaskSchedulerProtocol(Protocol):  # pragma: no cover
         start_after: str | None,
     ) -> list[tuple[Task, dt.datetime]]: ...
 
+    async def recover_orphans(self, now: dt.datetime) -> None: ...
+
 
 # ---------------------------------------------------------------------------
 # Atomic sub-protocols — extend the base protocols with Redis pipeline staging.

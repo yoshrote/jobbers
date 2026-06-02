@@ -403,3 +403,12 @@ async def test_get_run_at_returns_none_after_removal(scheduler):
     scheduler.stage_remove(pipe, task.id, task.queue)
     await pipe.execute()
     assert await scheduler.get_run_at(task.id) is None
+
+
+# ── recover_orphans ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_orphans_no_error_when_empty(scheduler):
+    """recover_orphans completes without error when there are no scheduled tasks."""
+    await scheduler.recover_orphans(PAST)

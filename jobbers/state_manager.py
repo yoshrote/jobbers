@@ -190,6 +190,7 @@ class StateManager:
         stale_time: dt.timedelta | None = None,
         dlq_age: dt.timedelta | None = None,
         completed_task_age: dt.timedelta | None = None,
+        recover_orphaned_scheduled: bool = False,
     ) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.UTC)
@@ -208,6 +209,9 @@ class StateManager:
         if completed_task_age:
             clean_ops.append(self.task_state.clean_terminal_tasks(now, completed_task_age))
             clean_ops.append(self.task_state.clean_dag_runs(now, completed_task_age))
+
+        if recover_orphaned_scheduled:
+            clean_ops.append(self.task_scheduler.recover_orphans(now))
 
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)

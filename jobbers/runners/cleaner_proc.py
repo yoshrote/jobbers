@@ -51,6 +51,12 @@ parser.add_argument(
     default=None,
     help="Delete task blobs and heartbeat entries for terminal tasks older than this many seconds",
 )
+parser.add_argument(
+    "--recover-orphaned-scheduled",
+    action="store_true",
+    default=False,
+    help="Re-add scheduled tasks orphaned by a crash between acquisition and dispatch.",
+)
 
 
 async def cleaner(args: argparse.Namespace) -> None:
@@ -65,6 +71,7 @@ async def cleaner(args: argparse.Namespace) -> None:
         stale_time=args.stale_time,
         dlq_age=args.dlq_age,
         completed_task_age=args.completed_task_age,
+        recover_orphaned_scheduled=args.recover_orphaned_scheduled,
     )
 
 

@@ -25,8 +25,6 @@ if TYPE_CHECKING:
     from redis.asyncio.client import Pipeline
 
 
-
-
 class RedisJSONTaskState(SharedTaskAdapterMixin):
     """
     TaskStateProtocol + AtomicTaskStateProtocol backed by Redis Stack (JSON encoding).

@@ -1413,6 +1413,24 @@ async def test_clean_stale_task_saga_mode(saga_state_manager):
     assert ULID1 not in saga_state_manager.task_state._heartbeats
 
 
+# ── recover_orphaned_scheduled ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clean_recover_orphan_skipped_when_flag_false(redis, state_manager):
+    """clean() without recover_orphaned_scheduled=True does not re-add orphans."""
+    task = Task(id=ULID1, name="my_task", version=1, queue="default", status=TaskStatus.SCHEDULED)
+    await state_manager.task_state.save_task(task)
+    await redis.hset(state_manager.task_scheduler.SCHEDULE_TASK_QUEUE, str(ULID1), "default")
+
+    with patch("datetime.datetime") as mock_dt:
+        mock_dt.now.return_value = FROZEN_TIME
+        await state_manager.clean()
+
+    score = await redis.zscore(state_manager.task_scheduler.SCHEDULE_QUEUE(queue="default"), bytes(ULID1))
+    assert score is None
+
+
 # ── cron no-pipeline paths ────────────────────────────────────────────────────
 
 
