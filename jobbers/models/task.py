@@ -1,7 +1,7 @@
 import datetime as dt
 import logging
 from enum import StrEnum
-from typing import TYPE_CHECKING, Annotated, Any, Self, cast, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel, Field, FieldSerializationInfo, PrivateAttr, TypeAdapter, field_serializer
 from pydantic.functional_validators import BeforeValidator
@@ -16,7 +16,7 @@ from .task_status import TaskStatus
 
 if TYPE_CHECKING:
     from jobbers.models.dag import DynamicFanOut
-    from jobbers.protocols import TaskAdapterProtocol
+    from jobbers.protocols import TaskStateProtocol
 
 _dag_callback_adapter: TypeAdapter[list[DAGCallback]] = TypeAdapter(list[DAGCallback])
 
@@ -37,9 +37,9 @@ def _parse_ulid(v: object) -> ULID | None:
     if v is None or isinstance(v, ULID):
         return v
     if isinstance(v, str):
-        return cast("ULID", ULID.from_str(v))
+        return ULID.from_str(v)
     if isinstance(v, (bytes, bytearray)):
-        return  cast("ULID", ULID.from_bytes(bytes(v)))
+        return ULID.from_bytes(bytes(v))
     raise ValueError(f"Cannot parse ULID: {v!r}")
 
 
@@ -206,7 +206,7 @@ class Task(BaseModel):
             if cb.error_callback is not None
         ]
 
-    async def generate_callbacks(self, ta: "TaskAdapterProtocol") -> list[Self]:
+    async def generate_callbacks(self, ta: "TaskStateProtocol") -> list[Self]:
         """
         Generate tasks to submit after this task completes.
 
@@ -266,7 +266,7 @@ class Task(BaseModel):
             summary["last_error"] = self.errors[-1]
         return summary
 
-    _adapter: "TaskAdapterProtocol | None" = PrivateAttr(default=None)
+    _adapter: "TaskStateProtocol | None" = PrivateAttr(default=None)
 
     async def heartbeat(self) -> None:
         if self._adapter is None:

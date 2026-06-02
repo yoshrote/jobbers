@@ -8,12 +8,13 @@ Jobbers is a lightweight distributed task execution framework (similar to Celery
 jobbers/
 ├── jobbers/                   # Python backend package
 │   ├── runners/               # Entry points for each process
-│   ├── adapters/              # Pluggable adapters to implement protocols: task storage, dead-letter, routing sub-adapters
+│   ├── adapters/              # Pluggable adapters: task storage, dead-letter, routing, task/cron schedulers
+│   │   ├── redis.py           # All plain-Redis adapter implementations
+│   │   ├── redis_json.py      # All Redis Stack (RedisJSON + RediSearch) adapter implementations
+│   │   ├── sql.py             # All SQLAlchemy adapter implementations
+│   │   └── static.py         # Read-only in-process adapters (routing + cron DAG)
 │   ├── protocols.py           # Protocol definitions
 │   ├── models/                # Pydantic models + enums
-│   ├── schedulers/            # Scheduler logic (task promotion, cron DAG execution)
-│   │   ├── task_scheduler.py  # TaskScheduler: promotes due scheduled tasks into queues
-│   │   └── cron_dag_scheduler.py  # CronDAGScheduler: drives cron DAG execution
 │   ├── utils/                 # OpenTelemetry, serialization, dependency injection resolver
 │   ├── state_manager.py       # Central Redis/SQL state management
 │   ├── task_processor.py      # Single-task execution lifecycle
@@ -51,8 +52,8 @@ All four run as separate processes (separate Docker containers in production).
 - **Python 3.11+**, FastAPI, asyncio, sqlalchemy[asyncio]
 - **Redis** — task queues, task scheduler, dead letter queue, task state
 - **SQLAlchemy** — queue/role config only when `ROUTING_BACKEND=sql`
-- **Two interchangeable task adapters:** `JsonTaskAdapter` (Redis JSON + RediSearch) and `MsgpackTaskAdapter` (plain Redis + msgpack + sorted sets)
-- **Two interchangeable dead letter adapters:** `JsonDeadQueue` (Redis JSON + RediSearch) and `DeadQueue` (plain Redis + sorted sets)
+- **Two interchangeable task adapters:** `RedisJSONTaskAdapter` (Redis JSON + RediSearch) and `RedisTaskAdapter` (plain Redis + msgpack + sorted sets)
+- **Two interchangeable dead letter adapters:** `RedisJSONDeadQueue` (Redis JSON + RediSearch) and `RedisDeadQueue` (plain Redis + sorted sets)
 - **Four interchangeable routing backends:** `sql`, `redis`, `redis_json`, `static` (see Routing Backends below)
 - **React 19 + Vite 7 + React Router 6** (no TypeScript, plain CSS)
 - **OpenTelemetry** (OTLP → OpenObserve)
@@ -115,12 +116,23 @@ All metrics use the OTLP exporter (configured in `jobbers/utils/otel.py`) and ar
 
 ## Adapter Architecture
 
-All pluggable storage is expressed as `@runtime_checkable Protocol` classes in `protocols.py`. The five protocols and their concrete implementations are:
+All pluggable storage is expressed as `@runtime_checkable Protocol` classes in `protocols.py`. The protocols and their concrete implementations are:
+
+### Adapter naming convention
+
+All concrete adapter classes follow the `{Backend}{Protocol}` pattern:
+
+- **Backend** prefix: `Redis` (plain Redis), `RedisJSON` (Redis Stack), `SQL` (SQLAlchemy), `Static` (in-process read-only)
+- **Protocol** suffix: the protocol name without the `Protocol` suffix (e.g., `TaskAdapter`, `DeadQueue`, `TaskScheduler`, `CronDAGScheduler`, `RoutingBackend`, `QueueConfigAdapter`, `TaskRoutingConfigAdapter`)
+
+Examples: `RedisTaskAdapter`, `RedisJSONDeadQueue`, `SQLCronDAGScheduler`, `StaticRoutingBackend`.
+
+No aliases — always use the full `{Backend}{Protocol}` name.
+
+### Routing protocols
 
 | Protocol | sql | redis | redis_json | static |
 | --- | --- | --- | --- | --- |
-| `TaskAdapterProtocol` | — | `MsgpackTaskAdapter` | `JsonTaskAdapter` | — |
-| `DeadQueueProtocol` | — | `DeadQueue` | `JsonDeadQueue` | — |
 | `QueueConfigProtocol` | `SQLQueueConfigAdapter` | `RedisQueueConfigAdapter` | `RedisJSONQueueConfigAdapter` | — |
 | `TaskRoutingConfigProtocol` | `SQLTaskRoutingConfigAdapter` | `RedisTaskRoutingConfigAdapter` | `RedisJSONTaskRoutingConfigAdapter` | — |
 | `RoutingBackendProtocol` | `SQLRoutingBackend` | `RedisRoutingBackend` | `RedisJSONRoutingBackend` | `StaticRoutingBackend` |
@@ -129,12 +141,42 @@ All pluggable storage is expressed as `@runtime_checkable Protocol` classes in `
 
 `get_queue_limits` exists on `QueueConfigProtocol` and all three dynamic implementations but is absent from `StaticRoutingBackend` (which is not expected to implement `QueueConfigProtocol`).
 
+### Task storage protocols (split-store design)
+
+Task storage is split across three independent protocols so each concern can use a different backend:
+
+| Protocol | Responsibility | Current implementations |
+| --- | --- | --- |
+| `TaskStateProtocol` | Task blob persistence, heartbeats, fan-in sets, DAG run index | `RedisTaskAdapter`, `RedisJSONTaskAdapter`, `SQLTaskAdapter` |
+| `TaskSubmitProtocol` | Composite submit/pop operations that require co-located state and queue (Lua scripts in Redis) | `RedisTaskAdapter`, `RedisJSONTaskAdapter`, `SQLTaskAdapter` |
+| `TaskQueueProtocol` | Active queue membership, enqueue/pop, rate limiting | (Redis sorted-set logic embedded in adapters above) |
+| `TaskSchedulerProtocol` | Delayed/scheduled task queue | `RedisTaskScheduler`, `SQLTaskScheduler` |
+| `DeadQueueProtocol` | Dead letter queue | `RedisDeadQueue`, `RedisJSONDeadQueue`, `SQLDeadQueue` |
+| `CronDAGSchedulerProtocol` | Recurring cron-scheduled DAG entries | `RedisCronDAGScheduler`, `SQLCronDAGScheduler`, `StaticCronDAGScheduler` |
+
+Each protocol has an **Atomic sub-protocol** that extends it with pipeline-staging methods (`stage_*`) and a `pipeline()` factory. `StateManager` checks whether the task adapter, scheduler, and DLQ all implement their Atomic sub-protocols at construction time and selects between **atomic pipeline mode** (MULTI/EXEC across all stores) and **saga mode** (sequential writes with Cleaner compensation):
+
+| Atomic sub-protocol | Adds over base |
+| --- | --- |
+| `AtomicTaskStateProtocol` | `pipeline()`, `stage_save()`, `stage_requeue()`, `stage_submit_task()`, `stage_remove_from_queue()`, `stage_remove_heartbeat()`, `stage_init_fan_in()`, `read_for_watch()`, `optimistic_dispatch_scheduled()` |
+| `AtomicTaskSchedulerProtocol` | `pipeline()`, `stage_add()`, `stage_remove()` |
+| `AtomicDeadQueueProtocol` | `backend_key`, `pipeline()` |
+| `AtomicCronDAGSchedulerProtocol` | `backend_key`, `pipeline()`, `stage_reschedule()`, `stage_set_active_run()`, `stage_clear_active_run()` |
+
+`AtomicCronDAGSchedulerProtocol` allows `StateManager` to fold cron reschedule and active-run marker ops into the same pipeline as task-state ops when the cron scheduler and task-state adapter share a backend (`backend_key` match). `StaticCronDAGScheduler` does not implement the atomic sub-protocol (no shared backend); `StateManager` falls back to sequential async calls.
+
+`optimistic_dispatch_scheduled(task, stage_extra)` encapsulates the optimistic-locking dispatch loop: read under WATCH, check status, set SUBMITTED, stage requeue, call `stage_extra` for additional staged ops (e.g., scheduler removal), commit. Redis implementations use WATCH/MULTI; SQL implementations use `SELECT FOR UPDATE`.
+
+`stage_remove_heartbeat(pipe, task)` stages a heartbeat sorted-set removal onto an existing pipeline, so `StateManager` does not need to reference any Redis key name constants directly.
+
+`StateManager` holds `task_state: TaskStateProtocol` and `task_submit: TaskSubmitProtocol` as two separate constructor parameters. In the common Redis case, both are the same adapter object; the split allows future configurations where state and queue live on different backends. See [docs/datastore-architecture.md](docs/datastore-architecture.md) for a full treatment of consistency modes and what alternative datastores (SQL task state, RabbitMQ queuing) would require.
+
 ## Routing Backends
 
 The routing backend controls where queue/role/task-routing config is stored. Select via `ROUTING_BACKEND`:
 
 | Value | Storage | SQL needed? | Dynamic CRUD? |
-|-------|---------|-------------|---------------|
+| ------- | --------- | ------------- | --------------- |
 | `sql` (default) | SQLAlchemy (SQLite or Postgres) | Yes | Yes |
 | `redis` | Plain Redis keys | No | Yes |
 | `redis_json` | RedisJSON + RediSearch (Redis Stack) | No | Yes |
@@ -151,6 +193,7 @@ Config is loaded once at startup. Priority (highest to lowest):
 5. **Built-in defaults** — one `default` queue, one `default` role
 
 Config file format (`routing.json`):
+
 ```json
 {
   "queues": [{"name": "default", "max_concurrent": 10}],
@@ -181,7 +224,7 @@ Config file format (`routing.json`):
 ## Testing
 
 - Uses `fakeredis` (in-memory, supports Lua + JSON modules) — no real Redis needed for most tests
-- `task_adapter` fixture is parametrized over `MsgpackTaskAdapter` (FakeRedis) and `JsonTaskAdapter` (real Redis Stack, skipped if unavailable)
+- `task_adapter` fixture is parametrized over `RedisTaskAdapter` (FakeRedis) and `RedisJSONTaskAdapter` (real Redis Stack, skipped if unavailable)
 - `queue_config_adapter` fixture is parametrized over `["sql", "redis", "redis_json"]`
 - `task_routing_config_adapter` fixture is parametrized over `["sql", "redis", "redis_json"]`
 - Key test files: `test_state_manager.py`, `test_task_processor.py`, `test_task_routes.py`, `test_task_generator.py`
@@ -236,7 +279,7 @@ The test suite follows a layered approach designed for speed and systematic prot
 | Tier | Where | Fixture | Purpose |
 | ------ | ------- | --------- | --------- |
 | **Protocol contract** | `tests/adapters/test_task_adapter_common.py`, `test_dead_queue_common.py`, `test_queue_config_common.py`, `test_task_routing_config_common.py` | `task_adapter` / `dead_queue` / `queue_config_adapter` / `task_routing_config_adapter` (each parametrized over all implementations) | Verify every implementation satisfies the protocol. Adding a new adapter means adding a fixture variant — all contract tests run automatically. |
-| **Implementation edge cases** | `tests/adapters/test_msgpack_adapter.py`, `test_json_adapter.py` | `msgpack_adapter` / `json_adapter` | Cover implementation-specific behaviour that is not a protocol requirement (e.g., sorting limitations, null JSON blobs). |
+| **Implementation edge cases** | `tests/adapters/test_msgpack_adapter.py`, `test_json_adapter.py` | `msgpack_adapter` / `json_adapter` | Cover implementation-specific behaviour that is not a protocol requirement (e.g., `RedisTaskAdapter` sorting limitations, null JSON blobs in `RedisJSONTaskAdapter`). |
 | **Orchestration** | `test_state_manager.py`, `test_task_processor.py`, `test_task_routes.py`, `test_task_generator.py` | `DummyTaskAdapter` or `Mock(spec=StateManager)` | Test coordination logic without touching real adapters; fast, no Redis Stack required. |
 
 #### Key rules
@@ -244,20 +287,23 @@ The test suite follows a layered approach designed for speed and systematic prot
 - **Prefer common tests.** If a behaviour belongs to the protocol, put it in the common file and run it against all implementations.
 - **xfail, don't skip, for known limitations.** If one implementation cannot satisfy a contract test, mark it `@pytest.mark.xfail(strict=True)` with a reason. This keeps the test discoverable and will alert you when the limitation is fixed.
 - **Adapter fixtures**
-  - `task_adapter` (parametrized `["raw", "json"]`) — MsgpackTaskAdapter via FakeRedis + JsonTaskAdapter via real Redis Stack (skipped if unavailable).
-  - `dead_queue` (parametrized `["raw", "json"]`) — same pattern, yields `(dq, task_adapter)`.
+  - `task_adapter` (parametrized `["redis", "redis_json", "sql"]`) — `RedisTaskAdapter` via FakeRedis + `RedisJSONTaskAdapter` via real Redis Stack (skipped if unavailable) + `SQLTaskAdapter` via in-memory SQLite.
+  - `dead_queue` (parametrized `["redis", "redis_json", "sql"]`) — same pattern, yields `(dq, task_adapter)`.
   - `queue_config_adapter` (parametrized `["sql", "redis", "redis_json"]`) — SQL via in-memory SQLite, Redis via FakeRedis, Redis JSON via real Redis Stack (skipped if unavailable).
   - `task_routing_config_adapter` (parametrized `["sql", "redis", "redis_json"]`) — same pattern.
-  - `msgpack_adapter` — plain MsgpackTaskAdapter via FakeRedis; for msgpack-specific edge cases.
-  - `json_adapter` — JsonTaskAdapter via real Redis Stack; for json-specific edge cases.
-  - `json_dead_queue` — JsonDeadQueue backed by `json_adapter`; for JsonDeadQueue-specific edge cases.
+  - `scheduler` (parametrized `["redis", "sql"]`) — `RedisTaskScheduler` via FakeRedis + `SQLTaskScheduler` via in-memory SQLite; in `tests/schedulers/`.
+  - `cron_dag_scheduler` (parametrized `["redis", "sql", "static"]`) — all three cron DAG scheduler backends; in `tests/schedulers/`.
+  - `mutable_cron_dag_scheduler` (parametrized `["redis", "sql"]`) — mutable backends only (static raises on add/remove); in `tests/schedulers/`.
+  - `msgpack_adapter` — plain `RedisTaskAdapter` via FakeRedis; for Redis-specific edge cases.
+  - `json_adapter` — `RedisJSONTaskAdapter` via real Redis Stack; for Redis Stack-specific edge cases.
+  - `json_dead_queue` — `RedisJSONDeadQueue` backed by `json_adapter`; for `RedisJSONDeadQueue`-specific edge cases.
   - `DummyTaskAdapter` (in `tests/conftest.py`) — in-memory stub; use for `state_manager` orchestration tests.
 
 #### Known hard-to-cover paths (concurrency guards)
 
 The following lines cannot be covered reliably without concurrent execution, low-level patching, or specially broken inputs:
 
-- `jobbers/adapters/redis.py` — `if task_data is None: continue` in `MsgpackTaskAdapter.clean_terminal_tasks` (key deleted between `scan_iter` and `GET`)
+- `jobbers/adapters/redis.py` — `if task_data is None: continue` in `RedisTaskAdapter.clean_terminal_tasks` (key deleted between `scan_iter` and `GET`)
 - `jobbers/adapters/redis_json.py` — `if role_doc is not None:` false branch in `RedisJSONQueueConfigAdapter.delete_queue`: JSON document deleted between the RediSearch result and the `JSON.GET` pipeline call (requires concurrent deletion)
 - `jobbers/task_generator.py` line 151 — the `if task:` requeue branch in `TaskGenerator.__anext__`'s `CancelledError` handler (task is always `None` when `get_next_task` raises, making this branch unreachable in practice)
 - `jobbers/di.py` lines 227, 232 — exception handlers in `DependencyResolver.__aexit__` that catch errors thrown by generator cleanup; requires an async/sync generator that raises during `.aclose()` / `.close()`

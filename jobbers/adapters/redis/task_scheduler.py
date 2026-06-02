@@ -1,3 +1,9 @@
+"""
+Plain Redis task scheduler adapter.
+
+- `RedisTaskScheduler` — TaskSchedulerProtocol + AtomicTaskSchedulerProtocol backed by Redis sorted sets.
+"""
+
 from __future__ import annotations
 
 import datetime as dt
@@ -11,12 +17,14 @@ if TYPE_CHECKING:
     from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.models.task import Task
-    from jobbers.protocols import TaskAdapterProtocol
+    from jobbers.protocols import TaskStateProtocol, TransactionHandle
 
 
-class TaskScheduler:
+class RedisTaskScheduler:
     """
-    Manages scheduled tasks in Redis, reusing task:<task_id> keys for task data.
+    TaskSchedulerProtocol and AtomicTaskSchedulerProtocol backed by plain Redis (sorted sets).
+
+    Reuses ``task:<task_id>`` keys for task data; stores schedules in sorted sets.
 
     Keys:
     - `schedule-queue:{queue}` sorted set — member: task_id bytes, score: run_at Unix timestamp.
@@ -37,7 +45,7 @@ class TaskScheduler:
         for _, key in ipairs(KEYS) do
             if collected >= limit then break end
             local remaining = limit - collected
-            local items = redis.call('ZRANGEBYSCORE', key, '-inf', now, 'WITHSCORES', 'LIMIT', 0, remaining)
+            local items = redis.call('ZRANGEBYSCORE', key, '-inf', now, 'WITHSCORES', 'LIMIT', '0', string.format('%d', remaining))
             for i = 1, #items, 2 do
                 redis.call('ZREM', key, items[i])
                 table.insert(results, items[i])
@@ -51,22 +59,43 @@ class TaskScheduler:
     def __init__(
         self,
         data_store: Redis,
-        task_adapter: TaskAdapterProtocol,
+        task_adapter: TaskStateProtocol,
         get_all_queues: Callable[[], Awaitable[list[str]]],
     ) -> None:
         self.data_store = data_store
         self.ta = task_adapter
         self._get_all_queues = get_all_queues
 
-    def stage_add(self, pipe: Pipeline, task: Task, run_at: dt.datetime) -> None:
-        """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
-        pipe.zadd(self.SCHEDULE_QUEUE(queue=task.queue), {bytes(task.id): run_at.timestamp()})
-        pipe.hset(self.SCHEDULE_TASK_QUEUE, str(task.id), task.queue)
+    @property
+    def backend_key(self) -> str:
+        return str(id(self.data_store))
 
-    def stage_remove(self, pipe: Pipeline, task_id: ULID, queue: str) -> None:
+    def pipeline(self, transaction: bool = True) -> Pipeline:
+        return self.data_store.pipeline(transaction=transaction)
+
+    def stage_add(self, pipe: TransactionHandle, task: Task, run_at: dt.datetime) -> None:
+        """Queue ZADD schedule-queue + HSET schedule-task-queue onto pipe (no execute)."""
+        p: Any = pipe
+        p.zadd(self.SCHEDULE_QUEUE(queue=task.queue), {bytes(task.id): run_at.timestamp()})
+        p.hset(self.SCHEDULE_TASK_QUEUE, str(task.id), task.queue)
+
+    async def add(self, task: Task, run_at: dt.datetime) -> None:
+        """Add a task to the scheduler (non-pipeline version for saga path)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_add(pipe, task, run_at)
+        await pipe.execute()
+
+    def stage_remove(self, pipe: TransactionHandle, task_id: ULID, queue: str) -> None:
         """Queue ZREM schedule-queue + HDEL schedule-task-queue onto pipe (no execute)."""
-        pipe.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
-        pipe.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
+        p: Any = pipe
+        p.zrem(self.SCHEDULE_QUEUE(queue=queue), bytes(task_id))
+        p.hdel(self.SCHEDULE_TASK_QUEUE, str(task_id))
+
+    async def remove(self, task_id: ULID, queue: str) -> None:
+        """Remove a task from the scheduler (non-pipeline version for saga path)."""
+        pipe = self.data_store.pipeline(transaction=True)
+        self.stage_remove(pipe, task_id, queue)
+        await pipe.execute()
 
     async def get_run_at(self, task_id: ULID) -> dt.datetime | None:
         """Return the scheduled run_at for a single task, or None if not found."""

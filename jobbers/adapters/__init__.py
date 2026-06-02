@@ -1,15 +1,21 @@
 """
-Pluggable adapters for task storage, dead letter queue, and routing config.
+Pluggable adapters for task storage, dead letter queue, routing config, and cron DAG scheduling.
 
 Task storage:
-- `TaskAdapterProtocol` — interface all task adapters must satisfy.
-- `JsonTaskAdapter` — Redis Stack (RedisJSON + RediSearch) backend.
-- `MsgpackTaskAdapter` — plain Redis (msgpack binary strings) backend.
+- `TaskStateProtocol` — task blob persistence interface.
+- `TaskSubmitProtocol` — composite submit/pop interface (requires co-located state + queue).
+- `RedisTaskState` — plain Redis backend (msgpack); implements TaskStateProtocol + AtomicTaskStateProtocol.
+- `RedisTaskSubmit` — plain Redis backend (msgpack); implements TaskSubmitProtocol.
+- `RedisJSONTaskState` — Redis Stack backend (RedisJSON + RediSearch); implements TaskStateProtocol + AtomicTaskStateProtocol.
+- `RedisJSONTaskSubmit` — Redis Stack backend (RedisJSON + RediSearch); implements TaskSubmitProtocol.
+- `SQLTaskState` — SQLAlchemy backend (tasks / task_fan_in / dag_runs tables); implements TaskStateProtocol + AtomicTaskStateProtocol.
+- `SQLTaskSubmit` — SQLAlchemy backend (tasks / task_queue tables); implements TaskSubmitProtocol.
 
 Dead letter queue:
 - `DeadQueueProtocol` — interface all DLQ implementations must satisfy.
-- `DeadQueue` — plain Redis backend (sorted sets + hash indexes).
-- `JsonDeadQueue` — Redis Stack backend (RedisJSON + RediSearch).
+- `RedisDeadQueue` — plain Redis backend (sorted sets + hash indexes).
+- `RedisJSONDeadQueue` — Redis Stack backend (RedisJSON + RediSearch).
+- `SQLDeadQueue` — SQLAlchemy backend (dead_letter_queue table).
 
 Routing backends (queues, roles, task routing config):
 - `RoutingBackendProtocol` — interface all routing backends must satisfy.
@@ -18,30 +24,87 @@ Routing backends (queues, roles, task routing config):
 - `RedisRoutingBackend` — plain Redis backend (no SQL required).
 - `RedisJSONRoutingBackend` — Redis Stack backend (RedisJSON + RediSearch; no SQL required).
 - `StaticRoutingBackend` — read-only hardcoded config (no database required).
+
+Task schedulers:
+- `RedisTaskScheduler` — plain Redis backend; implements ``AtomicTaskSchedulerProtocol``.
+- `SQLTaskScheduler` — SQLAlchemy backend (task_schedule table).
+
+Cron DAG schedulers:
+- `CronDAGSchedulerProtocol` — interface all cron DAG scheduler implementations must satisfy.
+- `RedisCronDAGScheduler` — plain Redis backend.
+- `SQLCronDAGScheduler` — SQLAlchemy backend (cron_dag_entries / cron_dag_active_runs tables).
+- `StaticCronDAGScheduler` — read-only in-memory backend.
+
+Signaling:
+- `CancellationBusProtocol` — interface for task cancellation pub/sub.
+- `RoutingNotificationProtocol` — interface for routing version and refresh signals.
+- `RedisCancellationBus` — Redis-backed CancellationBusProtocol.
+- `RedisRoutingNotifications` — Redis-backed RoutingNotificationProtocol.
 """
 
-from jobbers.adapters.redis import DeadQueue, MsgpackTaskAdapter, RedisRoutingBackend
-from jobbers.adapters.redis_json import JsonDeadQueue, JsonTaskAdapter, RedisJSONRoutingBackend
-from jobbers.adapters.sql import SQLRoutingBackend
-from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.adapters.redis import (
+    RedisCancellationBus,
+    RedisCronDAGScheduler,
+    RedisDeadQueue,
+    RedisRoutingBackend,
+    RedisRoutingNotifications,
+    RedisTaskScheduler,
+    RedisTaskState,
+    RedisTaskSubmit,
+)
+from jobbers.adapters.redis_json import (
+    RedisJSONDeadQueue,
+    RedisJSONRoutingBackend,
+    RedisJSONTaskState,
+    RedisJSONTaskSubmit,
+)
+from jobbers.adapters.sql import (
+    SQLCronDAGScheduler,
+    SQLDeadQueue,
+    SQLRoutingBackend,
+    SQLTaskScheduler,
+    SQLTaskState,
+    SQLTaskSubmit,
+)
+from jobbers.adapters.static import StaticCronDAGScheduler, StaticRoutingBackend
 from jobbers.protocols import (
+    CancellationBusProtocol,
+    CronDAGSchedulerProtocol,
     DeadQueueProtocol,
     RoutingBackendProtocol,
     RoutingBackendReadOnlyError,
-    TaskAdapterProtocol,
+    RoutingNotificationProtocol,
+    TaskStateProtocol,
+    TaskSubmitProtocol,
 )
 
 __all__ = [
-    "TaskAdapterProtocol",
+    "TaskStateProtocol",
+    "TaskSubmitProtocol",
+    "RedisTaskState",
+    "RedisTaskSubmit",
+    "RedisJSONTaskState",
+    "RedisJSONTaskSubmit",
+    "SQLTaskState",
+    "SQLTaskSubmit",
     "DeadQueueProtocol",
-    "JsonTaskAdapter",
-    "MsgpackTaskAdapter",
-    "DeadQueue",
-    "JsonDeadQueue",
+    "RedisDeadQueue",
+    "RedisJSONDeadQueue",
+    "SQLDeadQueue",
     "RoutingBackendProtocol",
     "RoutingBackendReadOnlyError",
     "SQLRoutingBackend",
     "RedisRoutingBackend",
     "RedisJSONRoutingBackend",
     "StaticRoutingBackend",
+    "RedisTaskScheduler",
+    "SQLTaskScheduler",
+    "CronDAGSchedulerProtocol",
+    "RedisCronDAGScheduler",
+    "SQLCronDAGScheduler",
+    "StaticCronDAGScheduler",
+    "CancellationBusProtocol",
+    "RoutingNotificationProtocol",
+    "RedisCancellationBus",
+    "RedisRoutingNotifications",
 ]

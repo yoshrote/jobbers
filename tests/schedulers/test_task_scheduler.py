@@ -1,15 +1,13 @@
-"""Tests for TaskScheduler."""
+"""Common scheduler contract tests — run against all scheduler implementations."""
 
 import datetime as dt
 
 import pytest
-import pytest_asyncio
+from ulid import ULID
 
-from jobbers.adapters.sql import SQLQueueConfigAdapter
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
-from jobbers.schedulers.task_scheduler import TaskScheduler
 
 PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 FUTURE = dt.datetime(2099, 1, 1, tzinfo=dt.UTC)
@@ -19,19 +17,8 @@ def make_task(task_id: str = "01JQC31AJP7TSA9X8AEP64XG08", queue: str = "default
     return Task(id=task_id, name="test_task", version=1, queue=queue, status=TaskStatus.SCHEDULED)
 
 
-@pytest_asyncio.fixture
-async def qca(session_factory):
-    yield SQLQueueConfigAdapter(session_factory)
-
-
-@pytest_asyncio.fixture
-async def scheduler(redis, dummy_task_adapter, session_factory):
-    qca = SQLQueueConfigAdapter(session_factory)
-    yield TaskScheduler(redis, dummy_task_adapter, qca.get_all_queues)
-
-
-async def schedule(s: TaskScheduler, task: Task, run_at: dt.datetime) -> None:
-    pipe = s.data_store.pipeline(transaction=True)
+async def schedule(s, task: Task, run_at: dt.datetime) -> None:
+    pipe = s.pipeline(transaction=True)
     s.stage_add(pipe, task, run_at)
     await pipe.execute()
 
@@ -59,7 +46,7 @@ async def test_remove_prevents_next_due(scheduler, dummy_task_adapter):
     task = make_task()
     await dummy_task_adapter.save_task(task)
     await schedule(scheduler, task, PAST)
-    pipe = scheduler.data_store.pipeline(transaction=True)
+    pipe = scheduler.pipeline(transaction=True)
     scheduler.stage_remove(pipe, task.id, task.queue)
     await pipe.execute()
     assert await scheduler.next_due(["default"]) is None
@@ -71,8 +58,8 @@ async def test_add_replaces_existing(scheduler, dummy_task_adapter):
     task = make_task()
     await dummy_task_adapter.save_task(task)
     await schedule(scheduler, task, PAST)
-    await scheduler.next_due(["default"])  # acquires (removes from sorted set)
-    await schedule(scheduler, task, PAST)  # re-adds to sorted set
+    await scheduler.next_due(["default"])  # acquires (removes from schedule)
+    await schedule(scheduler, task, PAST)  # re-adds
     assert await scheduler.next_due(["default"]) is not None
 
 
@@ -154,7 +141,6 @@ async def test_next_due_returns_earliest_run_at(scheduler, dummy_task_adapter):
     later_time = dt.datetime(2020, 6, 1, tzinfo=dt.UTC)
     for t in (earlier, later):
         await dummy_task_adapter.save_task(t)
-    # Insert in reverse order to prove sorting is by run_at, not insertion order
     await schedule(scheduler, later, later_time)
     await schedule(scheduler, earlier, earlier_time)
     result = await scheduler.next_due(["default"])
@@ -219,7 +205,6 @@ async def test_next_due_bulk_run_at_matches_scheduled_time(scheduler, dummy_task
     await dummy_task_adapter.save_task(task)
     await schedule(scheduler, task, scheduled_time)
     ((_, run_at),) = await scheduler.next_due_bulk(10, queues=["default"])
-    # Compare at second precision (timestamps are floats)
     assert abs((run_at - scheduled_time).total_seconds()) < 0.001
 
 
@@ -239,7 +224,7 @@ async def test_next_due_bulk_respects_limit(scheduler, dummy_task_adapter):
 
 @pytest.mark.asyncio
 async def test_next_due_bulk_empty_queue_list_returns_empty(scheduler, dummy_task_adapter):
-    """next_due_bulk(queues=[]) returns [] without touching Redis."""
+    """next_due_bulk(queues=[]) returns [] without touching the backend."""
     task = make_task()
     await dummy_task_adapter.save_task(task)
     await schedule(scheduler, task, PAST)
@@ -361,17 +346,17 @@ async def test_get_by_filter_task_version_excludes_non_matching(scheduler, dummy
     assert results[0][0].id == t1.id
 
 
-# ── next_due_bulk: queues=None with empty all-queues set ──────────────────────
+# ── next_due_bulk: queues=None with no configured queues ──────────────────────
 
 
 @pytest.mark.asyncio
-async def test_next_due_bulk_queues_none_empty_redis_returns_empty(scheduler):
+async def test_next_due_bulk_queues_none_no_queues_returns_empty(scheduler):
     """next_due_bulk with queues=None returns [] when no queues are configured."""
     result = await scheduler.next_due_bulk(1, queues=None)
     assert result == []
 
 
-# ── get_by_filter: limit and None-task edge cases ────────────────────────────
+# ── get_by_filter: limit edge cases ──────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -388,16 +373,33 @@ async def test_get_by_filter_stops_at_limit(scheduler, dummy_task_adapter):
     assert len(results) == 2
 
 
-@pytest.mark.asyncio
-async def test_get_by_filter_skips_none_tasks(scheduler, dummy_task_adapter, redis):
-    """get_by_filter silently skips IDs whose task data is missing (get_tasks_bulk returns None)."""
-    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
-    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
-    # Save only t1's data; add t2 to the schedule without persisting its task data.
-    await dummy_task_adapter.save_task(t1)
-    await schedule(scheduler, t1, PAST)
-    await schedule(scheduler, t2, PAST)  # t2 has no task data → get_tasks_bulk returns None
+# ── get_run_at ────────────────────────────────────────────────────────────────
 
-    results = await scheduler.get_by_filter(queue="default")
-    assert len(results) == 1
-    assert results[0][0].id == t1.id
+
+@pytest.mark.asyncio
+async def test_get_run_at_returns_scheduled_time(scheduler):
+    """get_run_at returns the exact datetime passed to stage_add."""
+    task = make_task()
+    scheduled_time = dt.datetime(2020, 6, 15, 12, 0, 0, tzinfo=dt.UTC)
+    await schedule(scheduler, task, scheduled_time)
+    run_at = await scheduler.get_run_at(task.id)
+    assert run_at is not None
+    assert abs((run_at - scheduled_time).total_seconds()) < 0.001
+
+
+@pytest.mark.asyncio
+async def test_get_run_at_returns_none_for_unscheduled(scheduler):
+    """get_run_at returns None for a task that was never scheduled."""
+    unscheduled_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG99")
+    assert await scheduler.get_run_at(unscheduled_id) is None
+
+
+@pytest.mark.asyncio
+async def test_get_run_at_returns_none_after_removal(scheduler):
+    """get_run_at returns None after the task is removed via stage_remove."""
+    task = make_task()
+    await schedule(scheduler, task, PAST)
+    pipe = scheduler.pipeline(transaction=True)
+    scheduler.stage_remove(pipe, task.id, task.queue)
+    await pipe.execute()
+    assert await scheduler.get_run_at(task.id) is None

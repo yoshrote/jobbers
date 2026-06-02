@@ -65,7 +65,7 @@ class TaskProcessor:
 
             with self.state_manager.task_in_registry(task):
                 await self.state_manager.update_task_heartbeat(task)
-                task._adapter = self.state_manager.ta
+                task._adapter = self.state_manager.task_state
                 _token = _current_task_cv.set(task)
                 kwargs = dict(task.parameters)
                 if task.inject_parent_results and task.parent_ids:
@@ -169,22 +169,18 @@ class TaskProcessor:
         if dynamic_fanout is not None:
             await self._handle_dynamic_fanout(task, dynamic_fanout)
         if task.has_callbacks():
-            callbacks = await task.generate_callbacks(self.state_manager.ta)
-            pipe = self.state_manager.job_store.pipeline(transaction=True)
-            for submitted_task in callbacks:
-                submitted_task.queue = await self.state_manager.resolve_queue(submitted_task)
-                self.state_manager.stage_submit_task(pipe, submitted_task, queue_config=None)
-            await pipe.execute()
+            callbacks = await task.generate_callbacks(self.state_manager.task_state)
+            for cb in callbacks:
+                cb.queue = await self.state_manager.resolve_queue(cb)
+            await self.state_manager.submit_tasks_batch(callbacks)
 
     async def post_process_error(self, task: Task) -> None:
         """Submit error callback tasks for a permanently-failed task."""
         error_callbacks = task.generate_error_callbacks()
         if error_callbacks:
-            pipe = self.state_manager.job_store.pipeline(transaction=True)
             for cb in error_callbacks:
                 cb.queue = await self.state_manager.resolve_queue(cb)
-                self.state_manager.stage_submit_task(pipe, cb, queue_config=None)
-            await pipe.execute()
+            await self.state_manager.submit_tasks_batch(error_callbacks)
 
     async def _handle_dynamic_fanout(self, parent: Task, fanout: DynamicFanOut) -> None:
         """
@@ -233,14 +229,7 @@ class TaskProcessor:
                     queue,
                 )
 
-        # Submit all children atomically in a single pipeline. A transactional pipeline
-        # (MULTI/EXEC) is all-or-nothing: either every child is enqueued or none are,
-        # with no partial state possible on a crash — strictly safer than sequential submission.
-        pipe = self.state_manager.job_store.pipeline(transaction=True)
-        for ct in child_tasks:
-            ct.set_status(TaskStatus.SUBMITTED)
-            self.state_manager.ta.stage_submit_task(pipe, ct)
-        await pipe.execute()
+        await self.state_manager.submit_tasks_batch(child_tasks)
 
     async def handle_dropped_task(self, task: Task) -> None:
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
@@ -292,9 +281,6 @@ class TaskProcessor:
         logger.info("Task %s completed.", task.id)
         task.set_status(TaskStatus.COMPLETED)
         if task.cron_id is not None:
-            pipe = self.state_manager.job_store.pipeline(transaction=True)
-            self.state_manager.ta.stage_save(pipe, task)
-            self.state_manager.cron_dag_scheduler.stage_clear_active_run(pipe, task.cron_id)
-            await pipe.execute()
+            await self.state_manager.complete_cron_task(task)
         else:
             await self.state_manager.save_task(task)

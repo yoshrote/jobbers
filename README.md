@@ -139,6 +139,7 @@ See [operations guide](docs/operations.md) for installation, environment variabl
 | -------- | -------- |
 | [Developer guide](docs/developer-guide.md) | Task registration, dependency injection, submitting tasks, queue/role setup, DLQ management, full API reference |
 | [Adapter selection](docs/adapter-selection.md) | Choosing between the msgpack (plain Redis) and JSON (Redis Stack) storage adapters |
+| [Datastore architecture](docs/datastore-architecture.md) | Split-store protocol design, atomic vs saga consistency modes, SQL task state, RabbitMQ queuing |
 | [Operations guide](docs/operations.md) | Installation, environment variables, Docker, monitoring |
 | [Task lifecycle](docs/task-lifecycle.md) | State machine diagram, transition rules, shutdown policies |
 | [DAGs and task chaining](docs/dags.md) | Static and dynamic DAG patterns |

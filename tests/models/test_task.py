@@ -98,6 +98,7 @@ def test_shutdown_resubmit_policy_sets_status_unsubmitted():
 
 def test_should_retry_true_when_retries_remain():
     """should_retry() is True while retry_attempt is still below max_retries."""
+
     async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
@@ -108,6 +109,7 @@ def test_should_retry_true_when_retries_remain():
 
 def test_should_retry_false_when_exhausted():
     """should_retry() is False once retry_attempt equals max_retries."""
+
     async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
@@ -118,6 +120,7 @@ def test_should_retry_false_when_exhausted():
 
 def test_should_schedule_true_when_retry_delay_set():
     """should_schedule() is True when the task config has a non-None retry_delay."""
+
     async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)
@@ -127,6 +130,7 @@ def test_should_schedule_true_when_retry_delay_set():
 
 def test_should_schedule_false_when_no_retry_delay():
     """should_schedule() is False when retry_delay is None."""
+
     async def noop() -> None: ...
 
     task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.FAILED)

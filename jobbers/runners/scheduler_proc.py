@@ -17,7 +17,6 @@ import os
 import sys
 from typing import TYPE_CHECKING
 
-from croniter import croniter
 from opentelemetry import metrics
 
 from jobbers import db
@@ -80,11 +79,7 @@ async def main(poll_interval: float, config_interval: dt.timedelta, role: str, b
             # reschedule them so they aren't lost.
             disabled = [(entry, run_at) for entry, run_at in cron_entries if not entry.enabled]
             if disabled:
-                pipe = state_manager.job_store.pipeline(transaction=True)
-                for entry, run_at in disabled:
-                    next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
-                    state_manager.cron_dag_scheduler.stage_reschedule(pipe, entry.id, next_run_at)
-                await pipe.execute()
+                await state_manager.reschedule_cron_entries_bulk(disabled)
 
         if not work_done:
             await asyncio.sleep(poll_interval)

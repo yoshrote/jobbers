@@ -61,7 +61,7 @@ def _parse_routing(raw: list[dict[str, Any]]) -> list[RoutingConfig]:
 
 class StaticRoutingBackend:
     """
-    Read-only routing backend with config fixed at startup.
+    RoutingBackendProtocol backed by in-process memory; config fixed at startup.
 
     Write operations raise RoutingBackendReadOnlyError. Intended for Celery-like
     deployments where queues and roles are defined once and never changed at runtime.

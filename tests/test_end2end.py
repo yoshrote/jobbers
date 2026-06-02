@@ -7,7 +7,15 @@ import pytest_asyncio
 from ulid import ULID
 
 import end2end
-from jobbers.adapters.redis import MsgpackTaskAdapter
+from jobbers.adapters.redis import (
+    RedisCancellationBus,
+    RedisCronDAGScheduler,
+    RedisDeadQueue,
+    RedisRoutingNotifications,
+    RedisTaskScheduler,
+    RedisTaskState,
+    RedisTaskSubmit,
+)
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_status import TaskStatus
@@ -30,7 +38,20 @@ def register_e2e_tasks():
 @pytest_asyncio.fixture
 async def sm(redis, session_factory):
     await SQLQueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
-    return StateManager(redis, SQLRoutingBackend(session_factory), task_adapter=MsgpackTaskAdapter(redis))
+    routing_backend = SQLRoutingBackend(session_factory)
+    task_state = RedisTaskState(redis)
+    task_submit = RedisTaskSubmit(redis, task_state)
+    return StateManager(
+        redis,
+        routing_backend,
+        task_state=task_state,
+        task_submit=task_submit,
+        dead_queue=RedisDeadQueue(redis, task_state),
+        task_scheduler=RedisTaskScheduler(redis, task_state, routing_backend.get_all_queues),
+        cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -39,7 +60,7 @@ async def sm(redis, session_factory):
 async def drain(sm: StateManager) -> int:
     """Pop and process tasks until all queues are empty. Returns count processed."""
     queues = {"default"}
-    ta = sm.ta
+    ta = sm.task_state
     count = 0
     while True:
         task = None
@@ -88,7 +109,7 @@ async def test_single_node_happy_path(sm: StateManager) -> None:
     await run_until_done(sm)
 
     assert len(submitted) == 1
-    task = await sm.ta.get_task(submitted[0].id)
+    task = await sm.task_state.get_task(submitted[0].id)
     assert task is not None
     assert task.status == TaskStatus.COMPLETED
     assert task.results == {"value": "a"}
@@ -116,9 +137,9 @@ async def test_linear_chain(sm: StateManager) -> None:
     b_node = a_node._successors[0][0]
     c_node = b_node._successors[0][0]
 
-    task_a = await sm.ta.get_task(a_node.id)
-    task_b = await sm.ta.get_task(b_node.id)
-    task_c = await sm.ta.get_task(c_node.id)
+    task_a = await sm.task_state.get_task(a_node.id)
+    task_b = await sm.task_state.get_task(b_node.id)
+    task_c = await sm.task_state.get_task(c_node.id)
 
     assert task_a is not None
     assert task_a.status == TaskStatus.COMPLETED
@@ -158,10 +179,10 @@ async def test_diamond_fan_out_fan_in(sm: StateManager) -> None:
     c_node = a_node._successors[1][0]
     d_node = b_node._successors[0][0]
 
-    task_a = await sm.ta.get_task(a_node.id)
-    task_b = await sm.ta.get_task(b_node.id)
-    task_c = await sm.ta.get_task(c_node.id)
-    task_d = await sm.ta.get_task(d_node.id)
+    task_a = await sm.task_state.get_task(a_node.id)
+    task_b = await sm.task_state.get_task(b_node.id)
+    task_c = await sm.task_state.get_task(c_node.id)
+    task_d = await sm.task_state.get_task(d_node.id)
 
     assert task_a is not None
     assert task_a.status == TaskStatus.COMPLETED
@@ -202,8 +223,8 @@ async def test_error_callback_fires_on_failure(sm: StateManager) -> None:
     # _successors entry: (successor, fan_in_key, error_node, inject_parent_results)
     c_node = a_node._successors[0][2]
 
-    task_a = await sm.ta.get_task(a_node.id)
-    task_c = await sm.ta.get_task(c_node.id)
+    task_a = await sm.task_state.get_task(a_node.id)
+    task_c = await sm.task_state.get_task(c_node.id)
 
     assert task_a is not None
     assert task_a.status == TaskStatus.FAILED
@@ -235,8 +256,8 @@ async def test_downstream_not_submitted_on_parent_failure(sm: StateManager) -> N
     a_node = roots[0]
     b_node = a_node._successors[0][0]
 
-    task_a = await sm.ta.get_task(a_node.id)
-    task_b = await sm.ta.get_task(b_node.id)
+    task_a = await sm.task_state.get_task(a_node.id)
+    task_b = await sm.task_state.get_task(b_node.id)
 
     assert task_a is not None
     assert task_a.status == TaskStatus.FAILED
@@ -261,8 +282,8 @@ async def test_multi_root_dag(sm: StateManager) -> None:
     # roots order is non-deterministic (set iteration); look up by parameter
     a_root = next(r for r in roots if r._parameters.get("value") == "a")
     b_root = next(r for r in roots if r._parameters.get("value") == "b")
-    task_a = await sm.ta.get_task(a_root.id)
-    task_b = await sm.ta.get_task(b_root.id)
+    task_a = await sm.task_state.get_task(a_root.id)
+    task_b = await sm.task_state.get_task(b_root.id)
 
     assert task_a is not None
     assert task_a.status == TaskStatus.COMPLETED
@@ -287,7 +308,7 @@ async def test_retry_exhaustion_dlq(sm: StateManager) -> None:
     _, submitted = await sm.submit_dag(*roots)
     await run_until_done(sm)
 
-    task = await sm.ta.get_task(submitted[0].id)
+    task = await sm.task_state.get_task(submitted[0].id)
     assert task is not None
     assert task.status == TaskStatus.FAILED
     assert task.retry_attempt == 2
@@ -313,7 +334,7 @@ async def test_scheduled_retry_path(sm: StateManager) -> None:
 
     await run_until_done(sm)
 
-    task = await sm.ta.get_task(task_id)
+    task = await sm.task_state.get_task(task_id)
     assert task is not None
     assert task.status == TaskStatus.FAILED
     assert task.retry_attempt == 2
@@ -337,7 +358,7 @@ async def test_parameters_passed_and_results(sm: StateManager) -> None:
     _, submitted = await sm.submit_dag(*roots)
     await run_until_done(sm)
 
-    task = await sm.ta.get_task(submitted[0].id)
+    task = await sm.task_state.get_task(submitted[0].id)
     assert task is not None
     assert task.status == TaskStatus.COMPLETED
     assert task.results == {"value": "hello"}
@@ -351,7 +372,7 @@ async def _wait_for_started(sm: StateManager, task_id: ULID, *, max_wait: float 
     """Poll until the task reaches STARTED status or the deadline expires."""
     deadline = asyncio.get_event_loop().time() + max_wait
     while asyncio.get_event_loop().time() < deadline:
-        t = await sm.ta.get_task(task_id)
+        t = await sm.task_state.get_task(task_id)
         if t is not None and t.status == TaskStatus.STARTED:
             return
         await asyncio.sleep(0.01)
@@ -381,7 +402,7 @@ async def test_cancel_running_task(sm: StateManager) -> None:
     with contextlib.suppress(asyncio.CancelledError):
         await cancel_listener
 
-    result = await sm.ta.get_task(task_id)
+    result = await sm.task_state.get_task(task_id)
     assert result is not None
     assert result.status == TaskStatus.CANCELLED
 
@@ -411,8 +432,8 @@ async def test_cancel_dag_root_leaves_downstream_unsubmitted(sm: StateManager) -
     with contextlib.suppress(asyncio.CancelledError):
         await cancel_listener
 
-    task_a = await sm.ta.get_task(a_node.id)
-    task_b = await sm.ta.get_task(b_node.id)
+    task_a = await sm.task_state.get_task(a_node.id)
+    task_b = await sm.task_state.get_task(b_node.id)
 
     assert task_a is not None
     assert task_a.status == TaskStatus.CANCELLED

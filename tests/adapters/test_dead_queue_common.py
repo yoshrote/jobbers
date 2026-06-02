@@ -10,7 +10,8 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.redis import DeadQueue
+from jobbers.adapters.redis import RedisDeadQueue
+from jobbers.adapters.sql import SQLDeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
 
@@ -37,7 +38,7 @@ def make_task(
 
 
 async def add_to_dlq(dq, task: Task, failed_at: dt.datetime) -> None:
-    pipe = dq.data_store.pipeline(transaction=True)
+    pipe = dq.pipeline()
     dq.stage_add(pipe, task, failed_at)
     await pipe.execute()
 
@@ -207,9 +208,9 @@ async def test_get_by_filter_no_criteria_sorted_by_failed_at_desc(dead_queue):
 async def test_get_by_filter_with_criteria_sorted_by_failed_at_desc(dead_queue):
     """get_by_filter returns results newest-first when a queue or task_name filter is applied."""
     dq, adapter = dead_queue
-    if isinstance(dq, DeadQueue):
+    if isinstance(dq, RedisDeadQueue):
         pytest.xfail(
-            "DeadQueue uses Redis sets for filtered lookups (sinter/smembers), "
+            "RedisDeadQueue uses Redis sets for filtered lookups (sinter/smembers), "
             "which have no ordering guarantee; results are not sorted by failed_at."
         )
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1")
@@ -257,8 +258,12 @@ async def test_get_by_filter_respects_limit_with_version_filter(dead_queue):
 async def test_get_by_filter_skips_missing_task_data(dead_queue):
     """If a task is in the DLQ index but its blob is gone, it is skipped."""
     dq, _ = dead_queue
+    if isinstance(dq, SQLDeadQueue):
+        pytest.skip(
+            "SQLDeadQueue stores full task data in the DLQ table; a missing-blob scenario cannot occur"
+        )
     task = make_task()
-    pipe = dq.data_store.pipeline(transaction=True)
+    pipe = dq.pipeline()
     dq.stage_add(pipe, task, FAILED_AT)
     await pipe.execute()
 
@@ -469,3 +474,46 @@ async def test_clean_empty_queue_is_silent(dead_queue):
     """Clean on an empty DLQ should not raise."""
     dq, _ = dead_queue
     await dq.clean(dt.datetime(2025, 1, 1, tzinfo=dt.UTC))
+
+
+# ── get_history edge cases ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_history_returns_empty_for_missing_task(dead_queue):
+    """get_history returns an empty list when the task is not in the DLQ."""
+    dq, _ = dead_queue
+    result = await dq.get_history("01JQC31AJP7TSA9X8AEP64XG99")
+    assert result == []
+
+
+# ── get_by_ids edge cases ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_by_ids_empty_input_returns_empty(dead_queue):
+    """get_by_ids returns an empty list when given an empty ID list."""
+    dq, adapter = dead_queue
+    task = make_task()
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
+    result = await dq.get_by_ids([])
+    assert result == []
+
+
+# ── get_by_filter with task_version ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_filters_by_task_version(dead_queue):
+    """get_by_filter with task_version returns only tasks of that version."""
+    dq, adapter = dead_queue
+    v1 = make_task("01JQC31AJP7TSA9X8AEP64XG01", version=1)
+    v2 = make_task("01JQC31AJP7TSA9X8AEP64XG02", version=2)
+    for task in (v1, v2):
+        await adapter.save_task(task)
+        await add_to_dlq(dq, task, FAILED_AT)
+
+    result = await dq.get_by_filter(task_version=2)
+    assert len(result) == 1
+    assert result[0].version == 2

@@ -31,7 +31,7 @@ services:
       # ZO_S3_BUCKET: "your-bucket-name"
       # ... other S3 configs
   redis:
-    image: redis:latest
+    image: redis/redis-stack:7.4.0-v2
     ports:
       - "6379:6379"
     volumes:

@@ -150,7 +150,7 @@ class FanInCallback(BaseModel):
     Submit `task` only once all fan-in predecessors have completed.
 
     `fan_in_key` is a Redis key for a set of pending predecessor task IDs.
-    Each predecessor removes its own ID via `TaskAdapterProtocol.fan_in_complete`;
+    Each predecessor removes its own ID via `TaskStateProtocol.fan_in_complete`;
     when the set becomes empty the collector task is submitted.
     """
 

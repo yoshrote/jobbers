@@ -184,9 +184,8 @@ async def test_scheduler_dispatches_enabled_cron_entry():
 async def test_scheduler_reschedules_disabled_cron_entry():
     """Disabled cron entries are rescheduled without being dispatched."""
     entry = make_cron_entry(enabled=False, cron_expr="0 * * * *")
-    mock_pipe = AsyncMock()
     state_manager = make_state_manager_with_tasks([], cron_entries=[(entry, PAST)])
-    state_manager.job_store.pipeline.return_value = mock_pipe
+    state_manager.reschedule_cron_entries_bulk = AsyncMock()
 
     async def fake_sleep(_: float) -> None:
         raise asyncio.CancelledError
@@ -203,8 +202,7 @@ async def test_scheduler_reschedules_disabled_cron_entry():
             pass
 
     state_manager.dispatch_cron_dag.assert_not_called()
-    state_manager.cron_dag_scheduler.stage_reschedule.assert_called_once()
-    mock_pipe.execute.assert_awaited_once()
+    state_manager.reschedule_cron_entries_bulk.assert_awaited_once_with([(entry, PAST)])
 
 
 @pytest.mark.asyncio
@@ -212,11 +210,10 @@ async def test_scheduler_handles_mixed_enabled_and_disabled_cron_entries():
     """Enabled entries are dispatched and disabled entries are rescheduled in one iteration."""
     enabled_entry = make_cron_entry(enabled=True)
     disabled_entry = make_cron_entry(enabled=False, cron_expr="0 * * * *")
-    mock_pipe = AsyncMock()
     state_manager = make_state_manager_with_tasks(
         [], cron_entries=[(enabled_entry, PAST), (disabled_entry, PAST)]
     )
-    state_manager.job_store.pipeline.return_value = mock_pipe
+    state_manager.reschedule_cron_entries_bulk = AsyncMock()
 
     async def fake_sleep(_: float) -> None:
         raise asyncio.CancelledError
@@ -233,5 +230,4 @@ async def test_scheduler_handles_mixed_enabled_and_disabled_cron_entries():
             pass
 
     state_manager.dispatch_cron_dag.assert_called_once_with(enabled_entry, PAST)
-    state_manager.cron_dag_scheduler.stage_reschedule.assert_called_once()
-    mock_pipe.execute.assert_awaited_once()
+    state_manager.reschedule_cron_entries_bulk.assert_awaited_once_with([(disabled_entry, PAST)])

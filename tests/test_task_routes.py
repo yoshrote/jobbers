@@ -19,6 +19,7 @@ from jobbers.task_routes import app
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
 ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
+FROZEN_TIME = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -29,7 +30,7 @@ async def setup(session_factory, state_manager):
     patches = [
         patch("jobbers.task_routes.db.get_session_factory", return_value=session_factory),
         patch("jobbers.task_routes.db.get_state_manager", return_value=state_manager),
-        patch("jobbers.db.get_task_adapter", return_value=state_manager.ta),
+        patch("jobbers.db.get_task_adapter", return_value=state_manager.task_state),
     ]
     for p in patches:
         p.start()
@@ -84,7 +85,7 @@ async def test_submit_valid_task(state_manager):
 
     assert simplify(response_task) == simplify(task_data)
     # Check that it actually exists in redis
-    assert simplify(task_data) == simplify(await state_manager.ta.get_task(task_data.id))
+    assert simplify(task_data) == simplify(await state_manager.task_state.get_task(task_data.id))
 
 
 @pytest.mark.asyncio
@@ -111,7 +112,7 @@ async def test_get_task_status_found(state_manager):
     task_data = Task(
         id=ULID1, name="Test Task", status="submitted", submitted_at=dt.datetime.now(dt.UTC), parameters={}
     )
-    await state_manager.ta.submit_task(task_data)
+    await state_manager.task_state.save_task(task_data)
 
     # Check that it exists via API
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -1218,3 +1219,147 @@ async def test_update_role_rejects_unknown_queue():
     assert response.status_code == 400
     assert "missing" in response.json()["detail"]
     mock_sm.save_role.assert_not_called()
+
+
+# ── task-status additional branches ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_task_status_scheduled_includes_scheduled_at(state_manager):
+    """GET /task-status/{id} includes scheduled_at when the task is SCHEDULED."""
+    run_at = dt.datetime(2025, 6, 1, tzinfo=dt.UTC)
+    task = Task(id=ULID1, name="my_task", queue="default", status="scheduled", submitted_at=FROZEN_TIME)
+    await state_manager.task_state.save_task(task)
+    # Seed into the scheduler so get_run_at returns a value
+    pipe = state_manager.job_store.pipeline(transaction=True)
+    state_manager.task_scheduler.stage_add(pipe, task, run_at)
+    await pipe.execute()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/task-status/{ULID1}")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "scheduled_at" in data
+    assert data["scheduled_at"] == run_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_get_task_status_dag_root_includes_diagram(state_manager):
+    """GET /task-status/{id} includes dag_diagram when the task has dag_callbacks set."""
+    from jobbers.models.dag import DAGTaskSpec, SimpleCallback
+
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
+    task = Task(
+        id=ULID1,
+        name="root_task",
+        queue="default",
+        status="submitted",
+        submitted_at=FROZEN_TIME,
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    await state_manager.task_state.save_task(task)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/task-status/{ULID1}")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "dag_diagram" in data
+    assert "root_task" in data["dag_diagram"]
+
+
+# ── DLQ resubmit with task_version filter ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resubmit_from_dlq_by_filter_with_task_version():
+    """POST /dead-letter-queue/resubmit passes task_version to get_by_filter."""
+    task = Task(id=ULID1, name="My Task", version=2, status="failed", parameters={})
+
+    mock_sm = MagicMock()
+    mock_sm.dead_queue.get_by_filter = AsyncMock(return_value=[task])
+    mock_sm.resubmit_dead_tasks = AsyncMock(return_value=[task])
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/dead-letter-queue/resubmit",
+                json={"queue": "default", "task_name": "My Task", "task_version": 2},
+            )
+
+    assert response.status_code == 200
+    mock_sm.dead_queue.get_by_filter.assert_called_once_with(
+        queue="default",
+        task_name="My Task",
+        task_version=2,
+        limit=100,
+    )
+
+
+# ── submit-dag with unregistered task ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_with_unregistered_task_returns_400():
+    """POST /submit-dag returns 400 when the diagram references a task not in the registry."""
+    diagram = 'flowchart TD\n  A["totally_unregistered_xyz@1"]'
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/submit-dag", json={"diagram": diagram})
+
+    assert response.status_code == 400
+    assert "totally_unregistered_xyz" in response.json()["detail"]
+
+
+# ── PUT /cron-dags/{id} branches ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_cron_dag_not_found_returns_404():
+    """PUT /cron-dags/{id} returns 404 when the cron DAG does not exist."""
+    mock_sm = MagicMock()
+    mock_sm.cron_dag_scheduler.get = AsyncMock(return_value=None)
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.put(
+                f"/cron-dags/{ULID1}",
+                json={
+                    "name": "updated",
+                    "cron_expr": "0 * * * *",
+                    "diagram": 'flowchart TD\n  A["my_task@1"]',
+                },
+            )
+
+    assert response.status_code == 404
+    assert str(ULID1) in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_cron_dag_invalid_cron_expr_returns_400():
+    """PUT /cron-dags/{id} returns 400 when cron_expr is not a valid cron expression."""
+    from jobbers.models.cron_dag import CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    existing = CronDAGEntry(
+        name="existing",
+        cron_expr="0 * * * *",
+        dag_spec=DAGTaskSpec(name="my_task"),
+    )
+    mock_sm = MagicMock()
+    mock_sm.cron_dag_scheduler.get = AsyncMock(return_value=existing)
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.put(
+                f"/cron-dags/{existing.id}",
+                json={
+                    "name": "updated",
+                    "cron_expr": "not a cron expression",
+                    "diagram": 'flowchart TD\n  A["my_task@1"]',
+                },
+            )
+
+    assert response.status_code == 400
+    assert "cron" in response.json()["detail"].lower()

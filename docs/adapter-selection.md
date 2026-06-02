@@ -2,7 +2,7 @@
 
 Jobbers ships two interchangeable storage adapters. Both implement the same protocol and support the same task lifecycle, but they have different infrastructure requirements and different performance characteristics at the API layer.
 
-| | `MsgpackTaskAdapter` + `DeadQueue` | `JsonTaskAdapter` + `JsonDeadQueue` |
+| | `RedisTaskState` / `RedisTaskSubmit` + `RedisDeadQueue` | `RedisJSONTaskState` / `RedisJSONTaskSubmit` + `RedisJSONDeadQueue` |
 | --- | --- | --- |
 | **Redis requirement** | Plain Redis | Redis Stack (JSON + RediSearch modules) |
 | **Task encoding** | Binary msgpack | JSON |
@@ -59,24 +59,34 @@ DAG-heavy deployments running on plain Redis should choose the msgpack adapter w
 
 If you use `dead_letter_policy=DeadLetterPolicy.SAVE` and need to browse or filter the DLQ:
 
-**`DeadQueue`** (msgpack) indexes by queue and task name using Redis sets. Filtering by either dimension alone returns results sorted by `failed_at`. Filtering by both queue and name simultaneously uses a set intersection, which loses ordering — results are returned in arbitrary order.
+**`RedisDeadQueue`** indexes by queue and task name using Redis sets. Filtering by either dimension alone returns results sorted by `failed_at`. Filtering by both queue and name simultaneously uses a set intersection, which loses ordering — results are returned in arbitrary order.
 
-**`JsonDeadQueue`** indexes via RediSearch and always returns results sorted by `failed_at` descending, regardless of which filters are applied.
+**`RedisJSONDeadQueue`** indexes via RediSearch and always returns results sorted by `failed_at` descending, regardless of which filters are applied.
 
 If your operational workflow involves browsing the DLQ by recency while filtering by task name or queue, use the JSON adapter.
 
 ---
 
+## Consistency mode
+
+Both adapters implement `AtomicTaskStateProtocol`, so `StateManager` operates in **atomic pipeline mode** by default: related state mutations (save blob + enqueue, save blob + add to DLQ, etc.) are grouped into a single Redis MULTI/EXEC transaction. This is the only consistency mode that currently ships.
+
+`StateManager` also supports a **saga mode** for cross-backend deployments where task state and the task queue live on different backends. In saga mode, writes are sequenced with the blob always written first, and the Cleaner reconciles any orphans left by mid-sequence crashes. This mode is activated automatically when any of the task adapter, scheduler, or dead letter queue does not implement its Atomic sub-protocol, or when `force_saga=True` is passed to `StateManager`.
+
+See [datastore-architecture.md](datastore-architecture.md) for details on the consistency model, what each mode guarantees, and what would be required to implement task state on SQL or queuing on RabbitMQ.
+
+---
+
 ## Summary: which adapter to choose
 
-**Choose the msgpack adapter when:**
+**Choose the msgpack adapter (`RedisTaskState` / `RedisTaskSubmit` + `RedisDeadQueue`) when:**
 
 - You are running plain Redis (AWS ElastiCache, Azure Cache for Redis, or any managed Redis without module support).
 - Your workload is primarily DAG-based and you access tasks through DAG run endpoints rather than the task list API.
 - Task payloads are large and Redis memory is a concern.
 - You do not need filtered pagination or DLQ ordering.
 
-**Choose the JSON adapter when:**
+**Choose the JSON adapter (`RedisJSONTaskState` / `RedisJSONTaskSubmit` + `RedisJSONDeadQueue`) when:**
 
 - Redis Stack is available (self-hosted, Redis Cloud, or Docker in development).
 - You use the task list API or admin dashboard to browse tasks by status, name, or queue.
