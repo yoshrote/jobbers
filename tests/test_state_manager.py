@@ -24,6 +24,7 @@ from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import StateManager, TaskException, UserCancellationError
+from tests.conftest import DummyCronDAGScheduler, DummyTaskSubmit
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -1072,7 +1073,7 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
         redis,
         routing_backend,
         task_state=dummy_task_adapter,
-        task_submit=dummy_task_adapter,
+        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
@@ -1098,7 +1099,7 @@ async def test_get_routing_config_caches_result(redis, session_factory, dummy_ta
         redis,
         routing_backend,
         task_state=dummy_task_adapter,
-        task_submit=dummy_task_adapter,
+        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
@@ -1134,7 +1135,7 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
         redis,
         routing_backend,
         task_state=dummy_task_adapter,
-        task_submit=dummy_task_adapter,
+        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
@@ -1174,7 +1175,7 @@ async def test_save_routing_config_invalidates_cache_and_bumps_version(
         redis,
         routing_backend,
         task_state=dummy_task_adapter,
-        task_submit=dummy_task_adapter,
+        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
@@ -1219,7 +1220,7 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
         redis,
         routing_backend,
         task_state=dummy_task_adapter,
-        task_submit=dummy_task_adapter,
+        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
@@ -1253,7 +1254,7 @@ async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_
         redis,
         routing_backend,
         task_state=dummy_task_adapter,
-        task_submit=dummy_task_adapter,
+        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
         dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
         task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
         cron_dag_scheduler=RedisCronDAGScheduler(redis),
@@ -1270,3 +1271,242 @@ async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_
     sm.invalidate_all_routing_config()
 
     assert len(sm._routing_config_cache) == 0
+
+
+# ── saga-mode state-manager paths ────────────────────────────────────────────
+# These tests use saga_state_manager (DummyTaskState, _atomic_state=None) or
+# cron_saga_state_manager (AtomicDummyTaskState + DummyCronDAGScheduler) to
+# exercise the else/elif branches that are dead code when all adapters are atomic.
+
+
+async def _dlq_saga(sm: StateManager, task: Task, failed_at: dt.datetime) -> None:
+    """Seed a task into the DLQ via the direct add_to_dlq method (saga-mode DLQ)."""
+    await sm.dead_queue.add_to_dlq(task, failed_at)
+
+
+async def _schedule_saga(sm: StateManager, task: Task, run_at: dt.datetime) -> None:
+    """Seed a task into the scheduler via the direct add method (saga-mode scheduler)."""
+    await sm.task_scheduler.add(task, run_at)
+
+
+@pytest.mark.asyncio
+async def test_fail_task_with_dlq_saga_mode(saga_state_manager):
+    """fail_task calls dead_queue.add_to_dlq directly when adapters are non-atomic."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
+    task.task_config = make_task_config(DeadLetterPolicy.SAVE)
+
+    await saga_state_manager.fail_task(task)
+
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.FAILED
+    dlq = await saga_state_manager.dead_queue.get_by_ids([str(ULID1)])
+    assert len(dlq) == 1
+
+
+@pytest.mark.asyncio
+async def test_fail_task_no_dlq_saga_mode(saga_state_manager):
+    """fail_task with NONE policy saves the task without touching the DLQ in saga mode."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
+    task.task_config = make_task_config(DeadLetterPolicy.NONE)
+
+    await saga_state_manager.fail_task(task)
+
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.FAILED
+    assert await saga_state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
+
+
+@pytest.mark.asyncio
+async def test_resubmit_dead_tasks_saga_mode(saga_state_manager):
+    """resubmit_dead_tasks uses direct save + remove_from_dlq in saga mode."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e"])
+    await saga_state_manager.task_state.save_task(task)
+    await _dlq_saga(saga_state_manager, task, FROZEN_TIME)
+
+    await saga_state_manager.resubmit_dead_tasks([task])
+
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert await saga_state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_submitted_task_saga_mode(saga_state_manager):
+    """Cancelling a SUBMITTED task in saga mode saves CANCELLED state without a pipeline."""
+    task = Task(
+        id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME
+    )
+    await saga_state_manager.task_state.save_task(task)
+
+    result = await saga_state_manager.request_task_cancellation(ULID1)
+
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancel_scheduled_task_saga_mode(saga_state_manager):
+    """Cancelling a SCHEDULED task in saga mode removes it from the scheduler sequentially."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.SCHEDULED)
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+    await saga_state_manager.task_state.save_task(task)
+    await _schedule_saga(saga_state_manager, task, run_at)
+
+    result = await saga_state_manager.request_task_cancellation(ULID1)
+
+    assert result is not None
+    assert result.status == TaskStatus.CANCELLED
+    assert await saga_state_manager.task_scheduler.get_run_at(ULID1) is None
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_schedule_new_task_saga_mode(saga_state_manager):
+    """schedule_new_task saves the task and calls scheduler.add() sequentially in saga mode."""
+    task = Task(id=ULID1, name="t", version=1, queue="default")
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+
+    result = await saga_state_manager.schedule_new_task(task, run_at)
+
+    assert result is task
+    assert task.status == TaskStatus.SCHEDULED
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SCHEDULED
+    scheduled_at = await saga_state_manager.task_scheduler.get_run_at(ULID1)
+    assert scheduled_at is not None
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_task_saga_mode(saga_state_manager):
+    """clean() with stale_time saves STALLED status and removes heartbeat sequentially in saga mode."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+    )
+    await saga_state_manager.task_state.save_task(started)
+    await saga_state_manager.task_state.update_task_heartbeat(started)
+    await saga_state_manager.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await saga_state_manager.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert ULID1 not in saga_state_manager.task_state._heartbeats
+
+
+# ── cron no-pipeline paths ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_no_pipeline(cron_saga_state_manager):
+    """dispatch_cron_dag calls reschedule/set_active_run/submit_task sequentially when cron is non-atomic."""
+    spec_queue = "default"
+    await cron_saga_state_manager.routing.save_queue_config(QueueConfig(name=spec_queue))
+
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue=spec_queue)
+    entry = CronDAGEntry(
+        name="nightly",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+    )
+    cron_sched = cron_saga_state_manager.cron_dag_scheduler
+    assert isinstance(cron_sched, DummyCronDAGScheduler)
+    await cron_sched.add(entry, FROZEN_TIME - dt.timedelta(hours=1))
+
+    await cron_saga_state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    # Entry should have been rescheduled to a future time
+    next_run_at = await cron_sched.get_next_run_at(entry.id)
+    assert next_run_at is not None
+    assert next_run_at > FROZEN_TIME
+
+    # A task should have been submitted
+    submitted = list(cron_saga_state_manager.task_state._store.values())
+    assert len(submitted) == 1
+    assert submitted[0].status == TaskStatus.SUBMITTED
+
+
+@pytest.mark.asyncio
+async def test_complete_cron_task_atomic_state_separate_cron_backend(cron_saga_state_manager):
+    """complete_cron_task saves via pipeline and calls clear_active_run separately on a non-atomic cron."""
+    cron_sched = cron_saga_state_manager.cron_dag_scheduler
+    assert isinstance(cron_sched, DummyCronDAGScheduler)
+
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
+    await cron_sched.add(entry, FROZEN_TIME)
+    task_id = ULID()
+    await cron_sched.set_active_run(entry.id, task_id)
+
+    task = Task(id=task_id, name="my_job", queue="default", status=TaskStatus.COMPLETED, cron_id=entry.id)
+
+    await cron_saga_state_manager.complete_cron_task(task)
+
+    saved = await cron_saga_state_manager.task_state.get_task(task_id)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    assert await cron_sched.get_active_run(entry.id) is None
+
+
+@pytest.mark.asyncio
+async def test_complete_cron_task_full_saga_mode(saga_state_manager):
+    """complete_cron_task uses save_task + clear_active_run sequentially when state is also non-atomic."""
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
+    cron_sched = saga_state_manager.cron_dag_scheduler
+    await cron_sched.add(entry, FROZEN_TIME)
+    task_id = ULID()
+    await cron_sched.set_active_run(entry.id, task_id, ttl=3600)
+
+    task = Task(id=task_id, name="my_job", queue="default", status=TaskStatus.COMPLETED, cron_id=entry.id)
+
+    await saga_state_manager.complete_cron_task(task)
+
+    saved = await saga_state_manager.task_state.get_task(task_id)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    assert await cron_sched.get_active_run(entry.id) is None
+
+
+@pytest.mark.asyncio
+async def test_reschedule_cron_entries_bulk_no_pipeline(cron_saga_state_manager):
+    """reschedule_cron_entries_bulk calls reschedule() sequentially when cron scheduler is non-atomic."""
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
+    cron_sched = cron_saga_state_manager.cron_dag_scheduler
+    assert isinstance(cron_sched, DummyCronDAGScheduler)
+    await cron_sched.add(entry, FROZEN_TIME)
+
+    run_at = FROZEN_TIME
+    await cron_saga_state_manager.reschedule_cron_entries_bulk([(entry, run_at)])
+
+    next_run_at = await cron_sched.get_next_run_at(entry.id)
+    assert next_run_at is not None
+    assert next_run_at > run_at

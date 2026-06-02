@@ -350,3 +350,60 @@ async def test_static_set_active_run_nx():
     result = await scheduler.set_active_run(entry.id, task_id_2, nx=True)
     assert result is False
     assert await scheduler.get_active_run(entry.id) == str(task_id_1)
+
+
+# ── AtomicCronDAGSchedulerProtocol: pipeline staging ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stage_reschedule_updates_next_run_at(mutable_cron_dag_scheduler):
+    """stage_reschedule committed in a pipeline moves the entry's next_run_at."""
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, PAST)
+    pipe = mutable_cron_dag_scheduler.pipeline(transaction=True)
+    mutable_cron_dag_scheduler.stage_reschedule(pipe, entry.id, FUTURE)
+    await pipe.execute()
+    next_run_at = await mutable_cron_dag_scheduler.get_next_run_at(entry.id)
+    assert next_run_at is not None
+    assert abs((next_run_at - FUTURE).total_seconds()) < 1
+
+
+@pytest.mark.asyncio
+async def test_stage_set_active_run_stores_marker(mutable_cron_dag_scheduler):
+    """stage_set_active_run committed in a pipeline persists the active-run marker."""
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, FUTURE)
+    task_id = ULID()
+    pipe = mutable_cron_dag_scheduler.pipeline(transaction=True)
+    mutable_cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task_id, ttl=3600)
+    await pipe.execute()
+    active = await mutable_cron_dag_scheduler.get_active_run(entry.id)
+    assert active == str(task_id)
+
+
+@pytest.mark.asyncio
+async def test_stage_set_active_run_nx_does_not_overwrite_existing(mutable_cron_dag_scheduler):
+    """stage_set_active_run(nx=True) in a pipeline does not overwrite an existing marker."""
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, FUTURE)
+    task_id_1 = ULID()
+    task_id_2 = ULID()
+    await mutable_cron_dag_scheduler.set_active_run(entry.id, task_id_1, ttl=3600)
+    pipe = mutable_cron_dag_scheduler.pipeline(transaction=True)
+    mutable_cron_dag_scheduler.stage_set_active_run(pipe, entry.id, task_id_2, ttl=3600, nx=True)
+    await pipe.execute()
+    active = await mutable_cron_dag_scheduler.get_active_run(entry.id)
+    assert active == str(task_id_1)
+
+
+@pytest.mark.asyncio
+async def test_stage_clear_active_run_removes_marker(mutable_cron_dag_scheduler):
+    """stage_clear_active_run committed in a pipeline removes the active-run marker."""
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, FUTURE)
+    task_id = ULID()
+    await mutable_cron_dag_scheduler.set_active_run(entry.id, task_id, ttl=3600)
+    pipe = mutable_cron_dag_scheduler.pipeline(transaction=True)
+    mutable_cron_dag_scheduler.stage_clear_active_run(pipe, entry.id)
+    await pipe.execute()
+    assert await mutable_cron_dag_scheduler.get_active_run(entry.id) is None

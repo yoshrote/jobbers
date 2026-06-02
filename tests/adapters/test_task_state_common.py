@@ -16,6 +16,7 @@ import pytest
 from ulid import ULID
 
 from jobbers.adapters.redis import RedisTaskState
+from jobbers.adapters.redis_json import RedisJSONTaskState
 from jobbers.models.dag import DAGRunPagination
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
@@ -801,3 +802,75 @@ async def test_get_fan_in_members_returns_predecessor_ids(task_adapter):
     for uid in predecessor_ids:
         await state.fan_in_complete(fan_in_key, uid)
     assert set(await state.get_fan_in_members(fan_in_key)) == predecessor_ids
+
+
+# ── compare_and_set_status ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compare_and_set_status_succeeds_when_expected_matches(task_adapter):
+    """compare_and_set_status transitions status and returns True when expected matches."""
+    state, submit = task_adapter
+    await submit.submit_task(make_task(status=TaskStatus.SUBMITTED))
+    result = await state.compare_and_set_status(ULID1, TaskStatus.SUBMITTED, TaskStatus.STARTED)
+    assert result is True
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STARTED
+
+
+@pytest.mark.asyncio
+async def test_compare_and_set_status_fails_when_status_differs(task_adapter):
+    """compare_and_set_status returns False and leaves status unchanged when expected does not match."""
+    state, submit = task_adapter
+    await submit.submit_task(make_task(status=TaskStatus.SUBMITTED))
+    result = await state.compare_and_set_status(ULID1, TaskStatus.STARTED, TaskStatus.COMPLETED)
+    assert result is False
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+
+
+@pytest.mark.asyncio
+async def test_compare_and_set_status_returns_false_for_missing_task(task_adapter):
+    """compare_and_set_status returns False when the task does not exist."""
+    state, submit = task_adapter
+    result = await state.compare_and_set_status(ULID(), TaskStatus.SUBMITTED, TaskStatus.STARTED)
+    assert result is False
+
+
+# ── clean ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clean_removes_tasks_within_age_window(task_adapter):
+    """clean() removes queue entries whose submitted_at falls within the given range."""
+    state, submit = task_adapter
+    if isinstance(state, RedisJSONTaskState):
+        pytest.xfail(
+            "RedisJSONTaskState.get_all_tasks uses RediSearch (JSON index), not the sorted set "
+            "that clean() modifies; removed entries still appear in search results."
+        )
+    old_task = make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(hours=2))
+    new_task = make_task(ULID2, submitted_at=FROZEN_TIME)
+    await submit.submit_task(old_task)
+    await submit.submit_task(new_task)
+
+    min_age = FROZEN_TIME - dt.timedelta(hours=3)
+    max_age = FROZEN_TIME - dt.timedelta(hours=1)
+    await state.clean({b"default"}, FROZEN_TIME, min_queue_age=min_age, max_queue_age=max_age)
+
+    remaining = await state.get_all_tasks(TaskPagination(queue="default"))
+    remaining_ids = {t.id for t in remaining}
+    assert ULID1 not in remaining_ids
+    assert ULID2 in remaining_ids
+
+
+@pytest.mark.asyncio
+async def test_clean_with_no_age_params_is_noop(task_adapter):
+    """clean() with no min/max age does nothing."""
+    state, submit = task_adapter
+    await submit.submit_task(make_task(ULID1))
+    await state.clean({b"default"}, FROZEN_TIME)
+    remaining = await state.get_all_tasks(TaskPagination(queue="default"))
+    assert len(remaining) == 1
