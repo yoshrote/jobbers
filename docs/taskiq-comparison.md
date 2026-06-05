@@ -355,9 +355,9 @@ Both frameworks support Redis. Durability depends on Redis persistence configura
 **Jobbers:**
 
 - **Broker:** Redis only
-- **Task adapters** (`TASK_ADAPTER`): how task state is stored in Redis
-  - `RedisTaskState` / `RedisTaskSubmit` — plain Redis + msgpack; works with any standard Redis instance
-  - `RedisJSONTaskState` / `RedisJSONTaskSubmit` — Redis Stack with JSON module + RediSearch; enables richer query and filtering support
+- **Task adapters** (`TASK_BACKEND`): how task state is stored in Redis
+  - `redis` → `RedisTaskState` / `RedisTaskSubmit` — plain Redis + msgpack; works with any standard Redis instance
+  - `redis_json` (default) → `RedisJSONTaskState` / `RedisJSONTaskSubmit` — Redis Stack with JSON module + RediSearch; enables richer query and filtering support
 - **Dead letter adapters:** `RedisDeadQueue` (plain Redis sorted set) or `RedisJSONDeadQueue` (Redis Stack JSON; supports richer DLQ filtering). Selection follows the task adapter.
 - **Routing backends** (`ROUTING_BACKEND`): where queue, role, and task-routing config is stored
 

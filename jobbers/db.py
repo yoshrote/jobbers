@@ -24,7 +24,7 @@ from jobbers.adapters.redis import (
 )
 from jobbers.adapters.redis_json import RedisJSONRoutingBackend
 from jobbers.adapters.sql import SQLRoutingBackend
-from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.adapters.static import StaticCronDAGScheduler, StaticRoutingBackend
 from jobbers.migrations.runner import run_migrations
 
 if TYPE_CHECKING:
@@ -36,13 +36,13 @@ if TYPE_CHECKING:
     )
     from jobbers.state_manager import StateManager
 
-TASK_ADAPTER_BACKEND = os.environ.get("TASK_ADAPTER", "json")
 DEFAULT_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
-# SQL-backend feature flags — each defaults to "redis" for backward compatibility.
-TASK_BACKEND = os.environ.get("TASK_BACKEND", "redis")
+# Backend feature flags.
+TASK_BACKEND = os.environ.get("TASK_BACKEND", "redis_json")
 DLQ_BACKEND = os.environ.get("DLQ_BACKEND", "redis")
 TASK_SCHEDULER_BACKEND = os.environ.get("TASK_SCHEDULER_BACKEND", "redis")
+CRON_DAG_SCHEDULER_BACKEND = os.environ.get("CRON_DAG_SCHEDULER_BACKEND", "redis")
 FORCE_SAGA_MODE = os.environ.get("FORCE_SAGA_MODE", "false").lower() == "true"
 
 _client: redis.Redis | None = None
@@ -93,7 +93,7 @@ async def close_sqlite_conn() -> None:
 
 def create_redis_task_state(client: redis.Redis) -> RedisTaskState | RedisJSONTaskState:
     """Create the Redis task state adapter for the configured backend."""
-    if TASK_ADAPTER_BACKEND == "msgpack":
+    if TASK_BACKEND == "redis":
         return RedisTaskState(client)
     return RedisJSONTaskState(client)
 
@@ -109,7 +109,7 @@ def create_redis_task_submit(
 
 def create_dead_queue(client: redis.Redis, task_adapter: TaskStateProtocol) -> DeadQueueProtocol:
     """Create a dead-queue adapter matched to the task adapter backend."""
-    if TASK_ADAPTER_BACKEND == "msgpack":
+    if TASK_BACKEND == "redis":
         return RedisDeadQueue(client, task_adapter)
     return RedisJSONDeadQueue(client, task_adapter)
 
@@ -193,6 +193,8 @@ async def init_state_manager() -> StateManager:
         needed_sql_features.add("dead_letter")
     if TASK_SCHEDULER_BACKEND == "sql":
         needed_sql_features.add("task_schedule")
+    if CRON_DAG_SCHEDULER_BACKEND == "sql":
+        needed_sql_features.add("cron_dag")
 
     routing_backend = await _create_routing_backend(client)
 
@@ -231,7 +233,18 @@ async def init_state_manager() -> StateManager:
     else:
         task_scheduler = RedisTaskScheduler(client, _task_adapter, routing_backend.get_all_queues)
 
-    cron_dag_scheduler = RedisCronDAGScheduler(client)
+    if CRON_DAG_SCHEDULER_BACKEND == "sql":
+        from jobbers.adapters.sql import SQLCronDAGScheduler
+
+        sf = await _get_or_create_sql(needed_sql_features)
+        dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
+        cron_dag_scheduler: RedisCronDAGScheduler | SQLCronDAGScheduler | StaticCronDAGScheduler = (
+            SQLCronDAGScheduler(sf, dsn=dsn)
+        )
+    elif CRON_DAG_SCHEDULER_BACKEND == "static":
+        cron_dag_scheduler = StaticCronDAGScheduler()
+    else:
+        cron_dag_scheduler = RedisCronDAGScheduler(client)
 
     _state_manager = StateManager(
         client,

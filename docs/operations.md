@@ -89,7 +89,7 @@ Run one or more Manager instances. Because all state lives in Redis and SQL, any
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `TASK_ADAPTER` | `json` | Storage backend: `json` (Redis Stack) or `msgpack` (plain Redis). See [adapter selection](adapter-selection.md). |
+| `TASK_BACKEND` | `redis_json` | Task storage backend: `redis_json` (Redis Stack), `redis` (plain Redis), or `sql`. See [adapter selection](adapter-selection.md). |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL for queue/role config |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint for metrics |
@@ -228,10 +228,10 @@ The Scheduler has no persistent state. It is safe to restart at any time — tas
 
 Jobbers ships with two interchangeable storage backends selected at startup:
 
-| `TASK_ADAPTER` | Adapter | Redis requirement |
+| `TASK_BACKEND` | Adapter | Redis requirement |
 | --- | --- | --- |
-| `json` (default) | `RedisJSONTaskState` / `RedisJSONTaskSubmit` + `RedisJSONDeadQueue` | Redis Stack (JSON + RediSearch modules) |
-| `msgpack` | `RedisTaskState` / `RedisTaskSubmit` + `RedisDeadQueue` | Plain Redis |
+| `redis_json` (default) | `RedisJSONTaskState` / `RedisJSONTaskSubmit` + `RedisJSONDeadQueue` | Redis Stack (JSON + RediSearch modules) |
+| `redis` | `RedisTaskState` / `RedisTaskSubmit` + `RedisDeadQueue` | Plain Redis |
 
 See [adapter selection](adapter-selection.md) for guidance on which to choose.
 
