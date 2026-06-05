@@ -832,6 +832,10 @@ class StateManager:
         """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
         return await self.task_state.get_dag_run(dag_run_id)
 
+    async def delete_task(self, task: Task) -> None:
+        """Delete a task record and remove it from all indexes."""
+        await self.task_state.delete_task(task)
+
     async def save_task(self, task: Task) -> Task:
         """Save the task state without extra validation."""
         if self._atomic_state is not None:

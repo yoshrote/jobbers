@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
+from jobbers.models.task_status import TaskStatus
 
 
 def test_all_backoff_strategy_values() -> None:
@@ -198,3 +199,44 @@ class TestMaxRetryDelay:
             )
             result = config.compute_retry_at(5)
             assert result == frozen_now, f"{strategy}: expected no delay when max_retry_delay=0"
+
+
+class TestCleanupOn:
+    """Tests for the cleanup_on field validator."""
+
+    def test_none_is_accepted(self):
+        config = make_config(cleanup_on=None)
+        assert config.cleanup_on is None
+
+    def test_terminal_statuses_are_accepted(self):
+        valid = {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.STALLED,
+            TaskStatus.DROPPED,
+        }
+        config = make_config(cleanup_on=valid)
+        assert config.cleanup_on == frozenset(valid)
+
+    def test_single_terminal_status_is_accepted(self):
+        config = make_config(cleanup_on={TaskStatus.COMPLETED})
+        assert TaskStatus.COMPLETED in config.cleanup_on
+
+    def test_active_status_submitted_is_rejected(self):
+        with pytest.raises(ValueError, match="Invalid cleanup_on status: SUBMITTED is not a terminal status"):
+            make_config(cleanup_on={TaskStatus.SUBMITTED})
+
+    def test_active_status_started_is_rejected(self):
+        with pytest.raises(ValueError, match="Invalid cleanup_on status: STARTED is not a terminal status"):
+            make_config(cleanup_on={TaskStatus.STARTED})
+
+    def test_active_status_scheduled_is_rejected(self):
+        with pytest.raises(ValueError, match="Invalid cleanup_on status: SCHEDULED is not a terminal status"):
+            make_config(cleanup_on={TaskStatus.SCHEDULED})
+
+    def test_unsubmitted_is_rejected(self):
+        with pytest.raises(
+            ValueError, match="Invalid cleanup_on status: UNSUBMITTED is not a terminal status"
+        ):
+            make_config(cleanup_on={TaskStatus.UNSUBMITTED})

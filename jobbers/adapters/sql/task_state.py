@@ -466,6 +466,12 @@ class SQLTaskState:
     async def ensure_index(self) -> None:
         """No-op: indexes are created by run_migrations."""
 
+    async def delete_task(self, task: Task) -> None:
+        """Delete a single task record."""
+        async with self._sf() as session:
+            async with session.begin():
+                await session.execute(delete(tasks).where(tasks.c.id == str(task.id)))
+
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete terminal tasks older than ``max_age``."""
         cutoff = now - max_age

@@ -448,6 +448,43 @@ async def test_get_stale_tasks_excludes_recent_tasks(task_adapter):
     assert len(result) == 0
 
 
+# ── delete_task ───────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_delete_task_removes_task_blob(task_adapter):
+    """delete_task causes get_task to return None."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.COMPLETED)
+    await state.save_task(task)
+    assert await state.get_task(task.id) is not None
+    await state.delete_task(task)
+    assert await state.get_task(task.id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_removes_heartbeat_entry(task_adapter):
+    """delete_task removes the heartbeat entry so the task no longer appears in get_active_tasks."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.STARTED)
+    await state.save_task(task)
+    task.heartbeat_at = FROZEN_TIME
+    await state.update_task_heartbeat(task)
+    assert any(t.id == task.id for t in await state.get_active_tasks({task.queue}))
+    await state.delete_task(task)
+    assert not any(t.id == task.id for t in await state.get_active_tasks({task.queue}))
+
+
+@pytest.mark.asyncio
+async def test_delete_task_idempotent(task_adapter):
+    """Calling delete_task twice on the same task does not raise."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.COMPLETED)
+    await state.save_task(task)
+    await state.delete_task(task)
+    await state.delete_task(task)  # should not raise
+
+
 @pytest.mark.asyncio
 async def test_get_stale_tasks_handles_multiple_queues(task_adapter):
     """Stale tasks from multiple queues are all returned."""

@@ -144,6 +144,10 @@ class DummyTaskState:
         self._store[task.id] = task
         return task
 
+    async def delete_task(self, task: Task) -> None:
+        self._store.pop(task.id, None)
+        self._heartbeats.pop(task.id, None)
+
     def __getattr__(self, name: str) -> object:
         raise NotImplementedError(f"DummyTaskState.{name} is not implemented")
 

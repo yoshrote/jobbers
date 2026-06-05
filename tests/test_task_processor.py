@@ -1446,3 +1446,163 @@ async def test_no_injection_when_flag_is_false():
 
     assert result.status == TaskStatus.COMPLETED
     task_function.assert_awaited_once_with(x=1)
+
+
+# ── _maybe_cleanup ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_maybe_cleanup_standalone_deletes_on_matching_status():
+    """Standalone task with cleanup_on={COMPLETED} is deleted after successful completion."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=None)
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        cleanup_on=frozenset({TaskStatus.COMPLETED}),
+    )
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
+
+    assert task.status == TaskStatus.COMPLETED
+    state_manager.delete_task.assert_awaited_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_maybe_cleanup_standalone_does_not_delete_when_status_not_in_cleanup_on():
+    """Standalone task with cleanup_on={FAILED} is NOT deleted on COMPLETED."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=None)
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        cleanup_on=frozenset({TaskStatus.FAILED}),
+    )
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
+
+    assert task.status == TaskStatus.COMPLETED
+    state_manager.delete_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_cleanup_standalone_no_cleanup_on():
+    """Standalone task without cleanup_on is never auto-deleted."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=None)
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
+
+    state_manager.delete_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_cleanup_dag_task_waits_when_siblings_still_active():
+    """DAG task is NOT deleted when a sibling is still in an active state."""
+    dag_run_id = ULID()
+    task_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
+    sibling_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+
+    task = Task(
+        id=task_id,
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    # Sibling is still STARTED (active).
+    sibling = Task(id=sibling_id, name="test_task", version=1, status=TaskStatus.STARTED, queue="default")
+
+    state_manager = _make_state_manager()
+    state_manager.get_dag_run = AsyncMock(return_value=(dt.datetime.now(dt.UTC), [task_id, sibling_id]))
+    state_manager.task_state.get_tasks_bulk = AsyncMock(return_value=[task, sibling])
+
+    task_function = AsyncMock(return_value=None)
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        cleanup_on=frozenset({TaskStatus.COMPLETED}),
+    )
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
+
+    assert task.status == TaskStatus.COMPLETED
+    state_manager.delete_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_cleanup_dag_task_deletes_when_all_siblings_terminal():
+    """When all DAG tasks are terminal, all those with matching cleanup_on are deleted."""
+    dag_run_id = ULID()
+    task_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
+    sibling_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+
+    task = Task(
+        id=task_id,
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    sibling = Task(id=sibling_id, name="test_task", version=1, status=TaskStatus.COMPLETED, queue="default")
+
+    state_manager = _make_state_manager()
+    state_manager.get_dag_run = AsyncMock(return_value=(dt.datetime.now(dt.UTC), [task_id, sibling_id]))
+
+    async def _get_tasks_bulk(ids: list) -> list:
+        # After process() runs, task status is COMPLETED; return both as terminal.
+        return [task, sibling]
+
+    state_manager.task_state.get_tasks_bulk = AsyncMock(side_effect=_get_tasks_bulk)
+
+    task_function = AsyncMock(return_value=None)
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        cleanup_on=frozenset({TaskStatus.COMPLETED}),
+    )
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch("jobbers.task_processor.registry.get_task_config", return_value=task_config),
+    ):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
+
+    assert task.status == TaskStatus.COMPLETED
+    assert state_manager.delete_task.await_count == 2

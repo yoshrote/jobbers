@@ -4,9 +4,10 @@ from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, PlainSerializer, WithJsonSchema
+from pydantic import BaseModel, Field, PlainSerializer, WithJsonSchema, field_validator
 
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+from jobbers.models.task_status import TaskStatus
 
 SerializableCallable = Annotated[
     Callable[..., Awaitable[Any]],
@@ -48,6 +49,7 @@ class TaskConfig(BaseModel):
     max_retry_delay: int = Field(default=3600)  # Upper bound on computed retry delay in seconds
     on_shutdown: TaskShutdownPolicy = Field(default=TaskShutdownPolicy.STOP)
     dead_letter_policy: DeadLetterPolicy = Field(default=DeadLetterPolicy.NONE)
+    cleanup_on: frozenset[TaskStatus] | None = Field(default=None)
     max_heartbeat_interval: dt.timedelta | None = Field(
         default=None
     )  # Interval for sending heartbeats in seconds, if applicable
@@ -69,6 +71,17 @@ class TaskConfig(BaseModel):
             when_used="json",
         ),
     ] = Field(default_factory=list)
+
+    @field_validator("cleanup_on")
+    @classmethod
+    def _validate_cleanup_on(cls, v: frozenset[TaskStatus] | None) -> frozenset[TaskStatus] | None:
+        if v is None:
+            return v
+        _non_terminal = TaskStatus.active_statuses() | {TaskStatus.UNSUBMITTED}
+        invalid = v & _non_terminal
+        if invalid:
+            raise ValueError(f"cleanup_on may not contain non-terminal statuses: {invalid}")
+        return v
 
     def compute_retry_at(self, attempt: int) -> dt.datetime:
         """Return the datetime at which the given retry attempt should run."""

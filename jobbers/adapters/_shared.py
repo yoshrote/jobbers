@@ -259,6 +259,15 @@ class SharedTaskAdapterMixin(ABC):
             pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task_id))
             await pipe.execute()
 
+    async def delete_task(self, task: Task) -> None:
+        """Delete a task blob and remove it from all indexes atomically."""
+        key_str = self.TASK_DETAILS(task_id=task.id)
+        pipe = self.data_store.pipeline(transaction=True)
+        pipe.delete(key_str)
+        pipe.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))
+        pipe.srem(self.TASK_BY_TYPE_IDX(name=task.name), bytes(task.id))
+        await pipe.execute()
+
     def stage_requeue(self, pipe: TransactionHandle, task: Task) -> None:
         """Queue ZADD task-queue + save-task commands onto pipe (no execute)."""
         assert task.submitted_at  # noqa: S101

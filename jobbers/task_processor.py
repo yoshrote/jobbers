@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type
 
 from opentelemetry import metrics
 
+from jobbers import registry
 from jobbers.context import _current_task as _current_task_cv
 from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
 from jobbers.models.task import Task
@@ -125,6 +126,7 @@ class TaskProcessor:
                         _current_task_cv.reset(_token)
 
             await self.state_manager.remove_task_heartbeat(task)
+            await self._maybe_cleanup(task)
 
         # Metrics recording
         tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
@@ -160,6 +162,44 @@ class TaskProcessor:
         except UserCancellationError:
             await self.handle_user_cancelled_task(task)
             raise  # Re-raise to exit the TaskGroup in run()
+
+    async def _maybe_cleanup(self, task: Task) -> None:
+        """
+        Delete the task record if its final status is in cleanup_on.
+
+        For DAG tasks, waits until all tasks in the run are terminal before
+        deleting any of them (parent results may still be needed by siblings).
+        """
+        if task.task_config is None or not task.task_config.cleanup_on:
+            return
+        if task.status not in task.task_config.cleanup_on:
+            return
+
+        if task.dag_run_id is None:
+            await self.state_manager.delete_task(task)
+            return
+
+        run = await self.state_manager.get_dag_run(task.dag_run_id)
+        if run is None:
+            # Orphaned run index — clean up immediately.
+            await self.state_manager.delete_task(task)
+            return
+
+        _, task_ids = run
+        sibling_tasks = await self.state_manager.task_state.get_tasks_bulk(task_ids)
+        if any(t is None or t.status in TaskStatus.active_statuses() for t in sibling_tasks):
+            return  # DAG still in flight; the last task to finish will trigger cleanup.
+
+        # All DAG tasks are terminal — delete those whose config says to.
+        to_delete: list[Task] = []
+        for sibling in sibling_tasks:
+            if sibling is None:
+                continue
+            cfg = registry.get_task_config(sibling.name, sibling.version)
+            if cfg and cfg.cleanup_on and sibling.status in cfg.cleanup_on:
+                to_delete.append(sibling)
+        if to_delete:
+            await asyncio.gather(*(self.state_manager.delete_task(t) for t in to_delete))
 
     def mark_task_as_started(self, task: Task) -> None:
         task.set_status(TaskStatus.STARTED)
