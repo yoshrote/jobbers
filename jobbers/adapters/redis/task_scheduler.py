@@ -50,11 +50,12 @@ class RedisTaskScheduler:
         for _, key in ipairs(KEYS) do
             if collected >= limit then break end
             local remaining = limit - collected
-            local items = redis.call('ZRANGEBYSCORE', key, '-inf', now, 'WITHSCORES', 'LIMIT', '0', string.format('%d', remaining))
-            for i = 1, #items, 2 do
-                redis.call('ZREM', key, items[i])
-                table.insert(results, items[i])
-                table.insert(results, items[i + 1])
+            local members = redis.call('ZRANGEBYSCORE', key, '-inf', now, 'LIMIT', 0, remaining)
+            for i = 1, #members do
+                local score = redis.call('ZSCORE', key, members[i])
+                redis.call('ZREM', key, members[i])
+                table.insert(results, members[i])
+                table.insert(results, score)
                 collected = collected + 1
             end
         end

@@ -47,11 +47,16 @@ class RedisCronDAGScheduler:
     # Returns flat list: [cron_id_bytes, score_str, cron_id_bytes, score_str, ...]
     _ACQUIRE_SCRIPT = """
         local now = ARGV[1]
-        local items = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'WITHSCORES', 'LIMIT', '0', ARGV[2])
-        for i = 1, #items, 2 do
-            redis.call('ZREM', KEYS[1], items[i])
+        local limit = tonumber(ARGV[2])
+        local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, limit)
+        local results = {}
+        for i = 1, #members do
+            local score = redis.call('ZSCORE', KEYS[1], members[i])
+            redis.call('ZREM', KEYS[1], members[i])
+            table.insert(results, members[i])
+            table.insert(results, score)
         end
-        return items
+        return results
     """
 
     def __init__(self, data_store: Redis) -> None:

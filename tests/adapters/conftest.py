@@ -73,7 +73,7 @@ async def task_adapter(request, redis, session_factory):
     elif request.param == "sql":
         yield SQLTaskState(session_factory), SQLTaskSubmit(session_factory)
     else:
-        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0, protocol=2)
         try:
             await r.flushdb()
         except RedisConnectionError as exc:  # pragma: no cover
@@ -104,7 +104,7 @@ async def redis_task_adapter(request, redis):
         state = RedisTaskState(redis)
         yield state, RedisTaskSubmit(redis, state)
     else:
-        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0, protocol=2)
         try:
             await r.flushdb()
         except RedisConnectionError as exc:  # pragma: no cover
@@ -129,7 +129,7 @@ async def json_adapter():
     Use this for json-specific edge case tests that cannot be expressed as
     protocol contract tests (e.g., null JSON blob, missing RediSearch doc).
     """
-    r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+    r = aioredis.from_url(DEFAULT_REDIS_URL, db=0, protocol=2)
     try:
         await r.flushdb()
     except RedisConnectionError as exc:  # pragma: no cover
@@ -173,7 +173,7 @@ async def queue_config_adapter(request, session_factory, redis):
     elif request.param == "redis":
         yield RedisQueueConfigAdapter(redis)
     else:
-        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0, protocol=2)
         try:
             await r.flushdb()
         except RedisConnectionError as exc:  # pragma: no cover
@@ -204,7 +204,7 @@ async def task_routing_config_adapter(request, session_factory, redis):
     elif request.param == "redis":
         yield RedisTaskRoutingConfigAdapter(redis)
     else:
-        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0, protocol=2)
         try:
             await r.flushdb()
         except RedisConnectionError as exc:  # pragma: no cover
@@ -239,7 +239,7 @@ async def dead_queue(request, dummy_task_adapter, session_factory):
     elif request.param == "sql":
         yield SQLDeadQueue(session_factory), SQLTaskState(session_factory)
     else:
-        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0)
+        r = aioredis.from_url(DEFAULT_REDIS_URL, db=0, protocol=2)
         try:
             await r.flushdb()
         except RedisConnectionError as exc:  # pragma: no cover

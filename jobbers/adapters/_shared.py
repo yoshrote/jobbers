@@ -305,7 +305,7 @@ class SharedTaskAdapterMixin(ABC):
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Remove DAG run index entries older than ``max_age``."""
         cutoff = (now - max_age).timestamp()
-        stale: list[bytes] = await self.data_store.zrangebyscore(self.DAG_RUNS, "-inf", cutoff)
+        stale = cast("list[bytes]", await self.data_store.zrange(self.DAG_RUNS, "-inf", cutoff, byscore=True))
         if stale:
             await self.data_store.zrem(self.DAG_RUNS, *stale)
 
@@ -379,9 +379,9 @@ class SharedTaskAdapterMixin(ABC):
         cutoff_time = now - stale_time
         stale_task_ids: set[bytes] = set()
         for queue in queues:
-            task_ids: list[bytes] = await self.data_store.zrangebyscore(
-                self.HEARTBEAT_SCORES(queue=queue), min=0, max=cutoff_time.timestamp()
-            )
+            task_ids = cast("list[bytes]", await self.data_store.zrange(
+                self.HEARTBEAT_SCORES(queue=queue), 0, cutoff_time.timestamp(), byscore=True
+            ))
             stale_task_ids.update(task_ids)
         fetched = await self.get_tasks_bulk([ULID.from_bytes(b) for b in stale_task_ids])
         for task in fetched:

@@ -65,13 +65,14 @@ class RedisTaskState(SharedTaskAdapterMixin):
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Fetch tasks from the queue sorted set and filter in Python."""
         if pagination.order_by == PaginationOrder.SUBMITTED_AT:
-            raw_ids = await self.data_store.zrangebyscore(
+            raw_ids = cast("list[bytes]", await self.data_store.zrange(
                 self.TASKS_BY_QUEUE(queue=pagination.queue),
                 "-inf",
                 "+inf",
-                start=pagination.offset,
+                byscore=True,
+                offset=pagination.offset,
                 num=pagination.limit * 5,
-            )
+            ))
         else:
             raw_ids = await self.data_store.zrange(
                 self.TASKS_BY_QUEUE(queue=pagination.queue),
@@ -119,7 +120,7 @@ class RedisTaskState(SharedTaskAdapterMixin):
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Remove stale DAG run entries and their per-run task sets."""
         cutoff = (now - max_age).timestamp()
-        stale: list[bytes] = await self.data_store.zrangebyscore(self.DAG_RUNS, "-inf", cutoff)
+        stale = cast("list[bytes]", await self.data_store.zrange(self.DAG_RUNS, "-inf", cutoff, byscore=True))
         if not stale:
             return
         pipe = self.data_store.pipeline(transaction=False)

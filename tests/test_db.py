@@ -18,7 +18,7 @@ async def test_get_client_creates_new_client(mock_redis):
     """Test that get_client creates a new Redis client if none exists."""
     client = get_client()
     assert client is not None
-    mock_redis.assert_called_once_with(DEFAULT_REDIS_URL)
+    mock_redis.assert_called_once_with(DEFAULT_REDIS_URL, protocol=2)
 
 
 @pytest.mark.asyncio
@@ -30,7 +30,7 @@ async def test_get_client_uses_existing_client(mock_redis):
     client2 = get_client()
 
     assert client1 is client2
-    mock_redis.assert_called_once_with(DEFAULT_REDIS_URL)
+    mock_redis.assert_called_once_with(DEFAULT_REDIS_URL, protocol=2)
 
 
 @pytest.mark.asyncio

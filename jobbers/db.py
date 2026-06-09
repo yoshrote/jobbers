@@ -56,7 +56,7 @@ _pre_registered_routing_backend: RoutingBackendProtocol | None = None
 def get_client() -> redis.Redis:
     global _client
     if _client is None:
-        _client = redis.from_url(DEFAULT_REDIS_URL)
+        _client = redis.from_url(DEFAULT_REDIS_URL, protocol=2)
     return _client
 
 
