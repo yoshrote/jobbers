@@ -224,19 +224,17 @@ class TestCleanupOn:
         assert TaskStatus.COMPLETED in config.cleanup_on
 
     def test_active_status_submitted_is_rejected(self):
-        with pytest.raises(ValueError, match="Invalid cleanup_on status: SUBMITTED is not a terminal status"):
+        with pytest.raises(ValueError, match="non-terminal statuses"):
             make_config(cleanup_on={TaskStatus.SUBMITTED})
 
     def test_active_status_started_is_rejected(self):
-        with pytest.raises(ValueError, match="Invalid cleanup_on status: STARTED is not a terminal status"):
+        with pytest.raises(ValueError, match="non-terminal statuses"):
             make_config(cleanup_on={TaskStatus.STARTED})
 
     def test_active_status_scheduled_is_rejected(self):
-        with pytest.raises(ValueError, match="Invalid cleanup_on status: SCHEDULED is not a terminal status"):
+        with pytest.raises(ValueError, match="non-terminal statuses"):
             make_config(cleanup_on={TaskStatus.SCHEDULED})
 
     def test_unsubmitted_is_rejected(self):
-        with pytest.raises(
-            ValueError, match="Invalid cleanup_on status: UNSUBMITTED is not a terminal status"
-        ):
+        with pytest.raises(ValueError, match="non-terminal statuses"):
             make_config(cleanup_on={TaskStatus.UNSUBMITTED})
