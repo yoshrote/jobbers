@@ -52,6 +52,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+zmq = ["pyzmq>=27", "tornado>=6.1"]
 test = [
     "fakeredis[lua,json]",
     "httpx",
