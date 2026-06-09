@@ -156,32 +156,6 @@ async def test_delete_routing_config_returns_false(backend):
     assert result is False
 
 
-# ── from_env ─────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_from_env_inline_json(monkeypatch):
-    monkeypatch.setenv("STATIC_QUEUES", '[{"name":"q1","max_concurrent":7}]')
-    monkeypatch.setenv("STATIC_ROLES", '{"r1":["q1"]}')
-    monkeypatch.setenv("STATIC_ROUTING", "[]")
-    monkeypatch.delenv("STATIC_CONFIG_FILE", raising=False)
-
-    b = StaticRoutingBackend.from_env()
-    assert await b.get_queue_config("q1") is not None
-    assert (await b.get_queue_config("q1")).max_concurrent == 7
-    assert await b.get_queues("r1") == {"q1"}
-
-
-@pytest.mark.asyncio
-async def test_from_env_defaults_when_nothing_set(monkeypatch):
-    for var in ("STATIC_QUEUES", "STATIC_ROLES", "STATIC_ROUTING", "STATIC_CONFIG_FILE"):
-        monkeypatch.delenv(var, raising=False)
-
-    b = StaticRoutingBackend.from_env()
-    assert await b.get_queue_config("default") is not None
-    assert "default" in await b.get_queues("default")
-
-
 # ── from_file ────────────────────────────────────────────────────────────────
 
 
@@ -206,28 +180,6 @@ async def test_from_file_json():
         assert rc.queues == ["file_q"]
     finally:
         os.unlink(path)
-
-
-@pytest.mark.asyncio
-async def test_from_env_loads_config_file_when_env_var_set(monkeypatch, tmp_path):
-    """from_env() calls from_file() when STATIC_CONFIG_FILE is set."""
-    config_file = tmp_path / "routing.json"
-    config_file.write_text(
-        json.dumps(
-            {
-                "queues": [{"name": "env_q", "max_concurrent": 3}],
-                "roles": {"env_role": ["env_q"]},
-                "routing": [],
-            }
-        )
-    )
-    monkeypatch.setenv("STATIC_CONFIG_FILE", str(config_file))
-    monkeypatch.delenv("STATIC_QUEUES", raising=False)
-
-    b = StaticRoutingBackend.from_env()
-    assert await b.get_queue_config("env_q") is not None
-    assert (await b.get_queue_config("env_q")).max_concurrent == 3
-    assert await b.get_queues("env_role") == {"env_q"}
 
 
 def test_from_file_yaml_raises_when_pyyaml_missing(tmp_path):

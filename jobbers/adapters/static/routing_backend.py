@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -69,8 +68,7 @@ class StaticRoutingBackend:
     Configuration priority (highest to lowest):
       1. Constructor arguments
       2. STATIC_CONFIG_FILE env var → JSON or YAML file
-      3. STATIC_QUEUES / STATIC_ROLES / STATIC_ROUTING inline JSON env vars
-      4. Built-in defaults: one "default" queue and "default" role
+      3. Built-in defaults: one "default" queue and "default" role
     """
 
     def __init__(
@@ -96,30 +94,6 @@ class StaticRoutingBackend:
             roles=_parse_roles(data.get("roles", {})) or None,
             routing_configs=_parse_routing(data.get("routing", [])),
         )
-
-    @classmethod
-    def from_env(cls) -> StaticRoutingBackend:
-        config_file = os.environ.get("STATIC_CONFIG_FILE")
-        if config_file:
-            return cls.from_file(config_file)
-
-        queues: list[QueueConfig] | None = None
-        roles: dict[str, set[str]] | None = None
-        routing_configs: list[RoutingConfig] = []
-
-        raw_queues = os.environ.get("STATIC_QUEUES")
-        if raw_queues:
-            queues = _parse_queues(json.loads(raw_queues))
-
-        raw_roles = os.environ.get("STATIC_ROLES")
-        if raw_roles:
-            roles = _parse_roles(json.loads(raw_roles))
-
-        raw_routing = os.environ.get("STATIC_ROUTING")
-        if raw_routing:
-            routing_configs = _parse_routing(json.loads(raw_routing))
-
-        return cls(queues=queues, roles=roles, routing_configs=routing_configs)
 
     # ── Queue reads ───────────────────────────────────────────────────────────
 

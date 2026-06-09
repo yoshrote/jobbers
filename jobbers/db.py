@@ -168,8 +168,8 @@ async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol
         await backend.ensure_indexes()
         return backend
 
-    if backend_type == "static":
-        return StaticRoutingBackend.from_env()
+    if backend_type == "static" and os.environ.get("STATIC_CONFIG_FILE") is not None:
+        return StaticRoutingBackend.from_file(os.environ["STATIC_CONFIG_FILE"])
 
     # sql (default) — initialize SQLAlchemy
     sf = await _get_or_create_sql({"routing"})
