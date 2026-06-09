@@ -9,6 +9,7 @@ from jobbers import db
 from jobbers.models.dag import DAGNode
 from jobbers.models.task import Task
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
+from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.utils.di import inspect_task_dependencies
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ def register_task(
     max_heartbeat_interval: dt.timedelta | None = None,
     backoff_strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
     dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE,
+    on_shutdown: TaskShutdownPolicy = TaskShutdownPolicy.STOP,
 ) -> Callable[..., Any]:
     """Register a task function with the given name and version."""
 
@@ -99,6 +101,7 @@ def register_task(
             max_heartbeat_interval=max_heartbeat_interval,
             backoff_strategy=backoff_strategy,
             dead_letter_policy=dead_letter_policy,
+            on_shutdown=on_shutdown,
         )
         _task_function_map[(name, version)] = task_conf
         return TaskWrapper(raw_func, name, version)
