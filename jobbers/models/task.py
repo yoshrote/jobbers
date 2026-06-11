@@ -274,11 +274,11 @@ class Task(BaseModel):
         self.heartbeat_at = dt.datetime.now(dt.UTC)
         await self._adapter.update_task_heartbeat(self)
 
-    async def parent_results(self) -> dict[Any, Any] | list[dict[Any, Any]]:
+    async def parent_results(self) -> dict[ULID, dict[Any, Any]]:
         """
         Fetch the results of this task's parent(s) using `parent_ids`.
 
-        Returns a single dict when there is one parent, a list of dicts when
+        Returns a dict of ULID to dicts when
         there are multiple (fan-in collector), or `{}` for root tasks.
         """
         if not self.parent_ids:
@@ -286,8 +286,8 @@ class Task(BaseModel):
         if self._adapter is None:
             raise RuntimeError("Task adapter not injected — set task._adapter before running")
         tasks = await self._adapter.get_tasks_bulk(self.parent_ids)
-        results_list = [t.results if t is not None else {} for t in tasks]
-        return results_list[0] if len(results_list) == 1 else results_list
+        results_map = {t.id: t.results for t in tasks if t is not None}
+        return results_map
 
     def set_status(self, status: TaskStatus) -> None:
         match status:

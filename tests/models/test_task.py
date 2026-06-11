@@ -513,7 +513,7 @@ async def test_parent_results_with_parent_ids_returns_parent_results():
     task._adapter = mock_adapter
     result = await task.parent_results()
 
-    assert result == {"val": 42}
+    assert result == {parent_id: {"val": 42}}
     mock_adapter.get_tasks_bulk.assert_awaited_once_with([parent_id])
 
 
@@ -558,9 +558,8 @@ async def test_parent_results_fan_in_returns_list_of_results():
     collector._adapter = mock_adapter
     result = await collector.parent_results()
 
-    assert isinstance(result, list)
-    assert {"a": 1} in result
-    assert {"b": 2} in result
+    assert result[p1_id] == {"a": 1}
+    assert result[p2_id] == {"b": 2}
 
 
 @pytest.mark.asyncio
