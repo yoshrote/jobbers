@@ -188,7 +188,7 @@ class SharedTaskAdapterMixin(ABC):
             except WatchError:
                 continue
 
-    async def optimistic_dispatch_scheduled(
+    async def atomic_dispatch_scheduled(
         self,
         task: Task,
         stage_extra: Callable[[TransactionHandle], None],

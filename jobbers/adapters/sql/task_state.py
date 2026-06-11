@@ -1,9 +1,8 @@
 """
 SQLAlchemy task state adapter.
 
-- `SQLTaskState` — TaskStateProtocol backed by SQLAlchemy.
-  Does NOT implement AtomicTaskStateProtocol (missing stage_remove_heartbeat and
-  optimistic_dispatch_scheduled); StateManager always uses saga mode with this adapter.
+- `SQLTaskState` — TaskStateProtocol + AtomicTaskStateProtocol backed by SQLAlchemy.
+  Uses SELECT FOR UPDATE (non-SQLite) in atomic_dispatch_scheduled instead of WATCH/MULTI.
 
 Shared helpers used by sql/task_submit.py are also defined here and re-exported.
 """
@@ -30,7 +29,7 @@ from jobbers.models.task_status import TaskStatus
 from jobbers.utils.sql_transaction import SQLTransactionBatch
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -125,12 +124,11 @@ async def _upsert_task(session: AsyncSession, row: dict[str, Any]) -> None:
 
 class SQLTaskState:
     """
-    TaskStateProtocol backed by SQLAlchemy.
+    TaskStateProtocol + AtomicTaskStateProtocol backed by SQLAlchemy.
 
     Tables: ``tasks`` / ``task_fan_in`` / ``dag_runs``.  Uses ``SQLTransactionBatch``
-    for staged writes.  Does **not** implement ``AtomicTaskStateProtocol`` — missing
-    ``stage_remove_heartbeat`` and ``optimistic_dispatch_scheduled``; ``StateManager``
-    always uses saga mode with this adapter.
+    for staged writes.  ``atomic_dispatch_scheduled`` uses ``SELECT FOR UPDATE``
+    (non-SQLite) instead of Redis WATCH/MULTI — no retry loop required.
     """
 
     # Key-helper stubs: present for structural compatibility with AtomicTaskStateProtocol
@@ -258,6 +256,39 @@ class SQLTaskState:
         result = await session.execute(stmt)
         row = result.first()
         return _row_to_task(row) if row is not None else None
+
+    def stage_remove_heartbeat(self, pipe: TransactionHandle, task: Task) -> None:
+        """Stage an UPDATE that clears heartbeat_at for this task."""
+        task_id_str = str(task.id)
+        assert isinstance(pipe, SQLTransactionBatch)  # noqa: S101
+
+        async def _clear(s: AsyncSession) -> None:
+            await s.execute(update(tasks).where(tasks.c.id == task_id_str).values(heartbeat_at=None))
+
+        pipe.add_op(_clear)
+
+    async def atomic_dispatch_scheduled(
+        self,
+        task: Task,
+        stage_extra: Callable[[TransactionHandle], None],
+    ) -> bool:
+        """
+        Transition a SCHEDULED task to SUBMITTED within a single SQL transaction.
+
+        Uses SELECT FOR UPDATE (non-SQLite) to lock the row for the duration of the
+        transaction — no retry loop required, unlike the Redis WATCH/MULTI path.
+        Returns True if dispatched, False if the task was missing or already CANCELLED.
+        """
+        pipe = self.pipeline(transaction=True)
+        current = await self.read_for_watch(pipe, task.id)
+        if current is None or current.status == TaskStatus.CANCELLED:
+            await pipe.execute()
+            return False
+        task.set_status(TaskStatus.SUBMITTED)
+        self.stage_requeue(pipe, task)
+        stage_extra(pipe)
+        await pipe.execute()
+        return True
 
     # ── TaskStateProtocol: direct reads/writes ─────────────────────────────
 

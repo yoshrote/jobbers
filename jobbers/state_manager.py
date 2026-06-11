@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Redis
 
-    from jobbers.adapters.redis import RedisTaskScheduler
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
@@ -41,6 +40,7 @@ if TYPE_CHECKING:
         DeadQueueProtocol,
         RoutingBackendProtocol,
         RoutingNotificationProtocol,
+        TaskSchedulerProtocol,
         TaskStateProtocol,
         TaskSubmitProtocol,
         TransactionHandle,
@@ -95,7 +95,7 @@ class StateManager:
         task_submit: TaskSubmitProtocol,
         *,
         dead_queue: DeadQueueProtocol,
-        task_scheduler: RedisTaskScheduler,
+        task_scheduler: TaskSchedulerProtocol,
         cron_dag_scheduler: CronDAGSchedulerProtocol,
         cancellation_bus: CancellationBusProtocol,
         routing_notifications: RoutingNotificationProtocol,
@@ -350,7 +350,7 @@ class StateManager:
             def _stage_scheduler_remove(pipe: TransactionHandle) -> None:
                 scheduler.stage_remove(pipe, task.id, task.queue)
 
-            dispatched = await self._atomic_state.optimistic_dispatch_scheduled(task, _stage_scheduler_remove)
+            dispatched = await self._atomic_state.atomic_dispatch_scheduled(task, _stage_scheduler_remove)
             if dispatched:
                 logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
             return task

@@ -252,7 +252,7 @@ async def init_state_manager() -> StateManager:
         task_state=_task_adapter,
         task_submit=task_submit,
         dead_queue=dead_queue,
-        task_scheduler=task_scheduler,  # type: ignore[arg-type]
+        task_scheduler=task_scheduler,
         cron_dag_scheduler=cron_dag_scheduler,
         cancellation_bus=RedisCancellationBus(client),
         routing_notifications=RedisRoutingNotifications(client),

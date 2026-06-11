@@ -663,6 +663,57 @@ async def test_stage_remove_from_queue_noop_when_absent(task_adapter):
     await pipe.execute()  # should not raise
 
 
+@pytest.mark.asyncio
+async def test_stage_remove_heartbeat_removes_from_stale_detection(task_adapter):
+    """After stage_remove_heartbeat, the task no longer appears in get_stale_tasks."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.STARTED)
+    task.heartbeat_at = FROZEN_TIME  # very old — would normally be stale
+    await state.save_task(task)
+    await state.update_task_heartbeat(task)
+    pipe = state.pipeline(transaction=True)
+    state.stage_remove_heartbeat(pipe, task)
+    await pipe.execute()
+    stale = [t async for t in state.get_stale_tasks({"default"}, dt.timedelta(seconds=0))]
+    assert not any(t.id == ULID1 for t in stale)
+
+
+@pytest.mark.asyncio
+async def test_atomic_dispatch_scheduled_transitions_to_submitted(task_adapter):
+    """atomic_dispatch_scheduled returns True and sets the task to SUBMITTED."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.SCHEDULED)
+    await state.save_task(task)
+    dispatched = await state.atomic_dispatch_scheduled(task, lambda _pipe: None)
+    assert dispatched is True
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+
+
+@pytest.mark.asyncio
+async def test_atomic_dispatch_scheduled_returns_false_for_cancelled(task_adapter):
+    """atomic_dispatch_scheduled returns False without modifying a CANCELLED task."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.CANCELLED)
+    await state.save_task(task)
+    dispatched = await state.atomic_dispatch_scheduled(task, lambda _pipe: None)
+    assert dispatched is False
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_atomic_dispatch_scheduled_returns_false_when_missing(task_adapter):
+    """atomic_dispatch_scheduled returns False when the task does not exist."""
+    state, _ = task_adapter
+    task = make_task(status=TaskStatus.SCHEDULED)
+    # do not save — task is absent
+    dispatched = await state.atomic_dispatch_scheduled(task, lambda _pipe: None)
+    assert dispatched is False
+
+
 # ── ensure_index ──────────────────────────────────────────────────────────────
 
 

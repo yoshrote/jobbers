@@ -326,7 +326,7 @@ class TaskSchedulerProtocol(Protocol):  # pragma: no cover
 
 @runtime_checkable
 class AtomicTaskStateProtocol(TaskStateProtocol, Protocol):  # pragma: no cover
-    """TaskStateProtocol + pipeline staging methods for same-backend atomic operations."""
+    """TaskStateProtocol + pipeline staging methods for same-backend atomic operations (Redis or SQL)."""
 
     def pipeline(self, transaction: bool = True) -> TransactionHandle: ...
 
@@ -340,7 +340,7 @@ class AtomicTaskStateProtocol(TaskStateProtocol, Protocol):  # pragma: no cover
     ) -> None: ...
     async def read_for_watch(self, pipe: TransactionHandle, task_id: ULID) -> Task | None: ...
 
-    async def optimistic_dispatch_scheduled(
+    async def atomic_dispatch_scheduled(
         self,
         task: Task,
         stage_extra: Callable[[TransactionHandle], None],
@@ -353,8 +353,7 @@ class AtomicTaskStateProtocol(TaskStateProtocol, Protocol):  # pragma: no cover
         additional staged operations before committing.
 
         Returns True if dispatched, False if the task was not found or already cancelled.
-        Implementations choose their locking strategy (WATCH/MULTI for Redis,
-        SELECT FOR UPDATE for SQL).
+        Locking strategy: WATCH/MULTI (Redis) or SELECT FOR UPDATE (SQL).
         """
         ...
 

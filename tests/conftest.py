@@ -199,7 +199,7 @@ class AtomicDummyTaskState(DummyTaskState):
     def stage_remove_heartbeat(self, pipe: object, task: Task) -> None:
         pipe.zrem(self.HEARTBEAT_SCORES(queue=task.queue), bytes(task.id))  # type: ignore[union-attr]
 
-    async def optimistic_dispatch_scheduled(self, task: Task, stage_extra: object) -> bool:
+    async def atomic_dispatch_scheduled(self, task: Task, stage_extra: object) -> bool:
         watched_task = self._store.get(task.id)
         if watched_task is None or watched_task.status == TaskStatus.CANCELLED:
             return False
