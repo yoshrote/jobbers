@@ -941,7 +941,7 @@ async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
     root_node.then(branch_a, branch_b)
     DAGNode.merge(branch_a, branch_b, into=collector)
 
-    root_spec = root_node._to_spec()
+    root_spec = root_node.to_spec()
     entry = CronDAGEntry(
         name="fan_in_job",
         cron_expr="0 0 * * *",

@@ -287,7 +287,7 @@ class DAGNode:
     # Conversion to serialisable / submittable form
     # ------------------------------------------------------------------
 
-    def _to_spec(self) -> DAGTaskSpec:
+    def to_spec(self) -> DAGTaskSpec:
         """Recursively build a `DAGTaskSpec` with embedded callbacks."""
         return DAGTaskSpec(
             id=self._id,
@@ -302,8 +302,8 @@ class DAGNode:
         """Return the list of `DAGCallback` objects for this node's successors."""
         callbacks: list[DAGCallback] = []
         for successor, fan_in_key, error_node, inject_parent_results in self._successors:
-            spec = successor._to_spec()
-            error_spec = error_node._to_spec() if error_node is not None else None
+            spec = successor.to_spec()
+            error_spec = error_node.to_spec() if error_node is not None else None
             if fan_in_key is None:
                 callbacks.append(
                     SimpleCallback(

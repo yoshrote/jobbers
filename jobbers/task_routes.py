@@ -580,7 +580,7 @@ async def create_cron_dag(request: CronDAGRequest) -> dict[str, Any]:
     if len(roots) != 1:
         raise HTTPException(status_code=400, detail="Cron DAGs must have exactly one root node.")
 
-    dag_spec = roots[0]._to_spec()
+    dag_spec = roots[0].to_spec()
     entry = CronDAGEntry(
         name=request.name,
         cron_expr=request.cron_expr,
@@ -639,7 +639,7 @@ async def update_cron_dag(cron_id: str, request: CronDAGRequest) -> dict[str, An
     if len(roots) != 1:
         raise HTTPException(status_code=400, detail="Cron DAGs must have exactly one root node.")
 
-    dag_spec = roots[0]._to_spec()
+    dag_spec = roots[0].to_spec()
     updated = CronDAGEntry(
         id=existing.id,
         name=request.name,

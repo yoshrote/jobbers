@@ -509,7 +509,7 @@ def test_round_trip_linear() -> None:
         B --> C
     """
     roots = parse_mermaid_dag(original)
-    spec = roots[0]._to_spec()  # type: ignore[attr-defined]
+    spec = roots[0].to_spec()  # type: ignore[attr-defined]
     diagram = dag_spec_to_mermaid(spec)
     roots2 = parse_mermaid_dag(diagram)
 
@@ -549,7 +549,7 @@ def test_round_trip_diamond() -> None:
         C --> D
     """
     roots = parse_mermaid_dag(original)
-    spec = roots[0]._to_spec()  # type: ignore[attr-defined]
+    spec = roots[0].to_spec()  # type: ignore[attr-defined]
     diagram = dag_spec_to_mermaid(spec)
     roots2 = parse_mermaid_dag(diagram)
 
