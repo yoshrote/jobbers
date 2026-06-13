@@ -12,10 +12,11 @@ Jobbers takes the opposite approach: **every task has a persistent state record*
 
 | State | Meaning |
 | --- | --- |
+| `unsubmitted` | Initial task state; has not been queued or scheduled. |
 | `submitted` | Waiting in the queue |
 | `started` | Actively executing on a worker |
 | `completed` | Finished successfully |
-| `failed` | Exhausted all retries |
+| `failed` | Exhausted all retries or raised an unexpected error |
 | `scheduled` | Waiting for a future time (delayed retry or future run) |
 | `cancelled` | User-initiated cancellation |
 | `stalled` | Heartbeat went silent — possible hang |
@@ -43,7 +44,7 @@ Tasks declare their retry policy at registration time:
 async def call_external_api(**kwargs): ...
 ```
 
-Only exceptions listed in `expected_exceptions` trigger a retry. Any other exception immediately transitions the task to `failed`, making bugs and unrecoverable errors distinct from transient failures. Backoff strategies range from `CONSTANT` to `EXPONENTIAL_JITTER` (randomized to avoid thundering-herd on retry storms).
+Only exceptions listed in `expected_exceptions` trigger a retry. Any other exception immediately transitions the task to `failed`, making bugs and unrecoverable errors distinct from transient failures. Backoff strategies range from `CONSTANT` to `EXPONENTIAL_JITTER` (randomized to avoid thundering-herd on retry storms). See [task definition reference](docs/task-definition-reference.md#retry-behaviour) for the full retry and backoff reference.
 
 ### Dead letter queue
 
@@ -55,7 +56,7 @@ Long-running tasks call `await task.heartbeat()` periodically. The Cleaner proce
 
 ### Graceful shutdown
 
-Workers respond to SIGTERM according to a per-task `on_shutdown` policy:
+Workers respond to SIGTERM according to a per-task `on_shutdown` policy (see [task definition reference](docs/task-definition-reference.md#shutdown-behavior)):
 
 | Policy | Behaviour |
 | --- | --- |
@@ -69,7 +70,7 @@ Workers respond to SIGTERM according to a per-task `on_shutdown` policy:
 
 Individual tasks can be composed into directed acyclic graphs (DAGs) where results flow forward through the graph and each node waits for its predecessors to complete before starting.
 
-Graphs are authored and exchanged as **Mermaid flowcharts**. The same format is used for submission, cron scheduling, and live status monitoring — the system renders task state back into the diagram with colour-coded nodes, so a diagram copied from the UI can be resubmitted without modification.
+Graphs are authored and exchanged as **Mermaid flowcharts**. The same format is used for submission, cron scheduling, and live status monitoring — the system renders task state back into the diagram with colour-coded nodes, so a diagram copied from the UI can be resubmitted without modification. See [DAG patterns](docs/dag-composition.md) for the Python `DAGNode` API and [Mermaid DAG spec](docs/mermaid-dag-spec.md) for the full diagram grammar.
 
 ```mermaid
 flowchart TD
@@ -125,7 +126,7 @@ curl -X POST http://localhost:8000/cron-dags \
   }'
 ```
 
-`skip_if_running` prevents overlapping runs if the previous fire is still active. Entries can be paused (`enabled: false`) without deleting them — the schedule is preserved and resumes when re-enabled.
+`skip_if_running` prevents overlapping runs if the previous fire is still active. Entries can be paused (`enabled: false`) without deleting them — the schedule is preserved and resumes when re-enabled. See [cron DAGs](docs/trigger-tasks.md#cron-configuration) for the full API reference and concurrency policy options.
 
 ---
 
@@ -153,7 +154,7 @@ All four Jobbers processes — Manager, Worker, Cleaner, and Scheduler — emit 
 - `tasks_retried` high → expected-exception policy may be too broad, or upstream dependency is flaky
 - `refresh_lag_ms` high → a worker may be stalled or not subscribed to the refresh pub/sub channel
 
-The included Docker Compose stack wires all processes to an OpenTelemetry Collector, which forwards to OpenObserve. Any OTLP-compatible backend works by pointing the `OTEL_EXPORTER_OTLP_*` environment variables at a different endpoint.
+The included Docker Compose stack wires all processes to an OpenTelemetry Collector, which forwards to OpenObserve. Any OTLP-compatible backend works by pointing the `OTEL_EXPORTER_OTLP_*` environment variables at a different endpoint. See the [operations guide](docs/operations.md) for the full metrics reference and setup instructions.
 
 ### Admin UI and API
 
@@ -167,7 +168,7 @@ A React admin UI (port 3000) provides a live view of active tasks, the retry del
 
 A task must clear three independent layers before execution begins:
 
-```
+```text
 Submission time
   └─ Per-queue rate limit (atomic Redis Lua script — no races)
 
@@ -180,11 +181,12 @@ Execution time
         └─ Heartbeat monitoring by Cleaner
 ```
 
-Each layer is independently tunable without restarting workers.
+Each layer is independently tunable without restarting workers. See [resource management](docs/resource-management.md) for configuration details and traffic direction patterns.
 
 ### Queues and roles
 
 **Queues** are named work buckets. Each has:
+
 - `max_concurrent` — how many tasks from this queue can run simultaneously per worker
 - Optional rate limit (`rate_numerator / rate_denominator / rate_period`) — enforced atomically at submission via a Lua sorted-set script
 
@@ -208,10 +210,12 @@ Workers subscribe to a Redis pub/sub channel per role for near-instant notificat
 The Cleaner is a one-shot process designed to be run on a cron schedule. It serves two purposes:
 
 **Issue detection:**
+
 - Scans heartbeat timestamps and marks any task that has gone silent as `stalled`
 - This is the only component that can detect a hung task not caught by SIGTERM
 
 **Memory pressure management:**
+
 - Prunes stored state for terminal tasks older than a configurable age
 - Removes expired dead letter queue entries
 - Cleans up stale rate-limiter sorted set entries
@@ -230,14 +234,14 @@ Tasks registered with `cleanup_on` have their state deleted automatically by the
 ```python
 @register_task(
     name="my_task",
-    cleanup_on=frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED}),
+    cleanup_on=frozenset({TaskStatus.COMPLETED, TaskStatus.CANCELLED}),
 )
 async def my_task(**kwargs): ...
 ```
 
 For DAG tasks, cleanup is deferred until all tasks in the run are terminal, so no sibling loses access to its parent's results prematurely.
 
-Tasks that do not configure `cleanup_on`, or that reach a status not in the set, still accumulate state in Redis. The Cleaner is essential for those tasks, and remains the only mechanism for stall detection and rate-limiter cleanup regardless of per-task configuration.
+Tasks that do not configure `cleanup_on`, or that reach a status not in the set, still accumulate state in Redis. The Cleaner is essential for those tasks, and remains the only mechanism for stall detection and rate-limiter cleanup regardless of per-task configuration. See the [operations guide](docs/operations.md#cleaner) for the full argument reference and recommended cron setup.
 
 ---
 
@@ -265,7 +269,7 @@ All adapters implement the same `@runtime_checkable Protocol` interfaces defined
 | Fixed queue topology at deploy time | `ROUTING_BACKEND=static`: load config from file or env vars, no database required |
 | Cron schedules defined in code | `CRON_DAG_SCHEDULER_BACKEND=static`: no cron state database, resets on restart |
 
-The worker hot path (enqueue, dequeue, state transitions) is equivalent across Redis adapters — both use atomic Lua scripts for submission and `BZPOPMIN` for dequeue. Adapter differences affect API query performance and operational features, not task throughput.
+The worker hot path (enqueue, dequeue, state transitions) is equivalent across Redis adapters — both use atomic Lua scripts for submission and `BZPOPMIN` for dequeue. Adapter differences affect API query performance and operational features, not task throughput. See [adapter selection](docs/adapter-selection.md) for a detailed comparison and guidance on mixed-backend configurations.
 
 ---
 
@@ -278,4 +282,4 @@ The worker hot path (enqueue, dequeue, state transitions) is equivalent across R
 | **Cleaner** | One-shot maintenance: stall detection, state pruning, rate-limiter cleanup, saga compensation |
 | **Scheduler** | Long-running: re-enqueues delayed retries and fires cron DAG runs when due |
 
-All four are independent processes that coordinate only through Redis and SQL. Workers and Manager instances scale horizontally without configuration changes.
+All four are independent processes that coordinate only through Redis and SQL. Workers and Manager instances scale horizontally without configuration changes. See the [operations guide](docs/operations.md) for installation, environment variables, and Docker Compose setup.

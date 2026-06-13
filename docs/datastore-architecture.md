@@ -38,8 +38,8 @@ Three operations require the task blob store and the queue to be co-located beca
 The Atomic sub-protocols extend their base protocols with pipeline staging methods:
 
 | Base protocol | Atomic extension | Adds |
-|---|---|---|
-| `TaskStateProtocol` | `AtomicTaskStateProtocol` | `pipeline()`, `stage_save()`, `stage_requeue()`, `stage_submit_task()`, `stage_remove_from_queue()`, `stage_remove_heartbeat()`, `stage_init_fan_in()`, `read_for_watch()`, `optimistic_dispatch_scheduled()` |
+| --- | --- | --- |
+| `TaskStateProtocol` | `AtomicTaskStateProtocol` | `pipeline()`, `stage_save()`, `stage_requeue()`, `stage_submit_task()`, `stage_remove_from_queue()`, `stage_remove_heartbeat()`, `stage_init_fan_in()`, `read_for_watch()`, `atomic_dispatch_scheduled()` |
 | `TaskSchedulerProtocol` | `AtomicTaskSchedulerProtocol` | `pipeline()`, `stage_add()`, `stage_remove()` |
 | `DeadQueueProtocol` | `AtomicDeadQueueProtocol` | `backend_key`, `pipeline()` |
 | `CronDAGSchedulerProtocol` | `AtomicCronDAGSchedulerProtocol` | `backend_key`, `pipeline()`, `stage_reschedule()`, `stage_set_active_run()`, `stage_clear_active_run()` |
@@ -55,7 +55,7 @@ When all adapters share the same backend (same Redis instance), `StateManager` b
 Operations that use atomic pipelines:
 
 | Operation | What is batched |
-|---|---|
+| --- | --- |
 | Submit task | ZADD queue + save blob + register DAG run |
 | Fail task with DLQ | Save blob + add to DLQ |
 | Schedule task | Save blob + ZADD scheduler |
@@ -65,7 +65,7 @@ Operations that use atomic pipelines:
 | Dispatch scheduled task | ZADD queue + save blob + HDEL scheduler entry |
 | Complete cron task | Save blob + clear active-run marker |
 
-`optimistic_dispatch_scheduled` (new in `AtomicTaskStateProtocol`) encapsulates the WATCH/MULTI loop for dispatching a scheduled task: it reads the current task state under WATCH, verifies the task is not cancelled, sets status to SUBMITTED, stages a requeue, and calls a caller-supplied `stage_extra` function (used to stage the scheduler removal) before committing. Retries transparently on `WatchError`. For a SQL adapter this would instead use `SELECT FOR UPDATE`.
+`atomic_dispatch_scheduled` (in `AtomicTaskStateProtocol`) encapsulates the atomic dispatch for a scheduled task: reads the current task state, verifies the task is not cancelled, sets status to SUBMITTED, stages a requeue, and calls a caller-supplied `stage_extra` function (used to stage the scheduler removal) before committing. Redis uses WATCH/MULTI and retries on `WatchError`; SQL uses `SELECT FOR UPDATE` and requires no retry loop.
 
 `stage_remove_heartbeat` (new in `AtomicTaskStateProtocol`) stages the heartbeat sorted-set removal onto an existing pipeline, so stall detection can batch the blob save and the heartbeat removal in one transaction without `StateManager` touching Redis key names directly.
 
@@ -84,7 +84,7 @@ If the process crashes between writes, the Cleaner reconciles:
 Saga mode makes the following consistency tradeoffs explicit:
 
 | Operation | Risk window | Cleaner compensation |
-|---|---|---|
+| --- | --- | --- |
 | Fail task → add to DLQ | Blob saved FAILED, DLQ write not yet executed | Not cleaned — task stays FAILED but is invisible in DLQ until next retry |
 | Resubmit from DLQ | Blob saved SUBMITTED, ZADD not yet executed | Cleaner detects SUBMITTED task with no queue entry and requeues |
 | Cancel submitted task | Blob saved CANCELLED, ZREM not yet executed | Worker pops the task, checks status before executing, discards |
@@ -92,25 +92,21 @@ Saga mode makes the following consistency tradeoffs explicit:
 
 ---
 
-## What a SQL task state adapter would require
+## SQL task state adapter
 
-`TaskStateProtocol` maps cleanly to SQL. All required methods have direct SQL equivalents:
+`SQLTaskState` fully implements both `TaskStateProtocol` and `AtomicTaskStateProtocol`. All methods have direct SQL equivalents:
 
 | Protocol method | SQL implementation |
-|---|---|
+| --- | --- |
 | `save_task` / `get_task` | `INSERT OR REPLACE` / `SELECT` on a tasks table |
-| `compare_and_set_status` | `UPDATE tasks SET status = ? WHERE id = ? AND status = ? RETURNING status` |
+| `compare_and_set_status` | `UPDATE tasks SET status = ? WHERE id = ? AND status = ?` |
 | `update_task_heartbeat` | `UPDATE tasks SET heartbeat_at = ?` |
-| `remove_task_heartbeat` | `UPDATE tasks SET heartbeat_at = NULL` |
-| `init_fan_in` / `fan_in_complete` | Fan-in table with `DELETE WHERE task_id = ? RETURNING COUNT(*)` |
+| `remove_task_heartbeat` / `stage_remove_heartbeat` | `UPDATE tasks SET heartbeat_at = NULL` |
+| `init_fan_in` / `fan_in_complete` | Fan-in table with savepoint-protected INSERT |
 | `get_stale_tasks` | `SELECT ... WHERE heartbeat_at < ?` |
 | `clean_terminal_tasks` | `DELETE WHERE status IN (...) AND completed_at < ?` |
 
-For `AtomicTaskStateProtocol`, a SQL adapter would implement `pipeline()` to return a staged-transaction object that accumulates SQL statements and executes them in a single `BEGIN ... COMMIT`. The `stage_*` methods append to this list. `execute()` runs the transaction.
-
-`optimistic_dispatch_scheduled` would use `SELECT FOR UPDATE` on the task row (within a transaction) rather than Redis WATCH/MULTI, giving the same optimistic-locking semantics under SQL isolation.
-
-`read_for_watch` becomes a plain `SELECT` — there is no WATCH analogue in SQL, but since the optimistic locking is handled entirely inside `optimistic_dispatch_scheduled` (via `SELECT FOR UPDATE`), this method can simply return the task without additional locking.
+`pipeline()` returns a `SQLTransactionBatch` — a staged-transaction object that accumulates SQL callables and executes them in a single `BEGIN ... COMMIT`. `atomic_dispatch_scheduled` uses `SELECT FOR UPDATE` (non-SQLite) instead of Redis WATCH/MULTI. No retry loop is needed; SQL's pessimistic row lock provides the same concurrency guarantee.
 
 ---
 

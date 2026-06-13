@@ -26,7 +26,7 @@ The worker acquires a slot before fetching the next task and releases it when ex
 
 ## 2. Queue Configuration
 
-Queues are the primary unit of traffic control. Each queue has two independent resource controls stored in SQL and enforced at task-fetch time.
+Queues are the primary unit of traffic control. Each queue has two independent resource controls stored in the routing backend (SQL, Redis, or static, depending on `ROUTING_BACKEND`) and enforced at task-fetch time.
 
 ### Per-Queue Concurrency Cap
 
@@ -79,59 +79,15 @@ The Cleaner process periodically prunes stale entries from rate-limiter sorted s
 
 ## 3. Task Configuration
 
-Per-task-type resource controls are set at registration time and baked into the worker binary. They govern retry behaviour, execution time, and what happens on worker shutdown.
+Per-task-type resource controls are set at registration time via `@register_task` and baked into the worker binary. The resource-relevant parameters are:
 
-```python
-@register_task(
-    name="my_task",
-    version=1,
-    max_retries=5,          # total retry attempts before giving up
-    retry_delay=10,         # base delay in seconds before retry
-    backoff_strategy=BackoffStrategy.EXPONENTIAL,
-    max_retry_delay=3600,   # cap on computed delay, seconds
-    timeout=300,            # hard execution timeout, seconds
-    max_concurrent=1,       # per-task-type concurrency limit (across all queues)
-    max_heartbeat_interval=dt.timedelta(minutes=5),
-    dead_letter_policy=DeadLetterPolicy.SAVE,
-    on_shutdown=TaskShutdownPolicy.STOP,
-)
-async def my_task(**kwargs):
-    ...
-```
+- `timeout` — hard execution timeout (seconds); task is cancelled if exceeded
+- `max_concurrent` — per-task-type concurrency cap across all queues on this worker
+- `max_heartbeat_interval` — if a task misses its heartbeat window the Cleaner marks it `STALLED`, freeing its concurrency slot
+- `on_shutdown` — what happens to in-flight tasks on SIGTERM: `STOP` (→ STALLED), `RESUBMIT` (re-enqueued), or `CONTINUE` (shielded to completion)
+- `dead_letter_policy` — `NONE` (failed tasks stay in FAILED state) or `SAVE` (copied to the Dead Letter Queue for inspection and replay)
 
-### Retry and Backoff
-
-When a task fails and has retries remaining the retry delay is computed from the backoff strategy:
-
-| Strategy | Formula |
-| --- | --- |
-| `CONSTANT` | `retry_delay` |
-| `LINEAR` | `retry_delay × attempt` |
-| `EXPONENTIAL` | `retry_delay × 2^attempt` |
-| `EXPONENTIAL_JITTER` | `uniform(0, retry_delay × 2^attempt)` |
-
-The result is capped at `max_retry_delay`. If `retry_delay` is set the task transitions to `SCHEDULED` and the Scheduler re-queues it when it comes due; otherwise it is immediately re-enqueued as `UNSUBMITTED`.
-
-### Heartbeat Monitoring
-
-Long-running tasks should call `task.heartbeat()` periodically. If `max_heartbeat_interval` is set and a task misses its heartbeat window, the Cleaner marks it `STALLED`. This prevents zombie tasks from holding queue concurrency slots indefinitely.
-
-### Shutdown Policy
-
-Controls what happens to in-flight tasks when a worker receives SIGTERM:
-
-| Policy | Behaviour |
-| --- | --- |
-| `STOP` | Cancel immediately; task moves to `STALLED` |
-| `RESUBMIT` | Re-enqueue as `UNSUBMITTED` (another worker picks it up) |
-| `CONTINUE` | Shield with `asyncio.shield()`; task runs to completion before the worker exits |
-
-### Dead Letter Policy
-
-| Policy | Behaviour |
-| --- | --- |
-| `NONE` | Failed tasks (retries exhausted) are simply marked `FAILED` |
-| `SAVE` | Failed tasks are copied to the Dead Letter Queue for inspection and manual replay |
+See [task-definition-reference.md](task-definition-reference.md) for the full parameter reference, retry/backoff formulas, and heartbeat details.
 
 ---
 
@@ -151,17 +107,9 @@ Roles are named sets of queues. A worker consumes exactly the queues belonging t
 
 ### The Refresh Tag Mechanism
 
-Each role has a `refresh_tag` (a ULID) stored in SQL. `TaskGenerator` caches the tag it last saw. On each task fetch cycle it re-reads the tag (at most once per `config_ttl` seconds, default 60 s). If the tag has changed the generator re-queries its queue list and rate/concurrency limits before the next fetch.
+Each role has a `refresh_tag` (a ULID). Workers poll the tag on each fetch cycle and re-query their queue list whenever it changes; a Redis pub/sub channel (`queue-config-refresh:{role}`) delivers immediate notification so idle workers don't wait for the next poll. The tag is bumped on every queue or role mutation, including queue deletion.
 
-```text
-PUT /roles/gpu-workers  { "queues": ["ml-inference", "image-resize"] }
-  → generates new ULID refresh_tag in SQL
-
-Worker polling loop:
-  → reads refresh_tag → mismatch → re-fetches queue list → now consuming ml-inference + image-resize
-```
-
-The refresh tag is also bumped whenever a queue is deleted, ensuring workers that included that queue automatically drop it within one `config_ttl` window.
+See [operations.md — Queue configuration refresh](operations.md#queue-configuration-refresh) for the full mechanics, propagation latency details, and observability metrics.
 
 ### Traffic Direction Patterns
 
@@ -172,7 +120,7 @@ Stop new submissions to a queue while in-flight tasks complete naturally:
 ```bash
 # Remove the queue from the role that processes it
 PUT /roles/default  { "queues": ["other-queue"] }
-# Workers stop polling "draining-queue" within config_ttl seconds
+# Workers stop polling "draining-queue" on their next fetch cycle
 # In-flight tasks on "draining-queue" finish normally (not cancelled)
 ```
 
@@ -181,7 +129,7 @@ PUT /roles/default  { "queues": ["other-queue"] }
 ```bash
 # Add a high-priority queue to a role
 PUT /roles/default  { "queues": ["normal", "urgent"] }
-# Workers pick up "urgent" within config_ttl seconds, no restart needed
+# Workers pick up "urgent" on their next fetch cycle, no restart needed
 ```
 
 #### Isolate a task type to dedicated workers

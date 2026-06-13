@@ -83,15 +83,26 @@ jobbers_manager myapp.tasks
 jobbers_manager /srv/myapp/tasks.py
 ```
 
+Pass `--static-config routing.json` to load queue/role config from a file instead of a database (implies `ROUTING_BACKEND=static`). Both JSON and YAML (`.yaml`/`.yml`) are accepted; YAML requires `pyyaml` to be installed.
+
+```bash
+jobbers_manager --static-config routing.json myapp.tasks
+jobbers_manager --static-config routing.yaml myapp.tasks   # requires pyyaml
+```
+
 Run one or more Manager instances. Because all state lives in Redis and SQL, any number can run concurrently behind a load balancer.
 
 **Environment variables:**
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `TASK_BACKEND` | `redis_json` | Task storage backend: `redis_json` (Redis Stack), `redis` (plain Redis), or `sql`. See [adapter selection](adapter-selection.md). |
+| `TASK_BACKEND` | `redis_json` | Task storage backend: `redis_json` (Redis Stack), `redis` (plain Redis), or `sql`. See [task-backend-feature-matrix.md](task-backend-feature-matrix.md). |
+| `DLQ_BACKEND` | `redis` | Dead-letter queue adapter: `redis`, `redis_json`, or `sql`. Defaults to match `TASK_BACKEND` in most deployments. |
+| `TASK_SCHEDULER_BACKEND` | `redis` | Delayed-task scheduler adapter: `redis` or `sql`. |
+| `ROUTING_BACKEND` | `sql` | Where queue/role config is stored: `sql`, `redis`, `redis_json`, or `static`. See [routing-backend-feature-matrix.md](routing-backend-feature-matrix.md). |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
-| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL for queue/role config |
+| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL; used when any backend is set to `sql`. Use `postgresql+asyncpg://...` for multi-worker deployments — SQLite does not support `SELECT FOR UPDATE` and is unsafe when multiple workers share the same SQL task state. |
+| `FORCE_SAGA_MODE` | `false` | Set to `true` to disable atomic pipeline mode and force saga coordination across all adapters. Useful for debugging cross-backend state issues. |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint for metrics |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint for logs |
@@ -108,7 +119,7 @@ WORKER_TTL=50 \
 jobbers_worker <task_module>
 ```
 
-Starts a worker process that pulls tasks from Redis queues and executes them. Like the manager, it loads `<task module>` to registered task functions.
+Starts a worker process that pulls tasks from Redis queues and executes them. Like the manager, it loads `<task_module>` to register task functions. Pass `--static-config routing.json` to use a static routing backend.
 
 **Environment variables:**
 
@@ -129,7 +140,7 @@ On `SIGTERM`, each in-flight task is handled according to its `on_shutdown` poli
 
 Workers do not require a restart to pick up changes to their role's queue list or to individual queue configurations (concurrency limits, rate limits). The mechanism works as follows:
 
-**Refresh tag.** Each role has a `refresh_tag` (a ULID) stored in the SQL `roles` table. `TaskGenerator.queues()` compares the stored tag against its locally cached value on every iteration. A mismatch means the role's queue assignment has changed: the worker reloads its queue list from SQL and invalidates its per-queue configuration cache.
+**Refresh tag.** Each role has a `refresh_tag` (a ULID) stored in the routing backend. `TaskGenerator.queues()` compares the stored tag against its locally cached value on every iteration. A mismatch means the role's queue assignment has changed: the worker reloads its queue list from the routing backend and invalidates its per-queue configuration cache.
 
 **What bumps the tag.** The tag is updated automatically whenever:
 
@@ -180,6 +191,7 @@ Duration arguments (`--stale-time`, `--completed-task-age`, `--dlq-age`, `--rate
 | `--rate-limit-age <s>` | Prune rate-limit tracking entries older than this. |
 | `--min-queue-age <s>` | Lower bound (epoch seconds) for queue entries to consider. |
 | `--max-queue-age <s>` | Upper bound (epoch seconds) for queue entries to consider. |
+| `--recover-orphaned-scheduled` | Re-enqueue scheduled tasks that are missing from the scheduler backend (e.g. after a Redis flush). |
 
 Recommended cron setup:
 
@@ -200,7 +212,7 @@ Recommended cron setup:
 A long-running process that handles two scheduling concerns on each poll:
 
 1. **Retry delays** — re-enqueues tasks that are waiting out a backoff delay when their `run_at` arrives.
-2. **Cron DAGs** — fires recurring `CronDAGEntry` runs when their cron expression comes due; see [docs/cron-dags.md](cron-dags.md).
+2. **Cron DAGs** — fires recurring `CronDAGEntry` runs when their cron expression comes due; see [interacting-with-tasks.md — Cron DAGs](interacting-with-tasks.md#cron-dags).
 
 Run exactly **one** Scheduler per Redis instance.
 
@@ -226,14 +238,10 @@ The Scheduler has no persistent state. It is safe to restart at any time — tas
 
 ## Adapters
 
-Jobbers ships with two interchangeable storage backends selected at startup:
+Jobbers has two independently configurable backend dimensions:
 
-| `TASK_BACKEND` | Adapter | Redis requirement |
-| --- | --- | --- |
-| `redis_json` (default) | `RedisJSONTaskState` / `RedisJSONTaskSubmit` + `RedisJSONDeadQueue` | Redis Stack (JSON + RediSearch modules) |
-| `redis` | `RedisTaskState` / `RedisTaskSubmit` + `RedisDeadQueue` | Plain Redis |
-
-See [adapter selection](adapter-selection.md) for guidance on which to choose.
+- **Task storage** (`TASK_BACKEND`): where task blobs, heartbeats, and the dead-letter queue live — `redis_json` (default, requires Redis Stack), `redis` (plain Redis), or `sql`. See [task-backend-feature-matrix.md](task-backend-feature-matrix.md).
+- **Routing config** (`ROUTING_BACKEND`): where queue/role config is stored — `sql` (default), `redis`, `redis_json`, or `static` (read-only, file-based). See [routing-backend-feature-matrix.md](routing-backend-feature-matrix.md).
 
 ---
 

@@ -8,7 +8,7 @@ This document provides a detailed comparison of Jobbers and Celery across the di
 
 **Celery** is the de-facto standard Python task queue. It is broker-agnostic, supports sync and async workloads, and has a large ecosystem of plugins and integrations. It optimizes for breadth: many brokers, many concurrency models, many result backends.
 
-**Jobbers** is opinionated and narrowly focused. It assumes Redis, assumes asyncio, and trades broker flexibility for depth in the areas that matter most at runtime: observable task state, fine-grained traffic control, and safe recovery from failures. The result is fewer knobs to configure upfront and more leverage over a running system.
+**Jobbers** is opinionated and narrowly focused. It assumes Redis (or SQL, depending on backend selection), assumes asyncio, and trades broker flexibility for depth in the areas that matter most at runtime: observable task state, fine-grained traffic control, and safe recovery from failures. The result is fewer knobs to configure upfront and more leverage over a running system.
 
 ---
 
@@ -35,11 +35,11 @@ One process to start. Familiar decorator. Minimal infrastructure required.
 
 ```bash
 pip install -e ".[test]"
-jobbers_migrate                        # creates SQL tables for queue/role config
+jobbers_migrate                        # creates SQL tables for queue/role config (only needed if ROUTING_BACKEND=sql)
 jobbers_manager my_tasks               # FastAPI server on :8000
 jobbers_worker my_tasks                # task executor
 jobbers_cleaner                        # stall detection + state pruning (cron-friendly)
-jobbers_scheduler                      # retry delay re-queuing
+jobbers_scheduler                      # retry delay re-queuing + cron DAG dispatch
 ```
 
 ```python
@@ -75,16 +75,21 @@ Four separate processes (separate containers in production). The Docker Compose 
 - **OpenTelemetry** traces, metrics, and logs are emitted out of the box via OTLP. No instrumentation code needed in task functions.
 - **Emitted metrics:**
 
-  | Metric | Type | Labels |
-  | --- | --- | --- |
-  | `tasks_processed` | Counter | queue, task, status |
-  | `tasks_retried` | Counter | queue, task, version |
-  | `execution_time` | Histogram (ms) | queue, task, status |
-  | `end_to_end_latency` | Histogram (ms) | queue, task, status |
-  | `time_in_queue` | Histogram | queue, task |
-  | `tasks_selected` | Counter | queue |
-  | `scheduled_task_dispatch_latency_seconds` | Histogram | — |
-  | `tasks_dead_lettered` | Counter | — |
+  | Metric | Type | Unit | Source | Labels |
+  | --- | --- | --- | --- | --- |
+  | `tasks_processed` | Counter | 1 | `task_processor.py` | queue, task, status |
+  | `tasks_retried` | Counter | 1 | `task_processor.py` | queue, task, version |
+  | `task_execution_time` | Histogram | ms | `task_processor.py` | queue, task, status |
+  | `task_end_to_end_latency` | Histogram | ms | `task_processor.py` | queue, task, status |
+  | `tasks_dead_lettered` | Counter | 1 | `state_manager.py` | queue, task, version |
+  | `tasks_missing_data` | Counter | 1 | `adapters/_shared.py` | — |
+  | `time_in_queue` | Histogram | ms | `task_generator.py` | queue, role, task |
+  | `tasks_selected` | Counter | 1 | `task_generator.py` | queue, role, task |
+  | `queue_config_refreshes` | Counter | 1 | `task_generator.py` | role |
+  | `refresh_lag_ms` | Histogram | ms | `task_generator.py` | role |
+  | `hit_counter` | UpDownCounter | — | `task_routes.py` | — |
+  | `cancellations_requested` | Counter | 1 | `task_routes.py` | queue, task |
+  | `scheduled_task_dispatch_latency_seconds` | Histogram | s | `runners/scheduler_proc.py` | queue, task_name |
 
 - **React admin UI** provides live task inspection, DLQ management, and queue/role configuration.
 - Docker Compose includes an OpenObserve instance pre-wired to the OTEL collector.
@@ -146,12 +151,12 @@ All results are capped at `max_retry_delay`. When a delay is configured, the tas
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /dead-letter-queue` | List DLQ entries (filter by task name, queue, date range) |
-| `GET /dead-letter-queue/{id}` | Inspect a single entry |
-| `POST /dead-letter-queue/resubmit` | Bulk resubmit by task name with optional retry count reset |
-| `DELETE /dead-letter-queue/{id}` | Remove a single entry |
+| `GET /dead-letter-queue` | Search DLQ entries (filter by `queue`, `task_name`, `task_version`, `limit`) |
+| `GET /dead-letter-queue/{task_id}/history` | Retrieve the full chronological failure history for a dead-lettered task |
+| `POST /dead-letter-queue/resubmit` | Bulk resubmit by explicit `task_ids` or by filter (`queue`/`task_name`/`task_version`), with optional retry count reset |
+| `DELETE /dead-letter-queue` | Bulk remove by `task_ids` |
 
-Two DLQ implementations are available: `RedisDeadQueue` (plain Redis sorted set) and `RedisJSONDeadQueue` (Redis Stack JSON, supports richer filtering).
+Two DLQ implementations are available: `RedisDeadQueue` (plain Redis sorted set), `RedisJSONDeadQueue` (Redis Stack JSON, supports richer filtering), and `SQLDeadQueue` (SQLAlchemy-backed).
 
 **Verdict:** Jobbers wins. A production-ready DLQ with a management API is significantly more useful than building one from signals.
 
@@ -170,9 +175,9 @@ Two DLQ implementations are available: `RedisDeadQueue` (plain Redis sorted set)
 | Queue rate limit | Per queue, at submission | Yes — `PUT /queues/{name}` |
 | Role → queue mapping | Which queues a worker polls | Yes — `PUT /roles/{name}` |
 
-Role and queue changes are detected within `config_ttl` seconds (default 60 s) by all workers running that role, with no restarts required. This enables live traffic patterns such as:
+Role and queue config changes are tracked via a per-role `refresh_tag` (a ULID). Workers re-check the tag on every fetch cycle, and a Redis pub/sub channel (`queue-config-refresh:{role}`) pushes immediate notification so idle workers don't have to wait for their next poll. There is no fixed polling interval to tune — propagation is effectively immediate for active workers and bounded by one fetch cycle for idle ones. This enables live traffic patterns such as:
 
-- **Drain a queue:** remove it from a role; workers stop polling it within one TTL window; in-flight tasks complete normally.
+- **Drain a queue:** remove it from a role; workers stop polling it on their next fetch cycle; in-flight tasks complete normally.
 - **Emergency throttle:** add or tighten a rate limit on a queue; takes effect on the next submission cycle.
 - **Isolate a workload:** create a new queue + role; deploy dedicated workers with `WORKER_ROLE=new-role`.
 
@@ -199,7 +204,7 @@ result = chord(group(add.s(i, i) for i in range(10)))(sum_results.s())
 
 Also available: `starmap`, `chunks`, nested workflows.
 
-**Jobbers** provides a DAG API for describing task dependency graphs. Two approaches can be freely mixed. For full details and examples see [docs/dags.md](dags.md).
+**Jobbers** provides a DAG API for describing task dependency graphs. Two approaches can be freely mixed. For full details and examples see [docs/dag-composition.md](dag-composition.md).
 
 **Mermaid as the DAG format** — Jobbers uses standard [Mermaid](https://mermaid.js.org/) `flowchart TD` diagrams as the serialisation format for all DAGs. This means DAGs can be defined as plain text, submitted via the API, and rendered natively in GitHub, VS Code, Obsidian, and any Mermaid-compatible tool without additional tooling. The API accepts Mermaid text as input and returns it as output — including in task status responses.
 
@@ -213,7 +218,7 @@ flowchart TD
 
 ```bash
 # Submit an ad-hoc DAG directly via the API
-curl -X POST /dags -d '{"diagram": "flowchart TD\n  A[\"extract\"]\n  B[\"transform\"]\n  A --> B"}'
+curl -X POST /submit-dag -d '{"diagram": "flowchart TD\n  A[\"extract\"]\n  B[\"transform\"]\n  A --> B"}'
 
 # Retrieve a running DAG — response includes dag_diagram for immediate rendering
 GET /task-status/{id}  →  { ..., "dag_diagram": "flowchart TD\n  ..." }
@@ -259,7 +264,7 @@ t.then(load.node())
 await state_manager.submit_dag(e)
 ```
 
-**Dynamic DAGs** — a task function returns a `TaskResult` with a `DynamicFanOut` when the number of children can only be determined at runtime (equivalent to Celery's `starmap`/`chunks`).
+**Dynamic DAGs** — a task function returns a `TaskResult` with a `DynamicFanOut` when the number of children can only be determined at runtime (equivalent to Celery's `starmap`/`chunks`). Tasks that only return data (no fan-out) can just return a plain dict — `TaskResult`/`task.make_result()` is only needed when triggering a `DynamicFanOut`.
 
 ```python
 from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
@@ -329,15 +334,15 @@ Both frameworks handle graceful restarts safely.
 
 **Celery with Redis broker:** Tasks acknowledged on dequeue by default. A worker crash loses in-flight tasks unless `acks_late=True` is set, which re-delivers unacknowledged tasks after a visibility timeout.
 
-**Jobbers:** Task state is written to Redis as `STARTED` immediately when execution begins. If a worker crashes without SIGTERM, the Cleaner process detects the missing heartbeat and marks the task `STALLED`. Stalled tasks can be manually resubmitted or (if `DeadLetterPolicy.SAVE`) are accessible via the DLQ API. The detection window is `max_heartbeat_interval` + Cleaner poll interval, which can be minutes.
+**Jobbers:** Task state is written immediately when execution begins (status transitions to `STARTED`). If a worker crashes without SIGTERM, the Cleaner process detects the missing heartbeat and marks the task `STALLED`. Stalled tasks can be manually resubmitted or (if `DeadLetterPolicy.SAVE`) are accessible via the DLQ API. The detection window is `max_heartbeat_interval` + Cleaner poll interval, which can be minutes. For adapters that implement the Atomic sub-protocols (`AtomicTaskStateProtocol`, `AtomicTaskSchedulerProtocol`, `AtomicDeadQueueProtocol`), `StateManager` performs cross-store writes inside a single MULTI/EXEC (Redis) or transaction (SQL) instead of sequential saga-style writes, narrowing the window for partial-write inconsistency between task state, scheduler, and DLQ.
 
 ### Broker durability
 
 **Celery** supports durable message delivery when using RabbitMQ with persistent messages and durable queues — tasks survive broker restarts without data loss.
 
-**Jobbers** is Redis-only. Durability depends entirely on Redis persistence configuration (AOF vs RDB). A Redis crash before AOF fsync can lose recently submitted tasks. This is a fundamental constraint of the Redis-only architecture.
+**Jobbers** is primarily Redis-based, though `TASK_BACKEND=sql` (via `SQLTaskState`/`SQLTaskSubmit`) avoids the Redis durability question entirely by using the same transactional database guarantees as any SQL-backed system. For Redis-backed deployments, durability depends on Redis persistence configuration (AOF vs RDB); a Redis crash before AOF fsync can lose recently submitted tasks.
 
-**Verdict:** Draw for graceful restarts. Celery with RabbitMQ offers stronger durability guarantees than Jobbers for hard crashes and broker failures.
+**Verdict:** Draw for graceful restarts. Celery with RabbitMQ offers stronger durability guarantees than Jobbers' Redis-backed adapters for hard crashes and broker failures; Jobbers running fully on `sql` backends closes most of that gap at the cost of SQL's lower raw throughput versus Redis.
 
 ---
 
@@ -350,11 +355,14 @@ Both frameworks handle graceful restarts safely.
 
 **Jobbers:**
 
-- **Broker:** Redis only
-- **Task adapters** (`TASK_BACKEND`): how task state is stored in Redis
+- **Broker:** Redis (queues are Redis sorted sets/Lua scripts in all current implementations)
+- **Task backends** (`TASK_BACKEND`): how task state is stored
   - `redis` → `RedisTaskState` / `RedisTaskSubmit` — plain Redis + msgpack; works with any standard Redis instance
   - `redis_json` (default) → `RedisJSONTaskState` / `RedisJSONTaskSubmit` — Redis Stack with JSON module + RediSearch; enables richer query filtering
-- **Dead letter adapters:** `RedisDeadQueue` (plain Redis sorted set) or `RedisJSONDeadQueue` (Redis Stack JSON; supports richer DLQ filtering). Selection follows the task adapter.
+  - `sql` → `SQLTaskState` / `SQLTaskSubmit` — SQLAlchemy; implements the full `AtomicTaskStateProtocol`, enabling atomic pipeline mode for all-SQL deployments
+- **Dead letter backends** (`DLQ_BACKEND`): `redis` (default) → `RedisDeadQueue`; `redis_json` → `RedisJSONDeadQueue`; `sql` → `SQLDeadQueue`
+- **Task scheduler backends** (`TASK_SCHEDULER_BACKEND`): `redis` (default) → `RedisTaskScheduler`; `sql` → `SQLTaskScheduler`
+- **Cron DAG scheduler backends** (`CRON_DAG_SCHEDULER_BACKEND`): `redis` (default) → `RedisCronDAGScheduler`; `sql` → `SQLCronDAGScheduler`; `static` → `StaticCronDAGScheduler` (read-only in-memory, resets on restart)
 - **Routing backends** (`ROUTING_BACKEND`): where queue, role, and task-routing config is stored
 
   | Backend | Storage | SQL? | Redis Stack? | Dynamic CRUD? |
@@ -364,11 +372,11 @@ Both frameworks handle graceful restarts safely.
   | `redis` | Plain Redis keys | No | No | Yes |
   | `redis_json` | RedisJSON + RediSearch | No | Yes | Yes |
 
-  The `static` backend is notable: it eliminates the SQL dependency entirely, loading routing config once from a JSON/YAML file (`STATIC_CONFIG_FILE`) or inline env vars (`STATIC_QUEUES`, `STATIC_ROLES`). With `static` + `RedisTaskState` / `RedisTaskSubmit`, Jobbers runs on a single plain Redis instance with no other database — analogous to Celery's Redis-only setup. The `redis` and `redis_json` backends add live CRUD without introducing SQL.
+  The `static` routing backend is notable: it eliminates the SQL dependency entirely, loading routing config once from a JSON/YAML file (`STATIC_CONFIG_FILE`) or inline env vars (`STATIC_QUEUES`, `STATIC_ROLES`). With `static` routing + `RedisTaskState` / `RedisTaskSubmit`, Jobbers runs on a single plain Redis instance with no other database — analogous to Celery's Redis-only setup. The `redis` and `redis_json` routing backends add live CRUD without introducing SQL. Conversely, selecting `sql` for every backend (task state, DLQ, scheduler, cron, routing) lets Jobbers run with no Redis at all.
 
-- **Results:** Stored as part of task state in Redis; no separate result backend. Cleanup is handled by Cleaner's `--completed-task-age`.
+- **Results:** Stored as part of task state; no separate result backend. Cleanup is handled by Cleaner's `--completed-task-age`.
 
-**Verdict:** Celery wins for transport-layer flexibility — RabbitMQ durability, SQS for cloud-native deployments, Kafka for streaming pipelines. Jobbers' Redis-only broker is a deliberate trade-off. Within that constraint, Jobbers offers meaningful flexibility: four routing backend options spanning zero-dependency (`static`), SQL-backed, and Redis-only configurations; two task adapters; and two DLQ implementations.
+**Verdict:** Celery wins for transport-layer flexibility — RabbitMQ durability, SQS for cloud-native deployments, Kafka for streaming pipelines. Jobbers' queue transport is Redis-only, but it now offers genuine flexibility on the storage side: every concern (task state, DLQ, scheduler, cron, routing config) can independently be backed by Redis, Redis Stack, or SQL — including an all-SQL, zero-Redis deployment, or an all-Redis, zero-SQL deployment via the `static` routing backend.
 
 ---
 
@@ -394,7 +402,7 @@ Full crontab expressions, interval scheduling, `@periodic_task` decorator. Beat 
 **Jobbers** handles two scheduling concerns in the same Scheduler process:
 
 1. **Retry delays** — re-queuing tasks that are waiting out a backoff delay after a failure.
-2. **Cron DAGs** — recurring scheduled DAG runs driven by standard 5-field cron expressions. Each `CronDAGEntry` stores a cron expression, a `DAGTaskSpec` describing the root task, and a `ConcurrencyPolicy` that controls whether to skip a run when the previous one is still active.
+2. **Cron DAGs** — recurring scheduled DAG runs driven by standard 5-field cron expressions. Each `CronDAGEntry` stores a cron expression, a Mermaid-diagram-backed DAG spec, an `enabled` flag, and a `ConcurrencyPolicy` that controls whether to skip a run when the previous one is still active.
 
 ```python
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
@@ -414,16 +422,16 @@ Cron entries are managed at runtime via a full REST API — no code deploy or Re
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /cron-dags` | Create a new cron-scheduled DAG (validates cron expression and Mermaid diagram) |
-| `GET /cron-dags` | List all entries ordered by next run time (paginated) |
+| `GET /cron-dags` | List all entries with next run times |
 | `GET /cron-dags/{id}` | Inspect a single entry |
-| `PUT /cron-dags/{id}` | Replace the diagram or cron expression; reschedules to next occurrence |
-| `DELETE /cron-dags/{id}` | Remove a cron entry |
+| `PUT /cron-dags/{id}` | Replace the diagram, cron expression, `enabled` flag, or concurrency policy; reschedules to the next occurrence |
+| `DELETE /cron-dags/{id}` | Remove a cron entry permanently |
 
-The DAG is specified as a Mermaid flowchart, so the same diagram that renders in a GitHub comment is the exact payload you `POST` to the API. Celery Beat stores schedules in Python config or a database backend; Jobbers stores them in Redis and exposes them through the same FastAPI server used for all other task management.
+The DAG is specified as a Mermaid flowchart, so the same diagram that renders in a GitHub comment is the exact payload you `POST` to the API. Celery Beat stores schedules in Python config or a database backend; Jobbers stores them via the configured `CRON_DAG_SCHEDULER_BACKEND` (`redis`, `sql`, or read-only `static`) and exposes them through the same FastAPI server used for all other task management.
 
-The full pattern is described in [docs/cron-dags.md](cron-dags.md).
+The full pattern is described in [docs/dag-composition.md](dag-composition.md) and [docs/interacting-with-tasks.md](interacting-with-tasks.md).
 
-**Verdict:** Jobbers edges ahead for cron-scheduled DAG workloads. It matches Celery Beat for runtime-modifiable schedules and exceeds it by integrating scheduling directly with the DAG model, `SKIP_IF_RUNNING` concurrency control, and Mermaid-format definitions. Standard cron step syntax (`*/5 * * * *`) covers virtually all "every N minutes/hours" use cases. The only remaining gap is sub-minute intervals: Celery Beat's `schedule=30.0` has no cron equivalent.
+**Verdict:** Jobbers edges ahead for cron-scheduled DAG workloads. It matches Celery Beat for runtime-modifiable schedules and exceeds it by integrating scheduling directly with the DAG model, configurable concurrency policy, and Mermaid-format definitions. Standard cron step syntax (`*/5 * * * *`) covers virtually all "every N minutes/hours" use cases. The only remaining gap is sub-minute intervals: Celery Beat's `schedule=30.0` has no cron equivalent.
 
 ---
 
@@ -443,10 +451,12 @@ result.state               # PENDING / STARTED / SUCCESS / FAILURE
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /task-status/{id}` | Full task detail: status, queue, results, retry count, heartbeat |
-| `GET /tasks?status=STARTED&queue=q` | Query tasks by status, queue, name, date range |
-| `GET /active-tasks` | All tasks with live heartbeat records |
-| `POST /cancel-task` | Cancel a task in any cancellable state (SUBMITTED, STARTED, SCHEDULED) |
+| `GET /task-status/{id}` | Full task detail: status, queue, results, retry count, heartbeat; includes `dag_diagram` for DAG roots |
+| `GET /task-list?queue=...&status=...&task_name=...&task_version=...` | Paginated task search by queue, status, name, version |
+| `GET /active-tasks` (optional `?queue=`) | Tasks with a live heartbeat record |
+| `GET /scheduled-tasks` | Tasks currently waiting in the scheduler (retry delays + future runs), with their scheduled time |
+| `POST /task/{id}/cancel` | Cancel a single task in any cancellable state |
+| `POST /tasks/cancel` | Bulk cancel by `task_ids` |
 
 Cancellation is cooperative: a running task checks for a cancellation signal at each `await` point (or heartbeat call). The worker does not need to be interrupted.
 
@@ -468,19 +478,19 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 
 | Feature | Celery | Jobbers | Notes |
 | --- | --- | --- | --- |
-| **Getting started** | Simple | Moderate | Celery: 1 process. Jobbers: 4 processes + migrate |
+| **Getting started** | Simple | Moderate | Celery: 1 process. Jobbers: 4 processes (+ migrate if `ROUTING_BACKEND=sql`) |
 | **Async Python** | Partial | Native | Jobbers built on asyncio throughout |
 | **Observability** | Flower UI only | OTEL + React UI | Jobbers emits traces, metrics, logs out of the box |
 | **Retry policies** | Explicit (`self.retry()`) | Declarative (automatic) | Both support exponential backoff + jitter |
-| **Dead letter queue** | Not built-in | First-class | Jobbers: queryable API + bulk resubmit |
-| **Traffic management** | Restart required | Live, no restart | Jobbers: dynamic roles/queues, per-queue caps |
+| **Dead letter queue** | Not built-in | First-class | Jobbers: queryable API + bulk resubmit, 3 backend options |
+| **Traffic management** | Restart required | Live, no restart | Jobbers: dynamic roles/queues, per-queue caps, refresh-tag + pub/sub propagation |
 | **Task composition** | Full canvas API | DAG API + Mermaid | Celery: canvas signatures. Jobbers: `DAGNode` + `DynamicFanOut` + `on_error` callbacks; DAGs defined and returned as Mermaid |
 | **Graceful restart safety** | Good | Good | Both handle SIGTERM correctly |
-| **Hard crash recovery** | `acks_late` required | Heartbeat + Cleaner | Detection window can be several minutes in Jobbers |
-| **Broker durability** | RabbitMQ: strong | Redis only | Celery + RabbitMQ offers stronger durability |
-| **Broker flexibility** | Redis, AMQP, SQS, Kafka | Redis only (4 routing backends, 2 task adapters) | Celery wins for transport; Jobbers flexible within Redis |
-| **Periodic/cron scheduling** | Celery Beat (full) | Cron DAGs + REST CRUD | Jobbers: full management API, `SKIP_IF_RUNNING`, Mermaid diagrams; Celery Beat: intervals + `@periodic_task` decorator |
-| **Task introspection** | Basic `AsyncResult` | Full lifecycle API | Jobbers: query by status/queue/name, cancel cooperatively |
+| **Hard crash recovery** | `acks_late` required | Heartbeat + Cleaner | Detection window can be several minutes; atomic pipeline mode narrows cross-store inconsistency where supported |
+| **Broker durability** | RabbitMQ: strong | Redis-backed: AOF/RDB-dependent; SQL-backed: transactional | Celery + RabbitMQ offers stronger durability than Jobbers' Redis adapters; Jobbers' `sql` backends close most of the gap |
+| **Broker/storage flexibility** | Redis, AMQP, SQS, Kafka | Redis queue transport; task state/DLQ/scheduler/cron/routing each independently Redis, Redis Stack, or SQL | Celery wins for transport; Jobbers flexible on storage per concern |
+| **Periodic/cron scheduling** | Celery Beat (full) | Cron DAGs + REST CRUD | Jobbers: full management API, configurable concurrency policy, Mermaid diagrams; Celery Beat: intervals + `@periodic_task` decorator |
+| **Task introspection** | Basic `AsyncResult` | Full lifecycle API | Jobbers: query by status/queue/name/version, cancel cooperatively (single or bulk) |
 | **Security** | Broker-layer + optional signing | Proxy-layer only | Neither has strong built-in auth |
 
 ### When to choose Jobbers
@@ -488,16 +498,15 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 - Your workload is async Python and you want I/O-bound tasks without threading overhead.
 - You need live, fine-grained traffic control (reroute queues, throttle rate, cap concurrency without worker restarts).
 - Operational visibility is a first-class concern and you want OTEL without additional instrumentation work.
-- You want a built-in, queryable DLQ with bulk resubmit.
-- You are already running Redis and do not need a second broker.
+- You want a built-in, queryable DLQ with bulk resubmit, with a choice of Redis, Redis Stack, or SQL storage.
+- You want to avoid Redis entirely (`sql` for every backend) or avoid SQL entirely (`static`/`redis` routing + Redis task/DLQ/scheduler backends) without changing your task code.
 - You need multi-step DAG workflows (chain, fan-out, fan-in, runtime-determined fan-out, error callbacks) with either explicit result fetching or automatic parent result injection.
-- You want recurring scheduled jobs that integrate natively with the DAG model and `SKIP_IF_RUNNING` concurrency control, manageable via REST API without code deploys.
+- You want recurring scheduled jobs that integrate natively with the DAG model and a configurable concurrency policy, manageable via REST API without code deploys.
 - You want DAG workflows defined in a standard, portable format (Mermaid) that renders natively in GitHub, VS Code, and documentation tools.
 
 ### When to choose Celery
 
 - You need **sub-minute** recurring tasks (Celery Beat supports `schedule=30.0`; cron expressions bottom out at 1-minute resolution, so `*/5 * * * *` covers "every 5 minutes" but not "every 30 seconds").
-- You require broker flexibility (RabbitMQ for durability, SQS for cloud-native deployments).
+- You require message-transport flexibility (RabbitMQ for durability, SQS for cloud-native deployments, Kafka for streaming pipelines) — Jobbers' queue transport is Redis-only regardless of which storage backends are chosen for state/DLQ/scheduling.
 - Your tasks are sync, or you have a large existing Celery codebase.
-- You need stronger message durability guarantees than Redis provides.
 - You prefer defining and submitting a workflow as a single inline expression (`chain(a.s(), b.s())()`) rather than building a graph and calling `submit_dag` separately.

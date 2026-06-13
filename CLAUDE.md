@@ -187,16 +187,16 @@ Each protocol has an **Atomic sub-protocol** that extends it with pipeline-stagi
 
 | Atomic sub-protocol | Adds over base |
 | --- | --- |
-| `AtomicTaskStateProtocol` | `pipeline()`, `stage_save()`, `stage_requeue()`, `stage_submit_task()`, `stage_remove_from_queue()`, `stage_remove_heartbeat()`, `stage_init_fan_in()`, `read_for_watch()`, `optimistic_dispatch_scheduled()` |
+| `AtomicTaskStateProtocol` | `pipeline()`, `stage_save()`, `stage_requeue()`, `stage_submit_task()`, `stage_remove_from_queue()`, `stage_remove_heartbeat()`, `stage_init_fan_in()`, `read_for_watch()`, `atomic_dispatch_scheduled()` |
 | `AtomicTaskSchedulerProtocol` | `pipeline()`, `stage_add()`, `stage_remove()` |
 | `AtomicDeadQueueProtocol` | `backend_key`, `pipeline()` |
 | `AtomicCronDAGSchedulerProtocol` | `backend_key`, `pipeline()`, `stage_reschedule()`, `stage_set_active_run()`, `stage_clear_active_run()` |
 
 `AtomicCronDAGSchedulerProtocol` allows `StateManager` to fold cron reschedule and active-run marker ops into the same pipeline as task-state ops when the cron scheduler and task-state adapter share a backend (`backend_key` match). `StaticCronDAGScheduler` does not implement the atomic sub-protocol (no shared backend); `StateManager` falls back to sequential async calls.
 
-`optimistic_dispatch_scheduled(task, stage_extra)` encapsulates the optimistic-locking dispatch loop: read under WATCH, check status, set SUBMITTED, stage requeue, call `stage_extra` for additional staged ops (e.g., scheduler removal), commit. Implemented only by Redis adapters (WATCH/MULTI). `SQLTaskState` does **not** implement `AtomicTaskStateProtocol` — it is missing `optimistic_dispatch_scheduled` and `stage_remove_heartbeat`; `StateManager` always uses saga mode with SQL task state.
+`atomic_dispatch_scheduled(task, stage_extra)` encapsulates the atomic dispatch: read task (under WATCH for Redis, SELECT FOR UPDATE for SQL), check status, set SUBMITTED, stage requeue, call `stage_extra` for additional staged ops (e.g., scheduler removal), commit. Implemented by Redis adapters (WATCH/MULTI, retries on WatchError) and `SQLTaskState` (SELECT FOR UPDATE, no retry needed). `SQLTaskState` now implements the full `AtomicTaskStateProtocol`, enabling atomic pipeline mode for all-SQL deployments.
 
-`stage_remove_heartbeat(pipe, task)` stages a Redis heartbeat sorted-set removal onto an existing pipeline (Redis adapters only), so `StateManager` does not need to reference any Redis key name constants directly.
+`stage_remove_heartbeat(pipe, task)` stages a heartbeat removal onto an existing pipeline. For Redis, removes the entry from the heartbeat sorted set; for SQL, sets `heartbeat_at = NULL` in the tasks table.
 
 `StateManager` holds `task_state: TaskStateProtocol` and `task_submit: TaskSubmitProtocol` as two separate constructor parameters. Each is now a distinct class: `RedisTaskState`/`RedisTaskSubmit` share the same Redis client but have separate responsibilities. Both are created by `create_redis_task_adapters()` in `db.py`. See [docs/datastore-architecture.md](docs/datastore-architecture.md) for a full treatment of consistency modes and what alternative datastores (SQL task state, RabbitMQ queuing) would require.
 
@@ -218,8 +218,7 @@ Config is loaded once at startup. Priority (highest to lowest):
 1. **Programmatic** — call `db.register_routing_backend(StaticRoutingBackend(...))` before `init_state_manager()`
 2. **Config file via env var** — `STATIC_CONFIG_FILE=/path/to/routing.json` (also accepts `.yaml`/`.yml` with `pyyaml` installed)
 3. **CLI runners** — pass `--static-config routing.json` to any runner (implies static backend)
-4. **Inline JSON env vars** — `STATIC_QUEUES`, `STATIC_ROLES`, `STATIC_ROUTING`
-5. **Built-in defaults** — one `default` queue, one `default` role
+4. **Built-in defaults** — one `default` queue, one `default` role
 
 Config file format (`routing.json`):
 
@@ -241,15 +240,13 @@ Config file format (`routing.json`):
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Scheduler |
 | `SCHEDULER_BATCH_SIZE` | `1` | Scheduler |
 | `TASK_BACKEND` | `"redis_json"` | All (`"redis_json"`, `"redis"`, or `"sql"`) |
+| `DLQ_BACKEND` | `"redis"` | All (`"redis"`, `"redis_json"`, or `"sql"`) |
+| `TASK_SCHEDULER_BACKEND` | `"redis"` | All (`"redis"` or `"sql"`) |
 | `ROUTING_BACKEND` | `"sql"` | All (`"sql"`, `"redis"`, `"redis_json"`, or `"static"`) |
 | `CRON_DAG_SCHEDULER_BACKEND` | `"redis"` | All (`"redis"`, `"sql"`, or `"static"`); `static` is read-only in-memory (state resets on restart) |
 | `REDIS_URL` | `redis://localhost:6379` | All |
-| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (only used when `ROUTING_BACKEND=sql`) |
+| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (used when any backend is `"sql"`; use PostgreSQL for multi-worker deployments) |
 | `STATIC_CONFIG_FILE` | — | All (path to JSON/YAML routing config; requires `ROUTING_BACKEND=static`) |
-| `STATIC_QUEUES` | — | All (inline JSON array of queue configs; fallback when no `STATIC_CONFIG_FILE`) |
-| `STATIC_ROLES` | — | All (inline JSON object mapping role → queue list) |
-| `STATIC_ROUTING` | — | All (inline JSON array of routing configs) |
-| `CONFIG_CACHE_TTL` | `30` | All (queue/routing config cache TTL in seconds) |
 
 ## Testing
 
