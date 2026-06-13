@@ -15,6 +15,7 @@ from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.protocols import RoutingBackendReadOnlyError
+from jobbers.registry import clear_registry, register_task
 
 
 @pytest_asyncio.fixture
@@ -151,9 +152,8 @@ async def test_save_routing_config_raises(backend):
 
 @pytest.mark.asyncio
 async def test_delete_routing_config_returns_false(backend):
-    # delete is a no-op for static backend (config can't be removed at runtime)
-    result = await backend.delete_routing_config("t", 1)
-    assert result is False
+    with pytest.raises(RoutingBackendReadOnlyError):
+        await backend.delete_routing_config("t", 1)
 
 
 # ── from_file ────────────────────────────────────────────────────────────────
@@ -161,6 +161,9 @@ async def test_delete_routing_config_returns_false(backend):
 
 @pytest.mark.asyncio
 async def test_from_file_json():
+    @register_task(name="ft", version=1)
+    async def _ft(**_): ...
+
     data = {
         "queues": [{"name": "file_q", "max_concurrent": 4}],
         "roles": {"file_role": ["file_q"]},
@@ -180,6 +183,49 @@ async def test_from_file_json():
         assert rc.queues == ["file_q"]
     finally:
         os.unlink(path)
+        clear_registry()
+
+
+def test_from_file_unknown_queue_in_role(tmp_path):
+    data = {
+        "queues": [{"name": "q1", "max_concurrent": 2}],
+        "roles": {"r": ["q1", "typo_q"]},
+        "routing": [],
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="unknown queue 'typo_q'"):
+        StaticRoutingBackend.from_file(str(p))
+
+
+def test_from_file_unknown_queue_in_routing(tmp_path):
+    @register_task(name="rt", version=1)
+    async def _rt(**_): ...
+
+    data = {
+        "queues": [{"name": "q1", "max_concurrent": 2}],
+        "roles": {},
+        "routing": [{"task_name": "rt", "task_version": 1, "strategy": "single", "queues": ["typo_q"]}],
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(data))
+    try:
+        with pytest.raises(ValueError, match="unknown queue 'typo_q'"):
+            StaticRoutingBackend.from_file(str(p))
+    finally:
+        clear_registry()
+
+
+def test_from_file_unregistered_task_in_routing(tmp_path):
+    data = {
+        "queues": [{"name": "q1", "max_concurrent": 2}],
+        "roles": {},
+        "routing": [{"task_name": "no_such_task", "task_version": 9, "strategy": "single", "queues": ["q1"]}],
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="unregistered task 'no_such_task' v9"):
+        StaticRoutingBackend.from_file(str(p))
 
 
 def test_from_file_yaml_raises_when_pyyaml_missing(tmp_path):

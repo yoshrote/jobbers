@@ -88,11 +88,35 @@ class StaticRoutingBackend:
 
     @classmethod
     def from_file(cls, path: str) -> StaticRoutingBackend:
+        from jobbers.registry import get_task_config
+
         data = _load_file(path)
+        roles = _parse_roles(data.get("roles", {})) or None
+        queues = _parse_queues(data.get("queues", [])) or None
+        known_queues = {q.name for q in (queues or [_DEFAULT_QUEUE])}
+
+        if roles is not None:
+            for role_name, role_queues in roles.items():
+                for q in role_queues:
+                    if q not in known_queues:
+                        raise ValueError(f"Role '{role_name}' references unknown queue '{q}'")
+
+        routing_configs = _parse_routing(data.get("routing", []))
+        for rc in routing_configs:
+            for q in rc.queues:
+                if q not in known_queues:
+                    raise ValueError(
+                        f"Routing config for '{rc.task_name}' v{rc.task_version} references unknown queue '{q}'"
+                    )
+            if get_task_config(rc.task_name, rc.task_version) is None:
+                raise ValueError(
+                    f"Routing config references unregistered task '{rc.task_name}' v{rc.task_version}"
+                )
+
         return cls(
-            queues=_parse_queues(data.get("queues", [])) or None,
-            roles=_parse_roles(data.get("roles", {})) or None,
-            routing_configs=_parse_routing(data.get("routing", [])),
+            queues=queues,
+            roles=roles,
+            routing_configs=routing_configs,
         )
 
     # ── Queue reads ───────────────────────────────────────────────────────────
@@ -159,4 +183,6 @@ class StaticRoutingBackend:
         )
 
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
-        return False
+        raise RoutingBackendReadOnlyError(
+            "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
+        )
