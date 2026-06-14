@@ -63,25 +63,27 @@ class RedisQueueConfigAdapter:
         await pipe.execute()
 
     async def delete_queue(self, queue_name: str) -> None:
+        # Remove queue from all role sets and bump refresh tags first so that a crash
+        # after this point leaves an orphaned-but-valid queue config rather than roles
+        # referencing a deleted queue.
+        raw_roles: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
+        role_names = [r.decode() for r in raw_roles]
+        if role_names:
+            srem_pipe = self._client.pipeline(transaction=False)
+            for role in role_names:
+                srem_pipe.srem(self.ROLE_QUEUES_KEY(name=role), queue_name)
+            removed_counts: list[int] = await srem_pipe.execute()
+            affected = [role for role, count in zip(role_names, removed_counts) if count]
+            if affected:
+                new_tag = str(ULID())
+                bump_pipe = self._client.pipeline(transaction=True)
+                for role in affected:
+                    bump_pipe.set(self.ROLE_REFRESH_TAG_KEY(name=role), new_tag)
+                await bump_pipe.execute()
         pipe = self._client.pipeline(transaction=True)
         pipe.delete(self.QUEUE_KEY(name=queue_name))
         pipe.srem(self.QUEUES_INDEX, queue_name)
         await pipe.execute()
-        raw_roles: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
-        role_names = [r.decode() for r in raw_roles]
-        if not role_names:
-            return
-        srem_pipe = self._client.pipeline(transaction=False)
-        for role in role_names:
-            srem_pipe.srem(self.ROLE_QUEUES_KEY(name=role), queue_name)
-        removed_counts: list[int] = await srem_pipe.execute()
-        affected = [role for role, count in zip(role_names, removed_counts) if count]
-        if affected:
-            new_tag = str(ULID())
-            bump_pipe = self._client.pipeline(transaction=True)
-            for role in affected:
-                bump_pipe.set(self.ROLE_REFRESH_TAG_KEY(name=role), new_tag)
-            await bump_pipe.execute()
 
     async def get_all_queues(self) -> list[str]:
         raw: set[bytes] = await self._client.smembers(self.QUEUES_INDEX)  # type: ignore[misc]

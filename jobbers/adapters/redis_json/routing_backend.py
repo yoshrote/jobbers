@@ -86,25 +86,27 @@ class RedisJSONQueueConfigAdapter:
         await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", _pack(queue_config))  # type: ignore[misc]
 
     async def delete_queue(self, queue_name: str) -> None:
-        await self._client.delete(self.QUEUE_KEY(name=queue_name))
+        # Remove queue from all role docs and bump refresh tags first so that a crash
+        # after this point leaves an orphaned-but-valid queue config rather than roles
+        # referencing a deleted queue.
         results = await self._client.ft(self.ROLE_IDX).search(
             SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
         )
         affected = [doc.id.removeprefix("routing:role:") for doc in (results.docs or [])]
-        if not affected:
-            return
-        get_pipe = self._client.pipeline(transaction=False)
-        for role in affected:
-            get_pipe.json().get(self.ROLE_KEY(name=role))
-        role_docs: list[dict[str, Any] | None] = await get_pipe.execute()
-        new_tag = str(ULID())
-        write_pipe = self._client.pipeline(transaction=True)
-        for role, role_doc in zip(affected, role_docs):
-            if role_doc is not None:
-                new_queues = [q for q in role_doc.get("queues", []) if q != queue_name]
-                write_pipe.json().set(self.ROLE_KEY(name=role), "$.queues", new_queues)
-            write_pipe.set(self.REFRESH_TAG_KEY(name=role), new_tag)
-        await write_pipe.execute()
+        if affected:
+            get_pipe = self._client.pipeline(transaction=False)
+            for role in affected:
+                get_pipe.json().get(self.ROLE_KEY(name=role))
+            role_docs: list[dict[str, Any] | None] = await get_pipe.execute()
+            new_tag = str(ULID())
+            write_pipe = self._client.pipeline(transaction=True)
+            for role, role_doc in zip(affected, role_docs):
+                if role_doc is not None:
+                    new_queues = [q for q in role_doc.get("queues", []) if q != queue_name]
+                    write_pipe.json().set(self.ROLE_KEY(name=role), "$.queues", new_queues)
+                write_pipe.set(self.REFRESH_TAG_KEY(name=role), new_tag)
+            await write_pipe.execute()
+        await self._client.delete(self.QUEUE_KEY(name=queue_name))
 
     async def get_all_queues(self) -> list[str]:
         results = await self._client.ft(self.QUEUE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
