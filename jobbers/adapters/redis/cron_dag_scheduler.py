@@ -66,8 +66,9 @@ class RedisCronDAGScheduler:
         """Return a Redis pipeline for atomic staging of cron ops."""
         return self.data_store.pipeline(transaction=transaction)
 
-    def stage_add(self, pipe: Pipeline, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
-        """Queue HSET cron-dag:{id} + ZADD cron-schedule onto pipe (no execute)."""
+    async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
+        """Persist a cron entry and schedule it (direct, non-staged version)."""
+        pipe = self.data_store.pipeline(transaction=True)
         cron_id_str = str(entry.id)
         cron_id_bytes = bytes(entry.id)
         pipe.hset(
@@ -82,17 +83,12 @@ class RedisCronDAGScheduler:
             },
         )
         pipe.zadd(self.CRON_SCHEDULE, {cron_id_bytes: next_run_at.timestamp()})
+        await pipe.execute()
 
     def stage_remove(self, pipe: Pipeline, cron_id: ULID) -> None:
         """Queue DEL cron-dag:{id} + ZREM cron-schedule onto pipe (no execute)."""
         pipe.delete(self.CRON_DAG_KEY(cron_id=str(cron_id)))
         pipe.zrem(self.CRON_SCHEDULE, bytes(cron_id))
-
-    async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
-        """Persist a cron entry and schedule it (direct, non-staged version)."""
-        pipe = self.data_store.pipeline(transaction=True)
-        self.stage_add(pipe, entry, next_run_at)
-        await pipe.execute()
 
     async def remove(self, cron_id: ULID) -> None:
         """Delete a cron entry and remove it from the schedule (direct, non-staged version)."""
