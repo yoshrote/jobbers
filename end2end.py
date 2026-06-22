@@ -1,7 +1,6 @@
 import asyncio
 from typing import Any
 
-from jobbers.models.dag import TaskResult
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy
 from jobbers.registry import register_task
 
@@ -18,8 +17,8 @@ class CustomException(Exception):
     max_concurrent=None,
     max_retries=0,
 )
-async def echo_task(value: str = "default") -> TaskResult:
-    return TaskResult(results={"value": value})
+async def echo_task(value: str = "default") -> dict[str, str]:
+    return {"value": value}
 
 
 @register_task(
