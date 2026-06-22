@@ -1010,6 +1010,73 @@ async def test_task_result_parent_ids_copied_to_task():
 
 
 @pytest.mark.asyncio
+async def test_task_processor_stores_plain_dict_result():
+    """Returning a plain dict saves the result data (not discarded as empty dict)."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value={"rows": 42})
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.results == {"rows": 42}
+    assert result.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_task_processor_plain_dict_deduplicates_parent_ids():
+    """Returning a plain dict deduplicates any existing parent_ids on the task."""
+    parent_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        parent_ids=[parent_id, parent_id],
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value={"ok": True})
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.parent_ids == [parent_id]
+
+
+@pytest.mark.asyncio
+async def test_task_processor_none_result_stores_empty_dict():
+    """Returning None is valid and stores an empty results dict."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=None)
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.results == {}
+    assert result.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_end_to_end_latency_recorded_when_submitted_at_set():
     """end_to_end_latency metric is recorded when task has submitted_at and completed_at."""
     task = Task(

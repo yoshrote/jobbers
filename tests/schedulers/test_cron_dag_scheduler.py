@@ -30,9 +30,7 @@ async def scheduler(redis):
 
 
 async def add_entry(s: RedisCronDAGScheduler, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
-    pipe = s.data_store.pipeline(transaction=True)
-    s.stage_add(pipe, entry, next_run_at)
-    await pipe.execute()
+    await s.add(entry, next_run_at)
 
 
 # ── ConcurrencyStager ─────────────────────────────────────────────────────────

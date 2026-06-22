@@ -95,14 +95,16 @@ class TaskProcessor:
                     # Run the task and handle exceptions
                     try:
                         async with asyncio.timeout(task.task_config.timeout):
-                            raw_result = await self._current_promise
+                            raw_result: dict[Any, Any] | TaskResult | None = await self._current_promise
                         if isinstance(raw_result, TaskResult):
                             task.results = raw_result.results
                             dynamic_fanout = raw_result.fanout
                             if raw_result.parent_ids:
                                 task.parent_ids = raw_result.parent_ids
                         else:
-                            task.results = {}
+                            if task.parent_ids:
+                                task.parent_ids = list(set(task.parent_ids))  # deduplicate parent IDs
+                            task.results = raw_result or {}
                     except TimeoutError:
                         task = await self.handle_timeout_exception(task)
                     except asyncio.CancelledError as exc:
