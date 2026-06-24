@@ -30,10 +30,6 @@ class SQLTaskSubmit:
     Requires the same session factory as the paired ``SQLTaskState``.
     """
 
-    # Key-helper stubs for structural compatibility with RedisTaskState.
-    TASKS_BY_QUEUE = "task-queues:{queue}".format
-    TASK_DETAILS = "task:{task_id}".format
-
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], dsn: str = "") -> None:
         self._sf = session_factory
         self._dsn = dsn
@@ -108,6 +104,6 @@ class SQLTaskSubmit:
         raise NotImplementedError("SQLTaskSubmit does not support rate-limited submission")
 
     async def clean_rate_limiter(
-        self, queues: set[bytes], now: dt.datetime, rate_limit_age: dt.timedelta
+        self, queues: set[str], now: dt.datetime, rate_limit_age: dt.timedelta
     ) -> None:
         pass

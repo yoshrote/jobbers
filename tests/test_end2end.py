@@ -42,7 +42,6 @@ async def sm(redis, session_factory):
     task_state = RedisTaskState(redis)
     task_submit = RedisTaskSubmit(redis, task_state)
     return StateManager(
-        redis,
         routing_backend,
         task_state=task_state,
         task_submit=task_submit,

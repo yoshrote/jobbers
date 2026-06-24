@@ -150,7 +150,7 @@ async def test_clean_rate_limiter_removes_expired_entries(task_adapter):
     await submit.submit_rate_limited_task(task, queue_config)
 
     far_future = FROZEN_TIME + dt.timedelta(hours=2)
-    await submit.clean_rate_limiter({b"default"}, now=far_future, rate_limit_age=dt.timedelta(hours=1))
+    await submit.clean_rate_limiter({"default"}, now=far_future, rate_limit_age=dt.timedelta(hours=1))
 
     tasks_in_queue = await state.get_all_tasks(TaskPagination(queue="default"))
     assert len(tasks_in_queue) == 1

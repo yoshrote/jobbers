@@ -433,7 +433,6 @@ def _make_state_manager(
     cron_dag_scheduler: object,
 ) -> StateManager:
     sm = StateManager(
-        redis,
         routing,
         task_state=task_state,
         task_submit=task_submit,
@@ -478,7 +477,6 @@ async def state_manager_real_ta(redis, dummy_routing_backend):
     task_state = RedisTaskState(redis)
     task_submit = RedisTaskSubmit(redis, task_state)
     sm = StateManager(
-        redis,
         dummy_routing_backend,
         task_state=task_state,
         task_submit=task_submit,

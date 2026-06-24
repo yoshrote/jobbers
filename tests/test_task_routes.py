@@ -1231,7 +1231,7 @@ async def test_get_task_status_scheduled_includes_scheduled_at(state_manager):
     task = Task(id=ULID1, name="my_task", queue="default", status="scheduled", submitted_at=FROZEN_TIME)
     await state_manager.task_state.save_task(task)
     # Seed into the scheduler so get_run_at returns a value
-    pipe = state_manager.job_store.pipeline(transaction=True)
+    pipe = state_manager.task_scheduler.pipeline(transaction=True)
     state_manager.task_scheduler.stage_add(pipe, task, run_at)
     await pipe.execute()
 

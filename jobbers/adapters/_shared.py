@@ -423,7 +423,7 @@ class SharedTaskAdapterMixin(ABC):
 
     async def clean(
         self,
-        queues: set[bytes],
+        queues: set[str],
         now: dt.datetime,
         min_queue_age: dt.datetime | None = None,
         max_queue_age: dt.datetime | None = None,
@@ -436,18 +436,18 @@ class SharedTaskAdapterMixin(ABC):
                 pipe = self.data_store.pipeline(transaction=True)
                 if earliest_time <= latest_time:
                     pipe.zremrangebyscore(
-                        self.TASKS_BY_QUEUE(queue=queue.decode()),
+                        self.TASKS_BY_QUEUE(queue=queue),
                         min=earliest_time.timestamp(),
                         max=latest_time.timestamp(),
                     )
                 else:
                     pipe.zremrangebyscore(
-                        self.TASKS_BY_QUEUE(queue=queue.decode()),
+                        self.TASKS_BY_QUEUE(queue=queue),
                         min=0,
                         max=earliest_time.timestamp(),
                     )
                     pipe.zremrangebyscore(
-                        self.TASKS_BY_QUEUE(queue=queue.decode()),
+                        self.TASKS_BY_QUEUE(queue=queue),
                         min=latest_time.timestamp(),
                         max=now.timestamp(),
                     )
@@ -555,14 +555,12 @@ class _SharedRedisTaskSubmitBase:
         return result == 1
 
     async def clean_rate_limiter(
-        self, queues: set[bytes], now: dt.datetime, rate_limit_age: dt.timedelta
+        self, queues: set[str], now: dt.datetime, rate_limit_age: dt.timedelta
     ) -> None:
         earliest_time = now - rate_limit_age
         pipe = self._data_store.pipeline(transaction=True)
         for queue in queues:
-            pipe.zremrangebyscore(
-                self.QUEUE_RATE_LIMITER(queue=queue.decode()), min=0, max=earliest_time.timestamp()
-            )
+            pipe.zremrangebyscore(self.QUEUE_RATE_LIMITER(queue=queue), min=0, max=earliest_time.timestamp())
         await pipe.execute()
 
     async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:

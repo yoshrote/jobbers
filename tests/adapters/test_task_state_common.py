@@ -946,7 +946,7 @@ async def test_clean_removes_tasks_within_age_window(task_adapter):
 
     min_age = FROZEN_TIME - dt.timedelta(hours=3)
     max_age = FROZEN_TIME - dt.timedelta(hours=1)
-    await state.clean({b"default"}, FROZEN_TIME, min_queue_age=min_age, max_queue_age=max_age)
+    await state.clean({"default"}, FROZEN_TIME, min_queue_age=min_age, max_queue_age=max_age)
 
     remaining = await state.get_all_tasks(TaskPagination(queue="default"))
     remaining_ids = {t.id for t in remaining}
@@ -959,6 +959,6 @@ async def test_clean_with_no_age_params_is_noop(task_adapter):
     """clean() with no min/max age does nothing."""
     state, submit = task_adapter
     await submit.submit_task(make_task(ULID1))
-    await state.clean({b"default"}, FROZEN_TIME)
+    await state.clean({"default"}, FROZEN_TIME)
     remaining = await state.get_all_tasks(TaskPagination(queue="default"))
     assert len(remaining) == 1

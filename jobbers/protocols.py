@@ -181,7 +181,7 @@ class TaskSubmitProtocol(Protocol):  # pragma: no cover
         ...
 
     async def clean_rate_limiter(
-        self, queues: set[bytes], now: dt.datetime, rate_limit_age: dt.timedelta
+        self, queues: set[str], now: dt.datetime, rate_limit_age: dt.timedelta
     ) -> None:
         """Remove rate-limiter sorted-set entries older than ``rate_limit_age``."""
         ...
@@ -247,7 +247,7 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
     async def clean(
         self,
-        queues: set[bytes],
+        queues: set[str],
         now: dt.datetime,
         min_queue_age: dt.datetime | None,
         max_queue_age: dt.datetime | None,
@@ -286,7 +286,7 @@ class TaskQueueProtocol(Protocol):  # pragma: no cover
         """Atomically check the sliding window and enqueue if under limit.  Returns False if rate-limited."""
         ...
 
-    async def clean(self, queues: set[bytes], now: dt.datetime, rate_limit_age: dt.timedelta) -> None: ...
+    async def clean(self, queues: set[str], now: dt.datetime, rate_limit_age: dt.timedelta) -> None: ...
 
 
 @runtime_checkable

@@ -142,7 +142,7 @@ async def test_clean_max_queue_age_removes_old_tasks(session_factory):
     submit = SQLTaskSubmit(session_factory)
     await submit.submit_task(make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(days=2)))
     await submit.submit_task(make_task(ULID2, submitted_at=FROZEN_TIME))
-    await state.clean(queues={b"default"}, now=FROZEN_TIME, max_queue_age=FROZEN_TIME - dt.timedelta(days=1))
+    await state.clean(queues={"default"}, now=FROZEN_TIME, max_queue_age=FROZEN_TIME - dt.timedelta(days=1))
     ids = {t.id for t in await state.get_all_tasks(TaskPagination(queue="default"))}
     assert ULID1 not in ids
     assert ULID2 in ids
@@ -155,7 +155,7 @@ async def test_clean_min_queue_age_removes_recent_tasks(session_factory):
     submit = SQLTaskSubmit(session_factory)
     await submit.submit_task(make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(days=10)))
     await submit.submit_task(make_task(ULID2, submitted_at=FROZEN_TIME))
-    await state.clean(queues={b"default"}, now=FROZEN_TIME, min_queue_age=FROZEN_TIME - dt.timedelta(days=1))
+    await state.clean(queues={"default"}, now=FROZEN_TIME, min_queue_age=FROZEN_TIME - dt.timedelta(days=1))
     ids = {t.id for t in await state.get_all_tasks(TaskPagination(queue="default"))}
     assert ULID1 in ids
     assert ULID2 not in ids
@@ -167,7 +167,7 @@ async def test_clean_noop_when_no_age_params(session_factory):
     state = SQLTaskState(session_factory)
     submit = SQLTaskSubmit(session_factory)
     await submit.submit_task(make_task())
-    await state.clean(queues={b"default"}, now=dt.datetime.now(dt.UTC))
+    await state.clean(queues={"default"}, now=dt.datetime.now(dt.UTC))
     assert await state.task_exists(ULID1)
 
 

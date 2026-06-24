@@ -247,7 +247,6 @@ async def init_state_manager() -> StateManager:
         cron_dag_scheduler = RedisCronDAGScheduler(client)
 
     _state_manager = StateManager(
-        client,
         routing_backend,
         task_state=_task_adapter,
         task_submit=task_submit,

@@ -3,7 +3,6 @@ import contextlib
 import datetime as dt
 from unittest.mock import ANY, AsyncMock, call, patch
 
-import fakeredis.aioredis as fakeredis
 import pytest
 from ulid import ULID
 
@@ -508,7 +507,6 @@ def _make_state_manager():
     """Return a mock StateManager whose retry_task mirrors the real SM behaviour."""
     state_manager = AsyncMock(spec=StateManager)
     state_manager.task_scheduler = AsyncMock(spec=RedisTaskScheduler)
-    state_manager.job_store = fakeredis.FakeRedis()
     state_manager.task_state = AsyncMock()
 
     async def _schedule_retry_task(task: Task, run_at: dt.datetime) -> Task:

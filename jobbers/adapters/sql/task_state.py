@@ -131,19 +131,6 @@ class SQLTaskState:
     (non-SQLite) instead of Redis WATCH/MULTI — no retry loop required.
     """
 
-    # Key-helper stubs: present for structural compatibility with AtomicTaskStateProtocol
-    # (used by DummyTaskAdapter and shared test helpers that reference these names).
-    # These string-format callables are only meaningful in the Redis adapters' Lua scripts
-    # and the heartbeat sorted-set; SQL stores heartbeat in the tasks table itself.
-    TASKS_BY_QUEUE = "task-queues:{queue}".format
-    TASK_DETAILS = "task:{task_id}".format
-    HEARTBEAT_SCORES = "task-heartbeats:{queue}".format
-    TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
-    QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
-    DLQ_MISSING_DATA = "dlq-missing-data"
-    DAG_RUNS = "dag-runs"
-    DAG_RUN_TASKS = "dag-run:{dag_run_id}:tasks".format
-
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], dsn: str = "") -> None:
         self._sf = session_factory
         self._dsn = dsn
@@ -518,7 +505,7 @@ class SQLTaskState:
 
     async def clean(
         self,
-        queues: set[bytes],
+        queues: set[str],
         now: dt.datetime,
         min_queue_age: dt.datetime | None = None,
         max_queue_age: dt.datetime | None = None,
@@ -528,7 +515,7 @@ class SQLTaskState:
             return
         earliest = min_queue_age or dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
         latest = max_queue_age or now
-        queue_names = [q.decode() for q in queues]
+        queue_names = list(queues)
         async with self._sf() as session:
             async with session.begin():
                 await session.execute(

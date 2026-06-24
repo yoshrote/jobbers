@@ -238,7 +238,7 @@ async def test_clean_noop_when_no_age_params_leaves_sorted_set_intact(redis_task
     """clean() with neither min_queue_age nor max_queue_age does nothing to the sorted set."""
     state, submit = redis_task_adapter
     await submit.submit_task(make_task())
-    await state.clean(queues={b"default"}, now=dt.datetime.now(dt.UTC))
+    await state.clean(queues={"default"}, now=dt.datetime.now(dt.UTC))
     members = await state.data_store.zrange(state.TASKS_BY_QUEUE(queue="default"), 0, -1)
     assert bytes(ULID1) in members
 
@@ -249,7 +249,7 @@ async def test_clean_inverted_time_range(redis_task_adapter):
     state, submit = redis_task_adapter
     await submit.submit_task(make_task(ULID1, submitted_at=FROZEN_TIME))
     await state.clean(
-        queues={b"default"},
+        queues={"default"},
         now=FROZEN_TIME + dt.timedelta(hours=1),
         min_queue_age=FROZEN_TIME + dt.timedelta(seconds=30),
         max_queue_age=FROZEN_TIME - dt.timedelta(seconds=30),
@@ -264,7 +264,7 @@ async def test_clean_max_queue_age_removes_old_entries_from_sorted_set(redis_tas
     state, submit = redis_task_adapter
     await submit.submit_task(make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(days=2)))
     await submit.submit_task(make_task(ULID2, submitted_at=FROZEN_TIME))
-    await state.clean(queues={b"default"}, now=FROZEN_TIME, max_queue_age=FROZEN_TIME - dt.timedelta(days=1))
+    await state.clean(queues={"default"}, now=FROZEN_TIME, max_queue_age=FROZEN_TIME - dt.timedelta(days=1))
     members = await state.data_store.zrange(state.TASKS_BY_QUEUE(queue="default"), 0, -1)
     assert bytes(ULID1) not in members
     assert bytes(ULID2) in members
@@ -276,7 +276,7 @@ async def test_clean_min_queue_age_removes_entries_from_sorted_set(redis_task_ad
     state, submit = redis_task_adapter
     await submit.submit_task(make_task(ULID1, submitted_at=FROZEN_TIME - dt.timedelta(days=10)))
     await submit.submit_task(make_task(ULID2, submitted_at=FROZEN_TIME))
-    await state.clean(queues={b"default"}, now=FROZEN_TIME, min_queue_age=FROZEN_TIME - dt.timedelta(days=1))
+    await state.clean(queues={"default"}, now=FROZEN_TIME, min_queue_age=FROZEN_TIME - dt.timedelta(days=1))
     members = await state.data_store.zrange(state.TASKS_BY_QUEUE(queue="default"), 0, -1)
     assert bytes(ULID1) in members
     assert bytes(ULID2) not in members

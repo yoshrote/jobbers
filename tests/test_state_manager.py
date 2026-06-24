@@ -33,31 +33,31 @@ ULID2 = ULID.from_str("01JQC31BHQ5AXV0JK23ZWSS5NA")
 
 async def schedule(sm: StateManager, task: Task, run_at: dt.datetime) -> None:
     """Stage a task into the task scheduler sorted set at the given run_at time."""
-    pipe = sm.job_store.pipeline(transaction=True)
+    pipe = sm.task_scheduler.pipeline(transaction=True)
     sm.task_scheduler.stage_add(pipe, task, run_at)
     await pipe.execute()
 
 
 async def add_to_dlq(sm: StateManager, task: Task, failed_at: dt.datetime) -> None:
     """Stage a task into the dead-letter queue at the given failed_at timestamp."""
-    pipe = sm.job_store.pipeline(transaction=True)
+    pipe = sm.dead_queue.pipeline(transaction=True)
     sm.dead_queue.stage_add(pipe, task, failed_at)
     await pipe.execute()
 
 
 @pytest.mark.asyncio
-async def test_bump_refresh_tag_publishes_pubsub(state_manager):
+async def test_bump_refresh_tag_publishes_pubsub(redis, state_manager):
     """bump_refresh_tag publishes the new tag value to queue-config-refresh:{role}."""
-    with patch.object(state_manager.job_store, "publish", new_callable=AsyncMock) as mock_publish:
+    with patch.object(redis, "publish", new_callable=AsyncMock) as mock_publish:
         new_tag = await state_manager.bump_refresh_tag("myrole")
 
     mock_publish.assert_called_once_with("queue-config-refresh:myrole", new_tag)
 
 
 @pytest.mark.asyncio
-async def test_save_role_publishes_pubsub(state_manager):
+async def test_save_role_publishes_pubsub(redis, state_manager):
     """save_role publishes the new refresh tag to queue-config-refresh:{role}."""
-    with patch.object(state_manager.job_store, "publish", new_callable=AsyncMock) as mock_publish:
+    with patch.object(redis, "publish", new_callable=AsyncMock) as mock_publish:
         await state_manager.save_role("newrole", set())
 
     channel, tag = mock_publish.call_args[0]
@@ -453,7 +453,7 @@ async def test_cancel_submitted_task(redis, state_manager):
     task = Task(
         id=ULID1, name="my_task", queue="default", status=TaskStatus.SUBMITTED, submitted_at=FROZEN_TIME
     )
-    pipe = state_manager.job_store.pipeline()
+    pipe = state_manager.task_state.pipeline()
     state_manager.task_state.stage_requeue(pipe, task)
     await pipe.execute()
     await state_manager.task_state.save_task(task)
@@ -649,7 +649,7 @@ async def test_schedule_retry_task_adds_to_scheduler(redis, state_manager):
 
 
 @pytest.mark.asyncio
-async def test_update_task_heartbeat_sets_timestamp(state_manager_real_ta):
+async def test_update_task_heartbeat_sets_timestamp(redis, state_manager_real_ta):
     """update_task_heartbeat stamps heartbeat_at on the task and persists it."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
     await state_manager_real_ta.task_state.save_task(task)
@@ -658,14 +658,14 @@ async def test_update_task_heartbeat_sets_timestamp(state_manager_real_ta):
     await state_manager_real_ta.update_task_heartbeat(task)
 
     assert task.heartbeat_at is not None
-    score = await state_manager_real_ta.job_store.zscore(
+    score = await redis.zscore(
         state_manager_real_ta.task_state.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)
     )
     assert score is not None
 
 
 @pytest.mark.asyncio
-async def test_remove_task_heartbeat_clears_entry(state_manager_real_ta):
+async def test_remove_task_heartbeat_clears_entry(redis, state_manager_real_ta):
     """remove_task_heartbeat removes the task from the heartbeat sorted set."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
     await state_manager_real_ta.task_state.save_task(task)
@@ -673,7 +673,7 @@ async def test_remove_task_heartbeat_clears_entry(state_manager_real_ta):
 
     await state_manager_real_ta.remove_task_heartbeat(task)
 
-    score = await state_manager_real_ta.job_store.zscore(
+    score = await redis.zscore(
         state_manager_real_ta.task_state.HEARTBEAT_SCORES(queue="default"), bytes(ULID1)
     )
     assert score is None
@@ -841,7 +841,7 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_cron_dag_submits_task_and_reschedules(state_manager):
+async def test_dispatch_cron_dag_submits_task_and_reschedules(redis, state_manager):
     """dispatch_cron_dag submits the root task and reschedules the entry."""
     spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
@@ -862,12 +862,12 @@ async def test_dispatch_cron_dag_submits_task_and_reschedules(state_manager):
     assert task.status == TaskStatus.SUBMITTED
 
     # The entry should be rescheduled in the cron sorted set
-    members = await state_manager.job_store.zrange("cron-schedule", 0, -1)
+    members = await redis.zrange("cron-schedule", 0, -1)
     assert bytes(entry.id) in members
 
 
 @pytest.mark.asyncio
-async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager):
+async def test_dispatch_cron_dag_skip_if_running_skips_when_active(redis, state_manager):
     """dispatch_cron_dag skips dispatch but reschedules when concurrency_policy=SKIP_IF_RUNNING and previous run is active."""
     spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
@@ -880,7 +880,7 @@ async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager
     # Plant an active task that the skip-guard will find
     active_task = Task(id=ULID1, name="my_job", queue="default", status=TaskStatus.STARTED)
     await state_manager.task_state.save_task(active_task)
-    await state_manager.job_store.set(f"cron-active:{entry.id}", str(ULID1))
+    await redis.set(f"cron-active:{entry.id}", str(ULID1))
 
     run_at = FROZEN_TIME
     await state_manager.dispatch_cron_dag(entry, run_at)
@@ -891,12 +891,12 @@ async def test_dispatch_cron_dag_skip_if_running_skips_when_active(state_manager
     assert ULID1 in stored
 
     # Entry must still be rescheduled
-    members = await state_manager.job_store.zrange("cron-schedule", 0, -1)
+    members = await redis.zrange("cron-schedule", 0, -1)
     assert bytes(entry.id) in members
 
 
 @pytest.mark.asyncio
-async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_skipping(state_manager):
+async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_skipping(redis, state_manager):
     """dispatch_cron_dag records the new root task when concurrency_policy=SKIP_IF_RUNNING and no prior run is active."""
     spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
@@ -916,7 +916,7 @@ async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_sk
 
     # The active-run key should now record the new task ID
     active_key = f"cron-active:{entry.id}"
-    active_val = await state_manager.job_store.get(active_key)
+    active_val = await redis.get(active_key)
     assert active_val is not None
 
 
@@ -1060,7 +1060,6 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
     """get_queue_config returns a cached value on the second call."""
     routing_backend = SQLRoutingBackend(session_factory)
     sm = StateManager(
-        redis,
         routing_backend,
         task_state=dummy_task_adapter,
         task_submit=DummyTaskSubmit(dummy_task_adapter._store),
@@ -1086,7 +1085,6 @@ async def test_get_routing_config_caches_result(redis, session_factory, dummy_ta
     """get_routing_config returns a cached value on the second call."""
     routing_backend = SQLRoutingBackend(session_factory)
     sm = StateManager(
-        redis,
         routing_backend,
         task_state=dummy_task_adapter,
         task_submit=DummyTaskSubmit(dummy_task_adapter._store),
@@ -1122,7 +1120,6 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
     """save_queue_config writes to SQL, clears the cache entry, and bumps refresh_tag for containing roles."""
     routing_backend = SQLRoutingBackend(session_factory)
     sm = StateManager(
-        redis,
         routing_backend,
         task_state=dummy_task_adapter,
         task_submit=DummyTaskSubmit(dummy_task_adapter._store),
@@ -1162,7 +1159,6 @@ async def test_save_routing_config_invalidates_cache_and_bumps_version(
     """save_routing_config writes to SQL, clears the cache entry, and updates routing:version to a new ULID."""
     routing_backend = SQLRoutingBackend(session_factory)
     sm = StateManager(
-        redis,
         routing_backend,
         task_state=dummy_task_adapter,
         task_submit=DummyTaskSubmit(dummy_task_adapter._store),
@@ -1207,7 +1203,6 @@ async def test_delete_routing_config_invalidates_cache_and_bumps_version(
     """delete_routing_config removes from SQL, clears the cache entry, and updates routing:version to a new ULID."""
     routing_backend = SQLRoutingBackend(session_factory)
     sm = StateManager(
-        redis,
         routing_backend,
         task_state=dummy_task_adapter,
         task_submit=DummyTaskSubmit(dummy_task_adapter._store),
@@ -1241,7 +1236,6 @@ async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_
     """invalidate_all_routing_config clears all entries from the routing cache dict."""
     routing_backend = SQLRoutingBackend(session_factory)
     sm = StateManager(
-        redis,
         routing_backend,
         task_state=dummy_task_adapter,
         task_submit=DummyTaskSubmit(dummy_task_adapter._store),

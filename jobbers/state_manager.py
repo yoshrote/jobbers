@@ -24,8 +24,6 @@ from jobbers.models.task_status import TaskStatus
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
-    from redis.asyncio.client import Redis
-
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGNode, DAGRunPagination
     from jobbers.models.queue_config import QueueConfig
@@ -89,7 +87,6 @@ class StateManager:
 
     def __init__(
         self,
-        job_store: Redis,
         routing_backend: RoutingBackendProtocol,
         task_state: TaskStateProtocol,
         task_submit: TaskSubmitProtocol,
@@ -101,7 +98,6 @@ class StateManager:
         routing_notifications: RoutingNotificationProtocol,
         force_saga: bool = False,
     ) -> None:
-        self.job_store: Redis = job_store
         self.routing: RoutingBackendProtocol = routing_backend
         self.cancellation_bus: CancellationBusProtocol = cancellation_bus
         self.routing_notifications: RoutingNotificationProtocol = routing_notifications
@@ -194,7 +190,7 @@ class StateManager:
     ) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.UTC)
-        queues = {q.encode() for q in await self.get_all_queues()}
+        queues = set(await self.get_all_queues())
 
         clean_ops = []
         if rate_limit_age:
@@ -215,7 +211,7 @@ class StateManager:
 
         if stale_time:
             stale_tasks_by_type: dict[tuple[str, int], list[Task]] = defaultdict(list)
-            async for task in self.task_state.get_stale_tasks({q.decode() for q in queues}, stale_time):
+            async for task in self.task_state.get_stale_tasks(queues, stale_time):
                 if task.status != TaskStatus.STARTED:
                     continue
                 stale_tasks_by_type[(task.name, task.version)].append(task)
@@ -274,8 +270,7 @@ class StateManager:
             # If remove fails, Cleaner reconciles DLQ entries for SUBMITTED/STARTED tasks.
             await asyncio.gather(*(self.task_state.save_task(t) for t in tasks))
             for task in tasks:
-                if hasattr(self.dead_queue, "remove_from_dlq"):
-                    await self.dead_queue.remove_from_dlq(task.id, task.queue, task.name)
+                await self.dead_queue.remove_from_dlq(task.id, task.queue, task.name)
         return tasks
 
     async def fail_task(self, task: Task) -> Task:
@@ -293,8 +288,7 @@ class StateManager:
             await self.task_state.save_task(task)
             if needs_dlq:
                 logger.info("Task %s sent to dead letter queue.", task.id)
-                if hasattr(self.dead_queue, "add_to_dlq"):
-                    await self.dead_queue.add_to_dlq(task, now)
+                await self.dead_queue.add_to_dlq(task, now)
         if needs_dlq:
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return task
