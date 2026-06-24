@@ -184,25 +184,20 @@ async def test_delete_queue_removes_role_queue_association(queue_config_adapter)
 
 
 @pytest.mark.asyncio
-async def test_delete_queue_bumps_refresh_tag_for_affected_roles(queue_config_adapter):
-    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
-    await queue_config_adapter.save_role("role1", {"q1"})
-    tag_before = await queue_config_adapter.get_refresh_tag("role1")
-    await queue_config_adapter.delete_queue("q1")
-    tag_after = await queue_config_adapter.get_refresh_tag("role1")
-    assert tag_after != tag_before
-
-
-@pytest.mark.asyncio
-async def test_delete_queue_does_not_bump_unaffected_roles(queue_config_adapter):
+async def test_delete_queue_returns_affected_roles(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
     await queue_config_adapter.save_queue_config(QueueConfig(name="q2"))
     await queue_config_adapter.save_role("role1", {"q1"})
     await queue_config_adapter.save_role("role2", {"q2"})
-    tag_before = await queue_config_adapter.get_refresh_tag("role2")
-    await queue_config_adapter.delete_queue("q1")
-    tag_after = await queue_config_adapter.get_refresh_tag("role2")
-    assert tag_after == tag_before
+    affected = await queue_config_adapter.delete_queue("q1")
+    assert set(affected) == {"role1"}
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_returns_empty_for_unassigned_queue(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    affected = await queue_config_adapter.delete_queue("q1")
+    assert affected == []
 
 
 @pytest.mark.asyncio
@@ -306,59 +301,40 @@ async def test_save_queue_config_overwrites_existing(queue_config_adapter):
     assert result.max_concurrent == 9
 
 
-# ── refresh tags ──────────────────────────────────────────────────────────────
+# ── save_role return type ──────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_get_refresh_tag_creates_and_returns_consistent(queue_config_adapter):
-    tag1 = await queue_config_adapter.get_refresh_tag("role_a")
-    assert tag1 is not None
-    tag2 = await queue_config_adapter.get_refresh_tag("role_a")
-    assert tag1 == tag2
+async def test_save_role_returns_none(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    result = await queue_config_adapter.save_role("role1", {"q1"})
+    assert result is None
+
+
+# ── get_roles_for_queue ────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_bump_refresh_tag_returns_new_value(queue_config_adapter):
-    tag_before = await queue_config_adapter.get_refresh_tag("role_b")
-    new_tag_str = await queue_config_adapter.bump_refresh_tag("role_b")
-    tag_after = await queue_config_adapter.get_refresh_tag("role_b")
-    assert str(tag_after) == new_tag_str
-    assert tag_after != tag_before
-
-
-@pytest.mark.asyncio
-async def test_bump_refresh_tags_for_queue_affects_containing_roles(queue_config_adapter):
+async def test_get_roles_for_queue_returns_containing_roles(queue_config_adapter):
     for q in ("shared_q", "other_q", "unrelated_q"):
         await queue_config_adapter.save_queue_config(QueueConfig(name=q))
     await queue_config_adapter.save_role("role_x", {"shared_q", "other_q"})
     await queue_config_adapter.save_role("role_y", {"shared_q"})
     await queue_config_adapter.save_role("role_z", {"unrelated_q"})
 
-    tag_x_before = await queue_config_adapter.get_refresh_tag("role_x")
-    tag_z_before = await queue_config_adapter.get_refresh_tag("role_z")
-
-    affected = await queue_config_adapter.bump_refresh_tags_for_queue("shared_q")
-    assert set(affected) == {"role_x", "role_y"}
-
-    tag_x_after = await queue_config_adapter.get_refresh_tag("role_x")
-    tag_z_after = await queue_config_adapter.get_refresh_tag("role_z")
-    assert tag_x_after != tag_x_before
-    assert tag_z_after == tag_z_before
+    roles = await queue_config_adapter.get_roles_for_queue("shared_q")
+    assert set(roles) == {"role_x", "role_y"}
 
 
 @pytest.mark.asyncio
-async def test_bump_refresh_tags_for_queue_no_roles_returns_empty(queue_config_adapter):
-    affected = await queue_config_adapter.bump_refresh_tags_for_queue("any_queue")
-    assert affected == []
+async def test_get_roles_for_queue_returns_empty_when_no_roles(queue_config_adapter):
+    roles = await queue_config_adapter.get_roles_for_queue("any_queue")
+    assert roles == []
 
 
 @pytest.mark.asyncio
-async def test_bump_refresh_tags_for_queue_no_matching_role_returns_empty(queue_config_adapter):
+async def test_get_roles_for_queue_returns_empty_when_no_matching_role(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="other_q"))
     await queue_config_adapter.save_role("r", {"other_q"})
-    tag_before = await queue_config_adapter.get_refresh_tag("r")
-
-    affected = await queue_config_adapter.bump_refresh_tags_for_queue("missing_q")
-
-    assert affected == []
-    assert await queue_config_adapter.get_refresh_tag("r") == tag_before
+    roles = await queue_config_adapter.get_roles_for_queue("missing_q")
+    assert roles == []

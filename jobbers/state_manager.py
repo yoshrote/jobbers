@@ -549,9 +549,9 @@ class StateManager:
 
     # Proxy methods
     async def get_refresh_tag(self, role: str) -> ULID:
-        return await self.routing.get_refresh_tag(role)
+        return await self.routing_notifications.get_refresh_tag(role)
 
-    async def poll_refresh_signal(self, role: str) -> bool:
+    async def poll_refresh_signal(self, role: str) -> ULID:
         return await self.routing_notifications.poll_refresh_signal(role)
 
     def stage_submit_task(
@@ -690,12 +690,12 @@ class StateManager:
         await self.routing_notifications.bump_routing_version()
 
     async def bump_refresh_tag(self, role: str) -> str:
-        new_tag = await self.routing.bump_refresh_tag(role)
-        await self.routing_notifications.notify_refresh(role, new_tag)
-        return new_tag
+        return await self.routing_notifications.bump_refresh_tag(role)
 
-    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
-        return await self.routing.bump_refresh_tags_for_queue(queue_name)
+    async def bump_refresh_tags_for_queue(self, queue_name: str) -> None:
+        roles = await self.routing.get_roles_for_queue(queue_name)
+        for role in roles:
+            await self.routing_notifications.bump_refresh_tag(role)
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         """Save queue config, invalidate local cache, and bump refresh_tags for affected roles."""
@@ -733,12 +733,14 @@ class StateManager:
         return await self.routing.get_all_roles()
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
-        new_tag = await self.routing.save_role(role, queues_set)
-        await self.routing_notifications.notify_refresh(role, new_tag)
+        await self.routing.save_role(role, queues_set)
+        await self.routing_notifications.bump_refresh_tag(role)
 
     async def delete_queue(self, queue_name: str) -> None:
         self.invalidate_queue_config(queue_name)
-        await self.routing.delete_queue(queue_name)
+        affected_roles = await self.routing.delete_queue(queue_name)
+        for role in affected_roles:
+            await self.routing_notifications.bump_refresh_tag(role)
 
     async def delete_role(self, role: str) -> None:
         await self.routing.delete_role(role)

@@ -12,8 +12,6 @@ import json
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, insert, select, update
-from sqlalchemy.exc import IntegrityError
-from ulid import ULID
 
 from jobbers.migrations.schema import (
     queues,
@@ -38,7 +36,7 @@ class SQLQueueConfigAdapter:
     QueueConfigProtocol backed by SQLAlchemy async sessions.
 
     Tables:
-      roles       — named roles, each with a ``refresh_tag`` for change detection.
+      roles       — named roles.
       queues      — queue configurations (concurrency limits and rate limiting).
       role_queues — many-to-many mapping of roles to queues.
     """
@@ -89,19 +87,15 @@ class SQLQueueConfigAdapter:
                     )
                 )
 
-    async def delete_queue(self, queue_name: str) -> None:
-        """Delete a queue and cascade to role_queues; bump refresh_tag for affected roles."""
-        new_tag = str(ULID())
+    async def delete_queue(self, queue_name: str) -> list[str]:
+        """Delete a queue and cascade to role_queues. Returns affected role names."""
         async with self._session_factory.begin() as session:
             result = await session.execute(
                 select(role_queues.c.role).where(role_queues.c.queue == queue_name).distinct()
             )
             affected_roles = [row[0] for row in result.fetchall()]
             await session.execute(delete(queues).where(queues.c.name == queue_name))
-            if affected_roles:
-                await session.execute(
-                    update(roles).where(roles.c.name.in_(affected_roles)).values(refresh_tag=new_tag)
-                )
+        return affected_roles
 
     async def get_all_queues(self) -> list[str]:
         async with self._session_factory() as session:
@@ -126,21 +120,17 @@ class SQLQueueConfigAdapter:
             result = await session.execute(select(role_queues.c.queue).where(role_queues.c.role == role))
             return {row[0] for row in result.fetchall()}
 
-    async def save_role(self, role: str, queues_set: set[str]) -> str:
-        new_tag = str(ULID())
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
         async with self._session_factory.begin() as session:
             existing = await session.execute(select(roles.c.name).where(roles.c.name == role))
-            if existing.fetchone():
-                await session.execute(update(roles).where(roles.c.name == role).values(refresh_tag=new_tag))
-            else:
-                await session.execute(insert(roles).values(name=role, refresh_tag=new_tag))
+            if not existing.fetchone():
+                await session.execute(insert(roles).values(name=role))
             await session.execute(delete(role_queues).where(role_queues.c.role == role))
             if queues_set:
                 await session.execute(
                     insert(role_queues),
                     [{"role": role, "queue": q} for q in queues_set],
                 )
-        return new_tag
 
     async def get_all_roles(self) -> list[str]:
         async with self._session_factory() as session:
@@ -152,49 +142,15 @@ class SQLQueueConfigAdapter:
         async with self._session_factory.begin() as session:
             await session.execute(delete(roles).where(roles.c.name == role))
 
-    # ── Refresh tags ──────────────────────────────────────────────────────────
+    # ── Role discovery ────────────────────────────────────────────────────────
 
-    async def get_refresh_tag(self, role: str) -> ULID:
-        """Return the current refresh tag for a role, creating one if needed."""
+    async def get_roles_for_queue(self, queue_name: str) -> list[str]:
+        """Return names of all roles that contain queue_name."""
         async with self._session_factory() as session:
-            result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
-        tag_str: str | None = result.scalar()
-        if tag_str:
-            existing_tag: ULID = ULID.from_str(tag_str)
-            return existing_tag
-
-        init_tag = ULID()
-        try:
-            async with self._session_factory.begin() as session:
-                await session.execute(insert(roles).values(name=role, refresh_tag=str(init_tag)))
-        except IntegrityError:
-            pass  # Another process inserted first
-        # Re-read in case another process won the race
-        async with self._session_factory() as session:
-            result = await session.execute(select(roles.c.refresh_tag).where(roles.c.name == role))
-        tag_str = result.scalar()
-        return ULID.from_str(tag_str) if tag_str else init_tag
-
-    async def bump_refresh_tag(self, role: str) -> str:
-        """Generate a new ULID tag for *role* and write it to SQL. Returns the new tag string."""
-        new_tag = str(ULID())
-        async with self._session_factory.begin() as session:
-            await session.execute(update(roles).where(roles.c.name == role).values(refresh_tag=new_tag))
-        return new_tag
-
-    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
-        """Bump refresh_tag for every role that contains *queue_name*. Returns affected role names."""
-        new_tag = str(ULID())
-        async with self._session_factory.begin() as session:
             result = await session.execute(
                 select(role_queues.c.role).where(role_queues.c.queue == queue_name).distinct()
             )
-            affected_roles = [row[0] for row in result.fetchall()]
-            if affected_roles:
-                await session.execute(
-                    update(roles).where(roles.c.name.in_(affected_roles)).values(refresh_tag=new_tag)
-                )
-        return affected_roles
+            return [row[0] for row in result.fetchall()]
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +252,8 @@ class SQLRoutingBackend:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         await self._qca.save_queue_config(queue_config)
 
-    async def delete_queue(self, queue_name: str) -> None:
-        await self._qca.delete_queue(queue_name)
+    async def delete_queue(self, queue_name: str) -> list[str]:
+        return await self._qca.delete_queue(queue_name)
 
     async def get_all_queues(self) -> list[str]:
         return await self._qca.get_all_queues()
@@ -305,8 +261,8 @@ class SQLRoutingBackend:
     async def get_queues(self, role: str) -> set[str]:
         return await self._qca.get_queues(role)
 
-    async def save_role(self, role: str, queues_set: set[str]) -> str:
-        return await self._qca.save_role(role, queues_set)
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
+        await self._qca.save_role(role, queues_set)
 
     async def get_all_roles(self) -> list[str]:
         return await self._qca.get_all_roles()
@@ -314,14 +270,8 @@ class SQLRoutingBackend:
     async def delete_role(self, role: str) -> None:
         await self._qca.delete_role(role)
 
-    async def get_refresh_tag(self, role: str) -> ULID:
-        return await self._qca.get_refresh_tag(role)
-
-    async def bump_refresh_tag(self, role: str) -> str:
-        return await self._qca.bump_refresh_tag(role)
-
-    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
-        return await self._qca.bump_refresh_tags_for_queue(queue_name)
+    async def get_roles_for_queue(self, queue_name: str) -> list[str]:
+        return await self._qca.get_roles_for_queue(queue_name)
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
         return await self._rca.get_routing_config(task_name, task_version)

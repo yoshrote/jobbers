@@ -6,8 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ulid import ULID
-
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.protocols import RoutingBackendReadOnlyError
@@ -82,7 +80,6 @@ class StaticRoutingBackend:
         self._routing: dict[tuple[str, int], RoutingConfig] = {
             (rc.task_name, rc.task_version): rc for rc in (routing_configs or [])
         }
-        self._refresh_tag = ULID()
 
     # ── Factory methods ───────────────────────────────────────────────────────
 
@@ -135,10 +132,10 @@ class StaticRoutingBackend:
     async def get_all_roles(self) -> list[str]:
         return sorted(self._roles)
 
-    # ── Refresh tags (static — workers never re-poll) ─────────────────────────
+    # ── Role discovery ────────────────────────────────────────────────────────
 
-    async def get_refresh_tag(self, role: str) -> ULID:
-        return self._refresh_tag
+    async def get_roles_for_queue(self, queue_name: str) -> list[str]:
+        return [role for role, queues in self._roles.items() if queue_name in queues]
 
     # ── Routing config reads ──────────────────────────────────────────────────
 
@@ -152,27 +149,17 @@ class StaticRoutingBackend:
             "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
         )
 
-    async def delete_queue(self, queue_name: str) -> None:
+    async def delete_queue(self, queue_name: str) -> list[str]:
         raise RoutingBackendReadOnlyError(
             "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
         )
 
-    async def save_role(self, role: str, queues_set: set[str]) -> str:
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
         raise RoutingBackendReadOnlyError(
             "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
         )
 
     async def delete_role(self, role: str) -> None:
-        raise RoutingBackendReadOnlyError(
-            "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
-        )
-
-    async def bump_refresh_tag(self, role: str) -> str:
-        raise RoutingBackendReadOnlyError(
-            "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
-        )
-
-    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
         raise RoutingBackendReadOnlyError(
             "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
         )

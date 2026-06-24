@@ -107,10 +107,7 @@ class TaskGenerator:
             self.state_manager.invalidate_all_routing_config()
             logger.info("Routing config invalidated at version %s", new_routing_version)
 
-        if await self.state_manager.poll_refresh_signal(self.role):
-            self.refresh_tag = None  # force tag re-read below
-
-        new_refresh_tag = await self.state_manager.get_refresh_tag(self.role)
+        new_refresh_tag = await self.state_manager.poll_refresh_signal(self.role)
         if new_refresh_tag != self.refresh_tag:
             self.refresh_tag = new_refresh_tag
             self.task_queues = {queue for queue in await self.find_queues() if queue}

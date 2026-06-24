@@ -46,16 +46,6 @@ async def add_to_dlq(sm: StateManager, task: Task, failed_at: dt.datetime) -> No
 
 
 @pytest.mark.asyncio
-async def test_get_refresh_tag(state_manager):
-    """Test that get_refresh_tag creates and returns a consistent refresh tag for a role."""
-    tag1 = await state_manager.get_refresh_tag("test_role")
-    assert tag1 is not None
-
-    tag2 = await state_manager.get_refresh_tag("test_role")
-    assert tag1 == tag2
-
-
-@pytest.mark.asyncio
 async def test_bump_refresh_tag_publishes_pubsub(state_manager):
     """bump_refresh_tag publishes the new tag value to queue-config-refresh:{role}."""
     with patch.object(state_manager.job_store, "publish", new_callable=AsyncMock) as mock_publish:
@@ -1145,7 +1135,7 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
     qca = SQLQueueConfigAdapter(session_factory)
     await qca.save_queue_config(QueueConfig(name="q1", max_concurrent=5))
     await qca.save_role("role_a", {"q1"})
-    tag_before = await sm.get_refresh_tag("role_a")
+    tag_before = await sm.poll_refresh_signal("role_a")
 
     # Warm the cache
     r1 = await sm.get_queue_config("q1")

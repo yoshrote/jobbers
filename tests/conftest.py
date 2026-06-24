@@ -555,7 +555,6 @@ class DummyRoutingBackend:
         self._queues: dict[str, QueueConfig] = {}
         self._roles: dict[str, set[str]] = {}
         self._routing: dict[tuple[str, int], RoutingConfig] = {}
-        self._tags: dict[str, ULID] = {}
 
     # ── Queue CRUD ────────────────────────────────────────────────────────────
 
@@ -565,13 +564,14 @@ class DummyRoutingBackend:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         self._queues[queue_config.name] = queue_config
 
-    async def delete_queue(self, queue_name: str) -> None:
+    async def delete_queue(self, queue_name: str) -> list[str]:
         self._queues.pop(queue_name, None)
-        new_tag = ULID()
+        affected = []
         for role, queues in self._roles.items():
             if queue_name in queues:
                 queues.discard(queue_name)
-                self._tags[role] = new_tag
+                affected.append(role)
+        return affected
 
     async def get_all_queues(self) -> list[str]:
         return sorted(self._queues)
@@ -581,38 +581,19 @@ class DummyRoutingBackend:
     async def get_queues(self, role: str) -> set[str]:
         return set(self._roles.get(role, set()))
 
-    async def save_role(self, role: str, queues_set: set[str]) -> str:
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
         self._roles[role] = set(queues_set)
-        new_tag = ULID()
-        self._tags[role] = new_tag
-        return str(new_tag)
 
     async def get_all_roles(self) -> list[str]:
         return sorted(self._roles)
 
     async def delete_role(self, role: str) -> None:
         self._roles.pop(role, None)
-        self._tags.pop(role, None)
 
-    # ── Refresh tags ──────────────────────────────────────────────────────────
+    # ── Role discovery ────────────────────────────────────────────────────────
 
-    async def get_refresh_tag(self, role: str) -> ULID:
-        if role not in self._tags:
-            self._tags[role] = ULID()
-        return self._tags[role]
-
-    async def bump_refresh_tag(self, role: str) -> str:
-        new_tag = ULID()
-        self._tags[role] = new_tag
-        return str(new_tag)
-
-    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
-        affected = [role for role, queues in self._roles.items() if queue_name in queues]
-        if affected:
-            new_tag = ULID()
-            for role in affected:
-                self._tags[role] = new_tag
-        return affected
+    async def get_roles_for_queue(self, queue_name: str) -> list[str]:
+        return [role for role, queues in self._roles.items() if queue_name in queues]
 
     # ── Task routing config ───────────────────────────────────────────────────
 

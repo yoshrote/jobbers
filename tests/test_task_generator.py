@@ -13,14 +13,6 @@ from jobbers.task_generator import _CAPACITY_BACKOFF_SECS, TaskGenerator
 EXHAUSTED = object()
 
 
-def _silent_pubsub(task_generator: TaskGenerator) -> AsyncMock:
-    """Pre-seed task_generator._refresh_pubsub with a no-message mock so queues() doesn't crash."""
-    pubsub = AsyncMock()
-    pubsub.get_message = AsyncMock(return_value=None)
-    task_generator._refresh_pubsub = pubsub
-    return pubsub
-
-
 @pytest.mark.asyncio
 async def test_find_queues_default_role():
     """Test that TaskGenerator finds default queues for the 'default' role."""
@@ -68,9 +60,8 @@ async def test_task_generator_iteration():
     state_manager.get_next_task.return_value = task
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
-    state_manager.get_refresh_tag = AsyncMock(return_value=ULID())
+    state_manager.poll_refresh_signal = AsyncMock(return_value=ULID())
     task_generator = TaskGenerator(state_manager, role="default")
-    _silent_pubsub(task_generator)
 
     assert await anext(task_generator, EXHAUSTED) == task
 
@@ -83,7 +74,7 @@ async def test_task_generator_sleeps_and_retries_on_capacity_filter():
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
-    state_manager.get_refresh_tag = AsyncMock(return_value=ULID())
+    state_manager.poll_refresh_signal = AsyncMock(return_value=ULID())
 
     task = Task(
         id=ULID(),
@@ -95,7 +86,6 @@ async def test_task_generator_sleeps_and_retries_on_capacity_filter():
     state_manager.get_next_task = AsyncMock(side_effect=[None, task])
 
     task_generator = TaskGenerator(state_manager, role="default")
-    _silent_pubsub(task_generator)
 
     with patch("jobbers.task_generator.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
         result = await task_generator.__anext__()
@@ -112,10 +102,9 @@ async def test_task_generator_cancelled_during_backoff_sleep():
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
     state_manager.get_next_task = AsyncMock(return_value=None)
-    state_manager.get_refresh_tag = AsyncMock(return_value=ULID())
+    state_manager.poll_refresh_signal = AsyncMock(return_value=ULID())
 
     task_generator = TaskGenerator(state_manager, role="default")
-    _silent_pubsub(task_generator)
 
     with patch(
         "jobbers.task_generator.asyncio.sleep", new_callable=AsyncMock, side_effect=asyncio.CancelledError
@@ -130,9 +119,8 @@ async def test_task_generator_stops_after_max_tasks():
     state_manager = AsyncMock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
-    state_manager.get_refresh_tag = AsyncMock(return_value=ULID())
+    state_manager.poll_refresh_signal = AsyncMock(return_value=ULID())
     task_generator = TaskGenerator(state_manager, max_tasks=2)
-    _silent_pubsub(task_generator)
 
     # Mock get_next_task to return a new Task
     state_manager.get_next_task = AsyncMock(
@@ -350,9 +338,8 @@ async def test_cancelled_error_propagates():
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
-    state_manager.get_refresh_tag = AsyncMock(return_value=ULID())
+    state_manager.poll_refresh_signal = AsyncMock(return_value=ULID())
     task_generator = TaskGenerator(state_manager)
-    _silent_pubsub(task_generator)
 
     state_manager.get_next_task.side_effect = asyncio.CancelledError
 
@@ -369,13 +356,12 @@ async def test_missing_submitted_at_raises_runtime_error():
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
-    state_manager.get_refresh_tag = AsyncMock(return_value=ULID())
+    state_manager.poll_refresh_signal = AsyncMock(return_value=ULID())
 
     task = Task(id=ULID(), name="test_task", version=1)  # submitted_at=None by default
     state_manager.get_next_task.return_value = task
 
     task_generator = TaskGenerator(state_manager)
-    _silent_pubsub(task_generator)
 
     with pytest.raises(RuntimeError, match="Pulled a task that was never submitted"):
         await task_generator.__anext__()
@@ -391,15 +377,14 @@ async def test_queues_invalidates_routing_config_on_version_change():
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
     tag = ULID()
-    state_manager.get_refresh_tag = AsyncMock(return_value=tag)
     old_version = ULID()
     new_version = ULID()
     state_manager.get_routing_version = AsyncMock(return_value=new_version)
+    state_manager.poll_refresh_signal = AsyncMock(return_value=tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
     task_generator.routing_version = old_version  # stale version
-    task_generator.refresh_tag = tag  # pre-warm to suppress queue reload
-    _silent_pubsub(task_generator)
+    task_generator.refresh_tag = tag  # same as poll_refresh_signal return → no queue reload
 
     await task_generator.queues()
 
@@ -414,14 +399,13 @@ async def test_queues_no_routing_invalidation_when_version_unchanged():
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
     tag = ULID()
-    state_manager.get_refresh_tag = AsyncMock(return_value=tag)
     version = ULID()
     state_manager.get_routing_version = AsyncMock(return_value=version)
+    state_manager.poll_refresh_signal = AsyncMock(return_value=tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
     task_generator.routing_version = version  # already current
-    task_generator.refresh_tag = tag  # pre-warm
-    _silent_pubsub(task_generator)
+    task_generator.refresh_tag = tag  # same as poll_refresh_signal return → no reload
 
     await task_generator.queues()
 
@@ -437,12 +421,11 @@ async def test_queues_invalidates_queue_config_on_refresh_tag_change():
     version = ULID()
     state_manager.get_routing_version = AsyncMock(return_value=version)
     new_tag = ULID()
-    state_manager.get_refresh_tag = AsyncMock(return_value=new_tag)
+    state_manager.poll_refresh_signal = AsyncMock(return_value=new_tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
     task_generator.routing_version = version  # pre-warm
     task_generator.refresh_tag = ULID()  # old tag, different from new_tag
-    _silent_pubsub(task_generator)
 
     await task_generator.queues()
 
@@ -455,27 +438,23 @@ async def test_queues_invalidates_queue_config_on_refresh_tag_change():
 
 
 @pytest.mark.asyncio
-async def test_queues_pubsub_message_forces_immediate_refresh():
-    """A pub/sub message causes queues() to reset refresh_tag and re-read from state_manager."""
+async def test_queues_pubsub_message_triggers_refresh_on_new_tag():
+    """A pub/sub message carrying a new tag causes queues() to reload even without a poll cycle."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
     version = ULID()
     state_manager.get_routing_version = AsyncMock(return_value=version)
+    old_tag = ULID()
     new_tag = ULID()
-    state_manager.get_refresh_tag = AsyncMock(return_value=new_tag)
+    state_manager.poll_refresh_signal = AsyncMock(return_value=new_tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
     task_generator.routing_version = version
-    task_generator.refresh_tag = new_tag  # pre-warm with same tag so it wouldn't refresh otherwise
-
-    pubsub = AsyncMock()
-    pubsub.get_message = AsyncMock(return_value={"type": "message", "data": str(new_tag).encode()})
-    task_generator._refresh_pubsub = pubsub  # inject active pubsub with a pending message
+    task_generator.refresh_tag = old_tag  # cached; different from new_tag delivered by pub/sub
 
     await task_generator.queues()
 
-    # Refresh triggered by pub/sub message even though the tag hadn't changed
     state_manager.invalidate_queue_config.assert_called_once_with("default")
     assert task_generator.refresh_tag == new_tag
 
@@ -489,12 +468,11 @@ async def test_queues_records_refresh_metrics():
     version = ULID()
     state_manager.get_routing_version = AsyncMock(return_value=version)
     new_tag = ULID()
-    state_manager.get_refresh_tag = AsyncMock(return_value=new_tag)
+    state_manager.poll_refresh_signal = AsyncMock(return_value=new_tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
     task_generator.routing_version = version
     task_generator.refresh_tag = ULID()  # old tag — triggers refresh
-    _silent_pubsub(task_generator)
 
     with (
         patch.object(tg_module.queue_config_refreshes, "add") as mock_counter,

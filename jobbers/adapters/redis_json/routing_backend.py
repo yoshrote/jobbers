@@ -14,7 +14,6 @@ from redis.commands.search.field import TagField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query as SearchQuery
 from redis.exceptions import ResponseError
-from ulid import ULID
 
 from jobbers.adapters.redis_json._helpers import _escape_tag, _pack
 from jobbers.models.queue_config import QueueConfig
@@ -45,14 +44,12 @@ class RedisJSONQueueConfigAdapter:
     Key scheme:
       routing:queue:{name}   — JSON doc (QueueConfig fields)
       routing:role:{name}    — JSON doc {queues: [...]}
-      routing:tag:{name}     — String (ULID, refresh tag)
     """
 
     QUEUE_IDX = "routing_queue_idx"
     ROLE_IDX = "routing_role_idx"
     QUEUE_KEY = "routing:queue:{name}".format
     ROLE_KEY = "routing:role:{name}".format
-    REFRESH_TAG_KEY = "routing:tag:{name}".format
 
     def __init__(self, client: Redis) -> None:
         self._client = client
@@ -85,10 +82,9 @@ class RedisJSONQueueConfigAdapter:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", _pack(queue_config))  # type: ignore[misc]
 
-    async def delete_queue(self, queue_name: str) -> None:
-        # Remove queue from all role docs and bump refresh tags first so that a crash
-        # after this point leaves an orphaned-but-valid queue config rather than roles
-        # referencing a deleted queue.
+    async def delete_queue(self, queue_name: str) -> list[str]:
+        # Remove queue from all role docs first so that a crash after this point leaves
+        # an orphaned-but-valid queue config rather than roles referencing a deleted queue.
         results = await self._client.ft(self.ROLE_IDX).search(
             SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
         )
@@ -98,15 +94,14 @@ class RedisJSONQueueConfigAdapter:
             for role in affected:
                 get_pipe.json().get(self.ROLE_KEY(name=role))
             role_docs: list[dict[str, Any] | None] = await get_pipe.execute()
-            new_tag = str(ULID())
             write_pipe = self._client.pipeline(transaction=True)
             for role, role_doc in zip(affected, role_docs):
                 if role_doc is not None:
                     new_queues = [q for q in role_doc.get("queues", []) if q != queue_name]
                     write_pipe.json().set(self.ROLE_KEY(name=role), "$.queues", new_queues)
-                write_pipe.set(self.REFRESH_TAG_KEY(name=role), new_tag)
             await write_pipe.execute()
         await self._client.delete(self.QUEUE_KEY(name=queue_name))
+        return affected
 
     async def get_all_queues(self) -> list[str]:
         results = await self._client.ft(self.QUEUE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
@@ -136,53 +131,24 @@ class RedisJSONQueueConfigAdapter:
             return set()
         return set(raw.get("queues", []))
 
-    async def save_role(self, role: str, queues_set: set[str]) -> str:
-        new_tag = str(ULID())
-        pipe = self._client.pipeline(transaction=True)
-        pipe.json().set(self.ROLE_KEY(name=role), "$", {"queues": list(queues_set)})
-        pipe.set(self.REFRESH_TAG_KEY(name=role), new_tag)
-        await pipe.execute()
-        return new_tag
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
+        await self._client.json().set(self.ROLE_KEY(name=role), "$", {"queues": list(queues_set)})  # type: ignore[misc]
 
     async def get_all_roles(self) -> list[str]:
         results = await self._client.ft(self.ROLE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
         return sorted(doc.id.removeprefix("routing:role:") for doc in (results.docs or []))
 
     async def delete_role(self, role: str) -> None:
-        pipe = self._client.pipeline(transaction=True)
-        pipe.delete(self.ROLE_KEY(name=role))
-        pipe.delete(self.REFRESH_TAG_KEY(name=role))
-        await pipe.execute()
+        await self._client.delete(self.ROLE_KEY(name=role))
 
-    # ── Refresh tags ──────────────────────────────────────────────────────────
+    # ── Role discovery ────────────────────────────────────────────────────────
 
-    async def get_refresh_tag(self, role: str) -> ULID:
-        raw: bytes | None = await self._client.get(self.REFRESH_TAG_KEY(name=role))
-        if raw:
-            return ULID.from_str(raw.decode())
-        init_tag = ULID()
-        await self._client.set(self.REFRESH_TAG_KEY(name=role), str(init_tag), nx=True)
-        raw = await self._client.get(self.REFRESH_TAG_KEY(name=role))
-        return ULID.from_str(raw.decode()) if raw else init_tag
-
-    async def bump_refresh_tag(self, role: str) -> str:
-        new_tag = str(ULID())
-        await self._client.set(self.REFRESH_TAG_KEY(name=role), new_tag)
-        return new_tag
-
-    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
-        """Find all roles containing queue_name via RediSearch and bump their refresh tags."""
+    async def get_roles_for_queue(self, queue_name: str) -> list[str]:
+        """Return names of all roles containing queue_name via RediSearch."""
         results = await self._client.ft(self.ROLE_IDX).search(
             SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
         )
-        affected = [doc.id.removeprefix("routing:role:") for doc in (results.docs or [])]
-        if affected:
-            new_tag = str(ULID())
-            pipe = self._client.pipeline(transaction=True)
-            for role in affected:
-                pipe.set(self.REFRESH_TAG_KEY(name=role), new_tag)
-            await pipe.execute()
-        return affected
+        return [doc.id.removeprefix("routing:role:") for doc in (results.docs or [])]
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +207,8 @@ class RedisJSONRoutingBackend:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         await self._qca.save_queue_config(queue_config)
 
-    async def delete_queue(self, queue_name: str) -> None:
-        await self._qca.delete_queue(queue_name)
+    async def delete_queue(self, queue_name: str) -> list[str]:
+        return await self._qca.delete_queue(queue_name)
 
     async def get_all_queues(self) -> list[str]:
         return await self._qca.get_all_queues()
@@ -250,8 +216,8 @@ class RedisJSONRoutingBackend:
     async def get_queues(self, role: str) -> set[str]:
         return await self._qca.get_queues(role)
 
-    async def save_role(self, role: str, queues_set: set[str]) -> str:
-        return await self._qca.save_role(role, queues_set)
+    async def save_role(self, role: str, queues_set: set[str]) -> None:
+        await self._qca.save_role(role, queues_set)
 
     async def get_all_roles(self) -> list[str]:
         return await self._qca.get_all_roles()
@@ -259,14 +225,8 @@ class RedisJSONRoutingBackend:
     async def delete_role(self, role: str) -> None:
         await self._qca.delete_role(role)
 
-    async def get_refresh_tag(self, role: str) -> ULID:
-        return await self._qca.get_refresh_tag(role)
-
-    async def bump_refresh_tag(self, role: str) -> str:
-        return await self._qca.bump_refresh_tag(role)
-
-    async def bump_refresh_tags_for_queue(self, queue_name: str) -> list[str]:
-        return await self._qca.bump_refresh_tags_for_queue(queue_name)
+    async def get_roles_for_queue(self, queue_name: str) -> list[str]:
+        return await self._qca.get_roles_for_queue(queue_name)
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
         return await self._rca.get_routing_config(task_name, task_version)

@@ -68,17 +68,21 @@ async def test_get_all_roles_sorted(backend):
 
 
 @pytest.mark.asyncio
-async def test_get_refresh_tag_stable(backend):
-    tag1 = await backend.get_refresh_tag("default")
-    tag2 = await backend.get_refresh_tag("default")
-    assert tag1 == tag2
+async def test_get_roles_for_queue_returns_containing_roles(backend):
+    roles = await backend.get_roles_for_queue("fast")
+    assert set(roles) == {"fast-workers"}
 
 
 @pytest.mark.asyncio
-async def test_get_refresh_tag_same_across_roles(backend):
-    tag_a = await backend.get_refresh_tag("default")
-    tag_b = await backend.get_refresh_tag("fast-workers")
-    assert tag_a == tag_b  # static backend uses one fixed tag for all roles
+async def test_get_roles_for_queue_returns_multiple_roles(backend):
+    roles = await backend.get_roles_for_queue("default")
+    assert set(roles) == {"default", "fast-workers"}
+
+
+@pytest.mark.asyncio
+async def test_get_roles_for_queue_returns_empty_for_unknown(backend):
+    roles = await backend.get_roles_for_queue("nonexistent")
+    assert roles == []
 
 
 @pytest.mark.asyncio
@@ -128,18 +132,6 @@ async def test_save_role_raises(backend):
 async def test_delete_role_raises(backend):
     with pytest.raises(RoutingBackendReadOnlyError):
         await backend.delete_role("default")
-
-
-@pytest.mark.asyncio
-async def test_bump_refresh_tag_raises(backend):
-    with pytest.raises(RoutingBackendReadOnlyError):
-        await backend.bump_refresh_tag("default")
-
-
-@pytest.mark.asyncio
-async def test_bump_refresh_tags_for_queue_raises(backend):
-    with pytest.raises(RoutingBackendReadOnlyError):
-        await backend.bump_refresh_tags_for_queue("default")
 
 
 @pytest.mark.asyncio

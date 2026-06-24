@@ -14,7 +14,6 @@ roles = Table(
     "roles",
     metadata,
     Column("name", String, primary_key=True),
-    Column("refresh_tag", String, nullable=False),
 )
 
 queues = Table(
@@ -56,7 +55,6 @@ task_routing = Table(
     Column("weights", String, nullable=True),  # JSON array of floats, NULL unless WEIGHTED
 )
 
-Index("idx_roles_refresh_tag", roles.c.refresh_tag)
 Index("idx_role_queues_role_queue", role_queues.c.role, role_queues.c.queue)
 
 # ---------------------------------------------------------------------------
