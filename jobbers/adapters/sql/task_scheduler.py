@@ -129,7 +129,7 @@ class SQLTaskScheduler:
             row = result.first()
             return _task_schedule_ensure_utc_nn(row.run_at) if row is not None else None
 
-    async def next_due(self, queues: list[str] | None) -> Task | None:
+    async def next_due(self, queues: list[str] | None = None) -> Task | None:
         """Acquire and return the single earliest due task, or None."""
         results = await self.next_due_bulk(1, queues=queues)
         return results[0][0] if results else None
