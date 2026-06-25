@@ -484,6 +484,10 @@ class SQLTaskState:
     async def ensure_index(self) -> None:
         """No-op: indexes are created by run_migrations."""
 
+    async def drop_stale_indexes(self) -> list[str]:
+        """No-op: SQL indexes are managed by run_migrations, not versioned per-generation."""
+        return []
+
     async def delete_task(self, task: Task) -> None:
         """Delete a single task record."""
         async with self._sf() as session:

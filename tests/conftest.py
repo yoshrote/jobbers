@@ -132,6 +132,9 @@ class DummyTaskState:
     async def ensure_index(self) -> None:
         raise NotImplementedError("DummyTaskState.ensure_index")
 
+    async def drop_stale_indexes(self) -> list[str]:
+        raise NotImplementedError("DummyTaskState.drop_stale_indexes")
+
     async def clean_terminal_tasks(self, now: object, max_age: object) -> None:
         raise NotImplementedError("DummyTaskState.clean_terminal_tasks")
 
@@ -295,6 +298,9 @@ class DummyDeadQueue:
 
     async def ensure_index(self) -> None:
         pass
+
+    async def drop_stale_indexes(self) -> list[str]:
+        return []
 
 
 class DummyTaskScheduler:
@@ -553,6 +559,9 @@ class DummyRoutingBackend:
         self._queues: dict[str, QueueConfig] = {}
         self._roles: dict[str, set[str]] = {}
         self._routing: dict[tuple[str, int], RoutingConfig] = {}
+
+    async def drop_stale_indexes(self) -> list[str]:
+        return []
 
     # ── Queue CRUD ────────────────────────────────────────────────────────────
 

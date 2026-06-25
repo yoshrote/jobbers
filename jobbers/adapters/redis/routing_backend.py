@@ -188,6 +188,10 @@ class RedisRoutingBackend:
         self._qca = RedisQueueConfigAdapter(client)
         self._rca = RedisTaskRoutingConfigAdapter(client)
 
+    async def drop_stale_indexes(self) -> list[str]:
+        """No-op: plain-Redis routing backend uses simple key patterns, not a search index."""
+        return []
+
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
         return await self._qca.get_queue_config(queue)
 

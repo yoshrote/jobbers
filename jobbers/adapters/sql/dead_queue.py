@@ -58,6 +58,10 @@ class SQLDeadQueue:
     async def ensure_index(self) -> None:
         """No-op: indexes are created by run_migrations."""
 
+    async def drop_stale_indexes(self) -> list[str]:
+        """No-op: SQL indexes are managed by run_migrations, not versioned per-generation."""
+        return []
+
     # ── AtomicDeadQueueProtocol: staged writes ─────────────────────────────
 
     def stage_add(self, pipe: TransactionHandle, task: Task, failed_at: dt.datetime) -> None:

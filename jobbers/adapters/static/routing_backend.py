@@ -116,6 +116,10 @@ class StaticRoutingBackend:
             routing_configs=routing_configs,
         )
 
+    async def drop_stale_indexes(self) -> list[str]:
+        """No-op: in-process backend holds no search index."""
+        return []
+
     # ── Queue reads ───────────────────────────────────────────────────────────
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:

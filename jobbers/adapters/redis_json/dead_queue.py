@@ -14,7 +14,12 @@ from redis.commands.search.query import Query as SearchQuery
 from redis.exceptions import ResponseError
 from ulid import ULID
 
-from jobbers.adapters.redis_json._helpers import _escape_tag
+from jobbers.adapters.redis_json._helpers import (
+    _drop_stale_indexes,
+    _escape_tag,
+    _get_schema_version,
+    _set_schema_version,
+)
 
 if TYPE_CHECKING:
     import datetime as dt
@@ -38,12 +43,16 @@ class RedisJSONDeadQueue:
     | `queue` | string | originating queue name. |
     | `failed_at` | float | Unix timestamp of failure. |
 
-    A RediSearch index (`dlq-json-idx`) on `dlq:*` keys enables server-side filtering
+    A RediSearch index (INDEX_NAME) on `dlq:*` keys enables server-side filtering
     by `name` and `queue` (tag fields) and sorting by `failed_at` (numeric, sortable).
+    INDEX_NAME is suffixed with SCHEMA_VERSION so a future non-additive migration
+    can build a new index alongside the old one before cutover.
     """
 
-    INDEX_NAME = "dlq-json-idx"
+    SCHEMA_VERSION = 1
+    INDEX_NAME = f"dlq-json-idx-v{SCHEMA_VERSION}"
     DLQ_KEY = "dlq:{task_id}".format
+    _VERSION_KEY = "schema_version:dlq_json"
 
     def __init__(self, data_store: Redis, task_adapter: TaskStateProtocol) -> None:
         self.data_store = data_store
@@ -57,7 +66,9 @@ class RedisJSONDeadQueue:
         return self.data_store.pipeline(transaction=transaction)
 
     async def ensure_index(self) -> None:
-        """Create the RediSearch index on DLQ JSON documents if it does not exist."""
+        """Create the RediSearch index on DLQ JSON documents if not already at the current schema version."""
+        if await _get_schema_version(self.data_store, self._VERSION_KEY) >= self.SCHEMA_VERSION:
+            return
         try:
             await self.data_store.ft(self.INDEX_NAME).info()  # type: ignore[no-untyped-call]
         except ResponseError:
@@ -70,6 +81,11 @@ class RedisJSONDeadQueue:
                 ],
                 definition=IndexDefinition(prefix=["dlq:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
             )
+        await _set_schema_version(self.data_store, self._VERSION_KEY, self.SCHEMA_VERSION)
+
+    async def drop_stale_indexes(self) -> list[str]:
+        """Drop RediSearch indexes from older schema generations of INDEX_NAME. Returns names dropped."""
+        return await _drop_stale_indexes(self.data_store, [self.INDEX_NAME], self.SCHEMA_VERSION)
 
     def stage_add(self, pipe: TransactionHandle, task: Task, failed_at: dt.datetime) -> None:
         """Queue JSON.SET DLQ entry onto pipe (no execute)."""

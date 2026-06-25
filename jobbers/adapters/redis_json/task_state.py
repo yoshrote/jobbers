@@ -18,7 +18,13 @@ from redis.exceptions import ResponseError
 from ulid import ULID
 
 from jobbers.adapters._shared import SharedTaskAdapterMixin
-from jobbers.adapters.redis_json._helpers import _escape_tag, _pack
+from jobbers.adapters.redis_json._helpers import (
+    _drop_stale_indexes,
+    _escape_tag,
+    _get_schema_version,
+    _pack,
+    _set_schema_version,
+)
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
 
 if TYPE_CHECKING:
@@ -32,7 +38,9 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
     Requires a Redis Stack instance (RedisJSON + RediSearch modules).
     """
 
-    INDEX_NAME = "task-idx"
+    SCHEMA_VERSION = 1
+    INDEX_NAME = f"task-idx-v{SCHEMA_VERSION}"
+    _VERSION_KEY = "schema_version:task_json"
 
     # -- Storage primitives --------------------------------------------------
 
@@ -60,7 +68,9 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
     # -- Backend-specific queries --------------------------------------------
 
     async def ensure_index(self) -> None:
-        """Create the RediSearch index, or add any missing fields to an existing one."""
+        """Create the RediSearch index, or add any missing fields, if not already at the current schema version."""
+        if await _get_schema_version(self.data_store, self._VERSION_KEY) >= self.SCHEMA_VERSION:
+            return
         desired_fields = [
             TagField("$.name", as_name="name"),
             TagField("$.queue", as_name="queue"),
@@ -76,6 +86,7 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
                 fields=desired_fields,
                 definition=IndexDefinition(prefix=["task:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
             )
+            await _set_schema_version(self.data_store, self._VERSION_KEY, self.SCHEMA_VERSION)
             return
 
         for field in desired_fields:
@@ -84,6 +95,11 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
             except ResponseError as e:
                 if "duplicate" not in str(e).lower():
                     raise
+        await _set_schema_version(self.data_store, self._VERSION_KEY, self.SCHEMA_VERSION)
+
+    async def drop_stale_indexes(self) -> list[str]:
+        """Drop RediSearch indexes from older schema generations of INDEX_NAME. Returns names dropped."""
+        return await _drop_stale_indexes(self.data_store, [self.INDEX_NAME], self.SCHEMA_VERSION)
 
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Query tasks via the RediSearch index with optional filters."""

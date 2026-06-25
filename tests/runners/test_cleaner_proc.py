@@ -21,6 +21,7 @@ def _make_args(**kwargs: object) -> argparse.Namespace:
         "dlq_age": None,
         "completed_task_age": None,
         "recover_orphaned_scheduled": False,
+        "drop_stale_indexes": False,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -45,6 +46,7 @@ async def test_cleaner_calls_state_manager_clean():
         dlq_age=None,
         completed_task_age=None,
         recover_orphaned_scheduled=False,
+        drop_stale_indexes=False,
     )
 
 
@@ -121,3 +123,17 @@ async def test_cleaner_passes_recover_orphaned_scheduled():
 
     _, kwargs = state_manager.clean.call_args
     assert kwargs["recover_orphaned_scheduled"] is True
+
+
+@pytest.mark.asyncio
+async def test_cleaner_passes_drop_stale_indexes():
+    state_manager = MagicMock()
+    state_manager.clean = AsyncMock()
+
+    args = _make_args(drop_stale_indexes=True)
+
+    with patch("jobbers.db.init_state_manager", return_value=state_manager):
+        await cleaner(args)
+
+    _, kwargs = state_manager.clean.call_args
+    assert kwargs["drop_stale_indexes"] is True

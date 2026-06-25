@@ -58,6 +58,10 @@ class RedisTaskState(SharedTaskAdapterMixin):
     async def ensure_index(self) -> None:
         """No-op: msgpack backend does not use a search index."""
 
+    async def drop_stale_indexes(self) -> list[str]:
+        """No-op: msgpack backend does not use a search index."""
+        return []
+
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Fetch tasks from the queue sorted set and filter in Python."""
         if pagination.order_by == PaginationOrder.SUBMITTED_AT:

@@ -15,7 +15,13 @@ from redis.commands.search.index_definition import IndexDefinition, IndexType
 from redis.commands.search.query import Query as SearchQuery
 from redis.exceptions import ResponseError
 
-from jobbers.adapters.redis_json._helpers import _escape_tag, _pack
+from jobbers.adapters.redis_json._helpers import (
+    _drop_stale_indexes,
+    _escape_tag,
+    _get_schema_version,
+    _pack,
+    _set_schema_version,
+)
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_routing import RoutingConfig
 
@@ -35,27 +41,34 @@ class RedisJSONQueueConfigAdapter:
     Two RediSearch indexes replace the plain-Redis set indexes used by
     RedisQueueConfigAdapter:
 
-      routing_queue_idx — on routing:queue:* docs; enables enumeration and fast
-                          queue-membership queries without a separate index set.
-      routing_role_idx  — on routing:role:* docs; enables bump_refresh_tags_for_queue
-                          to find affected roles via an indexed query rather than
-                          scanning all roles.
+      QUEUE_IDX — on routing:queue:* docs; enables enumeration and fast
+                  queue-membership queries without a separate index set.
+      ROLE_IDX  — on routing:role:* docs; enables bump_refresh_tags_for_queue
+                  to find affected roles via an indexed query rather than
+                  scanning all roles.
+
+    Index names are suffixed with SCHEMA_VERSION so that a future non-additive
+    migration can build a new index alongside the old one before cutover.
 
     Key scheme:
       routing:queue:{name}   — JSON doc (QueueConfig fields)
       routing:role:{name}    — JSON doc {queues: [...]}
     """
 
-    QUEUE_IDX = "routing_queue_idx"
-    ROLE_IDX = "routing_role_idx"
+    SCHEMA_VERSION = 1
+    QUEUE_IDX = f"routing_queue_idx_v{SCHEMA_VERSION}"
+    ROLE_IDX = f"routing_role_idx_v{SCHEMA_VERSION}"
     QUEUE_KEY = "routing:queue:{name}".format
     ROLE_KEY = "routing:role:{name}".format
+    _VERSION_KEY = "schema_version:routing_json"
 
     def __init__(self, client: Redis) -> None:
         self._client = client
 
     async def ensure_indexes(self) -> None:
-        """Create RediSearch indexes for queues and roles if they do not already exist."""
+        """Create RediSearch indexes for queues and roles if not already at the current schema version."""
+        if await _get_schema_version(self._client, self._VERSION_KEY) >= self.SCHEMA_VERSION:
+            return
         try:
             await self._client.ft(self.QUEUE_IDX).info()  # type: ignore[no-untyped-call]
         except ResponseError:
@@ -70,6 +83,11 @@ class RedisJSONQueueConfigAdapter:
                 fields=[TagField("$.queues[*]", as_name="queues")],
                 definition=IndexDefinition(prefix=["routing:role:"], index_type=IndexType.JSON),  # type: ignore[no-untyped-call]
             )
+        await _set_schema_version(self._client, self._VERSION_KEY, self.SCHEMA_VERSION)
+
+    async def drop_stale_indexes(self) -> list[str]:
+        """Drop RediSearch indexes from older schema generations of QUEUE_IDX/ROLE_IDX. Returns names dropped."""
+        return await _drop_stale_indexes(self._client, [self.QUEUE_IDX, self.ROLE_IDX], self.SCHEMA_VERSION)
 
     # ── Queue CRUD ────────────────────────────────────────────────────────────
 
@@ -200,6 +218,9 @@ class RedisJSONRoutingBackend:
 
     async def ensure_indexes(self) -> None:
         await self._qca.ensure_indexes()
+
+    async def drop_stale_indexes(self) -> list[str]:
+        return await self._qca.drop_stale_indexes()
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
         return await self._qca.get_queue_config(queue)

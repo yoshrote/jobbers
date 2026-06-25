@@ -57,6 +57,12 @@ parser.add_argument(
     default=False,
     help="Re-add scheduled tasks orphaned by a crash between acquisition and dispatch.",
 )
+parser.add_argument(
+    "--drop-stale-indexes",
+    action="store_true",
+    default=False,
+    help="Drop RediSearch indexes left behind by older schema versions (RedisJSON backends only).",
+)
 
 
 async def cleaner(args: argparse.Namespace) -> None:
@@ -72,6 +78,7 @@ async def cleaner(args: argparse.Namespace) -> None:
         dlq_age=args.dlq_age,
         completed_task_age=args.completed_task_age,
         recover_orphaned_scheduled=args.recover_orphaned_scheduled,
+        drop_stale_indexes=args.drop_stale_indexes,
     )
 
 

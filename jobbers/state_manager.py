@@ -187,12 +187,16 @@ class StateManager:
         dlq_age: dt.timedelta | None = None,
         completed_task_age: dt.timedelta | None = None,
         recover_orphaned_scheduled: bool = False,
+        drop_stale_indexes: bool = False,
     ) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.UTC)
         queues = set(await self.get_all_queues())
 
         clean_ops = []
+
+        if drop_stale_indexes:
+            clean_ops.append(self._drop_stale_indexes())
         if rate_limit_age:
             clean_ops.append(self.task_submit.clean_rate_limiter(queues, now, rate_limit_age))
 
@@ -241,6 +245,18 @@ class StateManager:
                 await self.task_state.remove_task_heartbeat(stale_task)
 
         await asyncio.gather(*clean_ops)
+
+    async def _drop_stale_indexes(self) -> None:
+        """Drop RediSearch indexes from older schema generations across all adapters."""
+        dropped = []
+        for names in await asyncio.gather(
+            self.routing.drop_stale_indexes(),
+            self.task_state.drop_stale_indexes(),
+            self.dead_queue.drop_stale_indexes(),
+        ):
+            dropped.extend(names)
+        if dropped:
+            logger.info("Dropped stale RediSearch indexes: %s", dropped)
 
     async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""

@@ -1415,6 +1415,45 @@ async def test_clean_recover_orphan_skipped_when_flag_false(redis, state_manager
     assert score is None
 
 
+# ── drop_stale_indexes ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clean_drop_stale_indexes_skipped_when_flag_false(state_manager):
+    """clean() without drop_stale_indexes=True does not call drop_stale_indexes on any adapter."""
+    with (
+        patch.object(state_manager.routing, "drop_stale_indexes", AsyncMock(return_value=[])) as routing_drop,
+        patch.object(state_manager.task_state, "drop_stale_indexes", AsyncMock(return_value=[])) as task_drop,
+        patch.object(state_manager.dead_queue, "drop_stale_indexes", AsyncMock(return_value=[])) as dlq_drop,
+    ):
+        await state_manager.clean()
+
+    routing_drop.assert_not_called()
+    task_drop.assert_not_called()
+    dlq_drop.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_clean_drop_stale_indexes_calls_all_three_adapters(state_manager):
+    """clean(drop_stale_indexes=True) calls drop_stale_indexes on routing, task_state, and dead_queue."""
+    with (
+        patch.object(
+            state_manager.routing, "drop_stale_indexes", AsyncMock(return_value=["routing-idx-v1"])
+        ) as routing_drop,
+        patch.object(
+            state_manager.task_state, "drop_stale_indexes", AsyncMock(return_value=["task-idx-v1"])
+        ) as task_drop,
+        patch.object(
+            state_manager.dead_queue, "drop_stale_indexes", AsyncMock(return_value=["dlq-idx-v1"])
+        ) as dlq_drop,
+    ):
+        await state_manager.clean(drop_stale_indexes=True)
+
+    routing_drop.assert_called_once()
+    task_drop.assert_called_once()
+    dlq_drop.assert_called_once()
+
+
 # ── cron no-pipeline paths ────────────────────────────────────────────────────
 
 

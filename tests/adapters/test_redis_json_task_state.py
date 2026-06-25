@@ -90,6 +90,7 @@ async def test_get_all_tasks_missing_blob_is_skipped(json_adapter):
 async def test_ensure_index_reraises_non_duplicate_error(json_adapter):
     """ensure_index re-raises ResponseError when the message is not 'duplicate'."""
     state, submit = json_adapter
+    await state.data_store.delete(state._VERSION_KEY)  # bypass the schema-version gate
     mock_search = MagicMock()
     mock_search.info = AsyncMock(return_value={"attributes": []})
     mock_search.alter_schema_add = AsyncMock(side_effect=ResponseError("ERR: unknown field type"))

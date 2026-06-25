@@ -52,6 +52,10 @@ class RedisDeadQueue:
     async def ensure_index(self) -> None:
         """No-op: plain-Redis dead queue does not use a search index."""
 
+    async def drop_stale_indexes(self) -> list[str]:
+        """No-op: plain-Redis dead queue does not use a search index."""
+        return []
+
     def stage_add(self, pipe: TransactionHandle, task: Task, failed_at: dt.datetime) -> None:
         """Queue all four DLQ index writes onto pipe (no execute)."""
         p: Any = pipe

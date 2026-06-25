@@ -246,6 +246,10 @@ class SQLRoutingBackend:
         self._qca = SQLQueueConfigAdapter(session_factory)
         self._rca = SQLTaskRoutingConfigAdapter(session_factory)
 
+    async def drop_stale_indexes(self) -> list[str]:
+        """No-op: SQL indexes are managed by run_migrations, not versioned per-generation."""
+        return []
+
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
         return await self._qca.get_queue_config(queue)
 
