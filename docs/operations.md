@@ -14,16 +14,16 @@
 pip install -e .
 ```
 
-This installs the `jobbers` package and registers five CLI entry points:
-`jobbers_manager`, `jobbers_worker`, `jobbers_cleaner`, `jobbers_scheduler`, `jobbers_openapi`.
+This installs the `jobbers` package and registers six CLI entry points:
+`jobbers_manager`, `jobbers_worker`, `jobbers_cleaner`, `jobbers_scheduler`, `jobbers_openapi`, `jobbers_migrate`.
 
-Run the database migration before starting any process for the first time:
+Run the migration tool before starting any process for the first time:
 
 ```bash
 jobbers_migrate
 ```
 
-This creates the SQL tables used for queue and role configuration.
+This creates the SQL tables used for queue/role/task-state/DLQ/scheduler config (whichever backends are set to `sql`), and — when `ROUTING_BACKEND=redis_json` — creates the RediSearch routing indexes ahead of time instead of waiting for the first process to start.
 
 ### Frontend
 
@@ -192,6 +192,16 @@ Duration arguments (`--stale-time`, `--completed-task-age`, `--dlq-age`, `--rate
 | `--min-queue-age <s>` | Lower bound (epoch seconds) for queue entries to consider. |
 | `--max-queue-age <s>` | Upper bound (epoch seconds) for queue entries to consider. |
 | `--recover-orphaned-scheduled` | Re-enqueue scheduled tasks that are missing from the scheduler backend (e.g. after a Redis flush). |
+| `--drop-stale-indexes` | Drop RediSearch indexes left behind by older schema versions (RedisJSON backends only; no-op otherwise). |
+
+**Why `--drop-stale-indexes` belongs here and not in `jobbers_migrate`:** the expected order of operations for a RedisJSON schema bump is:
+
+1. Bump the adapter's `SCHEMA_VERSION` and deploy the new code. `jobbers_migrate` (or each process's own startup check) creates the new-generation index without touching the old one.
+2. The deploy rolls out. Old- and new-version processes briefly run side by side, each querying the index generation it was built for — both still exist, so neither sees an outage.
+3. The rollout finishes; no process is reading the old-generation index anymore.
+4. The Cleaner's next cron run (with `--drop-stale-indexes`) reclaims it.
+
+Putting the drop in `jobbers_migrate` would collapse steps 1 and 4 into the same moment — the one point in this sequence where the old index is guaranteed to still be load-bearing. Keeping it in the Cleaner, on its own independent cron, naturally lands it after step 3 instead.
 
 Recommended cron setup:
 

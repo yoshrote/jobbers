@@ -12,7 +12,7 @@ The routing backend controls where queue, role, and task-routing config is store
 | Config durability | In-process memory (reloaded from file/env) | SQL database | Redis persistence | Redis persistence |
 | Atomicity of `delete_queue` | N/A | Full transaction | Two-phase, role-cleanup-first (safe ordering) | Two-phase, role-cleanup-first (safe ordering) |
 | `bump_refresh_tags_for_queue` cost | N/A (raises) | O(SQL join) | O(N roles), pipelined | O(indexed query) |
-| Schema migrations | None | Auto-run at startup | None | RediSearch indexes created at startup |
+| Schema migrations | None | Auto-run at startup | None | RediSearch indexes created at startup, versioned via `SCHEMA_VERSION`; stale generations droppable via `drop_stale_indexes()` |
 | Runtime config changes | No | Yes | Yes | Yes |
 
 ---
@@ -68,7 +68,7 @@ The routing backend controls where queue, role, and task-routing config is store
 - **`bump_refresh_tags_for_queue` is O(N roles):** all N membership checks are issued in a single pipelined round trip, but the work is still proportional to role count. Fine for ≤50 roles; a concern at scale (where `redis_json`'s indexed query has the advantage).
 - **`delete_queue` is two-phase but uses safe ordering:** role cleanup (SREM from every role set + refresh tag bumps) runs first in a pipeline, then the queue config key is deleted. A crash between phases leaves an orphaned-but-valid queue config rather than roles referencing a deleted queue. The role-cleanup phase itself is all-or-nothing: all `SREM` calls are issued in a single pipeline, then tag bumps follow in a single MULTI/EXEC.
 - **Config durability depends on Redis persistence:** without AOF or RDB configured, a Redis restart wipes all routing config. Config must be re-created via the API after every restart.
-- No migration mechanism — a key naming change requires manual cleanup.
+- No migration mechanism — a key naming change requires manual cleanup. (`redis_json`'s `SCHEMA_VERSION` + `drop_stale_indexes()` only versions RediSearch index *names*, not this backend's plain-key config scheme.)
 
 ---
 
@@ -78,7 +78,7 @@ The routing backend controls where queue, role, and task-routing config is store
 
 ### Strengths
 
-- RediSearch indexes (`routing_queue_idx`, `routing_role_idx`) are created at startup via `ensure_indexes()`, mirroring SQL schema migrations — no per-request lazy initialization.
+- RediSearch indexes (`QUEUE_IDX`, `ROLE_IDX`, each suffixed with `SCHEMA_VERSION`) are created at startup via `ensure_indexes()` and can also be created ahead of time via `jobbers_migrate`, mirroring SQL schema migrations — no per-request lazy initialization.
 - `bump_refresh_tags_for_queue` and `get_all_roles` use the role index — role enumeration scales without scanning all roles.
 - `get_all_queues` uses the queue index — no secondary index set to maintain.
 - Config stored as JSON documents, which are easy to inspect and debug in Redis directly.

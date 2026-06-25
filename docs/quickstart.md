@@ -207,12 +207,14 @@ The Cleaner is a one-shot command run on a cron schedule. It prunes expired stat
 | `--dlq-age <s>` | Remove dead letter queue entries older than this. |
 | `--rate-limit-age <s>` | Prune rate-limit tracking keys older than this. |
 | `--recover-orphaned-scheduled` | Re-add tasks that were acquired by the Scheduler but never dispatched (e.g. a crash mid-dispatch). |
+| `--drop-stale-indexes` | Drop RediSearch indexes left behind by older schema versions (RedisJSON backends only; no-op otherwise). |
 
 **Recommended frequencies:**
 
 - **Stall detection** (`--stale-time`): every 1–5 minutes. Pick an interval shorter than your shortest `max_heartbeat_interval` so stalled tasks are caught promptly. The threshold should be slightly longer than your longest expected heartbeat gap to avoid false positives.
 - **State pruning** (`--completed-task-age`, `--dlq-age`, `--rate-limit-age`): once daily, off-peak hours.
 - **Orphan recovery** (`--recover-orphaned-scheduled`): include in the nightly run or after any unclean Scheduler restart.
+- **Stale index cleanup** (`--drop-stale-indexes`): only needed after a Redis Stack schema upgrade; run in the nightly batch, not at deploy time. See [Operations guide](operations.md#cleaner) for why.
 
 ---
 

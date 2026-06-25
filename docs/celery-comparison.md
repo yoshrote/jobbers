@@ -35,7 +35,7 @@ One process to start. Familiar decorator. Minimal infrastructure required.
 
 ```bash
 pip install -e ".[test]"
-jobbers_migrate                        # creates SQL tables for queue/role config (only needed if ROUTING_BACKEND=sql)
+jobbers_migrate                        # creates SQL tables (ROUTING_BACKEND=sql) or RediSearch routing indexes (ROUTING_BACKEND=redis_json)
 jobbers_manager my_tasks               # FastAPI server on :8000
 jobbers_worker my_tasks                # task executor
 jobbers_cleaner                        # stall detection + state pruning (cron-friendly)
@@ -478,7 +478,7 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 
 | Feature | Celery | Jobbers | Notes |
 | --- | --- | --- | --- |
-| **Getting started** | Simple | Moderate | Celery: 1 process. Jobbers: 4 processes (+ migrate if `ROUTING_BACKEND=sql`) |
+| **Getting started** | Simple | Moderate | Celery: 1 process. Jobbers: 2 processes minimum (manager + worker), 3 at full capability (+ cleanup and migrate tools) |
 | **Async Python** | Partial | Native | Jobbers built on asyncio throughout |
 | **Observability** | Flower UI only | OTEL + React UI | Jobbers emits traces, metrics, logs out of the box |
 | **Retry policies** | Explicit (`self.retry()`) | Declarative (automatic) | Both support exponential backoff + jitter |
