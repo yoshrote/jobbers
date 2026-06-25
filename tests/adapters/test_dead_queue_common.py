@@ -270,6 +270,48 @@ async def test_get_by_filter_skips_missing_task_data(dead_queue):
     assert await dq.get_by_filter() == []
 
 
+# ── clean_orphaned_entries ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_entries_removes_blobless_index(dead_queue):
+    """An index entry whose task blob is gone is removed and counted."""
+    dq, _ = dead_queue
+    if isinstance(dq, SQLDeadQueue):
+        pytest.skip(
+            "SQLDeadQueue stores full task data in the DLQ table; a missing-blob scenario cannot occur"
+        )
+    task = make_task()
+    pipe = dq.pipeline()
+    dq.stage_add(pipe, task, FAILED_AT)
+    await pipe.execute()
+
+    removed = await dq.clean_orphaned_entries()
+    assert removed == 1
+    assert await dq.get_by_filter() == []
+    assert await dq.get_by_ids([str(task.id)]) == []
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_entries_leaves_valid_entries(dead_queue):
+    """An index entry whose task blob still exists is left untouched."""
+    dq, adapter = dead_queue
+    task = make_task()
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
+
+    removed = await dq.clean_orphaned_entries()
+    assert removed == 0
+    results = await dq.get_by_ids([str(task.id)])
+    assert len(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_entries_empty_dlq_returns_zero(dead_queue):
+    dq, _ = dead_queue
+    assert await dq.clean_orphaned_entries() == 0
+
+
 @pytest.mark.asyncio
 async def test_get_by_filter_no_match_returns_empty(dead_queue):
     dq, adapter = dead_queue

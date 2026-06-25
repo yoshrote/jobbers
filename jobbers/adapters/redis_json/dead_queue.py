@@ -186,3 +186,20 @@ class RedisJSONDeadQueue:
         for doc in search_results.docs:
             pipe.delete(doc.id)
         await pipe.execute()
+
+    async def clean_orphaned_entries(self) -> int:
+        """Remove DLQ JSON documents whose task blob no longer exists. Returns count removed."""
+        q: SearchQuery = SearchQuery("*").no_content().paging(0, 10000)
+        search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
+        if not search_results.docs:
+            return 0
+        ulids = [ULID.from_str(doc.id.removeprefix("dlq:")) for doc in search_results.docs]
+        tasks = await self.ta.get_tasks_bulk(ulids)
+        orphaned_ids = [doc.id for doc, task in zip(search_results.docs, tasks) if task is None]
+        if not orphaned_ids:
+            return 0
+        pipe = self.data_store.pipeline(transaction=True)
+        for doc_id in orphaned_ids:
+            pipe.delete(doc_id)
+        await pipe.execute()
+        return len(orphaned_ids)

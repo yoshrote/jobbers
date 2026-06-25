@@ -1454,6 +1454,31 @@ async def test_clean_drop_stale_indexes_calls_all_three_adapters(state_manager):
     dlq_drop.assert_called_once()
 
 
+# ── clean_orphaned_dlq ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_dlq_skipped_when_flag_false(state_manager):
+    """clean() without clean_orphaned_dlq=True does not call clean_orphaned_entries."""
+    with patch.object(
+        state_manager.dead_queue, "clean_orphaned_entries", AsyncMock(return_value=0)
+    ) as dlq_clean:
+        await state_manager.clean()
+
+    dlq_clean.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_dlq_calls_dead_queue(state_manager):
+    """clean(clean_orphaned_dlq=True) calls clean_orphaned_entries on the dead queue."""
+    with patch.object(
+        state_manager.dead_queue, "clean_orphaned_entries", AsyncMock(return_value=2)
+    ) as dlq_clean:
+        await state_manager.clean(clean_orphaned_dlq=True)
+
+    dlq_clean.assert_called_once()
+
+
 # ── cron no-pipeline paths ────────────────────────────────────────────────────
 
 

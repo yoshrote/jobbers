@@ -188,6 +188,7 @@ class StateManager:
         completed_task_age: dt.timedelta | None = None,
         recover_orphaned_scheduled: bool = False,
         drop_stale_indexes: bool = False,
+        clean_orphaned_dlq: bool = False,
     ) -> None:
         """Clean up the state manager."""
         now = dt.datetime.now(dt.UTC)
@@ -197,6 +198,8 @@ class StateManager:
 
         if drop_stale_indexes:
             clean_ops.append(self._drop_stale_indexes())
+        if clean_orphaned_dlq:
+            clean_ops.append(self._clean_orphaned_dlq())
         if rate_limit_age:
             clean_ops.append(self.task_submit.clean_rate_limiter(queues, now, rate_limit_age))
 
@@ -257,6 +260,12 @@ class StateManager:
             dropped.extend(names)
         if dropped:
             logger.info("Dropped stale RediSearch indexes: %s", dropped)
+
+    async def _clean_orphaned_dlq(self) -> None:
+        """Remove DLQ index entries whose task blob no longer exists (Redis/RedisJSON only)."""
+        removed = await self.dead_queue.clean_orphaned_entries()
+        if removed:
+            logger.info("Removed %d orphaned DLQ entries", removed)
 
     async def get_next_task(self, queues: set[str], pop_timeout: int = 0) -> Task | None:
         """Get the next task from the queues in order of priority (first in the list is highest priority)."""

@@ -172,3 +172,7 @@ class SQLDeadQueue:
                 await session.execute(
                     delete(dead_letter_queue).where(dead_letter_queue.c.failed_at < earlier_than)
                 )
+
+    async def clean_orphaned_entries(self) -> int:
+        """No-op: SQLDeadQueue stores the full task blob in the row, so orphans cannot occur."""
+        return 0

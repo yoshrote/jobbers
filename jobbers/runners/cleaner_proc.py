@@ -63,6 +63,12 @@ parser.add_argument(
     default=False,
     help="Drop RediSearch indexes left behind by older schema versions (RedisJSON backends only).",
 )
+parser.add_argument(
+    "--clean-orphaned-dlq",
+    action="store_true",
+    default=False,
+    help="Remove dead-letter queue index entries whose task blob no longer exists (Redis/RedisJSON backends only).",
+)
 
 
 async def cleaner(args: argparse.Namespace) -> None:
@@ -79,6 +85,7 @@ async def cleaner(args: argparse.Namespace) -> None:
         completed_task_age=args.completed_task_age,
         recover_orphaned_scheduled=args.recover_orphaned_scheduled,
         drop_stale_indexes=args.drop_stale_indexes,
+        clean_orphaned_dlq=args.clean_orphaned_dlq,
     )
 
 

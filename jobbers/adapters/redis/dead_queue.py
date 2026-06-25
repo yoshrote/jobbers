@@ -192,3 +192,33 @@ class RedisDeadQueue:
                 pipe2.srem(self.DLQ_NAME(name=name), task_id_bytes)
                 pipe2.hdel(self.DLQ_META, uid_str)
         await pipe2.execute()
+
+    async def clean_orphaned_entries(self) -> int:
+        """Remove DLQ index entries whose task blob no longer exists. Returns count removed."""
+        id_bytes: list[bytes] = await cast(
+            "Awaitable[list[bytes]]",
+            self.data_store.zrange(self.DLQ, 0, -1),
+        )
+        if not id_bytes:
+            return 0
+        ulids = [ULID.from_bytes(b) for b in id_bytes]
+        tasks = await self.ta.get_tasks_bulk(ulids)
+        orphaned = [(b, u) for b, u, task in zip(id_bytes, ulids, tasks) if task is None]
+        if not orphaned:
+            return 0
+        read_pipe = self.data_store.pipeline(transaction=False)
+        for _, u in orphaned:
+            read_pipe.hget(self.DLQ_META, str(u))
+        meta_list = await read_pipe.execute()
+        write_pipe = self.data_store.pipeline(transaction=True)
+        removed = 0
+        for (task_id_bytes, u), meta_bytes in zip(orphaned, meta_list):
+            write_pipe.zrem(self.DLQ, task_id_bytes)
+            write_pipe.hdel(self.DLQ_META, str(u))
+            if meta_bytes is not None:
+                queue, name, _ = meta_bytes.decode().split("\0")
+                write_pipe.srem(self.DLQ_QUEUE(queue=queue), task_id_bytes)
+                write_pipe.srem(self.DLQ_NAME(name=name), task_id_bytes)
+            removed += 1
+        await write_pipe.execute()
+        return removed
