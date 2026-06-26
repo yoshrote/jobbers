@@ -8,7 +8,7 @@ Redis Stack (RedisJSON + RediSearch) routing sub-adapters and routing backend.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from redis.commands.search.field import TagField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
@@ -92,13 +92,13 @@ class RedisJSONQueueConfigAdapter:
     # ── Queue CRUD ────────────────────────────────────────────────────────────
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
-        raw: dict[str, Any] | None = await self._client.json().get(self.QUEUE_KEY(name=queue))  # type: ignore[misc]
+        raw = cast("dict[str, Any] | None", await self._client.json().get(self.QUEUE_KEY(name=queue)))
         if raw is None:
             return None
         return QueueConfig.model_validate(raw)
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
-        await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", _pack(queue_config))  # type: ignore[misc]
+        await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", _pack(queue_config))
 
     async def delete_queue(self, queue_name: str) -> list[str]:
         # Remove queue from all role docs first so that a crash after this point leaves
@@ -106,7 +106,7 @@ class RedisJSONQueueConfigAdapter:
         results = await self._client.ft(self.ROLE_IDX).search(
             SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
         )
-        affected = [doc.id.removeprefix("routing:role:") for doc in (results.docs or [])]
+        affected = [doc.id.removeprefix("routing:role:") for doc in results.docs]
         if affected:
             get_pipe = self._client.pipeline(transaction=False)
             for role in affected:
@@ -123,7 +123,7 @@ class RedisJSONQueueConfigAdapter:
 
     async def get_all_queues(self) -> list[str]:
         results = await self._client.ft(self.QUEUE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
-        return sorted(doc.id.removeprefix("routing:queue:") for doc in (results.docs or []))
+        return sorted(doc.id.removeprefix("routing:queue:") for doc in results.docs)
 
     async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]:
         if not queues_set:
@@ -144,17 +144,17 @@ class RedisJSONQueueConfigAdapter:
     # ── Role CRUD ─────────────────────────────────────────────────────────────
 
     async def get_queues(self, role: str) -> set[str]:
-        raw: dict[str, Any] | None = await self._client.json().get(self.ROLE_KEY(name=role))  # type: ignore[misc]
+        raw = cast("dict[str, Any] | None", await self._client.json().get(self.ROLE_KEY(name=role)))
         if raw is None:
             return set()
         return set(raw.get("queues", []))
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
-        await self._client.json().set(self.ROLE_KEY(name=role), "$", {"queues": list(queues_set)})  # type: ignore[misc]
+        await self._client.json().set(self.ROLE_KEY(name=role), "$", {"queues": list(queues_set)})
 
     async def get_all_roles(self) -> list[str]:
         results = await self._client.ft(self.ROLE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
-        return sorted(doc.id.removeprefix("routing:role:") for doc in (results.docs or []))
+        return sorted(doc.id.removeprefix("routing:role:") for doc in results.docs)
 
     async def delete_role(self, role: str) -> None:
         await self._client.delete(self.ROLE_KEY(name=role))
@@ -166,7 +166,7 @@ class RedisJSONQueueConfigAdapter:
         results = await self._client.ft(self.ROLE_IDX).search(
             SearchQuery(f"@queues:{{{_escape_tag(queue_name)}}}").no_content()
         )
-        return [doc.id.removeprefix("routing:role:") for doc in (results.docs or [])]
+        return [doc.id.removeprefix("routing:role:") for doc in results.docs]
 
 
 # ---------------------------------------------------------------------------
@@ -183,15 +183,16 @@ class RedisJSONTaskRoutingConfigAdapter:
         self._client = client
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        raw: dict[str, Any] | None = await self._client.json().get(  # type: ignore[misc]
-            self.ROUTING_KEY(task_name=task_name, task_version=task_version)
+        raw = cast(
+            "dict[str, Any] | None",
+            await self._client.json().get(self.ROUTING_KEY(task_name=task_name, task_version=task_version)),
         )
         if raw is None:
             return None
         return RoutingConfig.model_validate(raw)
 
     async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        await self._client.json().set(  # type: ignore[misc]
+        await self._client.json().set(
             self.ROUTING_KEY(task_name=routing_config.task_name, task_version=routing_config.task_version),
             "$",
             _pack(routing_config),

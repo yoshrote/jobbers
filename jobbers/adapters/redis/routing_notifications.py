@@ -6,7 +6,7 @@ Plain Redis routing notifications adapter.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from ulid import ULID
 
@@ -27,22 +27,22 @@ class RedisRoutingNotifications:
         self._tag_cache: dict[str, ULID] = {}
 
     async def get_routing_version(self) -> ULID | None:
-        raw: bytes | None = await self._client.get(self.ROUTING_VERSION_KEY)
-        return ULID.from_bytes(raw) if raw else None
+        raw = cast("bytes | None", await self._client.get(self.ROUTING_VERSION_KEY))
+        return ULID.from_str(raw.decode()) if raw else None
 
     async def bump_routing_version(self) -> None:
-        await self._client.set(self.ROUTING_VERSION_KEY, ULID().bytes)
+        await self._client.set(self.ROUTING_VERSION_KEY, str(ULID()))
 
     async def get_refresh_tag(self, role: str) -> ULID:
         if role in self._tag_cache:
             return self._tag_cache[role]
-        raw: bytes | None = await self._client.get(self.ROLE_REFRESH_TAG_KEY(name=role))
+        raw = cast("bytes | None", await self._client.get(self.ROLE_REFRESH_TAG_KEY(name=role)))
         if raw:
             tag = ULID.from_str(raw.decode())
         else:
             tag = ULID()
             await self._client.set(self.ROLE_REFRESH_TAG_KEY(name=role), str(tag), nx=True)
-            raw = await self._client.get(self.ROLE_REFRESH_TAG_KEY(name=role))
+            raw = cast("bytes | None", await self._client.get(self.ROLE_REFRESH_TAG_KEY(name=role)))
             if raw:
                 tag = ULID.from_str(raw.decode())
         self._tag_cache[role] = tag

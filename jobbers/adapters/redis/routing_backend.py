@@ -8,7 +8,7 @@ Plain Redis routing sub-adapters and routing backend.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from jobbers.adapters.redis._helpers import _pack
 from jobbers.models.queue_config import QueueConfig
@@ -46,7 +46,7 @@ class RedisQueueConfigAdapter:
     # ── Queue CRUD ────────────────────────────────────────────────────────────
 
     async def get_queue_config(self, queue: str) -> QueueConfig | None:
-        raw = await self._client.get(self.QUEUE_KEY(name=queue))
+        raw = cast("bytes | None", await self._client.get(self.QUEUE_KEY(name=queue)))
         if raw is None:
             return None
         return QueueConfig.model_validate(deserialize(raw))
@@ -61,7 +61,7 @@ class RedisQueueConfigAdapter:
     async def delete_queue(self, queue_name: str) -> list[str]:
         # Remove queue from all role sets first so that a crash after this point leaves
         # an orphaned-but-valid queue config rather than roles referencing a deleted queue.
-        raw_roles: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
+        raw_roles = cast("set[bytes]", await self._client.smembers(self.ROLES_INDEX))
         role_names = [r.decode() for r in raw_roles]
         affected: list[str] = []
         if role_names:
@@ -77,13 +77,13 @@ class RedisQueueConfigAdapter:
         return affected
 
     async def get_all_queues(self) -> list[str]:
-        raw: set[bytes] = await self._client.smembers(self.QUEUES_INDEX)  # type: ignore[misc]
+        raw = cast("set[bytes]", await self._client.smembers(self.QUEUES_INDEX))
         return sorted(m.decode() for m in raw)
 
     # ── Role CRUD ─────────────────────────────────────────────────────────────
 
     async def get_queues(self, role: str) -> set[str]:
-        raw: set[bytes] = await self._client.smembers(self.ROLE_QUEUES_KEY(name=role))  # type: ignore[misc]
+        raw = cast("set[bytes]", await self._client.smembers(self.ROLE_QUEUES_KEY(name=role)))
         return {m.decode() for m in raw}
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
@@ -95,7 +95,7 @@ class RedisQueueConfigAdapter:
         await pipe.execute()
 
     async def get_all_roles(self) -> list[str]:
-        raw: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
+        raw = cast("set[bytes]", await self._client.smembers(self.ROLES_INDEX))
         return sorted(m.decode() for m in raw)
 
     async def delete_role(self, role: str) -> None:
@@ -108,7 +108,7 @@ class RedisQueueConfigAdapter:
 
     async def get_roles_for_queue(self, queue_name: str) -> list[str]:
         """Return names of all roles that contain queue_name."""
-        raw_roles: set[bytes] = await self._client.smembers(self.ROLES_INDEX)  # type: ignore[misc]
+        raw_roles = cast("set[bytes]", await self._client.smembers(self.ROLES_INDEX))
         role_names = [r.decode() for r in raw_roles]
         if not role_names:
             return []
@@ -157,7 +157,9 @@ class RedisTaskRoutingConfigAdapter:
         self._client = client
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        raw = await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version))
+        raw = cast(
+            "bytes | None", await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version))
+        )
         if raw is None:
             return None
         return RoutingConfig.model_validate(deserialize(raw))

@@ -77,10 +77,13 @@ class RedisTaskState(SharedTaskAdapterMixin):
                 ),
             )
         else:
-            raw_ids = await self.data_store.zrange(
-                self.TASKS_BY_QUEUE(queue=pagination.queue),
-                pagination.offset,
-                pagination.offset + pagination.limit * 5 - 1,
+            raw_ids = cast(
+                "list[bytes]",
+                await self.data_store.zrange(
+                    self.TASKS_BY_QUEUE(queue=pagination.queue),
+                    pagination.offset,
+                    pagination.offset + pagination.limit * 5 - 1,
+                ),
             )
 
         results: list[Task] = []
@@ -88,7 +91,7 @@ class RedisTaskState(SharedTaskAdapterMixin):
             if len(results) >= pagination.limit:
                 break
             task_id = ULID.from_bytes(raw_id)
-            raw_data: bytes | None = await self.data_store.get(self.TASK_DETAILS(task_id=task_id))
+            raw_data = cast("bytes | None", await self.data_store.get(self.TASK_DETAILS(task_id=task_id)))
             if raw_data is None:
                 continue
             task = self.unpack(task_id, raw_data)
@@ -116,7 +119,7 @@ class RedisTaskState(SharedTaskAdapterMixin):
         if score is None:
             return None
         submitted_at = dt.datetime.fromtimestamp(score, dt.UTC)
-        raw_ids: list[bytes] = await self.data_store.zrange(self.DAG_RUN_TASKS(dag_run_id=dag_run_id), 0, -1)
+        raw_ids = cast("list[bytes]", await self.data_store.zrange(self.DAG_RUN_TASKS(dag_run_id=dag_run_id), 0, -1))
         task_ids = [ULID.from_bytes(b) for b in raw_ids]
         return submitted_at, task_ids
 

@@ -201,10 +201,7 @@ class RedisCronDAGScheduler:
 
     async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None:
         """Return the next scheduled run time for a cron entry, or None if not scheduled."""
-        score: float | None = await cast(
-            "Awaitable[float | None]",
-            self.data_store.zscore(self.CRON_SCHEDULE, bytes(cron_id)),
-        )
+        score = await self.data_store.zscore(self.CRON_SCHEDULE, bytes(cron_id))
         return dt.datetime.fromtimestamp(score, dt.UTC) if score is not None else None
 
     async def list(
@@ -216,8 +213,9 @@ class RedisCronDAGScheduler:
         Returns (entry, next_run_at) pairs plus the total count of all entries in the schedule.
         """
         total: int = await self.data_store.zcard(self.CRON_SCHEDULE)
-        raw: list[tuple[bytes, float]] = await self.data_store.zrange(
-            self.CRON_SCHEDULE, offset, offset + limit - 1, withscores=True
+        raw = cast(
+            "list[tuple[bytes, float]]",
+            await self.data_store.zrange(self.CRON_SCHEDULE, offset, offset + limit - 1, withscores=True),
         )
         results: list[tuple[CronDAGEntry, dt.datetime]] = []
         for cron_id_bytes, score in raw:

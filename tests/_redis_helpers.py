@@ -18,7 +18,7 @@ async def real_redis_connection() -> AsyncIterator[aioredis.Redis]:
     Skips the current test via ``pytest.skip`` if Redis is unreachable. Flushes db 0
     on entry and exit, and always closes the connection on exit.
     """
-    r = aioredis.from_url(DEFAULT_REDIS_URL, db=0, protocol=REDIS_PROTOCOL_VERSION)
+    r = aioredis.from_url(DEFAULT_REDIS_URL, db=0, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False)
     try:
         await r.flushdb()
     except RedisConnectionError as exc:  # pragma: no cover

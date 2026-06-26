@@ -40,8 +40,9 @@ async def run_migrations(
 async def ensure_redis_json_routing_indexes(redis_url: str) -> None:
     """Create the RedisJSON routing backend's RediSearch indexes (idempotent)."""
     from jobbers.adapters.redis_json import RedisJSONRoutingBackend
+    from jobbers.db import REDIS_PROTOCOL_VERSION
 
-    client = redis.from_url(redis_url)
+    client = redis.from_url(redis_url, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False)
     try:
         await RedisJSONRoutingBackend(client).ensure_indexes()
     finally:

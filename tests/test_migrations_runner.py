@@ -54,7 +54,7 @@ async def test_ensure_redis_json_routing_indexes_creates_indexes_and_closes_clie
         nonlocal ensure_indexes_called
         ensure_indexes_called = True
 
-    monkeypatch.setattr(runner.redis, "from_url", lambda url: fake_client)
+    monkeypatch.setattr(runner.redis, "from_url", lambda url, **kwargs: fake_client)
     monkeypatch.setattr(RedisJSONRoutingBackend, "ensure_indexes", fake_ensure_indexes)
 
     await runner.ensure_redis_json_routing_indexes("redis://example")
