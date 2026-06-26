@@ -26,7 +26,7 @@ async def qca(session_factory):
 
 @pytest_asyncio.fixture
 async def redis_scheduler(redis, dummy_task_adapter, session_factory):
-    """RedisTaskScheduler backed by FakeAsyncRedis + DummyTaskAdapter."""
+    """RedisTaskScheduler backed by the shared real Redis connection + DummyTaskAdapter."""
     qca = SQLQueueConfigAdapter(session_factory)
     yield RedisTaskScheduler(redis, dummy_task_adapter, qca.get_all_queues)
 
@@ -36,7 +36,7 @@ async def scheduler(request, redis, dummy_task_adapter, session_factory):
     """
     Parametrized fixture yielding a scheduler implementation for each backend.
 
-    - ``"redis"``: RedisTaskScheduler backed by FakeAsyncRedis + DummyTaskAdapter
+    - ``"redis"``: RedisTaskScheduler backed by the shared real Redis connection + DummyTaskAdapter
     - ``"sql"``: SQLTaskScheduler backed by in-memory SQLite
 
     Both implementations expose ``pipeline()`` / ``stage_add()`` / ``stage_remove()`` /
@@ -57,7 +57,7 @@ async def cron_dag_scheduler(request, redis, session_factory):
     """
     Parametrized fixture yielding a CronDAGSchedulerProtocol implementation.
 
-    - ``"redis"``: RedisCronDAGScheduler backed by FakeAsyncRedis.
+    - ``"redis"``: RedisCronDAGScheduler backed by the shared real Redis connection.
     - ``"sql"``: SQLCronDAGScheduler backed by in-memory SQLite.
     - ``"static"``: StaticCronDAGScheduler pre-seeded with one past-due entry
       (for tests that only need to read or list; add/remove raise ReadOnly).

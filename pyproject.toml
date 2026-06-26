@@ -53,7 +53,6 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "fakeredis[lua,json]",
     "httpx",
     "pytest",
     "pytest-asyncio",

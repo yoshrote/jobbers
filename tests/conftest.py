@@ -1,8 +1,8 @@
 import datetime as dt
 
-import fakeredis
 import pytest
 import pytest_asyncio
+from redis.exceptions import ResponseError
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from ulid import ULID
@@ -26,14 +26,19 @@ from jobbers.models.task import Task
 from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import StateManager
+from tests._redis_helpers import real_redis_connection
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def redis():
-    """Fixture to reset the tasks in the mocked Redis before each test."""
-    fake_store = fakeredis.FakeAsyncRedis()
-    yield fake_store
-    await fake_store.close()
+    """Fixture to reset the tasks in the real Redis before each test."""
+    async with real_redis_connection() as r:
+        state = RedisJSONTaskState(r)
+        try:
+            await state.ensure_index()
+        except ResponseError as exc:  # pragma: no cover
+            pytest.skip(f"Redis Stack (RediSearch) not available: {exc}")
+        yield r
 
 
 @pytest.fixture(params=["redis_json", "redis"], ids=["redis_json", "redis"])

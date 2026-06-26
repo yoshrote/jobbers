@@ -1,12 +1,12 @@
 """
 Tests for the RedisJSON schema-version gate.
 
-Uses a mocked `.ft()` so they run against fakeredis without requiring a real Redis Stack instance.
+Uses the shared real Redis connection for the version key (plain get/set), with
+`.ft()` mocked so the RediSearch calls themselves don't need to run.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import fakeredis
 import pytest
 
 from jobbers.adapters.redis_json import RedisJSONDeadQueue, RedisJSONTaskState
@@ -23,48 +23,47 @@ def _mock_ft() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_task_state_ensure_index_skips_when_already_at_current_version():
-    client = fakeredis.FakeAsyncRedis()
-    state = RedisJSONTaskState(client)
-    await client.set(state._VERSION_KEY, state.SCHEMA_VERSION)
+async def test_task_state_ensure_index_skips_when_already_at_current_version(redis):
+    state = RedisJSONTaskState(redis)
+    await redis.set(state._VERSION_KEY, state.SCHEMA_VERSION)
 
-    with patch.object(client, "ft", return_value=_mock_ft()) as ft:
+    with patch.object(redis, "ft", return_value=_mock_ft()) as ft:
         await state.ensure_index()
 
     ft.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_task_state_ensure_index_runs_and_stamps_version_when_stale():
-    client = fakeredis.FakeAsyncRedis()
-    state = RedisJSONTaskState(client)
+async def test_task_state_ensure_index_runs_and_stamps_version_when_stale(redis):
+    state = RedisJSONTaskState(redis)
+    # The autouse `redis` fixture already runs ensure_index() once during setup,
+    # which stamps this key — delete it to simulate a never-indexed (stale) state.
+    await redis.delete(state._VERSION_KEY)
 
-    with patch.object(client, "ft", return_value=_mock_ft()) as ft:
+    with patch.object(redis, "ft", return_value=_mock_ft()) as ft:
         await state.ensure_index()
 
     ft.assert_called()
-    assert await client.get(state._VERSION_KEY) == str(state.SCHEMA_VERSION).encode()
+    assert await redis.get(state._VERSION_KEY) == str(state.SCHEMA_VERSION).encode()
 
 
 @pytest.mark.asyncio
-async def test_dead_queue_ensure_index_skips_when_already_at_current_version():
-    client = fakeredis.FakeAsyncRedis()
-    dq = RedisJSONDeadQueue(client, task_adapter=MagicMock())
-    await client.set(dq._VERSION_KEY, dq.SCHEMA_VERSION)
+async def test_dead_queue_ensure_index_skips_when_already_at_current_version(redis):
+    dq = RedisJSONDeadQueue(redis, task_adapter=MagicMock())
+    await redis.set(dq._VERSION_KEY, dq.SCHEMA_VERSION)
 
-    with patch.object(client, "ft", return_value=_mock_ft()) as ft:
+    with patch.object(redis, "ft", return_value=_mock_ft()) as ft:
         await dq.ensure_index()
 
     ft.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_routing_queue_config_ensure_indexes_skips_when_already_at_current_version():
-    client = fakeredis.FakeAsyncRedis()
-    qca = RedisJSONQueueConfigAdapter(client)
-    await client.set(qca._VERSION_KEY, qca.SCHEMA_VERSION)
+async def test_routing_queue_config_ensure_indexes_skips_when_already_at_current_version(redis):
+    qca = RedisJSONQueueConfigAdapter(redis)
+    await redis.set(qca._VERSION_KEY, qca.SCHEMA_VERSION)
 
-    with patch.object(client, "ft", return_value=_mock_ft()) as ft:
+    with patch.object(redis, "ft", return_value=_mock_ft()) as ft:
         await qca.ensure_indexes()
 
     ft.assert_not_called()

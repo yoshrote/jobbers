@@ -61,6 +61,14 @@ class RedisRoutingNotifications:
             ps = self._client.pubsub()
             await ps.subscribe(self.REFRESH_CHANNEL(role=role))
             self._pubsubs[role] = ps
+            # subscribe() only sends the SUBSCRIBE command; the server always
+            # sends back a confirmation frame, which is still unread on the
+            # connection at this point. Block until it arrives and drain it
+            # now, so later get_message() calls never see it interleaved with
+            # real published messages (where a single filtered None would
+            # otherwise be mistaken for "no more messages" and cut the drain
+            # loop short).
+            await self._pubsubs[role].get_message(ignore_subscribe_messages=True, timeout=None)
         while msg := await self._pubsubs[role].get_message(ignore_subscribe_messages=True, timeout=0.0):
             self._tag_cache[role] = ULID.from_str(msg["data"].decode())
         if role not in self._tag_cache:

@@ -2,8 +2,8 @@
 Protocol contract tests for TaskRoutingConfigProtocol.
 
 Parametrized over SQLTaskRoutingConfigAdapter (in-memory SQLite) and
-RedisTaskRoutingConfigAdapter (FakeAsyncRedis). Any new implementation added to
-the task_routing_config_adapter fixture in conftest.py will automatically
+RedisTaskRoutingConfigAdapter (the shared real Redis connection). Any new implementation
+added to the task_routing_config_adapter fixture in conftest.py will automatically
 inherit all tests here.
 """
 

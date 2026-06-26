@@ -2,8 +2,8 @@
 Protocol contract tests for QueueConfigProtocol.
 
 Parametrized over SQLQueueConfigAdapter (in-memory SQLite) and RedisQueueConfigAdapter
-(FakeAsyncRedis). Any new implementation added to the queue_config_adapter fixture
-in conftest.py will automatically inherit all tests here.
+(the shared real Redis connection). Any new implementation added to the queue_config_adapter
+fixture in conftest.py will automatically inherit all tests here.
 """
 
 from __future__ import annotations
