@@ -379,9 +379,12 @@ class SharedTaskAdapterMixin(ABC):
         cutoff_time = now - stale_time
         stale_task_ids: set[bytes] = set()
         for queue in queues:
-            task_ids = cast("list[bytes]", await self.data_store.zrange(
-                self.HEARTBEAT_SCORES(queue=queue), 0, cutoff_time.timestamp(), byscore=True
-            ))
+            task_ids = cast(
+                "list[bytes]",
+                await self.data_store.zrange(
+                    self.HEARTBEAT_SCORES(queue=queue), 0, cutoff_time.timestamp(), byscore=True
+                ),
+            )
             stale_task_ids.update(task_ids)
         fetched = await self.get_tasks_bulk([ULID.from_bytes(b) for b in stale_task_ids])
         for task in fetched:

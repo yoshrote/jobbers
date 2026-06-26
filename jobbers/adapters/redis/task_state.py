@@ -65,14 +65,17 @@ class RedisTaskState(SharedTaskAdapterMixin):
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Fetch tasks from the queue sorted set and filter in Python."""
         if pagination.order_by == PaginationOrder.SUBMITTED_AT:
-            raw_ids = cast("list[bytes]", await self.data_store.zrange(
-                self.TASKS_BY_QUEUE(queue=pagination.queue),
-                "-inf",
-                "+inf",
-                byscore=True,
-                offset=pagination.offset,
-                num=pagination.limit * 5,
-            ))
+            raw_ids = cast(
+                "list[bytes]",
+                await self.data_store.zrange(
+                    self.TASKS_BY_QUEUE(queue=pagination.queue),
+                    "-inf",
+                    "+inf",
+                    byscore=True,
+                    offset=pagination.offset,
+                    num=pagination.limit * 5,
+                ),
+            )
         else:
             raw_ids = await self.data_store.zrange(
                 self.TASKS_BY_QUEUE(queue=pagination.queue),
