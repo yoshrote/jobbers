@@ -3,7 +3,7 @@ requires = [
     "hatchling", 
     "packaging",
     "tomli>=1.2.1; python_version<'3.11'",
-    "trove-classifiers==2026.4.28.13",
+    "trove-classifiers==2026.6.1.19",
 ]
 build-backend = "hatchling.build"
 
@@ -39,7 +39,7 @@ dependencies = [
     "opentelemetry-exporter-otlp",
     "opentelemetry-instrumentation-fastapi",    
     "pydantic>=2.13.3",
-    "redis<8",
+    "redis>=8",
     "python_on_whales",
     "msgpack",
     "aiosqlite",
@@ -53,7 +53,6 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "fakeredis[lua,json]",
     "httpx",
     "pytest",
     "pytest-asyncio",

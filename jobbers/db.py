@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from jobbers.state_manager import StateManager
 
 DEFAULT_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+REDIS_PROTOCOL_VERSION = 3
 
 # Backend feature flags.
 TASK_BACKEND = os.environ.get("TASK_BACKEND", "redis_json")
@@ -56,7 +57,7 @@ _pre_registered_routing_backend: RoutingBackendProtocol | None = None
 def get_client() -> redis.Redis:
     global _client
     if _client is None:
-        _client = redis.from_url(DEFAULT_REDIS_URL)
+        _client = redis.from_url(DEFAULT_REDIS_URL, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False)
     return _client
 
 

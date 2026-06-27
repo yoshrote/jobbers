@@ -294,8 +294,11 @@ class SharedTaskAdapterMixin(ABC):
     async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
         """Return a paginated list of DAG runs ordered by submission time (oldest first)."""
         total: int = await self.data_store.zcard(self.DAG_RUNS)
-        raw: list[tuple[bytes, float]] = await self.data_store.zrange(
-            self.DAG_RUNS, pagination.offset, pagination.offset + pagination.limit - 1, withscores=True
+        raw = cast(
+            "list[tuple[bytes, float]]",
+            await self.data_store.zrange(
+                self.DAG_RUNS, pagination.offset, pagination.offset + pagination.limit - 1, withscores=True
+            ),
         )
         return [
             (ULID.from_bytes(dag_id_bytes), dt.datetime.fromtimestamp(score, dt.UTC))
@@ -305,7 +308,7 @@ class SharedTaskAdapterMixin(ABC):
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Remove DAG run index entries older than ``max_age``."""
         cutoff = (now - max_age).timestamp()
-        stale: list[bytes] = await self.data_store.zrangebyscore(self.DAG_RUNS, "-inf", cutoff)
+        stale = cast("list[bytes]", await self.data_store.zrange(self.DAG_RUNS, "-inf", cutoff, byscore=True))
         if stale:
             await self.data_store.zrem(self.DAG_RUNS, *stale)
 
@@ -366,7 +369,7 @@ class SharedTaskAdapterMixin(ABC):
         """Return all tasks currently present in any heartbeat sorted set."""
         task_id_bytes: set[bytes] = set()
         for queue in queues:
-            members: list[bytes] = await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1)
+            members = cast("list[bytes]", await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1))
             task_id_bytes.update(members)
         if not task_id_bytes:
             return []
@@ -379,8 +382,11 @@ class SharedTaskAdapterMixin(ABC):
         cutoff_time = now - stale_time
         stale_task_ids: set[bytes] = set()
         for queue in queues:
-            task_ids: list[bytes] = await self.data_store.zrangebyscore(
-                self.HEARTBEAT_SCORES(queue=queue), min=0, max=cutoff_time.timestamp()
+            task_ids = cast(
+                "list[bytes]",
+                await self.data_store.zrange(
+                    self.HEARTBEAT_SCORES(queue=queue), 0, cutoff_time.timestamp(), byscore=True
+                ),
             )
             stale_task_ids.update(task_ids)
         fetched = await self.get_tasks_bulk([ULID.from_bytes(b) for b in stale_task_ids])
@@ -567,7 +573,7 @@ class _SharedRedisTaskSubmitBase:
         """Get the next task from the queues in order of priority."""
         task_queues = {self.TASKS_BY_QUEUE(queue=queue) for queue in queues}
         while pop_result := await self._data_store.bzpopmin(task_queues, timeout=pop_timeout):
-            queue_name, task_id_bytes, _ = pop_result
+            queue_name, task_id_bytes, _ = cast("tuple[bytes, bytes, float]", pop_result)
             logger.debug("Popped task %s from %s", task_id_bytes, queue_name)
             task = await self._get_task_fn(ULID.from_bytes(task_id_bytes))
             if task:

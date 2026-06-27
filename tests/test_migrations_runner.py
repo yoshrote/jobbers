@@ -1,4 +1,5 @@
-import fakeredis
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from jobbers.migrations import runner
@@ -45,25 +46,18 @@ async def test_run_cli_creates_redis_json_indexes_when_configured(monkeypatch):
 async def test_ensure_redis_json_routing_indexes_creates_indexes_and_closes_client(monkeypatch):
     from jobbers.adapters.redis_json import RedisJSONRoutingBackend
 
-    fake_client = fakeredis.FakeAsyncRedis()
-    closed = False
-    original_close = fake_client.close
+    fake_client = MagicMock()
+    fake_client.close = AsyncMock()
     ensure_indexes_called = False
-
-    async def tracking_close():
-        nonlocal closed
-        closed = True
-        await original_close()
 
     async def fake_ensure_indexes(self):
         nonlocal ensure_indexes_called
         ensure_indexes_called = True
 
-    fake_client.close = tracking_close
-    monkeypatch.setattr(runner.redis, "from_url", lambda url: fake_client)
+    monkeypatch.setattr(runner.redis, "from_url", lambda url, **kwargs: fake_client)
     monkeypatch.setattr(RedisJSONRoutingBackend, "ensure_indexes", fake_ensure_indexes)
 
     await runner.ensure_redis_json_routing_indexes("redis://example")
 
     assert ensure_indexes_called is True
-    assert closed is True
+    fake_client.close.assert_awaited_once()

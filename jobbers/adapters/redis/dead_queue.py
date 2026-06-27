@@ -116,9 +116,8 @@ class RedisDeadQueue:
     ) -> list[Task]:
         """Fetch DLQ entries matching the given filter criteria."""
         if queue is None and task_name is None:
-            id_bytes: list[bytes] = await cast(
-                "Awaitable[list[bytes]]",
-                self.data_store.zrevrange(self.DLQ, 0, -1),
+            id_bytes: list[bytes] = cast(
+                "list[bytes]", await self.data_store.zrange(self.DLQ, 0, -1, desc=True)
             )
         else:
             raw_ids: set[bytes]
@@ -172,9 +171,9 @@ class RedisDeadQueue:
 
     async def clean(self, earlier_than: dt.datetime) -> None:
         """Remove failed tasks older than the specified datetime."""
-        old_ids: list[bytes] = await cast(
-            "Awaitable[list[bytes]]",
-            self.data_store.zrangebyscore(self.DLQ, "-inf", earlier_than.timestamp()),
+        old_ids = cast(
+            "list[bytes]",
+            await self.data_store.zrange(self.DLQ, "-inf", earlier_than.timestamp(), byscore=True),
         )
         if not old_ids:
             return

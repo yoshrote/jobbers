@@ -193,9 +193,10 @@ class RedisJSONDeadQueue:
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
         if not search_results.docs:
             return 0
-        ulids = [ULID.from_str(doc.id.removeprefix("dlq:")) for doc in search_results.docs]
+        doc_ids = [doc.id for doc in search_results.docs]
+        ulids = [ULID.from_str(doc_id.removeprefix("dlq:")) for doc_id in doc_ids]
         tasks = await self.ta.get_tasks_bulk(ulids)
-        orphaned_ids = [doc.id for doc, task in zip(search_results.docs, tasks) if task is None]
+        orphaned_ids = [doc_id for doc_id, task in zip(doc_ids, tasks) if task is None]
         if not orphaned_ids:
             return 0
         pipe = self.data_store.pipeline(transaction=True)

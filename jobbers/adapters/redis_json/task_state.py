@@ -54,10 +54,10 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
         return Task.model_validate({"id": task_id, **raw})
 
     async def _load_raw(self, key: str) -> dict[str, Any] | None:
-        return cast("dict[str, Any] | None", await self.data_store.json().get(key))  # type: ignore[misc]
+        return cast("dict[str, Any] | None", await self.data_store.json().get(key))
 
     async def _load_raw_watch(self, pipe: Pipeline, key: str) -> dict[str, Any] | None:
-        return cast("dict[str, Any] | None", await pipe.json().get(key))  # type: ignore[misc]
+        return cast("dict[str, Any] | None", await pipe.json().get(key))
 
     def _stage_store(self, pipe: Pipeline, key: str, task: Task) -> None:
         pipe.json().set(key, "$", json.loads(self.pack(task)))
@@ -143,5 +143,5 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
         escaped = _escape_tag(str(dag_run_id))
         q = SearchQuery(f"@dag_run_id:{{{escaped}}}").no_content().paging(0, 10000)
         search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
-        task_ids = [ULID.from_str(doc.id.removeprefix("task:")) for doc in (search_results.docs or [])]
+        task_ids = [ULID.from_str(doc.id.removeprefix("task:")) for doc in search_results.docs]
         return submitted_at, task_ids
