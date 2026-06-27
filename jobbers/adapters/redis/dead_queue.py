@@ -193,7 +193,20 @@ class RedisDeadQueue:
         await pipe2.execute()
 
     async def clean_orphaned_entries(self) -> int:
-        """Remove DLQ index entries whose task blob no longer exists. Returns count removed."""
+        """
+        Remove DLQ orphans in both directions and return the total count removed.
+
+        - Forward: `dlq` entries whose task blob no longer exists.
+        - Reverse: `dlq-queue:*`/`dlq-name:*` index members no longer present in `dlq`
+          (e.g. left behind by a `remove_from_dlq` call made with a stale queue/name).
+        """
+        removed = await self._clean_blobless_entries()
+        removed += await self._clean_stale_index_members("dlq-queue:*")
+        removed += await self._clean_stale_index_members("dlq-name:*")
+        return removed
+
+    async def _clean_blobless_entries(self) -> int:
+        """Remove `dlq`/`dlq-meta`/index entries whose task blob no longer exists."""
         id_bytes: list[bytes] = await cast(
             "Awaitable[list[bytes]]",
             self.data_store.zrange(self.DLQ, 0, -1),
@@ -220,4 +233,27 @@ class RedisDeadQueue:
                 write_pipe.srem(self.DLQ_NAME(name=name), task_id_bytes)
             removed += 1
         await write_pipe.execute()
+        return removed
+
+    async def _clean_stale_index_members(self, match: str) -> int:
+        """Remove members of `dlq-queue:*`/`dlq-name:*` sets no longer present in `dlq`."""
+        removed = 0
+        async for raw_key in self.data_store.scan_iter(match=match):
+            members: set[bytes] = cast("set[bytes]", await self.data_store.smembers(raw_key))
+            if not members:
+                continue
+            member_list = list(members)
+            score_pipe = self.data_store.pipeline(transaction=False)
+            for member in member_list:
+                score_pipe.zscore(self.DLQ, member)
+            scores = await score_pipe.execute()
+            stale = [m for m, score in zip(member_list, scores) if score is None]
+            if not stale:
+                continue
+            pipe = self.data_store.pipeline(transaction=True)
+            pipe.srem(raw_key, *stale)
+            if len(stale) == len(member_list):
+                pipe.delete(raw_key)
+            await pipe.execute()
+            removed += len(stale)
         return removed

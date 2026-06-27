@@ -755,3 +755,37 @@ async def test_clean_handles_missing_meta(msgpack_dead_queue):
     await msgpack_dead_queue.data_store.hdel(msgpack_dead_queue.DLQ_META, str(task.id))
     await msgpack_dead_queue.clean(dt.datetime(2025, 1, 1, tzinfo=dt.UTC))
     assert await msgpack_dead_queue.data_store.zscore(msgpack_dead_queue.DLQ, bytes(task.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_entries_removes_stale_queue_index_member(msgpack_dead_queue):
+    """A dlq-queue:* member left behind by remove_from_dlq(..., queue=stale) is cleaned up."""
+    dq = msgpack_dead_queue
+    task = make_task(task_id=ULID1, queue="q1")
+    await _add_to_dlq(dq, task, FROZEN_TIME)
+
+    # Simulate a stale-queue removal: the real index set ("q1") never gets cleaned.
+    await dq.remove_from_dlq(task.id, queue="wrong-queue", name=task.name)
+    assert await dq.data_store.smembers(dq.DLQ_QUEUE(queue="q1")) == {bytes(task.id)}
+
+    removed = await dq.clean_orphaned_entries()
+    assert removed == 1
+    assert await dq.data_store.smembers(dq.DLQ_QUEUE(queue="q1")) == set()
+    assert not await dq.data_store.exists(dq.DLQ_QUEUE(queue="q1"))
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_entries_removes_stale_name_index_member(msgpack_dead_queue):
+    """A dlq-name:* member left behind by remove_from_dlq(..., name=stale) is cleaned up."""
+    dq = msgpack_dead_queue
+    task = make_task(task_id=ULID1, name="my_task")
+    await _add_to_dlq(dq, task, FROZEN_TIME)
+
+    # Simulate a stale-name removal: the real index set ("my_task") never gets cleaned.
+    await dq.remove_from_dlq(task.id, queue=task.queue, name="wrong-name")
+    assert await dq.data_store.smembers(dq.DLQ_NAME(name="my_task")) == {bytes(task.id)}
+
+    removed = await dq.clean_orphaned_entries()
+    assert removed == 1
+    assert await dq.data_store.smembers(dq.DLQ_NAME(name="my_task")) == set()
+    assert not await dq.data_store.exists(dq.DLQ_NAME(name="my_task"))
