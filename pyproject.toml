@@ -3,7 +3,7 @@ requires = [
     "hatchling", 
     "packaging",
     "tomli>=1.2.1; python_version<'3.11'",
-    "trove-classifiers==2026.4.28.13",
+    "trove-classifiers==2026.6.1.19",
 ]
 build-backend = "hatchling.build"
 
