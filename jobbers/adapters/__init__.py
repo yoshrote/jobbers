@@ -39,6 +39,8 @@ Signaling:
 - `CancellationBusProtocol` — interface for task cancellation pub/sub.
 - `RoutingNotificationProtocol` — interface for routing version and refresh signals.
 - `RedisCancellationBus` — Redis-backed CancellationBusProtocol.
+- `ZmqCancellationBus` — ZeroMQ PUB/SUB backed CancellationBusProtocol.
+- `ZmqRoutingNotifications` — ZeroMQ PUB+ROUTER backed RoutingNotificationProtocol.
 - `RedisRoutingNotifications` — Redis-backed RoutingNotificationProtocol.
 """
 
@@ -67,6 +69,7 @@ from jobbers.adapters.sql import (
     SQLTaskSubmit,
 )
 from jobbers.adapters.static import StaticCronDAGScheduler, StaticRoutingBackend
+from jobbers.adapters.zmq import ZmqBus, ZmqCancellationBus, ZmqRoutingNotifications
 from jobbers.protocols import (
     CancellationBusProtocol,
     CronDAGSchedulerProtocol,
@@ -106,5 +109,8 @@ __all__ = [
     "CancellationBusProtocol",
     "RoutingNotificationProtocol",
     "RedisCancellationBus",
+    "ZmqBus",
+    "ZmqCancellationBus",
+    "ZmqRoutingNotifications",
     "RedisRoutingNotifications",
 ]

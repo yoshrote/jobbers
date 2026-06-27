@@ -28,9 +28,12 @@ from jobbers.adapters.static import StaticCronDAGScheduler, StaticRoutingBackend
 from jobbers.migrations.runner import run_migrations
 
 if TYPE_CHECKING:
+    from jobbers.adapters.zmq import ZmqBus
     from jobbers.protocols import (
+        CancellationBusProtocol,
         DeadQueueProtocol,
         RoutingBackendProtocol,
+        RoutingNotificationProtocol,
         TaskStateProtocol,
         TaskSubmitProtocol,
     )
@@ -44,6 +47,8 @@ TASK_BACKEND = os.environ.get("TASK_BACKEND", "redis_json")
 DLQ_BACKEND = os.environ.get("DLQ_BACKEND", "redis")
 TASK_SCHEDULER_BACKEND = os.environ.get("TASK_SCHEDULER_BACKEND", "redis")
 CRON_DAG_SCHEDULER_BACKEND = os.environ.get("CRON_DAG_SCHEDULER_BACKEND", "redis")
+CANCELLATION_BUS_BACKEND = os.environ.get("CANCELLATION_BUS_BACKEND", "redis")
+ROUTING_NOTIFICATIONS_BACKEND = os.environ.get("ROUTING_NOTIFICATIONS_BACKEND", "redis")
 FORCE_SAGA_MODE = os.environ.get("FORCE_SAGA_MODE", "false").lower() == "true"
 
 _client: redis.Redis | None = None
@@ -52,6 +57,7 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _task_adapter: TaskStateProtocol | None = None
 _pre_registered_routing_backend: RoutingBackendProtocol | None = None
+_zmq_bus: ZmqBus | None = None
 
 
 def get_client() -> redis.Redis:
@@ -177,6 +183,39 @@ async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol
     return SQLRoutingBackend(sf)
 
 
+def _get_or_create_zmq_bus() -> ZmqBus:
+    """Return the process-singleton ZmqBus, creating it on first call."""
+    global _zmq_bus
+    if _zmq_bus is None:
+        from jobbers.adapters.zmq import ZmqBus
+
+        # Fall back to old ZMQ_CANCELLATION_* names for backward compatibility.
+        pub = os.environ.get("ZMQ_PUB_ADDRESS", os.environ.get("ZMQ_CANCELLATION_PUB_ADDRESS", "tcp://127.0.0.1:5555"))
+        sub = os.environ.get("ZMQ_SUB_ADDRESS", os.environ.get("ZMQ_CANCELLATION_SUB_ADDRESS", "tcp://127.0.0.1:5555"))
+        router = os.environ.get("ZMQ_ROUTER_ADDRESS", "tcp://127.0.0.1:5556")
+        req = os.environ.get("ZMQ_DEALER_ADDRESS", "tcp://127.0.0.1:5556")
+        _zmq_bus = ZmqBus(pub, sub, router, req)
+    return _zmq_bus
+
+
+def _create_cancellation_bus(client: redis.Redis) -> CancellationBusProtocol:
+    """Create the cancellation bus adapter for the configured backend."""
+    if CANCELLATION_BUS_BACKEND == "zmq":
+        from jobbers.adapters.zmq import ZmqCancellationBus
+
+        return ZmqCancellationBus(_get_or_create_zmq_bus())
+    return RedisCancellationBus(client)
+
+
+def _create_routing_notifications(client: redis.Redis) -> RoutingNotificationProtocol:
+    """Create the routing notifications adapter for the configured backend."""
+    if ROUTING_NOTIFICATIONS_BACKEND == "zmq":
+        from jobbers.adapters.zmq import ZmqRoutingNotifications
+
+        return ZmqRoutingNotifications(_get_or_create_zmq_bus())
+    return RedisRoutingNotifications(client)
+
+
 async def init_state_manager() -> StateManager:
     global _state_manager, _task_adapter
     from jobbers.state_manager import StateManager
@@ -254,12 +293,20 @@ async def init_state_manager() -> StateManager:
         dead_queue=dead_queue,
         task_scheduler=task_scheduler,
         cron_dag_scheduler=cron_dag_scheduler,
-        cancellation_bus=RedisCancellationBus(client),
-        routing_notifications=RedisRoutingNotifications(client),
+        cancellation_bus=_create_cancellation_bus(client),
+        routing_notifications=_create_routing_notifications(client),
         force_saga=FORCE_SAGA_MODE,
     )
     await _task_adapter.ensure_index()
     await _state_manager.dead_queue.ensure_index()
+
+    if ROUTING_NOTIFICATIONS_BACKEND == "zmq" and os.environ.get("ZMQ_IS_ROUTER", "").lower() == "true":
+        from jobbers.adapters.zmq import ZmqRoutingNotifications
+
+        if not isinstance(_state_manager.routing_notifications, ZmqRoutingNotifications):
+            raise RuntimeError("ZMQ_IS_ROUTER=true but routing_notifications is not ZmqRoutingNotifications")
+        await _state_manager.routing_notifications.start_server()
+
     return _state_manager
 
 
