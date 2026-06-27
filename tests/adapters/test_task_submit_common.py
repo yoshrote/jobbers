@@ -12,7 +12,6 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.sql import SQLTaskSubmit
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
@@ -101,8 +100,6 @@ def _rate_limited_queue(name: str = "default") -> QueueConfig:
 async def test_submit_rate_limited_task_enqueues_and_stores(task_adapter):
     """submit_rate_limited_task enqueues the task and stores it when the rate limit is not exceeded."""
     state, submit = task_adapter
-    if isinstance(submit, SQLTaskSubmit):
-        pytest.xfail("SQLTaskSubmit does not support rate-limited submission")
     task = make_task()
     task.set_status(TaskStatus.SUBMITTED)
     queue_config = _rate_limited_queue()
@@ -119,8 +116,6 @@ async def test_submit_rate_limited_task_enqueues_and_stores(task_adapter):
 async def test_submit_rate_limited_task_rejects_when_limit_reached(task_adapter):
     """submit_rate_limited_task returns False when the per-period rate limit is exhausted."""
     state, submit = task_adapter
-    if isinstance(submit, SQLTaskSubmit):
-        pytest.xfail("SQLTaskSubmit does not support rate-limited submission")
     queue_config = QueueConfig(
         name="default", rate_numerator=1, rate_denominator=1, rate_period=RatePeriod.MINUTE
     )
@@ -142,8 +137,6 @@ async def test_submit_rate_limited_task_rejects_when_limit_reached(task_adapter)
 async def test_clean_rate_limiter_removes_expired_entries(task_adapter):
     """clean_rate_limiter removes rate-limit entries older than the configured age."""
     state, submit = task_adapter
-    if isinstance(submit, SQLTaskSubmit):
-        pytest.skip("SQLTaskSubmit.clean_rate_limiter is a no-op")
     queue_config = _rate_limited_queue()
     task = make_task()
     task.set_status(TaskStatus.SUBMITTED)
