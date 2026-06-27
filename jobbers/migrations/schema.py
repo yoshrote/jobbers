@@ -129,6 +129,12 @@ dag_runs = Table(
 
 Index("idx_dag_runs_submitted", dag_runs.c.submitted_at)
 
+# Lock anchor only -- holds no rate-limit data itself. SELECT ... FOR UPDATE needs an
+# existing row to lock, but rate_limit_entries may have zero rows for a queue (first
+# submission, or window just emptied out). Without a guaranteed-present row, two
+# concurrent submitters could both read "count < limit" before either inserts. Rows are
+# lazily inserted on first rate-limited submission per queue and never cleaned up --
+# bounded by queue count, not task count.
 rate_limit_anchors = Table(
     "rate_limit_anchors",
     metadata,
