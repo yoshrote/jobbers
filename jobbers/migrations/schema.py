@@ -129,6 +129,33 @@ dag_runs = Table(
 
 Index("idx_dag_runs_submitted", dag_runs.c.submitted_at)
 
+# Lock anchor only -- holds no rate-limit data itself. SELECT ... FOR UPDATE needs an
+# existing row to lock, but rate_limit_entries may have zero rows for a queue (first
+# submission, or window just emptied out). Without a guaranteed-present row, two
+# concurrent submitters could both read "count < limit" before either inserts. Rows are
+# lazily inserted on first rate-limited submission per queue and never cleaned up --
+# bounded by queue count, not task count.
+rate_limit_anchors = Table(
+    "rate_limit_anchors",
+    metadata,
+    Column("queue", String, primary_key=True),
+)
+
+rate_limit_entries = Table(
+    "rate_limit_entries",
+    metadata,
+    Column(
+        "queue",
+        String,
+        ForeignKey("rate_limit_anchors.queue", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("task_id", String(26), primary_key=True),
+    Column("submitted_at", DateTime(timezone=True), nullable=False),
+)
+
+Index("idx_rate_limit_entries_queue_submitted", rate_limit_entries.c.queue, rate_limit_entries.c.submitted_at)
+
 # ---------------------------------------------------------------------------
 # Dead-letter queue table (feature: "dead_letter")
 # ---------------------------------------------------------------------------
@@ -203,7 +230,7 @@ cron_dag_active_runs = Table(
 
 TABLE_GROUPS: dict[str, list[Table]] = {
     "routing": [roles, queues, role_queues, task_routing],
-    "task_state": [tasks, task_queue, task_fan_in, dag_runs],
+    "task_state": [tasks, task_queue, task_fan_in, dag_runs, rate_limit_anchors, rate_limit_entries],
     "dead_letter": [dead_letter_queue],
     "task_schedule": [task_schedule],
     "cron_dag": [cron_dag_entries, cron_dag_active_runs],
