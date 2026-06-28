@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import importlib
-import importlib.util
 import logging
 import os
 import sys
@@ -12,8 +10,11 @@ from typing import TYPE_CHECKING
 
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.registry import get_task_config
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
+from jobbers.utils.concurrency import has_capacity
+from jobbers.utils.module_loading import load_task_module
 from jobbers.utils.otel import enable_otel
 
 if TYPE_CHECKING:
@@ -25,14 +26,20 @@ Important environment variables:
 - WORKER_ROLE: Role of the worker (default is "default")
 - WORKER_TTL: Time to live for the worker (in seconds) (default is 50)
 - WORKER_CONCURRENT_TASKS: Maximum number of concurrent tasks to process (default is 5)
+- WORKER_SYNC_PROCESSES: Maximum number of concurrent sync-task subprocesses (default is 2)
 
 Rate limiting should be implemented by limiting the creation of tasks rather
 than on the consumption of tasks.
 """
 
+# Mirrors task_generator.py's _CAPACITY_BACKOFF_SECS: how long to wait before retrying a
+# dequeue after pulling a sync task with no free subprocess slot.
+_SYNC_CAPACITY_BACKOFF_SECS = 1.0
 
-async def main() -> None:
+
+async def main(task_module: str) -> None:
     num_concurrent = int(os.environ.get("WORKER_CONCURRENT_TASKS", 5))
+    num_sync_concurrent = int(os.environ.get("WORKER_SYNC_PROCESSES", 2))
     role = os.environ.get("WORKER_ROLE", "default")
     worker_ttl = int(os.environ.get("WORKER_TTL", 50))  # if 0, will run indefinitely
     state_manager = await db.init_state_manager()
@@ -40,12 +47,14 @@ async def main() -> None:
     await task_generator.queues()  # warm up the refresh tag once
 
     semaphore = asyncio.Semaphore(num_concurrent)
+    sync_semaphore = asyncio.Semaphore(num_sync_concurrent)
     active: set[asyncio.Task[None]] = set()
 
     async def run_task(task: Task) -> None:
         logger.debug("Running task: %s[%sv%s]", task.id, task.name, task.version)
         try:
-            await TaskProcessor(state_manager).run(task)
+            processor = TaskProcessor(state_manager, task_module=task_module, sync_semaphore=sync_semaphore)
+            await processor.run(task)
         finally:
             semaphore.release()
 
@@ -58,6 +67,16 @@ async def main() -> None:
             except StopAsyncIteration:
                 semaphore.release()
                 break
+
+            task_config = get_task_config(task.name, task.version)
+            if task_config is not None and task_config.is_sync and not has_capacity(sync_semaphore):
+                # No sync subprocess slot free right now — push it straight back rather than
+                # marking it STARTED and holding this concurrency slot for the whole wait.
+                await state_manager.requeue_task(task)
+                semaphore.release()
+                await asyncio.sleep(_SYNC_CAPACITY_BACKOFF_SECS)
+                continue
+
             t = asyncio.create_task(run_task(task))
             active.add(t)
             t.add_done_callback(active.discard)
@@ -72,18 +91,6 @@ async def main() -> None:
             t.cancel()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
-
-
-def _load_task_module(arg: str) -> None:
-    if os.path.isabs(arg) or arg.endswith(".py"):
-        spec = importlib.util.spec_from_file_location("_user_tasks", arg)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load task module from path: {arg}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["_user_tasks"] = module
-        spec.loader.exec_module(module)
-    else:
-        importlib.import_module(arg)
 
 
 def run() -> None:
@@ -105,6 +112,6 @@ def run() -> None:
     logging.basicConfig(level=logging.INFO, handlers=handlers)
     logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
-    _load_task_module(args.task_module)
+    load_task_module(args.task_module)
 
-    asyncio.run(main(), debug=True)
+    asyncio.run(main(args.task_module), debug=True)
