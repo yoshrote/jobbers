@@ -1,6 +1,9 @@
 import asyncio
+import contextlib
 import logging
-from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type_hints
+import multiprocessing
+import queue as queue_module
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry import metrics
 
@@ -12,8 +15,8 @@ from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import get_task_config
 from jobbers.state_manager import StateManager, UserCancellationError
-from jobbers.utils.di import DependencyResolver
-from jobbers.utils.di import Depends as _Depends
+from jobbers.sync_runner import run_sync_task
+from jobbers.utils.di import DependencyResolver, merge_resolved_kwargs
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -29,12 +32,42 @@ execution_time = meter.create_histogram("task_execution_time", unit="ms")
 end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms")
 
 
+def _await_sync_result(
+    proc: multiprocessing.Process, result_q: "multiprocessing.Queue[Any]", poll_interval: float = 0.5
+) -> tuple[str, Any]:
+    """
+    Block (in a worker thread, via asyncio.to_thread) until the subprocess reports a result.
+
+    Polls instead of a bare `result_q.get()` so that once the parent kills the process on
+    timeout/cancellation, this call returns promptly instead of blocking forever waiting for
+    an item that will never arrive.
+    """
+    while True:
+        try:
+            result: tuple[str, Any] = result_q.get(timeout=poll_interval)
+            return result
+        except queue_module.Empty:
+            if not proc.is_alive():
+                return (
+                    "error",
+                    RuntimeError(f"sync task process exited (code {proc.exitcode}) without a result"),
+                )
+
+
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
 
-    def __init__(self, state_manager: StateManager) -> None:
+    def __init__(
+        self,
+        state_manager: StateManager,
+        task_module: str | None = None,
+        sync_semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
         self.state_manager = state_manager
         self._current_promise: Awaitable[Any] | None = None
+        # Only required for sync (non-async) task functions.
+        self.task_module = task_module
+        self.sync_semaphore = sync_semaphore or asyncio.Semaphore(1)
 
     async def run(self, task: Task) -> None:
         with self.state_manager.cancel_event(task.id):
@@ -72,60 +105,13 @@ class TaskProcessor:
                 if task.inject_parent_results and task.parent_ids:
                     kwargs["parent_results"] = await task.parent_results()
 
-                resolver = DependencyResolver(task.task_config.dependency_graph)
-                async with resolver:
-                    # Resolve DI deps and map them to their kwarg names
-                    dep_cache = await resolver.resolve_all()
-                    try:
-                        hints = get_type_hints(task.task_config.function, include_extras=True)
-                    except Exception:
-                        hints = {}
-                    for param_name, hint in hints.items():
-                        if param_name == "return":
-                            continue
-                        if get_origin(hint) is Annotated:
-                            for meta in get_args(hint)[1:]:
-                                if isinstance(meta, _Depends) and meta.dependency in dep_cache:
-                                    kwargs[param_name] = dep_cache[meta.dependency]
-
-                    self._current_promise = task.task_config.function(**kwargs)
-                    if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
-                        self._current_promise = asyncio.shield(self._current_promise)
-
-                    # Run the task and handle exceptions
-                    try:
-                        async with asyncio.timeout(task.task_config.timeout):
-                            raw_result: dict[Any, Any] | TaskResult | None = await self._current_promise
-                        if isinstance(raw_result, TaskResult):
-                            task.results = raw_result.results
-                            dynamic_fanout = raw_result.fanout
-                            if raw_result.parent_ids:
-                                task.parent_ids = raw_result.parent_ids
-                        else:
-                            if task.parent_ids:
-                                task.parent_ids = list(set(task.parent_ids))  # deduplicate parent IDs
-                            task.results = raw_result or {}
-                    except TimeoutError:
-                        task = await self.handle_timeout_exception(task)
-                    except asyncio.CancelledError as exc:
-                        if task.status == TaskStatus.CANCELLED:
-                            pass  # user cancellation already handled; keep CANCELLED status
-                        else:
-                            ex = exc
-                            await self.handle_system_cancelled_task(task)
-                    except Exception as exc:
-                        if (
-                            task.task_config
-                            and task.task_config.expected_exceptions
-                            and isinstance(exc, task.task_config.expected_exceptions)
-                        ):
-                            task = await self.handle_expected_exception(task, exc)
-                        else:
-                            await self.handle_unexpected_exception(task, exc)
+                try:
+                    if task.task_config.is_sync:
+                        task, dynamic_fanout, ex = await self._execute_sync(task, kwargs)
                     else:
-                        await self.handle_success(task)
-                    finally:
-                        _current_task_cv.reset(_token)
+                        task, dynamic_fanout, ex = await self._execute_async(task, kwargs)
+                finally:
+                    _current_task_cv.reset(_token)
 
             await self.state_manager.remove_task_heartbeat(task)
             await self._maybe_cleanup(task)
@@ -156,6 +142,164 @@ class TaskProcessor:
                 raise ex
 
         return task
+
+    async def _execute_async(
+        self, task: Task, kwargs: dict[str, Any]
+    ) -> tuple[Task, DynamicFanOut | None, BaseException | None]:
+        """Resolve DI and await the registered async task function in-process."""
+        dynamic_fanout: DynamicFanOut | None = None
+        ex: BaseException | None = None
+
+        resolver = DependencyResolver(task.task_config.dependency_graph)  # type: ignore[union-attr]
+        async with resolver:
+            dep_cache = await resolver.resolve_all()
+            kwargs = merge_resolved_kwargs(task.task_config.function, dep_cache, kwargs)  # type: ignore[union-attr]
+
+            self._current_promise = task.task_config.function(**kwargs)  # type: ignore[union-attr]
+            if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:  # type: ignore[union-attr]
+                self._current_promise = asyncio.shield(self._current_promise)
+
+            try:
+                async with asyncio.timeout(task.task_config.timeout):  # type: ignore[union-attr]
+                    raw_result: dict[Any, Any] | TaskResult | None = await self._current_promise
+                if isinstance(raw_result, TaskResult):
+                    task.results = raw_result.results
+                    dynamic_fanout = raw_result.fanout
+                    if raw_result.parent_ids:
+                        task.parent_ids = raw_result.parent_ids
+                else:
+                    if task.parent_ids:
+                        task.parent_ids = list(set(task.parent_ids))  # deduplicate parent IDs
+                    task.results = raw_result or {}
+            except TimeoutError:
+                task = await self.handle_timeout_exception(task)
+            except asyncio.CancelledError as exc:
+                if task.status == TaskStatus.CANCELLED:
+                    pass  # user cancellation already handled; keep CANCELLED status
+                else:
+                    ex = exc
+                    await self.handle_system_cancelled_task(task)
+            except Exception as exc:
+                if (
+                    task.task_config
+                    and task.task_config.expected_exceptions
+                    and isinstance(exc, task.task_config.expected_exceptions)
+                ):
+                    task = await self.handle_expected_exception(task, exc)
+                else:
+                    await self.handle_unexpected_exception(task, exc)
+            else:
+                await self.handle_success(task)
+
+        return task, dynamic_fanout, ex
+
+    async def _execute_sync(
+        self, task: Task, kwargs: dict[str, Any]
+    ) -> tuple[Task, DynamicFanOut | None, BaseException | None]:
+        """
+        Run a sync (non-async) registered task function in a dedicated subprocess.
+
+        DI resolves inside the child (see jobbers/sync_runner.py) since dependency providers
+        aren't picklable across the process boundary. `heartbeat_q` carries explicit
+        `ctx.heartbeat()` calls back to this process, which holds the live state adapter;
+        `cancel_evt` carries cooperative-cancellation requests the other way; `result_q`
+        carries the final outcome. Timeout/cancellation forcibly `.terminate()`/`.kill()` the
+        process — see CLAUDE.md for why a shared ProcessPoolExecutor can't do that safely.
+        """
+        dynamic_fanout: DynamicFanOut | None = None
+        ex: BaseException | None = None
+        task_config = task.task_config
+        if task_config is None:
+            raise RuntimeError("_execute_sync called without a resolved task_config")
+
+        sync_task = task.model_copy(deep=True)
+        sync_task._adapter = None
+        # The child re-derives task_config from its own registry after loading the task
+        # module (see sync_runner.run_sync_task) — pickling it here would carry `function`
+        # across the process boundary by reference, which is exactly the trap documented
+        # in CLAUDE.md (fails for file-path-loaded `_user_tasks` modules).
+        sync_task.task_config = None
+
+        heartbeat_q: multiprocessing.Queue[Any] = multiprocessing.Queue()
+        cancel_evt = multiprocessing.Event()
+        result_q: multiprocessing.Queue[Any] = multiprocessing.Queue()
+
+        proc = multiprocessing.Process(
+            target=run_sync_task,
+            args=(self.task_module, sync_task, kwargs, heartbeat_q, cancel_evt, result_q),
+            daemon=True,
+        )
+
+        async def _drain_heartbeats() -> None:
+            # Polls with a timeout (rather than a bare blocking get()) so that once the
+            # process is gone, this loop notices and returns on its own — a plain
+            # `heartbeat_q.get()` would leave the underlying thread (and this task's
+            # cancellation) blocked forever, since nothing will ever be queued again.
+            while True:
+                try:
+                    heartbeat_task_id = await asyncio.to_thread(heartbeat_q.get, True, 0.5)
+                except queue_module.Empty:
+                    if not proc.is_alive():
+                        return
+                    continue
+                if heartbeat_task_id == task.id:
+                    await self.state_manager.update_task_heartbeat(task)
+
+        async with self.sync_semaphore:
+            proc.start()
+            drain_task = asyncio.create_task(_drain_heartbeats())
+            self._current_promise = asyncio.to_thread(_await_sync_result, proc, result_q)
+            if task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
+                self._current_promise = asyncio.shield(self._current_promise)
+
+            try:
+                async with asyncio.timeout(task_config.timeout):
+                    status, payload = await self._current_promise
+                if status == "error":
+                    raise payload
+                raw_result: dict[Any, Any] | TaskResult | None = payload
+                if isinstance(raw_result, TaskResult):
+                    task.results = raw_result.results
+                    dynamic_fanout = raw_result.fanout
+                    if raw_result.parent_ids:
+                        task.parent_ids = raw_result.parent_ids
+                else:
+                    if task.parent_ids:
+                        task.parent_ids = list(set(task.parent_ids))  # deduplicate parent IDs
+                    task.results = raw_result or {}
+            except TimeoutError:
+                # Shielded (on_shutdown=CONTINUE) tasks keep running in the background, same as
+                # the async path — don't kill the process out from under them.
+                if task_config.on_shutdown != TaskShutdownPolicy.CONTINUE:
+                    proc.terminate()
+                task = await self.handle_timeout_exception(task)
+            except asyncio.CancelledError as exc:
+                if task_config.on_shutdown != TaskShutdownPolicy.CONTINUE:
+                    cancel_evt.set()
+                    proc.terminate()
+                if task.status == TaskStatus.CANCELLED:
+                    pass  # user cancellation already handled; keep CANCELLED status
+                else:
+                    ex = exc
+                    await self.handle_system_cancelled_task(task)
+            except Exception as exc:
+                if task_config.expected_exceptions and isinstance(exc, task_config.expected_exceptions):
+                    task = await self.handle_expected_exception(task, exc)
+                else:
+                    await self.handle_unexpected_exception(task, exc)
+            else:
+                await self.handle_success(task)
+            finally:
+                drain_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await drain_task
+                if task_config.on_shutdown != TaskShutdownPolicy.CONTINUE or not proc.is_alive():
+                    await asyncio.to_thread(proc.join, 5)
+                    if proc.is_alive():
+                        proc.kill()
+                        await asyncio.to_thread(proc.join)
+
+        return task, dynamic_fanout, ex
 
     async def monitor_task_cancellation(self, task: Task) -> None:
         """Monitor for task cancellation and handle it."""

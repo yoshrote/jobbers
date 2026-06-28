@@ -1,6 +1,6 @@
 import datetime as dt
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Annotated, Any
 
@@ -10,7 +10,7 @@ from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 
 SerializableCallable = Annotated[
-    Callable[..., Awaitable[Any]],
+    Callable[..., Any],
     WithJsonSchema({"type": "string", "readOnly": True}),
     PlainSerializer(
         lambda f: f"{f.__module__}.{f.__qualname__}",
@@ -49,6 +49,9 @@ class TaskConfig(BaseModel):
     max_retry_delay: int = Field(default=3600)  # Upper bound on computed retry delay in seconds
     on_shutdown: TaskShutdownPolicy = Field(default=TaskShutdownPolicy.STOP)
     dead_letter_policy: DeadLetterPolicy = Field(default=DeadLetterPolicy.NONE)
+    # True for tasks registered with a non-async function — executed in a dedicated subprocess
+    # (see jobbers/sync_runner.py) rather than awaited in-process.
+    is_sync: bool = Field(default=False)
     cleanup_on: frozenset[TaskStatus] | None = Field(default=None)
     max_heartbeat_interval: dt.timedelta | None = Field(
         default=None

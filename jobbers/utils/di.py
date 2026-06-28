@@ -282,3 +282,27 @@ class DependencyResolver:
             return await provider(**kwargs)
         else:
             return provider(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Resolved-value injection — called once per task invocation, after resolve_all()
+# ---------------------------------------------------------------------------
+
+
+def merge_resolved_kwargs(
+    func: Callable[..., Any], dep_cache: dict[Callable[..., Any], Any], kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Match resolver-cache values to func's Depends()-annotated params, merged onto kwargs."""
+    try:
+        hints = get_type_hints(func, include_extras=True)
+    except Exception:
+        hints = {}
+    merged = dict(kwargs)
+    for param_name, hint in hints.items():
+        if param_name == "return":
+            continue
+        if get_origin(hint) is Annotated:
+            for meta in get_args(hint)[1:]:
+                if isinstance(meta, Depends) and meta.dependency in dep_cache:
+                    merged[param_name] = dep_cache[meta.dependency]
+    return merged
