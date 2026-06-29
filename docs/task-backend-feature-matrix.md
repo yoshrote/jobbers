@@ -26,7 +26,7 @@ Compares `redis`, `redis_json`, `sql`, and `static` across protocol support, fea
 
 | Feature | `redis` | `redis_json` | `sql` | `static` |
 | --- | --- | --- | --- | --- |
-| Rate-limited submission | ✅ | ✅ | ❌ `NotImplementedError` | ❌ |
+| Rate-limited submission | ✅ | ✅ | ✅ | ❌ |
 | Server-side task filtering | ❌ Python-side after fetch | ✅ RediSearch `FT.SEARCH` | ✅ SQL `WHERE` clause | N/A |
 | Multi-field sort on task list | ❌ `submitted_at` only (sorted-set score) | ✅ any RediSearch sortable field | ✅ any indexed column | N/A |
 | Write operations | ✅ | ✅ | ✅ | ❌ raises `RoutingBackendReadOnlyError` |
@@ -45,7 +45,7 @@ Counts the number of network round-trips and server-side operations per call. Lu
 | Operation | `redis` | `redis_json` | `sql` |
 | --- | --- | --- | --- |
 | `submit_task` | 1 Lua script: `EXISTS` + `ZADD` + `SET` + `SADD`/`SREM` + 2×`ZADD` (DAG) | 1 Lua script: `EXISTS` + `ZADD` + `JSON.SET` + `SADD`/`SREM` + `ZADD` (DAG) | 2 transactions: `UPSERT tasks` + `UPDATE`/`INSERT task_queue` + optional `SELECT`/`INSERT dag_runs` |
-| `submit_rate_limited_task` | 1 Lua script: `ZREMRANGEBYSCORE` + `ZCARD` + 2×`ZADD` + `SET` + `SADD`/`SREM` + 2×`ZADD` (DAG) | 1 Lua script: same, `JSON.SET` instead of `SET` | ❌ not implemented |
+| `submit_rate_limited_task` | 1 Lua script: `ZREMRANGEBYSCORE` + `ZCARD` + 2×`ZADD` + `SET` + `SADD`/`SREM` + 2×`ZADD` (DAG) | 1 Lua script: same, `JSON.SET` instead of `SET` | 1 transaction: `INSERT` anchor row (savepoint, ignore conflict) + `SELECT ... FOR UPDATE` anchor + `DELETE` expired `rate_limit_entries` + `SELECT COUNT` + `UPSERT rate_limit_entries` + `UPSERT tasks` + `UPDATE`/`INSERT task_queue` |
 | `get_next_task` (pop) | 1 Lua script: `ZPOPMIN` + `GET` | 1 Lua script: `ZPOPMIN` + `JSON.GET` | 1 transaction: `SELECT FOR UPDATE` + `DELETE task_queue` + `SELECT tasks` |
 
 ### Task state reads and writes
@@ -80,6 +80,7 @@ The critical difference in `get_all_tasks`: `redis` does **N+1 round-trips** (on
 | Schema overhead | none — sparse key-value | none — document store | fixed schema: `tasks`, `task_queue`, `dag_runs`, `task_fan_in` tables |
 | Heartbeat storage | ZADD score in `heartbeats` sorted set | ZADD score in `heartbeats` sorted set | nullable `heartbeat_at` column in `tasks` table |
 | Fan-in sets | Redis sets with TTL (cleaned by Cleaner) | Redis sets with TTL (cleaned by Cleaner) | `task_fan_in` table rows (no TTL, cleaned by Cleaner) |
+| Rate limit window | sorted set per queue (`ZADD`/`ZREMRANGEBYSCORE`) | sorted set per queue (delegates to `redis` Lua script) | `rate_limit_entries` table row per (queue, task_id) + one `rate_limit_anchors` row per queue for `SELECT FOR UPDATE` serialization; pruned by age via `clean_rate_limiter` (Cleaner) |
 
 ---
 
@@ -159,3 +160,7 @@ Filters (`task_name`, `task_version`, `status`) are applied in Python after fetc
 #### Concurrent workers on SQLite can claim the same task
 
 `get_next_task` uses `SELECT FOR UPDATE SKIP LOCKED` on PostgreSQL to atomically claim a task row. On SQLite, `FOR UPDATE` is unsupported and is omitted (controlled by `"sqlite" not in dsn`). Two concurrent workers can `SELECT` the same task ID within overlapping transactions before either commits. Both then issue `DELETE` — one deletes the row, the other deletes 0 rows but the transaction still commits without error — and both proceed to fetch the task blob and execute it. **SQLite is not safe for multi-worker deployments; use PostgreSQL.**
+
+#### Rate-limited submission serializes on a per-queue anchor row
+
+`submit_rate_limited_task` (`jobbers/adapters/sql/task_submit.py`) reproduces the Redis sorted-set sliding window with two tables: `rate_limit_anchors` (one row per queue, that row's sole purpose is to be locked) and `rate_limit_entries` (one row per task_id currently inside the window). Each call inserts the anchor row if missing (via a savepoint that swallows the `IntegrityError` from a concurrent insert), then locks it with `SELECT ... FOR UPDATE` — on PostgreSQL this serializes all concurrent submitters to the same queue; on SQLite the lock is a no-op (same `"sqlite" not in dsn` guard as `get_next_task`), so concurrent SQLite submitters can race past the count check and both succeed when only one slot remains. Expired entries (`submitted_at < now - period`) are deleted before the `COUNT` check on every call rather than via a separate cleanup pass — `clean_rate_limiter` (called from the Cleaner) only prunes entries older than `rate_limit_age`, a coarser safety net independent of any specific queue's period. Re-submitting a task_id already inside the window is idempotent: it refreshes `submitted_at` without consuming a new slot, matching the Redis Lua script's `ZADD` semantics on an existing member.

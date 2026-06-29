@@ -55,7 +55,9 @@ This is enforced in memory by `StateManager.current_tasks_by_queue` — a dict u
 
 Interpreted as: **10 tasks every 1 minute**. The rate period in seconds is `rate_denominator × period_unit`.
 
-Rate limiting is enforced at **submission time** via an atomic Lua script on a Redis sorted set (`rate-limiter:{queue}`). The script:
+Rate limiting is enforced at **submission time** and is supported by `redis`, `redis_json`, and `sql` (`TASK_BACKEND`); the mechanism differs per backend but the windowing semantics are identical.
+
+On `redis`/`redis_json`, an atomic Lua script on a Redis sorted set (`rate-limiter:{queue}`):
 
 1. Removes entries older than the rate window.
 2. Counts remaining entries.
@@ -63,7 +65,9 @@ Rate limiting is enforced at **submission time** via an atomic Lua script on a R
 
 Because the check and enqueue happen in a single Lua transaction, there are no race conditions under concurrent submissions.
 
-The Cleaner process periodically prunes stale entries from rate-limiter sorted sets.
+On `sql`, `SQLTaskSubmit.submit_rate_limited_task` reproduces the same sliding window with two tables: `rate_limit_entries` (one row per task_id currently inside the window) and `rate_limit_anchors` (one row per queue, locked via `SELECT ... FOR UPDATE` to serialize concurrent submitters to that queue). On PostgreSQL the anchor lock makes the check-then-enqueue atomic, matching the Redis guarantee; on SQLite `FOR UPDATE` is a no-op, so concurrent submitters to the same queue can race past the limit check — same caveat as SQLite's general multi-worker unsafety (see [task-backend-feature-matrix.md](task-backend-feature-matrix.md)).
+
+The Cleaner process periodically prunes stale entries from rate-limiter sorted sets (`redis`/`redis_json`) or the `rate_limit_entries` table (`sql`).
 
 ### Queue CRUD API
 

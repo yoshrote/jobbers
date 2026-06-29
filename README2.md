@@ -265,7 +265,7 @@ All adapters implement the same `@runtime_checkable Protocol` interfaces defined
 | --- | --- |
 | Default — Redis Stack available | `TASK_BACKEND=redis_json` (default): server-side filtered queries, exact pagination, sorted DLQ results |
 | Plain Redis (no modules) | `TASK_BACKEND=redis`: same worker hot-path performance, smaller payloads, Python-side filtering |
-| No Redis / SQL-only infra | `TASK_BACKEND=sql`: full filtered queries via SQL WHERE; rate limiting not supported |
+| No Redis / SQL-only infra | `TASK_BACKEND=sql`: full filtered queries via SQL |
 | Fixed queue topology at deploy time | `ROUTING_BACKEND=static`: load config from file or env vars, no database required |
 | Cron schedules defined in code | `CRON_DAG_SCHEDULER_BACKEND=static`: no cron state database, resets on restart |
 
