@@ -8,7 +8,7 @@ import json
 import pytest
 from ulid import ULID
 
-from jobbers.models.dag import DAGTaskSpec, FanInCallback, SimpleCallback
+from jobbers.models.dag import DAGTaskSpec, DynamicFanOutCallback, FanInCallback, SimpleCallback
 from jobbers.models.task_status import TaskStatus
 from jobbers.utils.mermaid_dag import (
     MermaidParseError,
@@ -557,3 +557,152 @@ def test_round_trip_diamond() -> None:
     assert len(fan_in_map) == 1
     preds = next(iter(fan_in_map.values()))
     assert len(preds) == 2
+
+
+# ── parse_mermaid_dag — dynamic fan-out (-->> / --o) ────────────────────────
+
+
+def test_parse_fanout_single_step_arm() -> None:
+    """A -->> B; B --o C wires a DynamicFanOutCallback onto A."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        B["process_record"]
+        C["aggregate_results"]
+        A -->> B
+        B --o C
+    """
+    roots = parse_mermaid_dag(text)
+    assert len(roots) == 1
+    spec = roots[0].to_spec()
+    assert spec.name == "fetch_records"
+    assert len(spec.dag_callbacks) == 1
+    cb = spec.dag_callbacks[0]
+    assert isinstance(cb, DynamicFanOutCallback)
+    assert cb.arm_root.name == "process_record"
+    assert cb.collector.name == "aggregate_results"
+    assert cb.items_key == "items"
+
+
+def test_parse_fanout_custom_items_key() -> None:
+    """A --\"batches\">> B; B --o C uses 'batches' as items_key."""
+    text = '''
+    flowchart TD
+        A["split_work"]
+        B["process_batch"]
+        C["merge_batches"]
+        A --"batches">> B
+        B --o C
+    '''
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    cb = spec.dag_callbacks[0]
+    assert isinstance(cb, DynamicFanOutCallback)
+    assert cb.items_key == "batches"
+
+
+def test_parse_fanout_multi_step_arm() -> None:
+    """A -->> B; B --> E; E --o C: arm chain B → E, terminal is E."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        B["start_processing"]
+        E["finish_processing"]
+        C["aggregate_results"]
+        A -->> B
+        B --> E
+        E --o C
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    cb = spec.dag_callbacks[0]
+    assert isinstance(cb, DynamicFanOutCallback)
+    assert cb.arm_root.name == "start_processing"
+    assert cb.collector.name == "aggregate_results"
+    # arm_root spec should have a SimpleCallback to finish_processing
+    assert len(cb.arm_root.dag_callbacks) == 1
+    arm_cb = cb.arm_root.dag_callbacks[0]
+    assert isinstance(arm_cb, SimpleCallback)
+    assert arm_cb.task.name == "finish_processing"
+
+
+def test_parse_fanout_dispatcher_not_root_when_preceded() -> None:
+    """X --> A; A -->> B; B --o C: X is root, A is not."""
+    text = """
+    flowchart TD
+        X["kickoff"]
+        A["fetch_records"]
+        B["process_record"]
+        C["aggregate_results"]
+        X --> A
+        A -->> B
+        B --o C
+    """
+    roots = parse_mermaid_dag(text)
+    root_names = {r._name for r in roots}  # type: ignore[attr-defined]
+    assert root_names == {"kickoff"}
+    kickoff_spec = roots[0].to_spec()
+    assert len(kickoff_spec.dag_callbacks) == 1
+    assert isinstance(kickoff_spec.dag_callbacks[0], SimpleCallback)
+    fetch_spec = kickoff_spec.dag_callbacks[0].task
+    assert fetch_spec.name == "fetch_records"
+    assert len(fetch_spec.dag_callbacks) == 1
+    assert isinstance(fetch_spec.dag_callbacks[0], DynamicFanOutCallback)
+
+
+def test_parse_multiple_fanout_dispatchers_rejected() -> None:
+    """Two -->> edges from the same source node raise MermaidParseError."""
+    text = """
+    flowchart TD
+        A["dispatch"]
+        B["arm_type_1"]
+        C["arm_type_2"]
+        D["collector"]
+        A -->> B
+        A -->> C
+        B --o D
+        C --o D
+    """
+    with pytest.raises(MermaidParseError, match="multiple '-->>'"):
+        parse_mermaid_dag(text)
+
+
+def test_parse_fanout_missing_fanin_raises() -> None:
+    """A -->> B with no --o edge raises MermaidParseError."""
+    text = """
+    flowchart TD
+        A["dispatch"]
+        B["process"]
+        A -->> B
+    """
+    with pytest.raises(MermaidParseError, match="no '--o'"):
+        parse_mermaid_dag(text)
+
+
+# ── Generator — dynamic fan-out (-->> / --o) ────────────────────────────────
+
+
+def test_generator_fanout_emits_fanout_and_fanin_edges() -> None:
+    """dag_spec_to_mermaid emits -->> from dispatcher to arm root and --o from arm terminal to collector."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        B["process_record"]
+        C["aggregate_results"]
+        A -->> B
+        B --o C
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    diagram = dag_spec_to_mermaid(spec)
+    assert "-->>" in diagram
+    assert "--o" in diagram
+    # Should not emit --> between dispatcher and arm root
+    lines = [ln.strip() for ln in diagram.splitlines()]
+    # The arm root and collector ids
+    cb = spec.dag_callbacks[0]
+    assert isinstance(cb, DynamicFanOutCallback)
+    arm_id = str(cb.arm_root.id)
+    col_id = str(cb.collector.id)
+    assert any(f"-->>" in ln and arm_id in ln for ln in lines)
+    assert any(f"--o" in ln and col_id in ln for ln in lines)

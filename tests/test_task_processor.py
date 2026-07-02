@@ -7,7 +7,7 @@ import pytest
 from ulid import ULID
 
 from jobbers.adapters.redis import RedisTaskScheduler
-from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, SimpleCallback, TaskResult
+from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, FanInCallback, SimpleCallback, TaskResult
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
@@ -821,7 +821,7 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     c1 = DAGNode("worker_a")
     c2 = DAGNode("worker_b")
     collector = DAGNode("aggregator")
-    fanout = DynamicFanOut(children=[c1, c2], collector=collector)
+    fanout = DynamicFanOut(arms=[c1, c2], collector=collector)
 
     state_manager = _make_state_manager()
     state_manager.init_fan_in = AsyncMock()
@@ -832,7 +832,7 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     state_manager.get_queue_config = AsyncMock(return_value=None)
 
     processor = TaskProcessor(state_manager)
-    await processor._handle_dynamic_fanout(parent, fanout)
+    await processor._handle_dynamic_fanout(parent, fanout, [])
 
     # init_fan_in called once with correct key and both child IDs
     fan_in_key = f"dag:fan-in:{collector.id}"
@@ -867,7 +867,7 @@ async def test_handle_dynamic_fanout_no_children_submits_collector_immediately()
         dag_run_id=dag_run_id,
     )
     collector = DAGNode("aggregator")
-    fanout = DynamicFanOut(children=[], collector=collector)
+    fanout = DynamicFanOut(arms=[], collector=collector)
 
     state_manager = _make_state_manager()
     state_manager.init_fan_in = AsyncMock()
@@ -875,13 +875,221 @@ async def test_handle_dynamic_fanout_no_children_submits_collector_immediately()
     state_manager.submit_task = AsyncMock()
 
     processor = TaskProcessor(state_manager)
-    await processor._handle_dynamic_fanout(parent, fanout)
+    await processor._handle_dynamic_fanout(parent, fanout, [])
 
     state_manager.init_fan_in.assert_not_called()
     state_manager.submit_task.assert_awaited_once()
     submitted = state_manager.submit_task.call_args[0][0]
     assert submitted.id == collector.id
     assert submitted.dag_run_id == dag_run_id
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_multi_step_arms_wires_fan_in_to_terminals():
+    """Fan-in is attached to terminal (leaf) nodes, not arm roots, for multi-step arms."""
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    # arm: root_a → step_a (terminal); root_b is single-step (its own terminal)
+    root_a = DAGNode("root_a")
+    step_a = DAGNode("step_a")
+    root_a.then(step_a)
+    root_b = DAGNode("root_b")
+    collector = DAGNode("aggregator")
+    fanout = DynamicFanOut(arms=[root_a, root_b], collector=collector)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout, [])
+
+    # Collector fan-in must wait for {step_a, root_b} — the *terminals* — not {root_a, root_b}.
+    collector_fan_in_key = f"dag:fan-in:{collector.id}"
+    init_calls = {call[0][0]: call[0][1] for call in state_manager.init_fan_in.call_args_list}
+    assert collector_fan_in_key in init_calls
+    assert init_calls[collector_fan_in_key] == {step_a.id, root_b.id}
+
+    # Arm roots are submitted (not terminals); step_a's callbacks wire it to the collector.
+    arm_tasks = state_manager.submit_tasks_batch.call_args[0][0]
+    assert {t.id for t in arm_tasks} == {root_a.id, root_b.id}
+
+    # Verify the callback chain is baked correctly into root_a_task so that at
+    # execution time root_a → (submits) step_a → (decrements fan-in) → collector.
+    arm_tasks_by_id = {t.id: t for t in arm_tasks}
+    root_a_task = arm_tasks_by_id[root_a.id]
+    assert len(root_a_task.dag_callbacks) == 1
+    assert isinstance(root_a_task.dag_callbacks[0], SimpleCallback)
+    step_a_spec = root_a_task.dag_callbacks[0].task
+    assert step_a_spec.id == step_a.id
+    fan_in_cbs = [cb for cb in step_a_spec.dag_callbacks if isinstance(cb, FanInCallback)]
+    assert len(fan_in_cbs) == 1
+    assert fan_in_cbs[0].fan_in_key == collector_fan_in_key
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_arm_with_static_diamond_inits_both_fan_ins():
+    """An arm with a static diamond sub-graph initialises both the inner and outer fan-in sets."""
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    # arm_A: arm_root → (b1, b2) → merge_node   (static diamond within the arm)
+    arm_root = DAGNode("arm_root")
+    b1 = DAGNode("branch_1")
+    b2 = DAGNode("branch_2")
+    merge_node = DAGNode("merge_node")
+    arm_root.then(b1, b2)
+    DAGNode.merge(b1, b2, into=merge_node)
+    # arm_B: single-step
+    arm_b = DAGNode("arm_b")
+    collector = DAGNode("collector")
+    fanout = DynamicFanOut(arms=[arm_root, arm_b], collector=collector)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout, [])
+
+    outer_key = f"dag:fan-in:{collector.id}"
+    inner_key = f"dag:fan-in:{merge_node.id}"
+    init_calls = {c[0][0]: c[0][1] for c in state_manager.init_fan_in.call_args_list}
+
+    # Outer fan-in: collector waits for the terminal of arm_A (merge_node) and arm_b.
+    assert init_calls[outer_key] == {merge_node.id, arm_b.id}
+    # Inner (static) fan-in within arm_A: merge_node waits for b1 and b2.
+    assert init_calls[inner_key] == {b1.id, b2.id}
+
+    # Only arm roots are submitted — the branch and merge nodes are interior.
+    arm_tasks = state_manager.submit_tasks_batch.call_args[0][0]
+    assert {t.id for t in arm_tasks} == {arm_root.id, arm_b.id}
+
+    # Verify the full callback chain baked into arm_root_task:
+    #   arm_root → SimpleCallback(b1), SimpleCallback(b2)
+    #   b1 → FanInCallback(inner_key, merge_node)
+    #   merge_node → FanInCallback(outer_key, collector)
+    arm_tasks_by_id = {t.id: t for t in arm_tasks}
+    arm_root_task = arm_tasks_by_id[arm_root.id]
+    child_ids = {cb.task.id for cb in arm_root_task.dag_callbacks if isinstance(cb, SimpleCallback)}
+    assert child_ids == {b1.id, b2.id}
+
+    b1_spec = next(
+        cb.task
+        for cb in arm_root_task.dag_callbacks
+        if isinstance(cb, SimpleCallback) and cb.task.id == b1.id
+    )
+    inner_cbs = [cb for cb in b1_spec.dag_callbacks if isinstance(cb, FanInCallback)]
+    assert len(inner_cbs) == 1
+    assert inner_cbs[0].fan_in_key == inner_key
+
+    merge_spec = inner_cbs[0].task
+    assert merge_spec.id == merge_node.id
+    outer_cbs = [cb for cb in merge_spec.dag_callbacks if isinstance(cb, FanInCallback)]
+    assert len(outer_cbs) == 1
+    assert outer_cbs[0].fan_in_key == outer_key
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_with_outer_fan_in_delegates_to_collector():
+    """When the parent has outer FanInCallbacks the collector inherits them and delegate_fan_in is called."""
+    dag_run_id = ULID()
+    outer_fan_in_key = "dag:fan-in:outer-collector"
+    outer_fan_in_cb = FanInCallback(
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
+        fan_in_key=outer_fan_in_key,
+    )
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        dag_callbacks=[outer_fan_in_cb],
+    )
+    arm = DAGNode("arm_task")
+    collector = DAGNode("inner_collect")
+    fanout = DynamicFanOut(arms=[arm], collector=collector, propagate_fan_in=True)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+    state_manager.task_state.delegate_fan_in = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout, [outer_fan_in_cb])
+
+    # delegate_fan_in must swap parent.id → collector.id in the outer fan-in set.
+    state_manager.task_state.delegate_fan_in.assert_awaited_once_with(
+        outer_fan_in_key, parent.id, collector.id
+    )
+
+    # The collector task must carry the outer fan-in callback.
+    saved_collector = state_manager.save_task.call_args[0][0]
+    assert saved_collector.id == collector.id
+    assert outer_fan_in_cb in saved_collector.dag_callbacks
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_propagate_fan_in_false_skips_delegation():
+    """propagate_fan_in=False means outer fan-in callbacks are NOT transferred to the collector."""
+    dag_run_id = ULID()
+    outer_fan_in_key = "dag:fan-in:outer-collector"
+    outer_fan_in_cb = FanInCallback(
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
+        fan_in_key=outer_fan_in_key,
+    )
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        dag_callbacks=[outer_fan_in_cb],
+    )
+    arm = DAGNode("arm_task")
+    collector = DAGNode("inner_collect")
+    # opt-out: the parent task's FanInCallback should fire immediately, not be delegated
+    fanout = DynamicFanOut(arms=[arm], collector=collector, propagate_fan_in=False)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+    state_manager.task_state.delegate_fan_in = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    # With propagate_fan_in=False, post_process passes outer_fan_in_cbs=[]
+    await processor._handle_dynamic_fanout(parent, fanout, [])
+
+    # No delegation — delegate_fan_in must not be called.
+    state_manager.task_state.delegate_fan_in.assert_not_awaited()
+
+    # The collector must NOT carry the outer fan-in callback.
+    saved_collector = state_manager.save_task.call_args[0][0]
+    assert outer_fan_in_cb not in saved_collector.dag_callbacks
 
 
 @pytest.mark.asyncio
@@ -974,7 +1182,7 @@ async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
         status=TaskStatus.COMPLETED,
         queue="default",
     )
-    fanout = DynamicFanOut(children=[DAGNode("child")], collector=DAGNode("collect"))
+    fanout = DynamicFanOut(arms=[DAGNode("child")], collector=DAGNode("collect"))
 
     state_manager = _make_state_manager()
     processor = TaskProcessor(state_manager)
@@ -982,7 +1190,7 @@ async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
     with patch.object(processor, "_handle_dynamic_fanout", new_callable=AsyncMock) as mock_fanout:
         await processor.post_process(parent, dynamic_fanout=fanout)
 
-    mock_fanout.assert_awaited_once_with(parent, fanout)
+    mock_fanout.assert_awaited_once_with(parent, fanout, [])
 
 
 @pytest.mark.asyncio

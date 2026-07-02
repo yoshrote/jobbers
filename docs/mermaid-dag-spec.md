@@ -54,6 +54,9 @@ fetch_data(limit=100, ids=~WzEsMiwzXQ==, config=~eyJyZXRyaWVzIjozfQ==)
 | ----- | ------- |
 | `-->` | **Success callback** — fires when the source task completes successfully. Automatically promoted to a `FanInCallback` when the destination has ≥ 2 incoming `-->` edges. |
 | `-.->` | **Error callback** — fires only when the source reaches `FAILED` status (retries exhausted or unexpected exception). `CANCELLED`, `STALLED`, and `DROPPED` outcomes do **not** trigger this, nor do tasks that are still retrying. Each source node may have **at most one** `-.->` target. Diagrams with more than one `-.->` from the same source are rejected with a parse error. |
+| `-->>` | **Dynamic fan-out** — the source task's results drive a runtime fan-out. The destination is the arm-chain root template. See the Dynamic fan-out section below. |
+| `--"key">>` | **Dynamic fan-out with custom items key** — same as `-->>` but reads `results["key"]` instead of `results["items"]` for the list of arm parameters. |
+| `--o` | **Fan-in boundary** — marks the arm terminal. The destination is the collector task submitted once all arm instances have completed. |
 
 ---
 
@@ -196,14 +199,131 @@ If the task is the root of a DAG (`dag_callbacks` is non-empty), the response in
 
 ---
 
-## Known limitations
+## Dynamic fan-out
 
-The mermaid format is a **static** representation of a DAG.  Some features of the Python `DAGNode` / `DAGTaskSpec` API cannot be expressed in a diagram:
+Dynamic fan-out lets a diagram declare that a dispatcher task's output determines how many arm instances to spawn at runtime.  The number of arms is unknown at submission time; the dispatcher task returns a list of parameter dicts and the processor spawns one arm instance per entry.
+
+### Syntax
+
+```mermaid
+flowchart TD
+    A["fetch_records"]
+    B["process_record"]
+    C["aggregate_results"]
+
+    A -->> B
+    B --o C
+```
+
+| Edge | Meaning |
+| ---- | ------- |
+| `A -->> B` | `A` is the **dispatcher**; `B` is the **arm template** (root of each arm instance). |
+| `B --o C` | `B` is the **arm terminal** (last step of each arm); `C` is the **collector** submitted once all arms complete. |
+
+### Result data convention
+
+The dispatcher task returns a plain dict.  The processor reads a list under a configured key and spawns one arm instance per entry:
+
+```python
+@register_task(name="fetch_records", version=1)
+async def fetch_records(**kwargs) -> dict:
+    records = await db.fetch_pending()
+    return {"items": [{"record_id": r.id} for r in records]}
+```
+
+**Default key:** `"items"`.  Each entry is shallow-merged into the arm template's static parameters (entry values take precedence over template defaults).
+
+**Custom key:** specify it in the edge label:
+
+```mermaid
+A --"batches">> B
+```
+
+This reads `results["batches"]` instead.
+
+If the key is missing or its value is not a list, the processor submits the collector immediately (zero-arm degenerate case) and logs a warning.
+
+### Multi-step arm chain
+
+The arm template can itself be a chain of tasks connected by `-->` edges:
+
+```mermaid
+flowchart TD
+    A["fetch_records"]
+    B["start_processing"]
+    E["finish_processing"]
+    C["aggregate_results"]
+
+    A -->> B
+    B --> E
+    E --o C
+```
+
+Each arm instance runs `B → E`.  The `--o` edge identifies `E` as the terminal that fans into `C`.
+
+### Static fan-in within each arm
+
+An arm chain can contain its own static fan-in:
+
+```mermaid
+flowchart TD
+    A["fetch_records"]
+    B["split_chunk"]
+    B1["process_part_a"]
+    B2["process_part_b"]
+    D["merge_chunk"]
+    C["aggregate_all"]
+
+    A -->> B
+    B --> B1
+    B --> B2
+    B1 --> D
+    B2 --> D
+    D --o C
+```
+
+`B1` and `B2` are a static fan-in within each arm instance.  `D` is the arm terminal.
+
+### Nested fan-out
+
+An arm task can itself be a dispatcher, producing a nested fan-out:
+
+```mermaid
+flowchart TD
+    A["split_batches"]
+    B["process_batch"]
+    D["aggregate_batch"]
+    R["process_record"]
+    C["aggregate_all"]
+
+    A -->> B
+    B -->> R
+    R --o D
+    D --o C
+```
+
+`B` dispatches an inner fan-out over `R`.  `R` instances fan into `D` (inner collector); `D` instances fan into `C` (outer collector).  `propagate_fan_in=True` (the default) ensures `D` does not decrement the outer fan-in set until its own inner arms complete.
+
+### Node IDs in live diagrams
+
+In system-generated diagrams (task detail view), arm nodes are expanded with their actual execution ULIDs.  This means each arm instance appears as a distinct node in the diagram, and the manager UI can link each node to `GET /task-status/{id}` for per-arm statistics.
+
+### Constraints
+
+- Each dispatcher node may have **at most one** `-->>` edge.  Multiple fan-out edges from the same source are rejected with a parse error.
+- Each arm terminal may have **at most one** `--o` edge.
+- `--o` cannot be used as a generic Mermaid circle-head arrow in Jobbers diagrams; it always means "fan-in boundary".
+- Error callbacks (`-.->`) on the dispatcher work as normal.  Per-arm error callbacks are not expressible in the diagram; use the Python `DynamicFanOut` / `DAGNode` API directly if per-arm error handling is needed.
+
+---
+
+## Known limitations
 
 | Feature | Status |
 | ------- | ------ |
-| `DynamicFanOut` returned from a task function at runtime | **Not representable in mermaid.** `DynamicFanOut` is produced inside a task function during execution; the number of branches cannot be known at authoring time. Use the Python `DAGNode` API directly when this pattern is required. *(A Mermaid decision-node syntax is proposed but not yet implemented — see "Proposed changes" below.)* |
-| Multiple `-.->` error edges from the same source node | **Parse error.** The parser rejects diagrams with more than one error edge per source and raises `MermaidParseError`. This matches the underlying model constraint that each node has at most one error callback. |
+| Multiple `-.->` error edges from the same source node | **Parse error.** The parser rejects diagrams with more than one error edge per source. |
+| Per-arm error callbacks | **Not expressible.** Use the `DAGNode` API directly. |
+| Multiple arm template chains from one dispatcher | **Not supported.** Each dispatcher has a single arm template. |
 
 ---
 
@@ -212,115 +332,3 @@ The mermaid format is a **static** representation of a DAG.  Some features of th
 - **Parser**: custom regex-based (`jobbers/utils/mermaid_dag.py`), no third-party mermaid library required.  The grammar is small enough that a purpose-built parser is simpler and has zero extra dependencies.  If the grammar grows substantially, [`lark`](https://github.com/lark-parser/lark) (pure Python) is the recommended upgrade path.
 - **Frontend rendering**: [`mermaid`](https://www.npmjs.com/package/mermaid) npm package.
 - **Frontend validation**: [`@mermaid-js/parser`](https://www.npmjs.com/package/@mermaid-js/parser) npm package for real-time syntax checking in the editor.
-
----
-
-## Proposed changes
-
-> **NOT YET IMPLEMENTED.** The decision-node syntax, `@register_router`, `--o` fan-in edges from decision nodes, and diamond `D{...}` shapes described in this section do not exist in the current parser. Submitting a diagram containing `D{...}` nodes will produce a parse error. For runtime fan-out today, use the `TaskResult` + `DynamicFanOut` Python API described in [DAG Patterns](dags.md).
-
-### Decision nodes (dynamic fan-out)
-
-A diamond-shaped decision node would declare a dynamic fan-out whose number of children is determined at runtime by a registered routing function:
-
-```text
-D{"router_name[(key=val, ...)]"}
-```
-
-The routing function is called inline by the worker (not as a full task) with the dispatcher task's results and the optional router params. It returns a list of parameter dicts — one per child instance to spawn.
-
-#### Syntax
-
-```mermaid
-flowchart TD
-    A["fetch_records"]
-    D{"fanout"}
-    B["process_record"]
-    C["aggregate_results"]
-
-    A --> D
-    D --> B
-    B --o C
-```
-
-What this describes:
-
-1. `A` completes and its results are passed to the `fanout` routing function.
-2. The router returns N parameter dicts; one instance of `B` is spawned per dict, with the dict merged into `B`'s parameters.
-3. All `B` instances fan in to `C` — `C` runs once all branches complete.
-
-**With a multi-step branch chain** (`B --> E` before collecting):
-
-```mermaid
-flowchart TD
-    A["fetch_records"]
-    D{"fanout"}
-    B["process_chunk"]
-    E["enrich_result"]
-    C["aggregate_results"]
-
-    A --> D
-    D --> B
-    B --> E
-    E --o C
-```
-
-Each branch runs `B → E`; all `E` instances fan into `C`.
-
-**With router params:**
-
-```mermaid
-flowchart TD
-    A["fetch_records"]
-    D{"split_by_type(batch_size=10)"}
-    B["process_chunk"]
-    C["aggregate"]
-
-    A --> D
-    D --> B
-    B --o C
-```
-
-#### Edge contract
-
-| Edge | Meaning |
-| ---- | ------- |
-| `A --> D{...}` | `A` is the dispatcher; `D` is the routing node. |
-| `D --> B` | `B` is the first node in each per-branch chain. |
-| `B --> E` | Normal chain within the branch (zero or more intermediate steps). |
-| `E --o C` | `C` is the collector; `--o` marks the fan-in boundary. |
-
-`C` is a plain `["..."]` task node — no special shape needed.
-
-#### Router registry
-
-Routing functions would be registered with `@register_router`:
-
-```python
-from jobbers.registry import register_router
-
-@register_router("split_by_type")
-def split_by_type(parent_results: dict, batch_size: int = 1) -> list[dict]:
-    items = parent_results.get("items", [])
-    return [{"item": item} for item in items]
-```
-
-**Signature:** `(parent_results: dict[str, Any], **router_params) -> list[dict[str, Any]]`
-
-- `parent_results` — the `results` dict stored on the completed dispatcher task.
-- `**router_params` — any params declared in the decision node label, type-coerced using the same rules as task parameters.
-- Return value — a list of parameter dicts; one child instance is spawned per entry, with the dict shallow-merged into the branch template's declared parameters.
-
-**Built-in routers:**
-
-| Name | Behaviour |
-| ---- | --------- |
-| `fanout` | Expects `parent_results["items"]` to be a list; returns `[{"item": x} for x in items]`. |
-
-#### Constraints / scope
-
-- **Single child template chain per decision node.** Multiple diverging templates from one decision node (routing to different task types) is future work.
-- Decision nodes have **no task lifecycle**: no SUBMITTED/STARTED/COMPLETED, no retries, no DLQ. If the router function raises, the dispatcher task fails.
-- **`--o` is co-opted** for fan-in edges only; it cannot be used as a generic Mermaid circle-head arrow in Jobbers diagrams.
-- **Error callbacks**: `A -.-> err` on the dispatcher works as normal. Per-child-instance error callbacks are not expressible.
-- **Nested decision nodes** (a branch that itself fans out) are not supported.

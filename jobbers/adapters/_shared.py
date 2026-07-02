@@ -74,9 +74,20 @@ class SharedTaskAdapterMixin(ABC):
         return {removed, redis.call('SCARD', KEYS[1])}
     """
 
+    # Atomically swap old_id for new_id in both the tracking set (KEYS[1]) and
+    # the permanent members set (KEYS[2]).  Used by delegate_fan_in when a nested
+    # DynamicFanOut transfers the outer fan-in responsibility to a grandcollector.
+    _DELEGATE_FAN_IN_SCRIPT = """
+        redis.call('SREM', KEYS[1], ARGV[1])
+        redis.call('SADD', KEYS[1], ARGV[2])
+        redis.call('SREM', KEYS[2], ARGV[1])
+        redis.call('SADD', KEYS[2], ARGV[2])
+    """
+
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
         self._fan_in_script = self.data_store.register_script(self._FAN_IN_SCRIPT)
+        self._delegate_fan_in_script = self.data_store.register_script(self._DELEGATE_FAN_IN_SCRIPT)
 
     @property
     def backend_key(self) -> str:
@@ -369,7 +380,9 @@ class SharedTaskAdapterMixin(ABC):
         """Return all tasks currently present in any heartbeat sorted set."""
         task_id_bytes: set[bytes] = set()
         for queue in queues:
-            members = cast("list[bytes]", await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1))
+            members = cast(
+                "list[bytes]", await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1)
+            )
             task_id_bytes.update(members)
         if not task_id_bytes:
             return []
@@ -422,6 +435,14 @@ class SharedTaskAdapterMixin(ABC):
         members_key = f"{fan_in_key}:members"
         raw: set[bytes] = await cast("Awaitable[set[bytes]]", self.data_store.smembers(members_key))
         return [ULID.from_str(m.decode()) for m in raw]
+
+    async def delegate_fan_in(self, fan_in_key: str, old_id: ULID, new_id: ULID) -> None:
+        """Atomically swap *old_id* for *new_id* in the fan-in tracking and members sets."""
+        members_key = f"{fan_in_key}:members"
+        await self._delegate_fan_in_script(
+            keys=[fan_in_key, members_key],
+            args=[str(old_id).encode(), str(new_id).encode()],
+        )
 
     async def task_exists(self, task_id: ULID) -> bool:
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))

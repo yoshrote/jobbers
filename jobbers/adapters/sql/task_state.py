@@ -438,6 +438,28 @@ class SQLTaskState:
             )
             return [ULID.from_str(row.task_id) for row in result.all()]
 
+    async def delegate_fan_in(self, fan_in_key: str, old_id: ULID, new_id: ULID) -> None:
+        """Replace *old_id* with *new_id* in the fan-in set for *fan_in_key*."""
+        old_str = str(old_id)
+        new_str = str(new_id)
+        now = dt.datetime.now(dt.UTC)
+        async with self._sf() as session:
+            async with session.begin():
+                # DELETE old row and INSERT new one — avoids mutating the composite PK in place.
+                await session.execute(
+                    delete(task_fan_in).where(
+                        task_fan_in.c.fan_in_key == fan_in_key,
+                        task_fan_in.c.task_id == old_str,
+                    )
+                )
+                async with session.begin_nested() as sp:
+                    try:
+                        await session.execute(
+                            insert(task_fan_in).values(fan_in_key=fan_in_key, task_id=new_str, created_at=now)
+                        )
+                    except IntegrityError:
+                        await sp.rollback()  # new_id already present — idempotent
+
     # ── DAG run index ───────────────────────────────────────────────────────
 
     async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:

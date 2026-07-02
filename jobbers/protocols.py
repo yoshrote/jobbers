@@ -238,6 +238,15 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
     async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None: ...
     async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int: ...
     async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]: ...
+    async def delegate_fan_in(self, fan_in_key: str, old_id: ULID, new_id: ULID) -> None:
+        """
+        Atomically replace *old_id* with *new_id* in the tracking set and the permanent members set for *fan_in_key*.
+
+        Used when a dynamic fanout arm itself returns a nested ``DynamicFanOut``
+        with ``propagate_fan_in=True``: the arm's ID is swapped for the
+        grandcollector's ID so the outer fan-in waits for the grandcollector.
+        """
+        ...
 
     # DAG run index
     async def get_dag_runs(

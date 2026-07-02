@@ -1,12 +1,20 @@
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args, get_origin, get_type_hints
 
 from opentelemetry import metrics
 
 from jobbers import registry
 from jobbers.context import _current_task as _current_task_cv
-from jobbers.models.dag import DAGNode, DynamicFanOut, TaskResult
+from jobbers.models.dag import (
+    DAGNode,
+    DAGTaskSpec,
+    DynamicFanOut,
+    DynamicFanOutCallback,
+    FanInCallback,
+    SimpleCallback,
+    TaskResult,
+)
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
@@ -18,8 +26,69 @@ from jobbers.utils.di import Depends as _Depends
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
+    from ulid import ULID
+
 
 logger = logging.getLogger(__name__)
+
+
+class _FanInPred(NamedTuple):
+    node: DAGNode
+    err_node: DAGNode | None
+    inject_parent_results: bool
+
+
+def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
+    """
+    Reconstruct a ``DAGNode`` builder tree from a ``DAGTaskSpec`` subtree.
+
+    Walks all ``SimpleCallback`` and ``FanInCallback`` entries recursively,
+    creates one ``DAGNode`` per spec (preserving its pre-assigned ULID), and
+    wires them with ``.then()`` / ``DAGNode.merge()`` to match the original
+    graph structure.  ``DynamicFanOutCallback`` entries are ignored — nested
+    declarative fanouts are driven by the processor when those tasks execute.
+    """
+    # First pass: collect every reachable spec and create a matching DAGNode.
+    all_specs: dict[ULID, DAGTaskSpec] = {}
+    all_nodes: dict[ULID, DAGNode] = {}
+
+    def _collect(s: DAGTaskSpec) -> None:
+        if s.id in all_specs:
+            return
+        all_specs[s.id] = s
+        all_nodes[s.id] = DAGNode(
+            s.name, queue=s.queue, version=s.version, parameters=dict(s.parameters), task_id=s.id
+        )
+        for cb in s.dag_callbacks:
+            if isinstance(cb, (SimpleCallback, FanInCallback)):
+                _collect(cb.task)
+                if cb.error_callback:
+                    _collect(cb.error_callback)
+
+    _collect(root)
+
+    # Second pass: wire edges, collecting fan-in predecessor groups.
+    fan_in_preds: dict[ULID, list[_FanInPred]] = {}
+    for spec_id, spec in all_specs.items():
+        node = all_nodes[spec_id]
+        for cb in spec.dag_callbacks:
+            if isinstance(cb, SimpleCallback):
+                successor = all_nodes[cb.task.id]
+                err_node = all_nodes.get(cb.error_callback.id) if cb.error_callback else None
+                node.then(successor, on_error=err_node, inject_parent_results=cb.inject_parent_results)
+            elif isinstance(cb, FanInCallback):
+                err_node = all_nodes.get(cb.error_callback.id) if cb.error_callback else None
+                fan_in_preds.setdefault(cb.task.id, []).append(
+                    _FanInPred(node, err_node, cb.inject_parent_results)
+                )
+
+    for collector_id, preds in fan_in_preds.items():
+        collector_node = all_nodes[collector_id]
+        for pred in preds:
+            DAGNode.merge(pred.node, into=collector_node, on_error=pred.err_node,
+                          inject_parent_results=pred.inject_parent_results)
+
+    return all_nodes[root.id]
 
 
 meter = metrics.get_meter(__name__)
@@ -208,12 +277,29 @@ class TaskProcessor:
         logger.info("Task %s started (attempt %d).", task.id, task.retry_attempt + 1)
 
     async def post_process(self, task: Task, dynamic_fanout: DynamicFanOut | None = None) -> None:
+        # Handle declarative DynamicFanOutCallbacks embedded in the task spec.
+        # These are produced by the mermaid parser; task functions that return
+        # DynamicFanOut directly use the dynamic_fanout path below instead.
+        for cb in task.dag_callbacks:
+            if isinstance(cb, DynamicFanOutCallback):
+                await self._handle_declarative_fanout(task, cb)
+
+        # Detect outer fan-in callbacks that should be delegated to the grandcollector
+        # instead of being decremented by this task.  Only applies when propagate_fan_in
+        # is True (the default) on the returned DynamicFanOut.
+        outer_fan_in_cbs: list[FanInCallback] = []
+        if dynamic_fanout is not None and dynamic_fanout.propagate_fan_in:
+            outer_fan_in_cbs = [cb for cb in task.dag_callbacks if isinstance(cb, FanInCallback)]
+
         if dynamic_fanout is not None:
-            await self._handle_dynamic_fanout(task, dynamic_fanout)
+            await self._handle_dynamic_fanout(task, dynamic_fanout, outer_fan_in_cbs)
         if task.has_callbacks():
-            callbacks = await task.generate_callbacks(self.state_manager.task_state)
-            for cb in callbacks:
-                cb.queue = await self.state_manager.resolve_queue(cb)
+            skip_keys = frozenset(cb.fan_in_key for cb in outer_fan_in_cbs)
+            callbacks = await task.generate_callbacks(
+                self.state_manager.task_state, skip_fan_in_keys=skip_keys
+            )
+            for callback in callbacks:
+                callback.queue = await self.state_manager.resolve_queue(callback)
             await self.state_manager.submit_tasks_batch(callbacks)
 
     async def post_process_error(self, task: Task) -> None:
@@ -224,54 +310,142 @@ class TaskProcessor:
                 cb.queue = await self.state_manager.resolve_queue(cb)
             await self.state_manager.submit_tasks_batch(error_callbacks)
 
-    async def _handle_dynamic_fanout(self, parent: Task, fanout: DynamicFanOut) -> None:
+    async def _handle_declarative_fanout(self, parent: Task, cb: DynamicFanOutCallback) -> None:
+        """
+        Drive a declarative fan-out declared in a ``DynamicFanOutCallback``.
+
+        Reads ``parent.results[cb.items_key]`` (a list of dicts) and spawns one
+        arm instance per entry by cloning ``cb.arm_root`` with the entry's params
+        shallow-merged in (entry values override the template's static params).
+        ``cb.collector`` is used as-is for the fan-in collector.
+
+        Delegates to ``_handle_dynamic_fanout`` so that all fan-in wiring,
+        pre-save, and arm submission are handled identically to the programmatic
+        path.
+        """
+        items = parent.results.get(cb.items_key)
+        if not isinstance(items, list):
+            logger.warning(
+                "DynamicFanOutCallback on task %s: results[%r] is missing or not a list; "
+                "submitting collector immediately.",
+                parent.id,
+                cb.items_key,
+            )
+            items = []
+
+        # Build arm DAGNodes from the template, merging per-item params.
+        arm_nodes: list[DAGNode] = []
+        fresh_root, _ = cb.arm_root.fresh_copy()
+        for item_params in items:
+            cloned, _ = cb.arm_root.fresh_copy()
+            merged_params = {**fresh_root.parameters, **(item_params if isinstance(item_params, dict) else {})}
+            cloned = cloned.model_copy(update={"parameters": merged_params})
+            # Rebuild a DAGNode from the spec so _handle_dynamic_fanout can walk it.
+            arm_nodes.append(_spec_to_dag_node(cloned))
+
+        collector_node = _spec_to_dag_node(cb.collector.fresh_copy()[0])
+
+        outer_fan_in_cbs: list[FanInCallback] = (
+            [fc for fc in parent.dag_callbacks if isinstance(fc, FanInCallback)]
+            if cb.propagate_fan_in
+            else []
+        )
+        fanout = DynamicFanOut(
+            arms=arm_nodes,
+            collector=collector_node,
+            fan_in_ttl=cb.fan_in_ttl,
+            propagate_fan_in=cb.propagate_fan_in,
+        )
+        await self._handle_dynamic_fanout(parent, fanout, outer_fan_in_cbs)
+
+    async def _handle_dynamic_fanout(
+        self,
+        parent: Task,
+        fanout: DynamicFanOut,
+        outer_fan_in_cbs: list[FanInCallback],
+    ) -> None:
         """
         Wire and submit a runtime fan-out produced by a task function.
 
-        Calls `DAGNode.merge` to attach `FanInCallback`s to each child,
-        initialises the Redis tracking + members sets, pre-saves the collector
-        so it exists when the first child finishes, then submits all children
-        atomically in a single pipeline.
+        Finds the terminal (leaf) nodes of each arm, calls `DAGNode.merge` to
+        attach `FanInCallback`s to those terminals, initialises all fan-in sets
+        (both intermediate sets within multi-step arms and the collector set),
+        pre-saves the collector so it exists when the first terminal finishes,
+        then submits all arm-root tasks atomically.
 
-        **Best practice:** assign child tasks to queues without rate limiting.
-        Once a DAG is executing there is no safe recourse if a child submission
-        is rejected — the fan-in would be initialised but never complete.
-        Rate limits on child queues are bypassed with a warning logged.
-        Capacity limits (max_concurrent) are not enforced at submission time
-        but a low limit may cause queue backpressure that delays fan-in completion.
+        When *outer_fan_in_cbs* is non-empty the collector is a grandcollector:
+        those callbacks are transferred to it and the parent's ID is swapped for
+        the collector's ID in each outer fan-in set so the outer fan-in waits for
+        the grandcollector rather than this task.
+
+        **Best practice:** assign arm tasks to queues without rate limiting.
+        Once a DAG is executing there is no safe recourse if a submission is
+        rejected — the fan-in would be initialised but never complete.
+        Rate limits on arm queues are bypassed with a warning logged.
         """
-        if not fanout.children:
-            # Degenerate case: no children — submit the collector immediately.
+        if not fanout.arms:
+            # Degenerate case: no arms — submit the collector immediately.
             solo = fanout.collector.to_task(dag_run_id=parent.dag_run_id)
             await self.state_manager.submit_task(solo)
             return
 
+        # 1. Find the terminal (leaf) nodes of each arm before wiring the collector.
+        #    For single-step arms these are the arm roots themselves.
+        terminals = DAGNode.find_terminals(fanout.arms)
+
+        # 2. Collect intermediate fan-in sets within multi-step arm sub-chains.
+        #    fan_in_predecessors() walks the builder graph and returns all FanInCallback
+        #    key→predecessor-id mappings present *before* we wire the collector.
+        all_fan_ins: dict[str, set[ULID]] = {}
+        for arm in fanout.arms:
+            for k, v in arm.fan_in_predecessors().items():
+                all_fan_ins.setdefault(k, set()).update(v)
+
+        # 3. Wire the collector fan-in to the terminal nodes (not the arm roots).
         fan_in_key = f"dag:fan-in:{fanout.collector.id}"
-        DAGNode.merge(*fanout.children, into=fanout.collector)
+        DAGNode.merge(*terminals, into=fanout.collector)
+        terminal_ids = {t.id for t in terminals}
+        all_fan_ins[fan_in_key] = terminal_ids
 
-        child_ids = {child.id for child in fanout.children}
-        child_tasks = [
-            child.to_task(parent_id=parent.id, dag_run_id=parent.dag_run_id) for child in fanout.children
-        ]
+        # 4. Build tasks: submit arm roots, collector waits for terminal IDs.
+        arm_tasks = [arm.to_task(parent_id=parent.id, dag_run_id=parent.dag_run_id) for arm in fanout.arms]
         collector_task = fanout.collector.to_task(dag_run_id=parent.dag_run_id)
-        collector_task.parent_ids = list(child_ids)
+        collector_task.parent_ids = list(terminal_ids)
 
-        await self.state_manager.init_fan_in(fan_in_key, child_ids, ttl=fanout.fan_in_ttl)
-        # Pre-save the collector so it exists in Redis when the first child completes.
+        # 5. Delegation: transfer outer fan-in callbacks to the collector and
+        #    atomically swap parent's ID → collector's ID in each outer fan-in set.
+        if outer_fan_in_cbs:
+            collector_task.dag_callbacks = list(collector_task.dag_callbacks) + cast(
+                "list[SimpleCallback | FanInCallback | DynamicFanOutCallback]", outer_fan_in_cbs
+            )
+            await asyncio.gather(
+                *(
+                    self.state_manager.task_state.delegate_fan_in(
+                        cb.fan_in_key, parent.id, fanout.collector.id
+                    )
+                    for cb in outer_fan_in_cbs
+                )
+            )
+
+        # 6. Initialise all fan-in sets, pre-save the collector, submit arm roots.
+        await asyncio.gather(
+            *(self.state_manager.init_fan_in(k, ids, ttl=fanout.fan_in_ttl) for k, ids in all_fan_ins.items())
+        )
+        # Pre-save the collector so it exists in the store when the first terminal completes.
         await self.state_manager.save_task(collector_task)
 
-        # Warn if any child queue has rate limiting — we bypass it below.
-        child_queues = list({ct.queue for ct in child_tasks})
-        configs = await asyncio.gather(*(self.state_manager.get_queue_config(q) for q in child_queues))
-        for queue, config in zip(child_queues, configs):
+        # Warn if any arm queue has rate limiting — we bypass it below.
+        arm_queues = list({at.queue for at in arm_tasks})
+        configs = await asyncio.gather(*(self.state_manager.get_queue_config(q) for q in arm_queues))
+        for queue, config in zip(arm_queues, configs):
             if config and config.rate_numerator and config.rate_denominator and config.rate_period:
                 logger.warning(
-                    "Queue '%s' has rate limiting configured but DAG child task submission "
-                    "bypasses rate limits. Assign child tasks to queues without rate limiting.",
+                    "Queue '%s' has rate limiting configured but DAG arm task submission "
+                    "bypasses rate limits. Assign arm tasks to queues without rate limiting.",
                     queue,
                 )
 
-        await self.state_manager.submit_tasks_batch(child_tasks)
+        await self.state_manager.submit_tasks_batch(arm_tasks)
 
     async def handle_dropped_task(self, task: Task) -> None:
         logger.error("Dropping unknown task %s v%s id=%s.", task.name, task.version, task.id)
