@@ -132,7 +132,9 @@ class SQLTaskSubmit:
                     except IntegrityError:
                         await sp.rollback()
 
-                anchor_stmt = select(rate_limit_anchors.c.queue).where(rate_limit_anchors.c.queue == queue_name)
+                anchor_stmt = select(rate_limit_anchors.c.queue).where(
+                    rate_limit_anchors.c.queue == queue_name
+                )
                 if self._use_for_update:
                     anchor_stmt = anchor_stmt.with_for_update()
                 await session.execute(anchor_stmt)
@@ -171,7 +173,9 @@ class SQLTaskSubmit:
                 )
                 if result.rowcount == 0:  # type: ignore[attr-defined]
                     await session.execute(
-                        insert(rate_limit_entries).values(queue=queue_name, task_id=task_id_str, submitted_at=now)
+                        insert(rate_limit_entries).values(
+                            queue=queue_name, task_id=task_id_str, submitted_at=now
+                        )
                     )
 
                 await _upsert_task(session, _task_to_row(task))

@@ -369,7 +369,9 @@ class SharedTaskAdapterMixin(ABC):
         """Return all tasks currently present in any heartbeat sorted set."""
         task_id_bytes: set[bytes] = set()
         for queue in queues:
-            members = cast("list[bytes]", await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1))
+            members = cast(
+                "list[bytes]", await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1)
+            )
             task_id_bytes.update(members)
         if not task_id_bytes:
             return []
