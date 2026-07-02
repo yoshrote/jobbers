@@ -892,6 +892,31 @@ async def test_get_fan_in_members_returns_predecessor_ids(task_adapter):
     assert set(await state.get_fan_in_members(fan_in_key)) == predecessor_ids
 
 
+@pytest.mark.asyncio
+async def test_delegate_fan_in_swaps_id_in_tracking_and_members_sets(task_adapter):
+    """delegate_fan_in atomically replaces old_id with new_id in both tracking and members sets."""
+    state, _ = task_adapter
+    fan_in_key = "fan-in:delegate-test"
+    new_id = ULID4
+
+    # Initialise with ULID1 and ULID2 so there are two predecessors.
+    await state.init_fan_in(fan_in_key, {ULID1, ULID2})
+
+    # Delegate ULID1 → new_id (simulating a nested fanout where new_id's
+    # grandcollector will report completion instead of ULID1).
+    await state.delegate_fan_in(fan_in_key, ULID1, new_id)
+
+    # The tracking set should now contain ULID2 and new_id (not ULID1).
+    # Completing ULID2 leaves 1 remaining; new_id completes the set.
+    assert await state.fan_in_complete(fan_in_key, ULID2) == 1
+    assert await state.fan_in_complete(fan_in_key, new_id) == 0
+
+    # The members set must also contain new_id so the collector gets the right parent_ids.
+    members = set(await state.get_fan_in_members(fan_in_key))
+    assert new_id in members
+    assert ULID1 not in members
+
+
 # ── compare_and_set_status ────────────────────────────────────────────────────
 
 

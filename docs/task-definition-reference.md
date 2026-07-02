@@ -44,7 +44,7 @@ Task functions may return a plain dict, `None`, or a `TaskResult`:
 | --- | --- |
 | `dict` | Stored as `task.results`; available to downstream tasks via `task.parent_results`. |
 | `None` | Treated as an empty result (`{}`). Use for fire-and-forget tasks that produce no output. |
-| `TaskResult` | Only needed to trigger a `DynamicFanOut`. See [dag-composition.md](dag-composition.md). |
+| `TaskResult` | Only needed for the *programmatic* `DynamicFanOut` API. For diagram-declared fan-outs (`-->>` / `--o`), return a plain dict instead. See [dag-composition.md](dag-composition.md). |
 
 For most tasks, return a plain dict:
 
@@ -55,7 +55,32 @@ async def compute_stats(dataset_id: int, **kwargs) -> dict:
     return {"count": len(rows)}
 ```
 
-Use `task.make_result()` only when triggering a dynamic fan-out:
+### Fanout dispatcher result shape
+
+When a task is declared as a dynamic fan-out dispatcher in a mermaid diagram (`-->>` edge), its return dict must include a list of parameter dicts under a configured key.  The processor reads this list and spawns one arm instance per entry.
+
+**Default key:** `"items"`
+
+```python
+@register_task(name="fetch_records", version=1)
+async def fetch_records(**kwargs) -> dict:
+    records = await db.fetch_pending()
+    return {
+        "count": len(records),             # stored on dispatcher; accessible via parent_results()
+        "items": [                          # one entry per arm instance
+            {"record_id": r.id, "priority": r.priority}
+            for r in records
+        ],
+    }
+```
+
+**Custom key:** set in the diagram edge label — `A --"batches">> B` reads `results["batches"]`.
+
+**Parameter merging:** each entry dict is shallow-merged into the arm template's static parameters from the diagram.  Entry values take precedence over template defaults.
+
+**Zero-item case:** if the key is missing or its value is not a list, the processor submits the collector immediately with no arm instances and logs a warning.
+
+Use `task.make_result()` only when triggering a fan-out *programmatically* (the `DynamicFanOut` API):
 
 ```python
 from jobbers.context import get_current_task
@@ -65,11 +90,11 @@ from jobbers.models.dag import DynamicFanOut, DAGNode
 async def dispatch_work(**kwargs):
     task = get_current_task()
     items = await fetch_items()
-    children = [DAGNode("process_item", parameters={"id": i}) for i in items]
+    arms = [DAGNode("process_item", parameters={"id": i}) for i in items]
     collector = DAGNode("aggregate_results")
     return task.make_result(
         results={"count": len(items)},
-        fanout=DynamicFanOut(children=children, collector=collector),
+        fanout=DynamicFanOut(arms=arms, collector=collector),
     )
 ```
 

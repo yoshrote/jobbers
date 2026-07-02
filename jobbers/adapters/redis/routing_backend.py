@@ -158,7 +158,8 @@ class RedisTaskRoutingConfigAdapter:
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
         raw = cast(
-            "bytes | None", await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version))
+            "bytes | None",
+            await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version)),
         )
         if raw is None:
             return None

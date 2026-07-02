@@ -10,7 +10,7 @@ from ulid import ULID
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.utils.di import get_injected_param_names
 
-from .dag import DAGCallback, DAGTaskSpec, FanInCallback, SimpleCallback, TaskResult
+from .dag import DAGCallback, DAGTaskSpec, DynamicFanOutCallback, FanInCallback, SimpleCallback, TaskResult
 from .task_config import TaskConfig
 from .task_status import TaskStatus
 
@@ -206,7 +206,11 @@ class Task(BaseModel):
             if cb.error_callback is not None
         ]
 
-    async def generate_callbacks(self, ta: "TaskStateProtocol") -> list[Self]:
+    async def generate_callbacks(
+        self,
+        ta: "TaskStateProtocol",
+        skip_fan_in_keys: "frozenset[str] | set[str]" = frozenset(),
+    ) -> list[Self]:
         """
         Generate tasks to submit after this task completes.
 
@@ -218,13 +222,23 @@ class Task(BaseModel):
 
         Returns -1 from `fan_in_complete` when the ID was not a member (already
         processed or key expired); in that case the collector is not submitted.
+
+        ``skip_fan_in_keys`` is the set of ``fan_in_key`` values that should NOT
+        be decremented by this task.  Used when the processor has delegated those
+        outer fan-in callbacks to a grandcollector, so the grandcollector's
+        completion — not this task's — decrements the outer set.
         """
         results: list[Self] = []
         for cb in self.dag_callbacks:
             match cb:
+                case DynamicFanOutCallback():
+                    # Handled separately by TaskProcessor.post_process; skip here.
+                    continue
                 case SimpleCallback():
                     results.append(self._build_callback_task(cb.task, [self.id], cb.inject_parent_results))
                 case FanInCallback():
+                    if cb.fan_in_key in skip_fan_in_keys:
+                        continue
                     remaining = await ta.fan_in_complete(cb.fan_in_key, self.id)
                     if remaining == 0:
                         member_ids = await ta.get_fan_in_members(cb.fan_in_key)

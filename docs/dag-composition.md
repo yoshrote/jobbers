@@ -226,7 +226,63 @@ The error node itself is a plain `DAGNode` and can have its own `then()` chain f
 
 ### Dynamic Fan-Out
 
-When the number of children is not known until runtime, call `task.make_result()` with a `DynamicFanOut` from your task function:
+When the number of arms is not known until runtime, declare it in the mermaid diagram using `-->>` (fan-out) and `--o` (fan-in boundary) edges:
+
+```mermaid
+flowchart TD
+    D["dispatch_records"]
+    B["process_record"]
+    C["aggregate_results"]
+
+    D -->> B
+    B --o C
+```
+
+The dispatcher task returns a plain dict with an `"items"` key containing a list of parameter dicts — one per arm to spawn:
+
+```python
+@register_task(name="dispatch_records", version=1)
+async def dispatch_records(**kwargs) -> dict:
+    records = await fetch_pending_records()
+    return {
+        "count": len(records),
+        "items": [{"record_id": r["id"]} for r in records],
+    }
+```
+
+The processor reads `results["items"]` and spawns one `process_record` instance per entry, merging the entry dict into the arm template's parameters.  The fan-in is wired automatically — `aggregate_results` is submitted once all arm instances complete.
+
+#### Result data conventions
+
+| Convention | Details |
+| ---------- | ------- |
+| Default key | `"items"` — the processor reads `results["items"]` by default |
+| Custom key | Add a label to the `-->>` edge: `D --"batches">> B` reads `results["batches"]` |
+| Entry shape | Each entry is a `dict`; its keys are merged into the arm template's static parameters (entry values take precedence) |
+| Non-list / missing | Processor submits the collector immediately with zero arms and logs a warning |
+| Other result fields | Any other keys in the returned dict (`"count"`, etc.) are stored on the dispatcher task and accessible via `parent_results()` |
+
+#### Multi-step arm chains
+
+Connect arm nodes with `-->` edges before the `--o` terminal:
+
+```mermaid
+flowchart TD
+    D["dispatch_records"]
+    B["start_processing"]
+    E["finish_processing"]
+    C["aggregate_results"]
+
+    D -->> B
+    B --> E
+    E --o C
+```
+
+Each arm instance runs `B → E`.  The `--o` edge on `E` marks it as the terminal.
+
+#### Programmatic API (advanced)
+
+For cases where the arm structure itself must be computed in Python (e.g., different task types per arm, or arms that are themselves DAGs determined at runtime), use `DynamicFanOut` directly:
 
 ```python
 from jobbers.models.dag import DAGNode, DynamicFanOut
@@ -235,34 +291,18 @@ from jobbers.models.dag import DAGNode, DynamicFanOut
 async def dispatch_records(**kwargs):
     task = get_current_task()
     records = await fetch_pending_records()
-
-    children = [
+    arms = [
         DAGNode("process_record", parameters={"record_id": r["id"]})
         for r in records
     ]
     collector = DAGNode("aggregate_results")
-
     return task.make_result(
         results={"count": len(records)},
-        fanout=DynamicFanOut(children=children, collector=collector),
+        fanout=DynamicFanOut(arms=arms, collector=collector),
     )
 ```
 
-```mermaid
-graph TD
-    D[dispatch_records] -->|runtime| A[process_record id=1]
-    D --> B[process_record id=2]
-    D --> C[process_record id=N]
-    A --> AG[aggregate_results]
-    B --> AG
-    C --> AG
-```
-
-Jobbers **only supports Dynamic Fan-Out** built programatically at the moment.
-
-The processor wires the fan-in automatically: it initialises the Redis tracking set and submits all children and the collector in the same step. `DynamicFanOut.fan_in_ttl` (default `86400` seconds) controls how long the Redis tracking set persists.
-
-Do **not** call `DAGNode.merge()` yourself in this case — the processor does it.
+The processor wires the fan-in automatically.  Do **not** call `DAGNode.merge()` yourself — the processor does it.
 
 ---
 
@@ -330,9 +370,9 @@ Fan-in tracking sets are created with a TTL (default 24 hours for dynamic fan-ou
 
 A `DAGNode` graph describes a **single run**. You cannot make one cron run depend on the completion of a previous cron run; use a separate application-level gate (e.g., check a status in your own database) inside the root task if you need that.
 
-### Dynamic Fan-Out Nesting
+### Nested Dynamic Fan-Out
 
-Dynamic fan-out (`DynamicFanOut`) can only produce a single collector per invocation. You cannot nest a dynamic fan-out inside another dynamic fan-out in a single task return value. Use a static multi-level DAG instead.
+When using the mermaid syntax (`-->>` / `--o`), nesting is supported — an arm task can itself be a dispatcher with its own `-->>` / `--o` pair (see the mermaid spec for the nested example).  When using the programmatic `DynamicFanOut` API directly, nesting requires the inner `DynamicFanOut` to be returned from the arm task function, which the processor handles via `propagate_fan_in`.
 
 ### Static DAG Shape
 

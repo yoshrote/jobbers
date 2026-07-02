@@ -223,6 +223,9 @@ class AtomicDummyTaskState(DummyTaskState):
     ) -> None:
         pass
 
+    async def delegate_fan_in(self, fan_in_key: str, old_id: object, new_id: object) -> None:
+        pass  # no in-memory fan-in tracking; tests that exercise this go through real adapters
+
 
 class DummyTaskSubmit:
     """

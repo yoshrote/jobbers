@@ -600,7 +600,7 @@ def test_make_result_empty_parent_ids_for_root_task():
 def test_make_result_passes_fanout_through():
     """make_result() includes a fanout when provided."""
     task = Task(id=ULID1, name="dispatcher", version=1, queue="default", status=TaskStatus.STARTED)
-    fanout = DynamicFanOut(children=[DAGNode("child")], collector=DAGNode("collect"))
+    fanout = DynamicFanOut(arms=[DAGNode("child")], collector=DAGNode("collect"))
     result = task.make_result(results={}, fanout=fanout)
 
     assert isinstance(result, TaskResult)

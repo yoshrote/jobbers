@@ -113,7 +113,7 @@ class DAGTaskSpec(BaseModel):
                         inject_parent_results=cb.inject_parent_results,
                     )
                 )
-            else:
+            elif isinstance(cb, FanInCallback):
                 new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
                 new_child = cb.task._remap(id_map)
                 new_collector_id = id_map.setdefault(cb.task.id, new_child.id)
@@ -124,6 +124,19 @@ class DAGTaskSpec(BaseModel):
                         fan_in_key=new_fan_in_key,
                         error_callback=new_err,
                         inject_parent_results=cb.inject_parent_results,
+                    )
+                )
+            else:
+                # DynamicFanOutCallback: remap arm_root and collector specs
+                new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
+                new_callbacks.append(
+                    DynamicFanOutCallback(
+                        arm_root=cb.arm_root._remap(id_map),
+                        collector=cb.collector._remap(id_map),
+                        items_key=cb.items_key,
+                        fan_in_ttl=cb.fan_in_ttl,
+                        propagate_fan_in=cb.propagate_fan_in,
+                        error_callback=new_err,
                     )
                 )
         return DAGTaskSpec(
@@ -161,8 +174,41 @@ class FanInCallback(BaseModel):
     inject_parent_results: bool = False  # Inject all predecessor results as `parent_results` kwarg
 
 
+class DynamicFanOutCallback(BaseModel):
+    """
+    Declarative dynamic fan-out driven by the dispatcher task's result data.
+
+    The processor reads arm parameters from the dispatcher task's results and
+    spawns one arm instance per entry.
+
+    ``arm_root`` is a template ``DAGTaskSpec`` for the root of each arm chain.
+    Each entry in ``dispatcher.results[items_key]`` (a list of dicts) is
+    shallow-merged into the arm root's parameters (entry values take precedence
+    over the template's static parameters).
+
+    ``collector`` is submitted once all arm terminals have completed (fan-in).
+
+    ``propagate_fan_in`` mirrors the same field on ``DynamicFanOut``: when
+    ``True`` (the default), if this dispatcher is itself an arm of an outer
+    fan-in, the outer fan-in responsibility is transferred to ``collector``
+    so the outer fan-in waits for the collector rather than the dispatcher.
+
+    This callback type is produced by the mermaid parser when it encounters a
+    ``-->>`` fan-out edge.  Task functions that need runtime control over arm
+    structure should continue to use ``DynamicFanOut`` / ``TaskResult`` instead.
+    """
+
+    type: Literal["dynamic_fanout"] = "dynamic_fanout"
+    arm_root: DAGTaskSpec
+    collector: DAGTaskSpec
+    items_key: str = "items"
+    fan_in_ttl: int = 86400
+    propagate_fan_in: bool = True
+    error_callback: DAGTaskSpec | None = None
+
+
 # Pydantic discriminated union – serialises/deserialises by the ``type`` field.
-DAGCallback = Annotated[SimpleCallback | FanInCallback, Field(discriminator="type")]
+DAGCallback = Annotated[SimpleCallback | FanInCallback | DynamicFanOutCallback, Field(discriminator="type")]
 
 # Allow self-referential DAGTaskSpec.dag_callbacks.
 DAGTaskSpec.model_rebuild()
@@ -182,6 +228,10 @@ def collect_fan_in_keys(spec: DAGTaskSpec) -> dict[str, set[ULID]]:
             return
         visited.add(s.id)
         for cb in s.dag_callbacks:
+            if isinstance(cb, DynamicFanOutCallback):
+                # Arm fan-in sets are initialised at runtime by the processor,
+                # not at static submission time, so skip here.
+                continue
             if isinstance(cb, FanInCallback):
                 result.setdefault(cb.fan_in_key, set()).add(s.id)
             _walk(cb.task)
@@ -222,6 +272,8 @@ class DAGNode:
         self._parameters: dict[str, Any] = parameters or {}
         # (successor_node, fan_in_key or None, error_node or None, inject_parent_results)
         self._successors: list[tuple[DAGNode, str | None, DAGNode | None, bool]] = []
+        # DynamicFanOutCallback entries declared via the mermaid parser (-->> / --o edges).
+        self._fanout_callbacks: list[DynamicFanOutCallback] = []
 
     @property
     def id(self) -> ULID:
@@ -254,6 +306,31 @@ class DAGNode:
         for node in nodes:
             self._successors.append((node, None, on_error, inject_parent_results))
         return self
+
+    @classmethod
+    def find_terminals(cls, roots: list[DAGNode]) -> list[DAGNode]:
+        """
+        Return all leaf nodes (nodes with no successors) reachable from *roots*.
+
+        Used by the processor to determine which nodes should decrement the fan-in
+        set when dynamic fanout arms are multi-step chains rather than single tasks.
+        """
+        terminals: list[DAGNode] = []
+        visited: set[int] = set()
+
+        def _walk(node: DAGNode) -> None:
+            if id(node) in visited:
+                return
+            visited.add(id(node))
+            if not node._successors:
+                terminals.append(node)
+            else:
+                for successor, _, _, _ in node._successors:
+                    _walk(successor)
+
+        for root in roots:
+            _walk(root)
+        return terminals
 
     @classmethod
     def merge(
@@ -298,6 +375,10 @@ class DAGNode:
             dag_callbacks=self._callbacks_recursive(),
         )
 
+    def add_fanout_callback(self, cb: DynamicFanOutCallback) -> None:
+        """Attach a declarative ``DynamicFanOutCallback`` to this node (used by the mermaid parser)."""
+        self._fanout_callbacks.append(cb)
+
     def _callbacks_recursive(self) -> list[DAGCallback]:
         """Return the list of `DAGCallback` objects for this node's successors."""
         callbacks: list[DAGCallback] = []
@@ -321,6 +402,7 @@ class DAGNode:
                         inject_parent_results=inject_parent_results,
                     )
                 )
+        callbacks.extend(self._fanout_callbacks)
         return callbacks
 
     def to_task(self, *, parent_id: ULID | None = None, dag_run_id: ULID | None = None) -> Task:
@@ -363,15 +445,30 @@ class DAGNode:
 @dataclass
 class DynamicFanOut:
     """
-    Describes runtime fan-out: a dynamic set of children and a collector.
+    Describes runtime fan-out: a dynamic set of arms and a collector.
+
+    Each element of *arms* may be either a single ``DAGNode`` or the root of a
+    multi-step sub-chain built with ``.then()`` and ``.merge()``.  The processor
+    automatically discovers the terminal (leaf) nodes of each arm and wires the
+    fan-in to those terminals, so the collector fires only after every arm has
+    fully completed.
 
     Do NOT call `DAGNode.merge` yourself — the processor does it.
     Embed this in a `TaskResult` to trigger fan-out processing.
+
+    ``propagate_fan_in`` controls behaviour when this task is itself an arm of an
+    outer dynamic fanout (i.e. it has a ``FanInCallback`` in its own
+    ``dag_callbacks``).  When ``True`` (the default), the processor transfers
+    those outer callbacks to the collector so the outer fan-in waits for the
+    collector to complete rather than firing as soon as this task dispatches.
+    Set to ``False`` only when you explicitly want the outer fan-in to fire the
+    moment this task returns, before its own nested fanout finishes.
     """
 
-    children: list[DAGNode]
+    arms: list[DAGNode]
     collector: DAGNode
     fan_in_ttl: int = 86400
+    propagate_fan_in: bool = True
 
 
 @dataclass
@@ -406,11 +503,11 @@ class TaskResult:
     async def dispatch_records(**kwargs):
         task = get_current_task()
         records = await fetch_records()
-        children = [DAGNode("process_record", parameters={"id": r}) for r in records]
+        arms = [DAGNode("process_record", parameters={"id": r}) for r in records]
         collector = DAGNode("aggregate_results")
         return task.make_result(
             results={"count": len(records)},
-            fanout=DynamicFanOut(children=children, collector=collector),
+            fanout=DynamicFanOut(arms=arms, collector=collector),
         )
     ```
     """
