@@ -829,11 +829,11 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 
     state_manager.init_fan_in = AsyncMock()
 
-    _, submitted = await state_manager.submit_dag(branch_a, branch_b)
+    dag_run_id, submitted = await state_manager.submit_dag(branch_a, branch_b)
 
-    # init_fan_in must be called with the collector's fan-in key
+    # init_fan_in must be called with the run's dag_run_id and the collector's fan-in key
     fan_in_key = f"dag:fan-in:{collector.id}"
-    state_manager.init_fan_in.assert_awaited_once_with(fan_in_key, {branch_a.id, branch_b.id})
+    state_manager.init_fan_in.assert_awaited_once_with(dag_run_id, fan_in_key, {branch_a.id, branch_b.id})
     assert len(submitted) == 2
 
 

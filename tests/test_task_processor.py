@@ -834,9 +834,11 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     processor = TaskProcessor(state_manager)
     await processor._handle_dynamic_fanout(parent, fanout, [])
 
-    # init_fan_in called once with correct key and both child IDs
+    # init_fan_in called once with the run's dag_run_id, correct key, and both child IDs
     fan_in_key = f"dag:fan-in:{collector.id}"
-    state_manager.init_fan_in.assert_awaited_once_with(fan_in_key, {c1.id, c2.id}, ttl=fanout.fan_in_ttl)
+    state_manager.init_fan_in.assert_awaited_once_with(
+        dag_run_id, fan_in_key, {c1.id, c2.id}, ttl=fanout.fan_in_ttl
+    )
     # collector pre-saved once with parent_ids == all child IDs
     state_manager.save_task.assert_awaited_once()
     saved_task = state_manager.save_task.call_args[0][0]
@@ -915,7 +917,8 @@ async def test_handle_dynamic_fanout_multi_step_arms_wires_fan_in_to_terminals()
 
     # Collector fan-in must wait for {step_a, root_b} — the *terminals* — not {root_a, root_b}.
     collector_fan_in_key = f"dag:fan-in:{collector.id}"
-    init_calls = {call[0][0]: call[0][1] for call in state_manager.init_fan_in.call_args_list}
+    init_calls = {call[0][1]: call[0][2] for call in state_manager.init_fan_in.call_args_list}
+    assert all(call[0][0] == dag_run_id for call in state_manager.init_fan_in.call_args_list)
     assert collector_fan_in_key in init_calls
     assert init_calls[collector_fan_in_key] == {step_a.id, root_b.id}
 
@@ -971,7 +974,8 @@ async def test_handle_dynamic_fanout_arm_with_static_diamond_inits_both_fan_ins(
 
     outer_key = f"dag:fan-in:{collector.id}"
     inner_key = f"dag:fan-in:{merge_node.id}"
-    init_calls = {c[0][0]: c[0][1] for c in state_manager.init_fan_in.call_args_list}
+    init_calls = {c[0][1]: c[0][2] for c in state_manager.init_fan_in.call_args_list}
+    assert all(c[0][0] == dag_run_id for c in state_manager.init_fan_in.call_args_list)
 
     # Outer fan-in: collector waits for the terminal of arm_A (merge_node) and arm_b.
     assert init_calls[outer_key] == {merge_node.id, arm_b.id}
@@ -1041,7 +1045,7 @@ async def test_handle_dynamic_fanout_with_outer_fan_in_delegates_to_collector():
 
     # delegate_fan_in must swap parent.id → collector.id in the outer fan-in set.
     state_manager.task_state.delegate_fan_in.assert_awaited_once_with(
-        outer_fan_in_key, parent.id, collector.id
+        dag_run_id, outer_fan_in_key, parent.id, collector.id
     )
 
     # The collector task must carry the outer fan-in callback.
@@ -1800,10 +1804,9 @@ async def test_maybe_cleanup_standalone_no_cleanup_on():
 
 @pytest.mark.asyncio
 async def test_maybe_cleanup_dag_task_waits_when_siblings_still_active():
-    """DAG task is NOT deleted when a sibling is still in an active state."""
+    """DAG task is NOT deleted while close_dag_run_task reports predecessors still pending."""
     dag_run_id = ULID()
     task_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
-    sibling_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
 
     task = Task(
         id=task_id,
@@ -1813,12 +1816,11 @@ async def test_maybe_cleanup_dag_task_waits_when_siblings_still_active():
         queue="default",
         dag_run_id=dag_run_id,
     )
-    # Sibling is still STARTED (active).
-    sibling = Task(id=sibling_id, name="test_task", version=1, status=TaskStatus.STARTED, queue="default")
 
     state_manager = _make_state_manager()
-    state_manager.get_dag_run = AsyncMock(return_value=(dt.datetime.now(dt.UTC), [task_id, sibling_id]))
-    state_manager.task_state.get_tasks_bulk = AsyncMock(return_value=[task, sibling])
+    # A sibling is still pending — close_dag_run_task reports 1 remaining.
+    state_manager.close_dag_run_task = AsyncMock(return_value=1)
+    state_manager.get_dag_run = AsyncMock()
 
     task_function = AsyncMock(return_value=None)
     task_config = TaskConfig(
@@ -1833,12 +1835,15 @@ async def test_maybe_cleanup_dag_task_waits_when_siblings_still_active():
         await processor.process(task)
 
     assert task.status == TaskStatus.COMPLETED
+    state_manager.close_dag_run_task.assert_awaited_once_with(dag_run_id, task_id)
+    # The run isn't fully terminal yet, so the expensive sweep must not run.
+    state_manager.get_dag_run.assert_not_awaited()
     state_manager.delete_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_maybe_cleanup_dag_task_deletes_when_all_siblings_terminal():
-    """When all DAG tasks are terminal, all those with matching cleanup_on are deleted."""
+    """When close_dag_run_task reports the run fully closed, the sweep deletes matching siblings."""
     dag_run_id = ULID()
     task_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
     sibling_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
@@ -1854,6 +1859,8 @@ async def test_maybe_cleanup_dag_task_deletes_when_all_siblings_terminal():
     sibling = Task(id=sibling_id, name="test_task", version=1, status=TaskStatus.COMPLETED, queue="default")
 
     state_manager = _make_state_manager()
+    # This is the last task in the run to close out.
+    state_manager.close_dag_run_task = AsyncMock(return_value=0)
     state_manager.get_dag_run = AsyncMock(return_value=(dt.datetime.now(dt.UTC), [task_id, sibling_id]))
 
     async def _get_tasks_bulk(ids: list) -> list:
@@ -1878,4 +1885,57 @@ async def test_maybe_cleanup_dag_task_deletes_when_all_siblings_terminal():
         await processor.process(task)
 
     assert task.status == TaskStatus.COMPLETED
+    state_manager.close_dag_run_task.assert_awaited_once_with(dag_run_id, task_id)
+    state_manager.get_dag_run.assert_awaited_once_with(dag_run_id)
+    # get_tasks_bulk fetches every sibling exactly once — the sweep runs once per run,
+    # not once per completion.
+    state_manager.task_state.get_tasks_bulk.assert_awaited_once()
     assert state_manager.delete_task.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_maybe_cleanup_runs_after_dynamic_fanout_registers_arms():
+    """
+    Regression test for an ordering hazard: _maybe_cleanup must run after post_process
+    spawns fan-out arms, so a dispatcher only closes itself out of the DAG run's pending
+    set once its own arms are already registered in that same set. If cleanup ran first
+    (as it used to), a dispatcher that looked like the last active task could trigger
+    cleanup before the arms it was about to spawn even existed.
+    """
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+
+    def _dispatch(**kwargs):
+        arm = DAGNode("worker")
+        collector = DAGNode("aggregator")
+        return TaskResult(results={}, fanout=DynamicFanOut(arms=[arm], collector=collector))
+
+    task_function = AsyncMock(side_effect=_dispatch)
+    task_config = TaskConfig(
+        name="dispatcher",
+        version=1,
+        function=task_function,
+        timeout=10,
+        cleanup_on=frozenset({TaskStatus.COMPLETED}),
+    )
+
+    state_manager = _make_state_manager()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+    state_manager.close_dag_run_task = AsyncMock(return_value=1)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
+
+    assert task.status == TaskStatus.COMPLETED
+    call_names = [c[0] for c in state_manager.mock_calls]
+    submit_index = call_names.index("submit_tasks_batch")
+    close_index = call_names.index("close_dag_run_task")
+    assert submit_index < close_index, "arms must be registered before the dispatcher closes out of the run"

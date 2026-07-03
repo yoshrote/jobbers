@@ -13,6 +13,7 @@ Section 3 — RedisDeadQueue edge case (``msgpack_dead_queue`` fixture).
 """
 
 import datetime as dt
+import json
 
 import pytest
 from ulid import ULID
@@ -527,32 +528,36 @@ async def test_stage_register_dag_run_noop_when_no_dag_run_id(redis_task_adapter
 
 @pytest.mark.asyncio
 async def test_stage_init_fan_in_creates_tracking_and_members_sets(redis_task_adapter):
-    """stage_init_fan_in writes a tracking set and a permanent members set."""
+    """stage_init_fan_in writes a remaining-count field and a permanent members-list field."""
     state, submit = redis_task_adapter
+    dag_run_id = ULID()
     fan_in_key = "fan-in:test"
     predecessor_ids = {ULID1, ULID2}
     pipe = state.data_store.pipeline(transaction=True)
-    state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
+    state.stage_init_fan_in(pipe, dag_run_id, fan_in_key, predecessor_ids)
     await pipe.execute()
-    tracking = await state.data_store.smembers(fan_in_key)
-    members = await state.data_store.smembers(f"{fan_in_key}:members")
-    expected = {str(ULID1).encode(), str(ULID2).encode()}
-    assert tracking == expected
-    assert members == expected
+    remaining = await state.data_store.hget(
+        state.DAG_RUN_FANIN(dag_run_id=dag_run_id), f"remaining:{fan_in_key}"
+    )
+    members_raw = await state.data_store.hget(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id), fan_in_key)
+    assert int(remaining) == len(predecessor_ids)
+    assert set(json.loads(members_raw)) == {str(ULID1), str(ULID2)}
 
 
 @pytest.mark.asyncio
 async def test_init_fan_in_creates_tracking_and_members_sets(redis_task_adapter):
-    """init_fan_in writes the same sets as stage_init_fan_in but executes immediately."""
+    """init_fan_in writes the same Hash fields as stage_init_fan_in but executes immediately."""
     state, submit = redis_task_adapter
+    dag_run_id = ULID()
     fan_in_key = "fan-in:direct"
     predecessor_ids = {ULID1, ULID2, ULID3}
-    await state.init_fan_in(fan_in_key, predecessor_ids)
-    tracking = await state.data_store.smembers(fan_in_key)
-    members = await state.data_store.smembers(f"{fan_in_key}:members")
-    expected = {str(uid).encode() for uid in predecessor_ids}
-    assert tracking == expected
-    assert members == expected
+    await state.init_fan_in(dag_run_id, fan_in_key, predecessor_ids)
+    remaining = await state.data_store.hget(
+        state.DAG_RUN_FANIN(dag_run_id=dag_run_id), f"remaining:{fan_in_key}"
+    )
+    members_raw = await state.data_store.hget(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id), fan_in_key)
+    assert int(remaining) == len(predecessor_ids)
+    assert set(json.loads(members_raw)) == {str(uid) for uid in predecessor_ids}
 
 
 @pytest.mark.asyncio

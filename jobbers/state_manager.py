@@ -460,6 +460,7 @@ class StateManager:
             fan_ins = collect_fan_in_keys(fresh_spec)
             queue_config = await self.get_queue_config(fresh_spec.queue)
 
+            dag_run_id = ULID()
             task = Task(
                 id=fresh_spec.id,
                 name=fresh_spec.name,
@@ -468,7 +469,7 @@ class StateManager:
                 parameters=fresh_spec.parameters,
                 dag_callbacks=fresh_spec.dag_callbacks,
                 cron_id=entry.id,
-                dag_run_id=ULID(),
+                dag_run_id=dag_run_id,
             )
 
             is_rate_limited = bool(
@@ -490,7 +491,9 @@ class StateManager:
                 self._atomic_cron.stage_reschedule(pipe, entry.id, next_run_at)
                 stager.stage_active_run(pipe, task.id)
                 for fan_in_key, predecessor_ids in fan_ins.items():
-                    self._atomic_state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)  # type: ignore[union-attr]
+                    self._atomic_state.stage_init_fan_in(  # type: ignore[union-attr]
+                        pipe, dag_run_id, fan_in_key, predecessor_ids
+                    )
                 if not is_rate_limited:
                     self.stage_submit_task(pipe, task, queue_config)
                 await pipe.execute()
@@ -502,14 +505,18 @@ class StateManager:
                 self.cron_dag_scheduler.stage_reschedule(cron_pipe, entry.id, next_run_at)
                 stager.stage_active_run(cron_pipe, task.id)
                 await cron_pipe.execute()
-                await asyncio.gather(*(self.task_state.init_fan_in(k, ids) for k, ids in fan_ins.items()))
+                await asyncio.gather(
+                    *(self.task_state.init_fan_in(dag_run_id, k, ids) for k, ids in fan_ins.items())
+                )
                 await self.submit_task(task)
             else:
                 # No pipeline support (e.g. StaticCronDAGScheduler): sequential calls.
                 await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
                 if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
                     await self.cron_dag_scheduler.set_active_run(entry.id, task.id, nx=True)
-                await asyncio.gather(*(self.task_state.init_fan_in(k, ids) for k, ids in fan_ins.items()))
+                await asyncio.gather(
+                    *(self.task_state.init_fan_in(dag_run_id, k, ids) for k, ids in fan_ins.items())
+                )
                 await self.submit_task(task)
             logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
 
@@ -799,8 +806,10 @@ class StateManager:
         else:
             await self.task_submit.submit_task(task=task)
 
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
-        await self.task_state.init_fan_in(fan_in_key, predecessor_ids, ttl)
+    async def init_fan_in(
+        self, dag_run_id: ULID, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+    ) -> None:
+        await self.task_state.init_fan_in(dag_run_id, fan_in_key, predecessor_ids, ttl)
 
     async def add_cron_dag(self, entry: CronDAGEntry) -> None:
         """
@@ -835,9 +844,9 @@ class StateManager:
             for key, ids in root.fan_in_predecessors().items():
                 all_fan_ins.setdefault(key, set()).update(ids)
 
-        await asyncio.gather(*(self.init_fan_in(k, ids) for k, ids in all_fan_ins.items()))
-
         dag_run_id = ULID()
+        await asyncio.gather(*(self.init_fan_in(dag_run_id, k, ids) for k, ids in all_fan_ins.items()))
+
         submitted: list[Task] = []
         for root in roots:
             task = root.to_task(dag_run_id=dag_run_id)
@@ -852,6 +861,10 @@ class StateManager:
     async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
         """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
         return await self.task_state.get_dag_run(dag_run_id)
+
+    async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
+        """Mark task_id resolved in the DAG run's pending set; return the remaining count."""
+        return await self.task_state.close_dag_run_task(dag_run_id, task_id)
 
     async def delete_task(self, task: Task) -> None:
         """Delete a task record and remove it from all indexes."""

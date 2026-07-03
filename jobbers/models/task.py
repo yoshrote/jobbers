@@ -239,9 +239,15 @@ class Task(BaseModel):
                 case FanInCallback():
                     if cb.fan_in_key in skip_fan_in_keys:
                         continue
-                    remaining = await ta.fan_in_complete(cb.fan_in_key, self.id)
+                    if self.dag_run_id is None:
+                        raise ValueError(
+                            f"Task {self.id} has a FanInCallback (key={cb.fan_in_key!r}) but no "
+                            "dag_run_id. Fan-in tracking is scoped per DAG run — submit via "
+                            "submit_dag()/dispatch_cron_dag() or dynamic fan-out, which assign one."
+                        )
+                    remaining = await ta.fan_in_complete(self.dag_run_id, cb.fan_in_key, self.id)
                     if remaining == 0:
-                        member_ids = await ta.get_fan_in_members(cb.fan_in_key)
+                        member_ids = await ta.get_fan_in_members(self.dag_run_id, cb.fan_in_key)
                         results.append(
                             self._build_callback_task(cb.task, member_ids, cb.inject_parent_results)
                         )

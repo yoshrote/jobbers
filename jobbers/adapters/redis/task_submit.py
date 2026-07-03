@@ -30,7 +30,7 @@ _MSGPACK_SUBMIT_SCRIPT = """
     end
     if ARGV[5] ~= '' then
         redis.call('ZADD', KEYS[4], 'NX', ARGV[1], ARGV[5])
-        redis.call('ZADD', KEYS[5], ARGV[1], ARGV[2])
+        redis.call('SADD', KEYS[5], ARGV[2])
     end
     return 1
 """
@@ -59,7 +59,7 @@ _MSGPACK_SUBMIT_RATE_LIMITED_SCRIPT = """
     end
     if enqueued == 1 and ARGV[7] ~= '' then
         redis.call('ZADD', KEYS[5], 'NX', ARGV[3], ARGV[7])
-        redis.call('ZADD', KEYS[6], ARGV[3], ARGV[4])
+        redis.call('SADD', KEYS[6], ARGV[4])
     end
     return enqueued
 """
@@ -78,7 +78,7 @@ class RedisTaskSubmit(_SharedRedisTaskSubmitBase):
     # KEYS[2] = task:{task_id}
     # KEYS[3] = task-type-idx:{name}
     # KEYS[4] = dag-runs
-    # KEYS[5] = dag-run:{dag_run_id}:tasks (placeholder key when task has no DAG run)
+    # KEYS[5] = dag-run:{dag_run_id}:pending (placeholder key when task has no DAG run)
     # ARGV[1] = submitted_at timestamp
     # ARGV[2] = task_id bytes
     # ARGV[3] = '1'/'0' for type index
@@ -92,7 +92,7 @@ class RedisTaskSubmit(_SharedRedisTaskSubmitBase):
     # KEYS[3] = task:{task_id}
     # KEYS[4] = task-type-idx:{name}
     # KEYS[5] = dag-runs
-    # KEYS[6] = dag-run:{dag_run_id}:tasks (placeholder key when task has no DAG run)
+    # KEYS[6] = dag-run:{dag_run_id}:pending (placeholder key when task has no DAG run)
     # ARGV[1] = earliest_time
     # ARGV[2] = rate_numerator
     # ARGV[3] = submitted_at timestamp
@@ -107,15 +107,9 @@ class RedisTaskSubmit(_SharedRedisTaskSubmitBase):
         super().__init__(data_store, state.pack, state.get_task)
 
     def _extra_submit_keys(self, task: Task) -> list[str]:
-        return [
-            self.DAG_RUN_TASKS(dag_run_id=task.dag_run_id)
-            if task.dag_run_id is not None
-            else self.DAG_RUN_TASKS(dag_run_id="")
-        ]
+        dag_run_id = task.dag_run_id if task.dag_run_id is not None else ""
+        return [self.DAG_RUN_PENDING(dag_run_id=dag_run_id)]
 
     def _extra_rate_limited_keys(self, task: Task) -> list[str]:
-        return [
-            self.DAG_RUN_TASKS(dag_run_id=task.dag_run_id)
-            if task.dag_run_id is not None
-            else self.DAG_RUN_TASKS(dag_run_id="")
-        ]
+        dag_run_id = task.dag_run_id if task.dag_run_id is not None else ""
+        return [self.DAG_RUN_PENDING(dag_run_id=dag_run_id)]

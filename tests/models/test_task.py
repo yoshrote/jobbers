@@ -343,6 +343,7 @@ async def test_generate_callbacks_fan_in_collector_has_member_parent_ids():
         version=1,
         queue="default",
         status=TaskStatus.COMPLETED,
+        dag_run_id=ULID(),
         dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
     )
     children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=0, fan_in_members=[p1, p2]))
@@ -361,6 +362,7 @@ async def test_generate_callbacks_fan_in_not_last_returns_nothing():
         version=1,
         queue="default",
         status=TaskStatus.COMPLETED,
+        dag_run_id=ULID(),
         dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
     )
     children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=1))
@@ -379,6 +381,7 @@ async def test_generate_callbacks_fan_in_last_creates_collector():
         version=1,
         queue="default",
         status=TaskStatus.COMPLETED,
+        dag_run_id=ULID(),
         dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
     )
     children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=0))
@@ -666,6 +669,7 @@ async def test_generate_callbacks_fan_in_propagates_inject_flag():
         version=1,
         queue="default",
         status=TaskStatus.COMPLETED,
+        dag_run_id=ULID(),
         dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key, inject_parent_results=True)],
     )
     children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=0, fan_in_members=[p1]))

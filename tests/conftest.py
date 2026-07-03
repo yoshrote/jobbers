@@ -116,13 +116,15 @@ class DummyTaskState:
     async def remove_task_heartbeat(self, task: Task) -> None:
         self._heartbeats.pop(task.id, None)
 
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: object, ttl: int = 86400) -> None:
+    async def init_fan_in(
+        self, dag_run_id: ULID, fan_in_key: str, predecessor_ids: object, ttl: int = 86400
+    ) -> None:
         pass
 
-    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
+    async def fan_in_complete(self, dag_run_id: ULID, fan_in_key: str, task_id: ULID) -> int:
         raise NotImplementedError("DummyTaskState.fan_in_complete")
 
-    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]:
+    async def get_fan_in_members(self, dag_run_id: ULID, fan_in_key: str) -> list[ULID]:
         raise NotImplementedError("DummyTaskState.get_fan_in_members")
 
     async def get_dag_runs(self, pagination: object) -> object:
@@ -133,6 +135,9 @@ class DummyTaskState:
 
     async def clean_dag_runs(self, now: object, max_age: object) -> None:
         raise NotImplementedError("DummyTaskState.clean_dag_runs")
+
+    async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
+        raise NotImplementedError("DummyTaskState.close_dag_run_task")
 
     async def ensure_index(self) -> None:
         raise NotImplementedError("DummyTaskState.ensure_index")
@@ -219,11 +224,13 @@ class AtomicDummyTaskState(DummyTaskState):
         return True
 
     def stage_init_fan_in(
-        self, pipe: object, fan_in_key: str, predecessor_ids: object, ttl: int = 86400
+        self, pipe: object, dag_run_id: ULID, fan_in_key: str, predecessor_ids: object, ttl: int = 86400
     ) -> None:
         pass
 
-    async def delegate_fan_in(self, fan_in_key: str, old_id: object, new_id: object) -> None:
+    async def delegate_fan_in(
+        self, dag_run_id: ULID, fan_in_key: str, old_id: object, new_id: object
+    ) -> None:
         pass  # no in-memory fan-in tracking; tests that exercise this go through real adapters
 
 

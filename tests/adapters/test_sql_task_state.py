@@ -124,12 +124,13 @@ async def test_stage_save_upserts(session_factory):
 async def test_stage_init_fan_in_creates_members(session_factory):
     """stage_init_fan_in via SQLTransactionBatch → get_fan_in_members returns the set."""
     state = SQLTaskState(session_factory)
+    dag_run_id = ULID()
     fan_in_key = "fan-in:sql-test"
     predecessor_ids = {ULID1, ULID2, ULID3}
     pipe = state.pipeline(transaction=True)
-    state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
+    state.stage_init_fan_in(pipe, dag_run_id, fan_in_key, predecessor_ids)
     await pipe.execute()
-    assert set(await state.get_fan_in_members(fan_in_key)) == predecessor_ids
+    assert set(await state.get_fan_in_members(dag_run_id, fan_in_key)) == predecessor_ids
 
 
 # ── clean ─────────────────────────────────────────────────────────────────────

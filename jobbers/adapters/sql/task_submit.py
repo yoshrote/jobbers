@@ -13,7 +13,14 @@ from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from jobbers.adapters.sql.task_state import _row_to_task, _task_to_row, _upsert_task
-from jobbers.migrations.schema import dag_runs, rate_limit_anchors, rate_limit_entries, task_queue, tasks
+from jobbers.migrations.schema import (
+    dag_run_pending,
+    dag_runs,
+    rate_limit_anchors,
+    rate_limit_entries,
+    task_queue,
+    tasks,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -23,10 +30,11 @@ if TYPE_CHECKING:
 
 
 async def _register_dag_run(session_factory: async_sessionmaker[AsyncSession], task: Task) -> None:
-    """Register the task's DAG run in ``dag_runs`` if it isn't already tracked."""
+    """Register the task's DAG run in ``dag_runs`` and its pending entry, if it isn't already tracked."""
     if task.dag_run_id is None:
         return
     dag_run_id_str = str(task.dag_run_id)
+    task_id_str = str(task.id)
     async with session_factory() as session:
         async with session.begin():
             existing = await session.execute(select(dag_runs).where(dag_runs.c.dag_run_id == dag_run_id_str))
@@ -34,6 +42,13 @@ async def _register_dag_run(session_factory: async_sessionmaker[AsyncSession], t
                 await session.execute(
                     insert(dag_runs).values(dag_run_id=dag_run_id_str, submitted_at=task.submitted_at)
                 )
+            async with session.begin_nested() as sp:
+                try:
+                    await session.execute(
+                        insert(dag_run_pending).values(dag_run_id=dag_run_id_str, task_id=task_id_str)
+                    )
+                except IntegrityError:
+                    await sp.rollback()
 
 
 class SQLTaskSubmit:

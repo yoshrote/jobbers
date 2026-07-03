@@ -129,6 +129,16 @@ dag_runs = Table(
 
 Index("idx_dag_runs_submitted", dag_runs.c.submitted_at)
 
+dag_run_pending = Table(
+    "dag_run_pending",
+    metadata,
+    Column("dag_run_id", String(26), nullable=False, primary_key=True),
+    Column("task_id", String(26), nullable=False, primary_key=True),
+    Column("closed", Boolean, nullable=False, server_default="0"),
+)
+
+Index("idx_dag_run_pending_run", dag_run_pending.c.dag_run_id)
+
 # Lock anchor only -- holds no rate-limit data itself. SELECT ... FOR UPDATE needs an
 # existing row to lock, but rate_limit_entries may have zero rows for a queue (first
 # submission, or window just emptied out). Without a guaranteed-present row, two
@@ -230,7 +240,15 @@ cron_dag_active_runs = Table(
 
 TABLE_GROUPS: dict[str, list[Table]] = {
     "routing": [roles, queues, role_queues, task_routing],
-    "task_state": [tasks, task_queue, task_fan_in, dag_runs, rate_limit_anchors, rate_limit_entries],
+    "task_state": [
+        tasks,
+        task_queue,
+        task_fan_in,
+        dag_runs,
+        dag_run_pending,
+        rate_limit_anchors,
+        rate_limit_entries,
+    ],
     "dead_letter": [dead_letter_queue],
     "task_schedule": [task_schedule],
     "cron_dag": [cron_dag_entries, cron_dag_active_runs],

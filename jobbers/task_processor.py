@@ -3,6 +3,7 @@ import logging
 from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args, get_origin, get_type_hints
 
 from opentelemetry import metrics
+from ulid import ULID
 
 from jobbers import registry
 from jobbers.context import _current_task as _current_task_cv
@@ -25,8 +26,6 @@ from jobbers.utils.di import Depends as _Depends
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
-
-    from ulid import ULID
 
 
 logger = logging.getLogger(__name__)
@@ -85,8 +84,12 @@ def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
     for collector_id, preds in fan_in_preds.items():
         collector_node = all_nodes[collector_id]
         for pred in preds:
-            DAGNode.merge(pred.node, into=collector_node, on_error=pred.err_node,
-                          inject_parent_results=pred.inject_parent_results)
+            DAGNode.merge(
+                pred.node,
+                into=collector_node,
+                on_error=pred.err_node,
+                inject_parent_results=pred.inject_parent_results,
+            )
 
     return all_nodes[root.id]
 
@@ -197,7 +200,6 @@ class TaskProcessor:
                         _current_task_cv.reset(_token)
 
             await self.state_manager.remove_task_heartbeat(task)
-            await self._maybe_cleanup(task)
 
         # Metrics recording
         tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
@@ -221,8 +223,15 @@ class TaskProcessor:
             # error callback would be surprising and is intentionally not supported.
             if task.status == TaskStatus.FAILED:
                 await self.post_process_error(task)
-            if ex is not None:
-                raise ex
+
+        # Runs after post_process/post_process_error so any fan-out arms this task
+        # spawned are already registered in the DAG run before this task is closed
+        # out of it — otherwise a dispatcher could look like the last active task
+        # and trigger cleanup before its own arms exist.
+        await self._maybe_cleanup(task)
+
+        if task.status != TaskStatus.COMPLETED and ex is not None:
+            raise ex
 
         return task
 
@@ -238,30 +247,40 @@ class TaskProcessor:
         """
         Delete the task record if its final status is in cleanup_on.
 
-        For DAG tasks, waits until all tasks in the run are terminal before
-        deleting any of them (parent results may still be needed by siblings).
+        For standalone tasks this is a direct check. For DAG tasks, an atomic
+        per-run pending counter (rather than re-fetching every sibling on each
+        completion) detects when the whole run has gone terminal; the full
+        sibling sweep then runs exactly once, when the counter reaches zero,
+        instead of being redone from scratch on every one of the run's completions.
         """
+        if task.dag_run_id is None:
+            await self._maybe_delete_self(task)
+            return
+
+        remaining = await self.state_manager.close_dag_run_task(task.dag_run_id, task.id)
+        if remaining != 0:
+            # >0: DAG still in flight, the last task to close will trigger the sweep.
+            # -1: already closed (duplicate call) or the run's pending entry expired/was
+            # swept — either way, do not re-trigger the sweep from here.
+            return
+        await self._sweep_dag_run(task.dag_run_id)
+
+    async def _maybe_delete_self(self, task: Task) -> None:
+        """Delete a standalone (non-DAG) task's record if its status matches cleanup_on."""
         if task.task_config is None or not task.task_config.cleanup_on:
             return
-        if task.status not in task.task_config.cleanup_on:
-            return
-
-        if task.dag_run_id is None:
+        if task.status in task.task_config.cleanup_on:
             await self.state_manager.delete_task(task)
-            return
 
-        run = await self.state_manager.get_dag_run(task.dag_run_id)
+    async def _sweep_dag_run(self, dag_run_id: ULID) -> None:
+        """Delete every task in a now-fully-terminal DAG run whose config says to clean up."""
+        run = await self.state_manager.get_dag_run(dag_run_id)
         if run is None:
-            # Orphaned run index — clean up immediately.
-            await self.state_manager.delete_task(task)
+            # Orphaned run index — nothing left to sweep.
             return
 
         _, task_ids = run
         sibling_tasks = await self.state_manager.task_state.get_tasks_bulk(task_ids)
-        if any(t is None or t.status in TaskStatus.active_statuses() for t in sibling_tasks):
-            return  # DAG still in flight; the last task to finish will trigger cleanup.
-
-        # All DAG tasks are terminal — delete those whose config says to.
         to_delete: list[Task] = []
         for sibling in sibling_tasks:
             if sibling is None:
@@ -338,7 +357,10 @@ class TaskProcessor:
         fresh_root, _ = cb.arm_root.fresh_copy()
         for item_params in items:
             cloned, _ = cb.arm_root.fresh_copy()
-            merged_params = {**fresh_root.parameters, **(item_params if isinstance(item_params, dict) else {})}
+            merged_params = {
+                **fresh_root.parameters,
+                **(item_params if isinstance(item_params, dict) else {}),
+            }
             cloned = cloned.model_copy(update={"parameters": merged_params})
             # Rebuild a DAGNode from the spec so _handle_dynamic_fanout can walk it.
             arm_nodes.append(_spec_to_dag_node(cloned))
@@ -383,9 +405,13 @@ class TaskProcessor:
         rejected — the fan-in would be initialised but never complete.
         Rate limits on arm queues are bypassed with a warning logged.
         """
+        # Fan-in tracking is scoped per DAG run. A task fanning out without already
+        # being part of one starts a fresh run for the fanned-out sub-graph.
+        dag_run_id = parent.dag_run_id or ULID()
+
         if not fanout.arms:
             # Degenerate case: no arms — submit the collector immediately.
-            solo = fanout.collector.to_task(dag_run_id=parent.dag_run_id)
+            solo = fanout.collector.to_task(dag_run_id=dag_run_id)
             await self.state_manager.submit_task(solo)
             return
 
@@ -408,12 +434,13 @@ class TaskProcessor:
         all_fan_ins[fan_in_key] = terminal_ids
 
         # 4. Build tasks: submit arm roots, collector waits for terminal IDs.
-        arm_tasks = [arm.to_task(parent_id=parent.id, dag_run_id=parent.dag_run_id) for arm in fanout.arms]
-        collector_task = fanout.collector.to_task(dag_run_id=parent.dag_run_id)
+        arm_tasks = [arm.to_task(parent_id=parent.id, dag_run_id=dag_run_id) for arm in fanout.arms]
+        collector_task = fanout.collector.to_task(dag_run_id=dag_run_id)
         collector_task.parent_ids = list(terminal_ids)
 
         # 5. Delegation: transfer outer fan-in callbacks to the collector and
         #    atomically swap parent's ID → collector's ID in each outer fan-in set.
+        #    Outer callbacks only exist when the parent was already part of dag_run_id.
         if outer_fan_in_cbs:
             collector_task.dag_callbacks = list(collector_task.dag_callbacks) + cast(
                 "list[SimpleCallback | FanInCallback | DynamicFanOutCallback]", outer_fan_in_cbs
@@ -421,7 +448,7 @@ class TaskProcessor:
             await asyncio.gather(
                 *(
                     self.state_manager.task_state.delegate_fan_in(
-                        cb.fan_in_key, parent.id, fanout.collector.id
+                        dag_run_id, cb.fan_in_key, parent.id, fanout.collector.id
                     )
                     for cb in outer_fan_in_cbs
                 )
@@ -429,7 +456,10 @@ class TaskProcessor:
 
         # 6. Initialise all fan-in sets, pre-save the collector, submit arm roots.
         await asyncio.gather(
-            *(self.state_manager.init_fan_in(k, ids, ttl=fanout.fan_in_ttl) for k, ids in all_fan_ins.items())
+            *(
+                self.state_manager.init_fan_in(dag_run_id, k, ids, ttl=fanout.fan_in_ttl)
+                for k, ids in all_fan_ins.items()
+            )
         )
         # Pre-save the collector so it exists in the store when the first terminal completes.
         await self.state_manager.save_task(collector_task)
