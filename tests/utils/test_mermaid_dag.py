@@ -679,6 +679,43 @@ def test_parse_fanout_missing_fanin_raises() -> None:
         parse_mermaid_dag(text)
 
 
+def test_parse_nested_fanout_correct_collectors() -> None:
+    """A -->> B; B -->> R; R --o D; D --o C: A gets collector=C, B gets collector=D."""
+    text = """
+    flowchart TD
+        A["split_batches"]
+        B["process_batch"]
+        R["process_record"]
+        D["aggregate_batch"]
+        C["aggregate_all"]
+        A -->> B
+        B -->> R
+        R --o D
+        D --o C
+    """
+    roots = parse_mermaid_dag(text)
+    assert len(roots) == 1
+    spec = roots[0].to_spec()
+    assert spec.name == "split_batches"
+
+    # Outer dispatcher A: arm_root=B, collector=C (the outermost collector)
+    assert len(spec.dag_callbacks) == 1
+    outer_cb = spec.dag_callbacks[0]
+    assert isinstance(outer_cb, DynamicFanOutCallback)
+    assert outer_cb.arm_root.name == "process_batch"
+    assert outer_cb.collector.name == "aggregate_all", (
+        f"expected outer collector 'aggregate_all', got '{outer_cb.collector.name}'"
+    )
+
+    # Inner dispatcher B: arm_root=R, collector=D (the inner collector)
+    inner_cb = outer_cb.arm_root.dag_callbacks[0]
+    assert isinstance(inner_cb, DynamicFanOutCallback)
+    assert inner_cb.arm_root.name == "process_record"
+    assert inner_cb.collector.name == "aggregate_batch", (
+        f"expected inner collector 'aggregate_batch', got '{inner_cb.collector.name}'"
+    )
+
+
 # ── Generator — dynamic fan-out (-->> / --o) ────────────────────────────────
 
 
@@ -706,3 +743,168 @@ def test_generator_fanout_emits_fanout_and_fanin_edges() -> None:
     col_id = str(cb.collector.id)
     assert any(f"-->>" in ln and arm_id in ln for ln in lines)
     assert any(f"--o" in ln and col_id in ln for ln in lines)
+
+
+def test_generator_fanout_expanded_multi_step_arm() -> None:
+    """Expanded mode (default) walks the arm chain: internal --> edges and --o from the terminal leaf."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        B["start_processing"]
+        E["finish_processing"]
+        C["aggregate_results"]
+        A -->> B
+        B --> E
+        E --o C
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    cb = spec.dag_callbacks[0]
+    assert isinstance(cb, DynamicFanOutCallback)
+    arm_root_id = str(cb.arm_root.id)
+    # arm_root has one SimpleCallback to finish_processing
+    arm_step_id = str(cb.arm_root.dag_callbacks[0].task.id)  # type: ignore[union-attr]
+    col_id = str(cb.collector.id)
+
+    diagram = dag_spec_to_mermaid(spec, expand_fanouts=True)
+    lines = [ln.strip() for ln in diagram.splitlines()]
+
+    # arm_root --> step is emitted
+    assert any(f"{arm_root_id} -->" in ln and arm_step_id in ln for ln in lines), \
+        "arm internal --> edge missing in expanded mode"
+    # terminal (step) --o collector
+    assert any(f"{arm_step_id} --o" in ln and col_id in ln for ln in lines), \
+        "terminal --o collector missing in expanded mode"
+    # arm_root should NOT have --o directly to collector
+    assert not any(f"{arm_root_id} --o" in ln for ln in lines), \
+        "arm_root should not connect directly to collector in expanded mode"
+    # finish_processing node definition must be present
+    assert "finish_processing" in diagram
+
+
+def test_generator_fanout_compact_hides_arm_internals() -> None:
+    """Compact mode (expand_fanouts=False) emits arm_root --o collector; arm internals are not shown."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        B["start_processing"]
+        E["finish_processing"]
+        C["aggregate_results"]
+        A -->> B
+        B --> E
+        E --o C
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    cb = spec.dag_callbacks[0]
+    assert isinstance(cb, DynamicFanOutCallback)
+    arm_root_id = str(cb.arm_root.id)
+    col_id = str(cb.collector.id)
+
+    diagram = dag_spec_to_mermaid(spec, expand_fanouts=False)
+    lines = [ln.strip() for ln in diagram.splitlines()]
+
+    # dispatcher -->> arm_root
+    assert any(f"-->>" in ln and arm_root_id in ln for ln in lines)
+    # arm_root --o collector (compact shorthand)
+    assert any(f"{arm_root_id} --o" in ln and col_id in ln for ln in lines)
+    # Internal step must NOT appear in the diagram
+    assert "finish_processing" not in diagram
+
+
+def test_generator_fanout_single_step_compact_and_expanded_equal() -> None:
+    """For a single-step arm, compact and expanded produce the same diagram structure."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        B["process_record"]
+        C["aggregate_results"]
+        A -->> B
+        B --o C
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    cb = spec.dag_callbacks[0]
+    assert isinstance(cb, DynamicFanOutCallback)
+    arm_id = str(cb.arm_root.id)
+    col_id = str(cb.collector.id)
+
+    for expand in (True, False):
+        diagram = dag_spec_to_mermaid(spec, expand_fanouts=expand)
+        lines = [ln.strip() for ln in diagram.splitlines()]
+        assert any(f"-->>" in ln and arm_id in ln for ln in lines)
+        assert any(f"{arm_id} --o" in ln and col_id in ln for ln in lines)
+
+
+def test_generator_fanout_compact_nested_shows_inner_fanout() -> None:
+    """Compact mode walks nested DynamicFanOutCallback: inner -->> and --o are visible."""
+    text = """
+    flowchart TD
+        A["split_batches"]
+        B["process_batch"]
+        R["process_record"]
+        D["aggregate_batch"]
+        C["aggregate_all"]
+        A -->> B
+        B -->> R
+        R --o D
+        D --o C
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    diagram = dag_spec_to_mermaid(spec, expand_fanouts=False)
+    lines = [ln.strip() for ln in diagram.splitlines()]
+
+    outer_cb = spec.dag_callbacks[0]
+    assert isinstance(outer_cb, DynamicFanOutCallback)
+    a_id = str(spec.id)
+    b_id = str(outer_cb.arm_root.id)
+    c_id = str(outer_cb.collector.id)
+    inner_cb = outer_cb.arm_root.dag_callbacks[0]
+    assert isinstance(inner_cb, DynamicFanOutCallback)
+    r_id = str(inner_cb.arm_root.id)
+    d_id = str(inner_cb.collector.id)
+
+    # Outer: A -->> B; B --o C
+    assert any(f"-->>" in ln and b_id in ln for ln in lines), "A -->> B missing"
+    assert any(f"{b_id} --o" in ln and c_id in ln for ln in lines), "B --o C missing"
+    # Inner: B -->> R; R --o D  (visible even in compact mode)
+    assert any(f"-->>" in ln and r_id in ln for ln in lines), "B -->> R missing"
+    assert any(f"{r_id} --o" in ln and d_id in ln for ln in lines), "R --o D missing"
+    # process_batch node is present
+    assert "process_batch" in diagram
+    # process_record node is present (it's an arm root of the inner fanout)
+    assert "process_record" in diagram
+
+
+def test_generator_fanout_expanded_round_trip() -> None:
+    """Expanded diagram of a multi-step arm round-trips through the parser correctly."""
+    text = """
+    flowchart TD
+        A["fetch_records"]
+        B["start_processing"]
+        E["finish_processing"]
+        C["aggregate_results"]
+        A -->> B
+        B --> E
+        E --o C
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    expanded_diagram = dag_spec_to_mermaid(spec, expand_fanouts=True)
+
+    # Re-parse the expanded diagram — must produce a valid DAG with the same structure.
+    roots2 = parse_mermaid_dag(expanded_diagram)
+    assert len(roots2) == 1
+    spec2 = roots2[0].to_spec()
+    assert spec2.name == "fetch_records"
+    assert len(spec2.dag_callbacks) == 1
+    cb2 = spec2.dag_callbacks[0]
+    assert isinstance(cb2, DynamicFanOutCallback)
+    assert cb2.arm_root.name == "start_processing"
+    assert cb2.collector.name == "aggregate_results"
+    # Arm chain: start_processing has a SimpleCallback to finish_processing
+    assert len(cb2.arm_root.dag_callbacks) == 1
+    arm_cb2 = cb2.arm_root.dag_callbacks[0]
+    assert isinstance(arm_cb2, SimpleCallback)
+    assert arm_cb2.task.name == "finish_processing"

@@ -582,20 +582,70 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
 
     # Build DynamicFanOutCallback on each dispatcher node.
     # The arm_root spec and collector spec are serialised from their DAGNodes.
-    for dispatcher_id, fo in fanout_dispatchers.items():
+    #
+    # For nested fanouts (arm_root is itself a dispatcher) two things are required:
+    #
+    # 1. Collector finding: the outer collector is found by following the --o chain —
+    #    inner_terminal --o inner_collector --o outer_collector.
+    # 2. Processing order: inner dispatchers must be processed before outer ones so that
+    #    arm_root.to_spec() captures the inner DynamicFanOutCallback already added to
+    #    the arm_root DAGNode.
+    def _find_arm_collector(arm_root_id: str) -> str | None:
+        # If arm_root is also a dispatcher, find its inner collector then follow the
+        # next --o edge to reach this dispatcher's outer collector.
+        if arm_root_id in fanout_dispatchers:
+            inner_root = fanout_dispatchers[arm_root_id].dst
+            inner_col = _find_arm_collector(inner_root)
+            if inner_col is not None and inner_col in fanin_map:
+                return fanin_map[inner_col].dst
+            return None
+        # Non-dispatcher arm root: BFS through success edges to find the terminal
+        # with a --o edge into a collector.
+        bfs_seen: set[str] = set()
+        queue = [arm_root_id]
+        while queue:
+            node = queue.pop(0)
+            if node in bfs_seen:
+                continue
+            bfs_seen.add(node)
+            if node in fanin_map and fanin_map[node].dst in collector_ids:
+                return fanin_map[node].dst
+            for edge in success_edges:
+                if edge.src == node and edge.dst not in collector_ids:
+                    queue.append(edge.dst)
+        return None
+
+    def _topo_dispatchers() -> list[str]:
+        """Return dispatcher IDs innermost-first so arm_root.to_spec() sees nested callbacks."""
+        result: list[str] = []
+        visiting: set[str] = set()
+        done: set[str] = set()
+
+        def _visit(did: str) -> None:
+            if did in done or did in visiting:
+                return
+            visiting.add(did)
+            arm_root_id = fanout_dispatchers[did].dst
+            if arm_root_id in fanout_dispatchers:
+                _visit(arm_root_id)
+            visiting.discard(did)
+            done.add(did)
+            result.append(did)
+
+        for did in fanout_dispatchers:
+            _visit(did)
+        return result
+
+    for dispatcher_id in _topo_dispatchers():
+        fo = fanout_dispatchers[dispatcher_id]
         arm_root_node = dag_nodes[fo.dst]
-        # Find the arm terminal: the arm node with a --o edge from fanin_map.
-        arm_terminal_id: str | None = next(
-            (fi.src for fi in fanin_edges if fi.src in arm_node_ids and fi.dst in collector_ids),
-            None,
-        )
-        if arm_terminal_id is None:
+        collector_id = _find_arm_collector(fo.dst)
+        if collector_id is None:
             raise MermaidParseError(
                 f"Fan-out from '{dispatcher_id}' has no '--o'' fan-in boundary edge. "
                 "Add a '--o' edge from the arm terminal to a collector node."
             )
-        fi = fanin_map[arm_terminal_id]
-        collector_node = dag_nodes[fi.dst]
+        collector_node = dag_nodes[collector_id]
         error_nid = error_map.get(dispatcher_id)
         on_error_spec = dag_nodes[error_nid].to_spec() if error_nid else None
         cb = DynamicFanOutCallback(
@@ -646,6 +696,7 @@ def _spec_label(spec: DAGTaskSpec, status: TaskStatus | None) -> str:
 def dag_spec_to_mermaid(
     spec: DAGTaskSpec,
     task_statuses: dict[str, TaskStatus] | None = None,
+    expand_fanouts: bool = True,
 ) -> str:
     """
     Generate a mermaid ``flowchart TD`` diagram from a :class:`~jobbers.models.dag.DAGTaskSpec` tree.
@@ -655,6 +706,10 @@ def dag_spec_to_mermaid(
         :class:`~jobbers.models.task_status.TaskStatus` for colour-coding.
         When provided, a ``{STATUS}`` section is appended to each label and
         ``:::classname`` suffixes are added.
+    :param expand_fanouts: When ``True`` (default), arm chains are expanded: internal
+        ``-->`` edges are emitted and the leaf arm node connects to the collector via
+        ``--o``.  When ``False``, each fan-out is shown compactly as submitted —
+        ``dispatcher -->> arm_root --o collector`` — without drilling into arm internals.
     :returns: Mermaid text including a ``classDef`` block (always present for
         frontend rendering convenience, even when no statuses are supplied).
     """
@@ -663,54 +718,113 @@ def dag_spec_to_mermaid(
     edge_seen: set[tuple[str, str, str]] = set()
     visited: set[str] = set()
 
+    def _node_line(s: DAGTaskSpec) -> str:
+        sid = str(s.id)
+        status = task_statuses.get(sid) if task_statuses else None
+        label = _spec_label(s, status)
+        class_sfx = f":::{_STATUS_CLASS[status]}" if status else ""
+        return f'    {sid}["{label}"]{class_sfx}'
+
+    def _add_edge(src: str, dst: str, arrow: str) -> None:
+        key = (src, dst, arrow)
+        if key not in edge_seen:
+            edge_seen.add(key)
+            edge_lines.append(f"    {src} {arrow} {dst}")
+
+    def _walk_arm(s: DAGTaskSpec, collector: DAGTaskSpec) -> None:
+        """Walk an arm spec tree in expanded mode.
+
+        Nodes with no ``SimpleCallback``/``FanInCallback`` successors are leaf nodes;
+        they connect to *collector* via ``--o``.  Intermediate nodes emit ``-->``
+        to their successors.  Nested ``DynamicFanOutCallback`` entries on arm nodes
+        are also expanded recursively.
+        """
+        sid = str(s.id)
+        if sid in visited:
+            return
+        visited.add(sid)
+        node_lines[sid] = _node_line(s)
+
+        arm_successors = [cb for cb in s.dag_callbacks if isinstance(cb, (SimpleCallback, FanInCallback))]
+
+        if not arm_successors:
+            # Leaf: arm ends here — connect to the outer collector.
+            _add_edge(sid, str(collector.id), "--o")
+            _walk(collector)
+        else:
+            for cb in arm_successors:
+                child_id = str(cb.task.id)
+                _add_edge(sid, child_id, "-->")
+                if cb.error_callback is not None:
+                    _add_edge(sid, str(cb.error_callback.id), "-.->")
+                    _walk(cb.error_callback)
+                _walk_arm(cb.task, collector)
+
+        # Nested DynamicFanOutCallback inside an arm node (only reached in expanded mode).
+        for cb in s.dag_callbacks:
+            if isinstance(cb, DynamicFanOutCallback):
+                inner_arm_id = str(cb.arm_root.id)
+                _add_edge(sid, inner_arm_id, "-->>")
+                if cb.error_callback is not None:
+                    _add_edge(sid, str(cb.error_callback.id), "-.->")
+                    _walk(cb.error_callback)
+                _walk_arm(cb.arm_root, cb.collector)
+                _walk(cb.collector)
+
+    def _walk_compact_arm(s: DAGTaskSpec) -> None:
+        """Compact walk: show the arm fanout skeleton without expanding chain steps.
+
+        Recurses into nested ``DynamicFanOutCallback`` entries so their ``-->>`` / ``--o``
+        structure is visible, but skips ``SimpleCallback`` / ``FanInCallback`` steps that
+        are repeated per arm instance at runtime.
+        """
+        sid = str(s.id)
+        if sid in visited:
+            return
+        visited.add(sid)
+        node_lines[sid] = _node_line(s)
+        for cb in s.dag_callbacks:
+            if isinstance(cb, DynamicFanOutCallback):
+                inner_arm_id = str(cb.arm_root.id)
+                _add_edge(sid, inner_arm_id, "-->>")
+                if cb.error_callback is not None:
+                    _add_edge(sid, str(cb.error_callback.id), "-.->")
+                    _walk(cb.error_callback)
+                _walk_compact_arm(cb.arm_root)
+                _add_edge(inner_arm_id, str(cb.collector.id), "--o")
+                _walk(cb.collector)
+
     def _walk(s: DAGTaskSpec) -> None:
         sid = str(s.id)
         if sid in visited:
             return
         visited.add(sid)
-
-        status = task_statuses.get(sid) if task_statuses else None
-        label = _spec_label(s, status)
-        class_sfx = f":::{_STATUS_CLASS[status]}" if status else ""
-        node_lines[sid] = f'    {sid}["{label}"]{class_sfx}'
+        node_lines[sid] = _node_line(s)
 
         for cb in s.dag_callbacks:
             if isinstance(cb, DynamicFanOutCallback):
                 arm_id = str(cb.arm_root.id)
                 col_id = str(cb.collector.id)
-                for fo_src, fo_dst, fo_arrow in [
-                    (sid, arm_id, "-->>"),
-                    (arm_id, col_id, "--o"),
-                ]:
-                    key = (fo_src, fo_dst, fo_arrow)
-                    if key not in edge_seen:
-                        edge_seen.add(key)
-                        edge_lines.append(f"    {fo_src} {fo_arrow} {fo_dst}")
+                _add_edge(sid, arm_id, "-->>")
                 if cb.error_callback is not None:
-                    err_id = str(cb.error_callback.id)
-                    err_key = (sid, err_id, "-.->")
-                    if err_key not in edge_seen:
-                        edge_seen.add(err_key)
-                        edge_lines.append(f"    {sid} -.-> {err_id}")
+                    _add_edge(sid, str(cb.error_callback.id), "-.->")
                     _walk(cb.error_callback)
-                _walk(cb.arm_root)
+                if expand_fanouts:
+                    _walk_arm(cb.arm_root, cb.collector)
+                else:
+                    # Compact: walk nested fanout structure but skip chain steps.
+                    _walk_compact_arm(cb.arm_root)
+                    _add_edge(arm_id, col_id, "--o")
                 _walk(cb.collector)
                 continue
 
             if not isinstance(cb, (SimpleCallback, FanInCallback)):
                 continue
             child_id = str(cb.task.id)
-            edge_key = (sid, child_id, "-->")
-            if edge_key not in edge_seen:
-                edge_seen.add(edge_key)
-                edge_lines.append(f"    {sid} --> {child_id}")
+            _add_edge(sid, child_id, "-->")
 
             if cb.error_callback is not None:
-                err_id = str(cb.error_callback.id)
-                err_key = (sid, err_id, "-.->")
-                if err_key not in edge_seen:
-                    edge_seen.add(err_key)
-                    edge_lines.append(f"    {sid} -.-> {err_id}")
+                _add_edge(sid, str(cb.error_callback.id), "-.->")
                 _walk(cb.error_callback)
 
             _walk(cb.task)
