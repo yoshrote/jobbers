@@ -114,6 +114,55 @@ async def my_task(**kwargs):
     return {"result": "value"}
 ```
 
+### Synchronous (CPU-bound) Tasks
+
+`@register_task` auto-detects whether the decorated function is `async def`. For genuinely
+CPU-bound, blocking work (parsing, inference, image processing) that can't be written as
+`async def`, just register a plain function instead — it runs in a dedicated
+`multiprocessing.Process` rather than being awaited in-process, so a thread pool's GIL
+contention isn't a concern.
+
+```python
+from jobbers.registry import register_task
+from jobbers.sync_runner import SyncTaskContext
+
+@register_task(name="crunch_numbers", version=1)
+def crunch_numbers(ctx: SyncTaskContext, n: int) -> dict:
+    for i in range(n):
+        if ctx.cancelled:
+            break          # cooperative — see caveat below
+        ctx.heartbeat()    # explicit, same convention as the async path's task.heartbeat()
+    return {"n": n}
+```
+
+- The function receives a `SyncTaskContext` as its first positional argument instead of
+  using `get_current_task()`/`task.heartbeat()` — contextvars and the live Redis/SQL adapter
+  don't cross a process boundary. `ctx.heartbeat()` pushes onto a queue the parent drains;
+  `ctx.cancelled` is a cooperative flag the function must check itself.
+- Dependency injection (`Depends()`) still works, but resolves *inside* the subprocess
+  (against a dependency graph looked up fresh via the registry after the task module is
+  reloaded there) — never across the process boundary by pickling the resolved value. This
+  means provider functions can safely open process-local resources (e.g. their own DB
+  connection) but must themselves be importable from the loaded task module.
+- `WORKER_SYNC_PROCESSES` (default `2`) bounds how many sync-task subprocesses a worker runs
+  concurrently — separate from `WORKER_CONCURRENT_TASKS`, which only bounds async tasks. If a
+  sync task is pulled while `WORKER_SYNC_PROCESSES` is saturated, the worker requeues it
+  immediately (`jobbers/runners/worker_proc.py`) rather than marking it STARTED and parking it
+  — this avoids a false STALLED verdict from the Cleaner and avoids holding a
+  `WORKER_CONCURRENT_TASKS` slot for the whole wait (which would otherwise starve async tasks
+  behind a sync backlog). For deployments that want to eliminate sync/async contention
+  entirely rather than just mitigate it, dedicate queues/roles to sync tasks and run those
+  workers with `WORKER_CONCURRENT_TASKS == WORKER_SYNC_PROCESSES`.
+- **Forced termination isn't transactional.** On timeout or cancellation the worker calls
+  `.terminate()`/`.kill()` on the OS process — reliable for stopping further progress and
+  freeing the slot, but it can't roll back work the function had already done (e.g. a
+  half-finished external write). `on_shutdown=TaskShutdownPolicy.CONTINUE` opts out of forced
+  termination, same as it does for async tasks via `asyncio.shield()`.
+- A shared `ProcessPoolExecutor` was deliberately avoided: it has no public API to kill one
+  in-flight task without tearing down the whole pool, so each sync task gets its own
+  short-lived process instead — process-spawn overhead is the trade for genuine
+  terminability.
+
 ## Queue & Role System
 
 - **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Storage backend depends on `ROUTING_BACKEND`.
@@ -237,6 +286,7 @@ Config file format (`routing.json`):
 | `WORKER_ROLE` | `"default"` | Worker |
 | `WORKER_TTL` | `50` | Worker (max tasks before restart) |
 | `WORKER_CONCURRENT_TASKS` | `5` | Worker |
+| `WORKER_SYNC_PROCESSES` | `2` | Worker (max concurrent sync-task subprocesses) |
 | `SCHEDULER_POLL_INTERVAL` | `5.0` | Scheduler |
 | `SCHEDULER_BATCH_SIZE` | `1` | Scheduler |
 | `TASK_BACKEND` | `"redis_json"` | All (`"redis_json"`, `"redis"`, or `"sql"`) |

@@ -1,4 +1,5 @@
 import datetime as dt
+import inspect
 import logging
 from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
@@ -68,7 +69,27 @@ def register_task(
     dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE,
     on_shutdown: TaskShutdownPolicy = TaskShutdownPolicy.STOP,
 ) -> Callable[..., Any]:
-    """Register a task function with the given name and version."""
+    """
+    Register a task function with the given name and version.
+
+    `async def` functions run in-process, awaited by the worker as usual. Plain (non-async)
+    functions are treated as synchronous/CPU-bound tasks and run in a dedicated subprocess
+    instead — see `jobbers/sync_runner.py`. Sync task functions receive a `SyncTaskContext` as
+    their first positional argument instead of using `get_current_task()`/`task.heartbeat()`:
+
+    ```python
+    from jobbers.sync_runner import SyncTaskContext
+
+
+    @register_task(name="crunch_numbers", version=1)
+    def crunch_numbers(ctx: SyncTaskContext, n: int) -> dict:
+        for i in range(n):
+            if ctx.cancelled:
+                break
+            ctx.heartbeat()
+        return {"n": n}
+    ```
+    """
 
     def decorator(func: Callable[..., Any]) -> TaskWrapper:
         """Decorate a task function and registers it for use with task instances."""
@@ -77,6 +98,7 @@ def register_task(
             raise ValueError("Task function must be callable")
         # Unwrap a TaskWrapper so double-decoration stores the raw function.
         raw_func: Callable[..., Any] = func._func if isinstance(func, TaskWrapper) else func
+        is_sync = not inspect.iscoroutinefunction(raw_func)
         dep_graph = inspect_task_dependencies(raw_func)
         if (name, version) in _task_function_map:
             if _task_function_map[(name, version)].function != raw_func:
@@ -102,6 +124,7 @@ def register_task(
             backoff_strategy=backoff_strategy,
             dead_letter_policy=dead_letter_policy,
             on_shutdown=on_shutdown,
+            is_sync=is_sync,
         )
         _task_function_map[(name, version)] = task_conf
         return TaskWrapper(raw_func, name, version)
