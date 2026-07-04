@@ -366,6 +366,8 @@ The graph must be a **DAG** — no cycles. Jobbers does not detect cycles at bui
 
 Fan-in tracking sets are created with a TTL (default 24 hours for dynamic fan-out; permanent for static DAGs until all predecessors complete). If a predecessor task is abandoned without reaching a terminal status within the TTL, the collector will never fire. Use heartbeat monitoring and the Cleaner process to detect stalled tasks early.
 
+See [dag-run-completion-tracking.md](dag-run-completion-tracking.md) for how fan-in state is consolidated per DAG run and cleaned up in a fixed number of keys, instead of relying purely on independent per-key TTLs.
+
 ### No Cross-Run Dependencies
 
 A `DAGNode` graph describes a **single run**. You cannot make one cron run depend on the completion of a previous cron run; use a separate application-level gate (e.g., check a status in your own database) inside the root task if you need that.
@@ -373,6 +375,8 @@ A `DAGNode` graph describes a **single run**. You cannot make one cron run depen
 ### Nested Dynamic Fan-Out
 
 When using the mermaid syntax (`-->>` / `--o`), nesting is supported — an arm task can itself be a dispatcher with its own `-->>` / `--o` pair (see the mermaid spec for the nested example).  When using the programmatic `DynamicFanOut` API directly, nesting requires the inner `DynamicFanOut` to be returned from the arm task function, which the processor handles via `propagate_fan_in`.
+
+Deep/wide nesting can put thousands of tasks in a single DAG run. See [dag-run-completion-tracking.md](dag-run-completion-tracking.md) for how DAG-run completion tracking stays O(1) per task completion at that scale, including a real ordering hazard that was found and fixed along the way.
 
 ### Static DAG Shape
 
