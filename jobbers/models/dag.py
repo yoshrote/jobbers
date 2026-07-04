@@ -229,8 +229,12 @@ def collect_fan_in_keys(spec: DAGTaskSpec) -> dict[str, set[ULID]]:
         visited.add(s.id)
         for cb in s.dag_callbacks:
             if isinstance(cb, DynamicFanOutCallback):
-                # Arm fan-in sets are initialised at runtime by the processor,
-                # not at static submission time, so skip here.
+                # Arm fan-in sets are initialised at runtime by the processor, so
+                # arm_root is intentionally not walked here. The collector, however,
+                # may itself feed into further static fan-ins (e.g. `collector --> D`
+                # in a mermaid diagram) — those need pre-populating like any other
+                # static edge, so walk into it.
+                _walk(cb.collector)
                 continue
             if isinstance(cb, FanInCallback):
                 result.setdefault(cb.fan_in_key, set()).add(s.id)
@@ -314,6 +318,14 @@ class DAGNode:
 
         Used by the processor to determine which nodes should decrement the fan-in
         set when dynamic fanout arms are multi-step chains rather than single tasks.
+
+        Deliberately looks only at `_successors`, not `_fanout_callbacks`: an arm
+        that is itself a nested dispatcher is still the correct initial terminal
+        here. Its provisional FanInCallback is dynamically delegated to its own
+        nested collector at runtime (see `_handle_declarative_fanout` /
+        `delegate_fan_in`) when that arm's `DynamicFanOutCallback.propagate_fan_in`
+        is True (the default). When it is False, this node completing — not its
+        nested tree completing — is exactly what should close the outer fan-in.
         """
         terminals: list[DAGNode] = []
         visited: set[int] = set()
@@ -437,6 +449,12 @@ class DAGNode:
                 if fan_in_key is not None:
                     result.setdefault(fan_in_key, set()).add(node._id)
                 _walk(successor)
+            # A DynamicFanOutCallback's collector is a fully-resolved DAGTaskSpec
+            # subtree (not a DAGNode), so any static fan-in it feeds into has to be
+            # collected via collect_fan_in_keys rather than this DAGNode-based walk.
+            for cb in node._fanout_callbacks:
+                for key, ids in collect_fan_in_keys(cb.collector).items():
+                    result.setdefault(key, set()).update(ids)
 
         _walk(self)
         return result

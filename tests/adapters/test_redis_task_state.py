@@ -561,6 +561,76 @@ async def test_init_fan_in_creates_tracking_and_members_sets(redis_task_adapter)
 
 
 @pytest.mark.asyncio
+async def test_init_fan_in_sets_ttl_on_first_call(redis_task_adapter):
+    """
+    The first init_fan_in call for a dag_run_id must actually set a TTL on both hashes.
+
+    Regression guard for the NX+GT combo: EXPIRE ... GT alone is a no-op on a key
+    with no existing TTL (Redis treats "no TTL" as infinite for GT purposes), which
+    would silently leave the fan-in hashes permanent. NX must fire first to
+    establish the initial expiry.
+    """
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:first", {ULID1}, ttl=100)
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id)) > 0
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id)) > 0
+
+
+@pytest.mark.asyncio
+async def test_init_fan_in_members_ttl_is_double_the_countdown_ttl(redis_task_adapter):
+    """The members hash gets 2x the countdown hash's ttl, as a read-after-expiry safety margin."""
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:margin", {ULID1}, ttl=100)
+    countdown_ttl = await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id))
+    members_ttl = await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id))
+    assert members_ttl > countdown_ttl
+
+
+@pytest.mark.asyncio
+async def test_init_fan_in_does_not_shrink_ttl_for_shorter_later_registration(redis_task_adapter):
+    """
+    A later collector registered with a shorter ttl must not shrink the shared hash's expiry.
+
+    Regression test: nested fan-outs share one DAG_RUN_FANIN/DAG_RUN_FANIN_MEMBERS
+    hash per dag_run_id. Plain EXPIRE overwrites the TTL on every call, so a second
+    collector with the (shorter) default ttl used to truncate an earlier collector's
+    longer, still-pending window — silently losing that collector's fan-in tracking
+    before it ever resolves.
+    """
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:long-lived", {ULID1}, ttl=200000)
+    long_ttl = await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id))
+
+    await state.init_fan_in(dag_run_id, "fan-in:short-lived", {ULID2}, ttl=100)
+
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id)) >= long_ttl - 5
+    assert (
+        await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id)) >= (long_ttl * 2) - 5
+    )
+    # Both fan-in keys' fields must still be present -- registering the second
+    # collector must not have dropped or reset the first collector's data.
+    remaining = await state.data_store.hget(
+        state.DAG_RUN_FANIN(dag_run_id=dag_run_id), "remaining:fan-in:long-lived"
+    )
+    assert int(remaining) == 1
+
+
+@pytest.mark.asyncio
+async def test_init_fan_in_extends_ttl_for_longer_later_registration(redis_task_adapter):
+    """A second collector registered with a longer ttl extends the shared hash's expiry."""
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:short-first", {ULID1}, ttl=100)
+    await state.init_fan_in(dag_run_id, "fan-in:long-second", {ULID2}, ttl=200000)
+
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id)) > 100
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id)) > 200
+
+
+@pytest.mark.asyncio
 async def test_read_for_watch_returns_task(redis_task_adapter):
     """read_for_watch returns the task when it exists."""
     state, submit = redis_task_adapter

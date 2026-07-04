@@ -277,13 +277,7 @@ class SharedTaskAdapterMixin(ABC):
 
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete blobs, heartbeat entries, and type-index members for old terminal tasks."""
-        terminal_statuses = {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.STALLED,
-            TaskStatus.DROPPED,
-        }
+        terminal_statuses = TaskStatus.terminal_statuses()
         cutoff = now - max_age
         async for raw_key in self.data_store.scan_iter("task:*"):
             key_str = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
@@ -365,7 +359,10 @@ class SharedTaskAdapterMixin(ABC):
                 [self.DAG_RUN_PENDING(dag_run_id=dag_run_id), self.DAG_RUN_CLOSED(dag_run_id=dag_run_id)]
             ),
         )
-        task_ids = [ULID.from_bytes(b) for b in raw_ids]
+        # SUNION has no ordering guarantee; ULIDs sort lexicographically by creation
+        # time, so sorting restores the submission-order guarantee callers rely on
+        # (e.g. the /dags/{dag_run_id} response) at no extra I/O cost.
+        task_ids = sorted(ULID.from_bytes(b) for b in raw_ids)
         return submitted_at, task_ids
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
@@ -487,9 +484,18 @@ class SharedTaskAdapterMixin(ABC):
         for pid in predecessor_ids:
             pending_fields[f"pending:{fan_in_key}:{pid}"] = "1"
         p.hset(fanin_key, mapping=pending_fields)
-        p.expire(fanin_key, ttl)
+        # Both hashes are shared by every collector registered under this dag_run_id.
+        # NX sets the expiry the first time the key is created; GT then only ever
+        # extends it on later calls, so a later collector's shorter ttl can never
+        # shrink the expiry out from under an earlier, still-pending collector's
+        # tracking data (plain EXPIRE would overwrite, not extend).
+        p.expire(fanin_key, ttl, nx=True)
+        p.expire(fanin_key, ttl, gt=True)
         p.hset(members_key, fan_in_key, json.dumps([str(pid) for pid in predecessor_ids]))
-        p.expire(members_key, ttl)
+        # Members data must outlive the countdown by a margin so get_fan_in_members
+        # can still succeed even if read right as the countdown key expires.
+        p.expire(members_key, ttl * 2, nx=True)
+        p.expire(members_key, ttl * 2, gt=True)
 
     async def init_fan_in(
         self, dag_run_id: ULID, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400

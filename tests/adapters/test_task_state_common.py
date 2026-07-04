@@ -820,6 +820,37 @@ async def test_get_dag_run_returns_submitted_at_and_task_ids(task_adapter):
     assert set(task_ids) == {ULID2, ULID3}
 
 
+@pytest.mark.asyncio
+async def test_get_dag_run_task_ids_are_chronologically_ordered(task_adapter):
+    """
+    get_dag_run's task_ids come back in submission (ULID) order, regardless of backend.
+
+    Regression test: the plain-Redis backend used to guarantee this via a
+    sorted-set read; after consolidating to a Set union, the order became
+    arbitrary. ULIDs sort lexicographically by creation time, so sorting the
+    result restores the ordering guarantee callers (e.g. GET /dags/{dag_run_id})
+    rely on, without any extra I/O.
+    """
+    state, submit = task_adapter
+    dag_run_id = ULID1
+    # Explicit timestamps (not back-to-back ULID() calls) so ordering is
+    # deterministic rather than relying on ULID()'s random tie-breaking bits
+    # within the same millisecond.
+    earliest = ULID.from_datetime(FROZEN_TIME)
+    middle = ULID.from_datetime(FROZEN_TIME + dt.timedelta(seconds=1))
+    latest = ULID.from_datetime(FROZEN_TIME + dt.timedelta(seconds=2))
+    # Register deliberately out of chronological order.
+    for tid in (latest, earliest, middle):
+        task = make_task(tid, submitted_at=FROZEN_TIME)
+        task.dag_run_id = dag_run_id
+        await submit.submit_task(task)
+
+    result = await state.get_dag_run(dag_run_id)
+    assert result is not None
+    _, task_ids = result
+    assert task_ids == [earliest, middle, latest]
+
+
 # ── clean_dag_runs ────────────────────────────────────────────────────────────
 
 

@@ -26,3 +26,7 @@ class TaskStatus(StrEnum):
     @classmethod
     def active_statuses(cls) -> set["TaskStatus"]:
         return {cls.SUBMITTED, cls.STARTED, cls.SCHEDULED}
+
+    @classmethod
+    def terminal_statuses(cls) -> set["TaskStatus"]:
+        return {cls.COMPLETED, cls.FAILED, cls.CANCELLED, cls.STALLED, cls.DROPPED}

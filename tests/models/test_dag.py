@@ -6,6 +6,7 @@ from jobbers.models.dag import (
     DAGNode,
     DAGTaskSpec,
     DynamicFanOut,
+    DynamicFanOutCallback,
     FanInCallback,
     SimpleCallback,
     TaskResult,
@@ -195,6 +196,71 @@ def test_fresh_copy_then_collect_fan_in_keys_no_old_ids():
     assert new_predecessor_id in fan_ins[f"dag:fan-in:{new_collector_id}"]
 
 
+def test_collect_fan_in_keys_walks_into_dynamic_fanout_collector():
+    """
+    A static fan-in reachable through a dynamic fan-out's collector must be pre-populated.
+
+    Regression test: the old code `continue`d past every DynamicFanOutCallback
+    without ever visiting cb.collector, so any static fan-in downstream of a
+    dynamic-fanout collector (e.g. `collector --> grand_collector` in a mermaid
+    diagram) was under-counted at DAG-submission time — that fan-in could then
+    fire before the collector's own branch actually completed.
+    """
+    grand_collector = make_spec("grand_collector")
+    fan_key = f"dag:fan-in:{grand_collector.id}"
+    collector = DAGTaskSpec(
+        name="collector",
+        dag_callbacks=[FanInCallback(task=grand_collector, fan_in_key=fan_key)],
+    )
+    arm_root = make_spec("arm_root")
+    fanout_cb = DynamicFanOutCallback(arm_root=arm_root, collector=collector, items_key="items")
+    dispatcher = DAGTaskSpec(name="dispatcher", dag_callbacks=[fanout_cb])
+
+    result = collect_fan_in_keys(dispatcher)
+    assert result == {fan_key: {collector.id}}
+
+
+def test_collect_fan_in_keys_does_not_walk_into_arm_root():
+    """Arm-root fan-ins are intentionally NOT pre-populated — initialised at runtime by the processor."""
+    inner_collector = make_spec("inner_collector")
+    inner_fan_key = f"dag:fan-in:{inner_collector.id}"
+    arm_step = DAGTaskSpec(
+        name="arm_step",
+        dag_callbacks=[FanInCallback(task=inner_collector, fan_in_key=inner_fan_key)],
+    )
+    arm_root = DAGTaskSpec(name="arm_root", dag_callbacks=[SimpleCallback(task=arm_step)])
+    collector = make_spec("collector")
+    fanout_cb = DynamicFanOutCallback(arm_root=arm_root, collector=collector, items_key="items")
+    dispatcher = DAGTaskSpec(name="dispatcher", dag_callbacks=[fanout_cb])
+
+    result = collect_fan_in_keys(dispatcher)
+    assert inner_fan_key not in result
+
+
+def test_dag_node_fan_in_predecessors_walks_into_fanout_collector():
+    """
+    DAGNode.fan_in_predecessors must include fan-ins reachable through a fan-out collector.
+
+    A DynamicFanOutCallback's collector is a fully-resolved DAGTaskSpec subtree
+    (attached via add_fanout_callback), not a DAGNode, so fan_in_predecessors has
+    to delegate to collect_fan_in_keys for it rather than only walking _successors.
+    """
+    grand_collector = make_spec("grand_collector")
+    fan_key = f"dag:fan-in:{grand_collector.id}"
+    collector_spec = DAGTaskSpec(
+        name="collector",
+        dag_callbacks=[FanInCallback(task=grand_collector, fan_in_key=fan_key)],
+    )
+    arm_root_spec = make_spec("arm_root")
+    fanout_cb = DynamicFanOutCallback(arm_root=arm_root_spec, collector=collector_spec, items_key="items")
+
+    dispatcher_node = DAGNode("dispatcher")
+    dispatcher_node.add_fanout_callback(fanout_cb)
+
+    preds = dispatcher_node.fan_in_predecessors()
+    assert preds == {fan_key: {collector_spec.id}}
+
+
 # ── TaskResult ────────────────────────────────────────────────────────────────
 
 
@@ -371,6 +437,28 @@ def test_find_terminals_deduplicates_shared_merge_target():
     DAGNode.merge(b1, b2, into=merger)
     terminals = DAGNode.find_terminals([root])
     assert terminals == [merger]
+
+
+def test_find_terminals_treats_nested_dispatcher_as_its_own_terminal():
+    """
+    An arm that is itself a nested dispatcher is intentionally its own terminal here.
+
+    This is by design, not a gap: the outer collector's FanInCallback is wired to this
+    node provisionally; if the nested DynamicFanOutCallback's own propagate_fan_in is
+    True (the default), _handle_declarative_fanout delegates that FanInCallback to the
+    nested collector at runtime once this node actually executes and reveals its nested
+    fan-out. If propagate_fan_in is False, this node completing — not its nested tree
+    completing — is exactly what the caller asked to close the outer fan-in.
+    """
+    dispatcher = DAGNode("dispatcher")
+    dispatcher.add_fanout_callback(
+        DynamicFanOutCallback(
+            arm_root=make_spec("inner_arm"),
+            collector=make_spec("inner_collector"),
+            items_key="items",
+        )
+    )
+    assert DAGNode.find_terminals([dispatcher]) == [dispatcher]
 
 
 # ── error callbacks ───────────────────────────────────────────────────────────

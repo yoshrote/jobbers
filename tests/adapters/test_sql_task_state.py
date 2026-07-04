@@ -9,8 +9,10 @@ get_next_task) is exercised here only as test setup for state operations.
 """
 
 import datetime as dt
+from unittest.mock import patch
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from jobbers.adapters.sql import SQLTaskState, SQLTaskSubmit
@@ -170,6 +172,51 @@ async def test_clean_noop_when_no_age_params(session_factory):
     await submit.submit_task(make_task())
     await state.clean(queues={"default"}, now=dt.datetime.now(dt.UTC))
     assert await state.task_exists(ULID1)
+
+
+# ── close_dag_run_task ────────────────────────────────────────────────────────
+#
+# Decreasing-count/idempotency protocol behaviour is covered once, against all
+# three backends, by test_task_state_common.py's test_close_dag_run_task_*
+# tests. The test below only pins the SQL-specific locking implementation
+# detail (which table the serializing FOR UPDATE targets) that those common
+# tests can't see and don't need to.
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_locks_dag_runs_anchor_not_every_pending_row(session_factory):
+    """
+    close_dag_run_task's serializing lock targets the run's single dag_runs row.
+
+    Regression test: an earlier version of this lock selected FOR UPDATE over every
+    dag_run_pending row in the run (unfiltered by task_id), which serializes every
+    concurrent sibling completion in the run instead of just the read-then-write for
+    one task -- a severe throughput cost for large fan-outs on Postgres. Locking the
+    run's one dag_runs row gives the same serialization guarantee without a lock
+    that grows with the run's size. This can't be observed behaviourally under
+    SQLite's single-connection test fixture, so it's pinned by inspecting the
+    compiled lock statement instead.
+    """
+    state = SQLTaskState(session_factory)
+    submit = SQLTaskSubmit(session_factory)
+    dag_run_id = ULID()
+    task = make_task(ULID1, submitted_at=FROZEN_TIME)
+    task.dag_run_id = dag_run_id
+    await submit.submit_task(task)
+
+    original_execute = AsyncSession.execute
+    captured_statements: list[str] = []
+
+    async def _capturing_execute(self, statement, *args, **kwargs):
+        captured_statements.append(str(statement))
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", _capturing_execute):
+        await state.close_dag_run_task(dag_run_id, ULID1)
+
+    lock_statement = captured_statements[0]
+    assert "FROM dag_runs" in lock_statement
+    assert "dag_run_pending" not in lock_statement
 
 
 # ── transaction atomicity ─────────────────────────────────────────────────────

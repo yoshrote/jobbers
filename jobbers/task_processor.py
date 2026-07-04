@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args, ge
 from opentelemetry import metrics
 from ulid import ULID
 
-from jobbers import registry
 from jobbers.context import _current_task as _current_task_cv
 from jobbers.models.dag import (
     DAGNode,
@@ -44,8 +43,9 @@ def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
     Walks all ``SimpleCallback`` and ``FanInCallback`` entries recursively,
     creates one ``DAGNode`` per spec (preserving its pre-assigned ULID), and
     wires them with ``.then()`` / ``DAGNode.merge()`` to match the original
-    graph structure.  ``DynamicFanOutCallback`` entries are ignored — nested
-    declarative fanouts are driven by the processor when those tasks execute.
+    graph structure.  ``DynamicFanOutCallback`` entries are reattached as-is
+    via ``add_fanout_callback`` (not recursed into) — nested declarative
+    fanouts are driven by the processor when those tasks execute.
     """
     # First pass: collect every reachable spec and create a matching DAGNode.
     all_specs: dict[ULID, DAGTaskSpec] = {}
@@ -80,6 +80,8 @@ def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
                 fan_in_preds.setdefault(cb.task.id, []).append(
                     _FanInPred(node, err_node, cb.inject_parent_results)
                 )
+            elif isinstance(cb, DynamicFanOutCallback):
+                node.add_fanout_callback(cb)
 
     for collector_id, preds in fan_in_preds.items():
         collector_node = all_nodes[collector_id]
@@ -228,7 +230,13 @@ class TaskProcessor:
         # spawned are already registered in the DAG run before this task is closed
         # out of it — otherwise a dispatcher could look like the last active task
         # and trigger cleanup before its own arms exist.
-        await self._maybe_cleanup(task)
+        #
+        # Only terminal statuses close the task out of DAG-run tracking. A task
+        # that is retrying (SCHEDULED / UNSUBMITTED) is not done — closing it here
+        # would desync the DAG-run pending counter and could trigger the sibling
+        # sweep while this task is still going to run again.
+        if task.status in TaskStatus.terminal_statuses():
+            await self._maybe_cleanup(task)
 
         if task.status != TaskStatus.COMPLETED and ex is not None:
             raise ex
@@ -252,18 +260,14 @@ class TaskProcessor:
         completion) detects when the whole run has gone terminal; the full
         sibling sweep then runs exactly once, when the counter reaches zero,
         instead of being redone from scratch on every one of the run's completions.
+        The counter-close-and-sweep logic lives on StateManager so the Cleaner's
+        stale-heartbeat path (which moves a task straight to STALLED, bypassing
+        normal completion) can trigger it too.
         """
         if task.dag_run_id is None:
             await self._maybe_delete_self(task)
             return
-
-        remaining = await self.state_manager.close_dag_run_task(task.dag_run_id, task.id)
-        if remaining != 0:
-            # >0: DAG still in flight, the last task to close will trigger the sweep.
-            # -1: already closed (duplicate call) or the run's pending entry expired/was
-            # swept — either way, do not re-trigger the sweep from here.
-            return
-        await self._sweep_dag_run(task.dag_run_id)
+        await self.state_manager.close_dag_run_task_and_sweep(task)
 
     async def _maybe_delete_self(self, task: Task) -> None:
         """Delete a standalone (non-DAG) task's record if its status matches cleanup_on."""
@@ -272,48 +276,42 @@ class TaskProcessor:
         if task.status in task.task_config.cleanup_on:
             await self.state_manager.delete_task(task)
 
-    async def _sweep_dag_run(self, dag_run_id: ULID) -> None:
-        """Delete every task in a now-fully-terminal DAG run whose config says to clean up."""
-        run = await self.state_manager.get_dag_run(dag_run_id)
-        if run is None:
-            # Orphaned run index — nothing left to sweep.
-            return
-
-        _, task_ids = run
-        sibling_tasks = await self.state_manager.task_state.get_tasks_bulk(task_ids)
-        to_delete: list[Task] = []
-        for sibling in sibling_tasks:
-            if sibling is None:
-                continue
-            cfg = registry.get_task_config(sibling.name, sibling.version)
-            if cfg and cfg.cleanup_on and sibling.status in cfg.cleanup_on:
-                to_delete.append(sibling)
-        if to_delete:
-            await asyncio.gather(*(self.state_manager.delete_task(t) for t in to_delete))
-
     def mark_task_as_started(self, task: Task) -> None:
         task.set_status(TaskStatus.STARTED)
         logger.info("Task %s started (attempt %d).", task.id, task.retry_attempt + 1)
 
     async def post_process(self, task: Task, dynamic_fanout: DynamicFanOut | None = None) -> None:
+        # Detect outer fan-in callbacks that should be delegated to a grandcollector
+        # instead of being decremented by this task, from either fan-out mechanism:
+        # a declarative DynamicFanOutCallback in the spec (mermaid `-->>`), or a
+        # programmatic DynamicFanOut returned by the task function. Only applies
+        # when propagate_fan_in is True (the default). Keyed by fan_in_key so
+        # skip_fan_in_keys below reflects whichever mechanism actually delegated it
+        # — the declarative path performs its own delegation inside
+        # _handle_declarative_fanout, so it must still be reflected here or
+        # generate_callbacks would redundantly try to decrement an already-delegated key.
+        outer_fan_in_cbs_by_key: dict[str, FanInCallback] = {}
+
         # Handle declarative DynamicFanOutCallbacks embedded in the task spec.
         # These are produced by the mermaid parser; task functions that return
         # DynamicFanOut directly use the dynamic_fanout path below instead.
         for cb in task.dag_callbacks:
             if isinstance(cb, DynamicFanOutCallback):
                 await self._handle_declarative_fanout(task, cb)
-
-        # Detect outer fan-in callbacks that should be delegated to the grandcollector
-        # instead of being decremented by this task.  Only applies when propagate_fan_in
-        # is True (the default) on the returned DynamicFanOut.
-        outer_fan_in_cbs: list[FanInCallback] = []
-        if dynamic_fanout is not None and dynamic_fanout.propagate_fan_in:
-            outer_fan_in_cbs = [cb for cb in task.dag_callbacks if isinstance(cb, FanInCallback)]
+                if cb.propagate_fan_in:
+                    for fc in task.dag_callbacks:
+                        if isinstance(fc, FanInCallback):
+                            outer_fan_in_cbs_by_key[fc.fan_in_key] = fc
 
         if dynamic_fanout is not None:
-            await self._handle_dynamic_fanout(task, dynamic_fanout, outer_fan_in_cbs)
+            if dynamic_fanout.propagate_fan_in:
+                for fc in task.dag_callbacks:
+                    if isinstance(fc, FanInCallback):
+                        outer_fan_in_cbs_by_key[fc.fan_in_key] = fc
+            await self._handle_dynamic_fanout(task, dynamic_fanout, list(outer_fan_in_cbs_by_key.values()))
+
         if task.has_callbacks():
-            skip_keys = frozenset(cb.fan_in_key for cb in outer_fan_in_cbs)
+            skip_keys = frozenset(outer_fan_in_cbs_by_key)
             callbacks = await task.generate_callbacks(
                 self.state_manager.task_state, skip_fan_in_keys=skip_keys
             )
@@ -380,6 +378,35 @@ class TaskProcessor:
         )
         await self._handle_dynamic_fanout(parent, fanout, outer_fan_in_cbs)
 
+    async def _delegate_outer_fan_in(
+        self,
+        collector_task: Task,
+        dag_run_id: ULID,
+        parent_id: ULID,
+        collector_id: ULID,
+        outer_fan_in_cbs: list[FanInCallback],
+    ) -> None:
+        """
+        Transfer outer_fan_in_cbs onto collector_task and delegate them to collector_id.
+
+        Atomically swaps parent_id for collector_id in each outer fan-in set, so the
+        outer fan-in waits for the collector rather than the task that just
+        dispatched it. No-op if outer_fan_in_cbs is empty.
+        """
+        if not outer_fan_in_cbs:
+            return
+        collector_task.dag_callbacks = list(collector_task.dag_callbacks) + cast(
+            "list[SimpleCallback | FanInCallback | DynamicFanOutCallback]", outer_fan_in_cbs
+        )
+        await asyncio.gather(
+            *(
+                self.state_manager.task_state.delegate_fan_in(
+                    dag_run_id, cb.fan_in_key, parent_id, collector_id
+                )
+                for cb in outer_fan_in_cbs
+            )
+        )
+
     async def _handle_dynamic_fanout(
         self,
         parent: Task,
@@ -410,8 +437,13 @@ class TaskProcessor:
         dag_run_id = parent.dag_run_id or ULID()
 
         if not fanout.arms:
-            # Degenerate case: no arms — submit the collector immediately.
+            # Degenerate case: no arms — submit the collector immediately. Outer fan-in
+            # callbacks still need to be delegated to it, exactly as in the normal path
+            # below, otherwise an outer fan-in waiting on *parent* never gets closed.
             solo = fanout.collector.to_task(dag_run_id=dag_run_id)
+            await self._delegate_outer_fan_in(
+                solo, dag_run_id, parent.id, fanout.collector.id, outer_fan_in_cbs
+            )
             await self.state_manager.submit_task(solo)
             return
 
@@ -441,18 +473,9 @@ class TaskProcessor:
         # 5. Delegation: transfer outer fan-in callbacks to the collector and
         #    atomically swap parent's ID → collector's ID in each outer fan-in set.
         #    Outer callbacks only exist when the parent was already part of dag_run_id.
-        if outer_fan_in_cbs:
-            collector_task.dag_callbacks = list(collector_task.dag_callbacks) + cast(
-                "list[SimpleCallback | FanInCallback | DynamicFanOutCallback]", outer_fan_in_cbs
-            )
-            await asyncio.gather(
-                *(
-                    self.state_manager.task_state.delegate_fan_in(
-                        dag_run_id, cb.fan_in_key, parent.id, fanout.collector.id
-                    )
-                    for cb in outer_fan_in_cbs
-                )
-            )
+        await self._delegate_outer_fan_in(
+            collector_task, dag_run_id, parent.id, fanout.collector.id, outer_fan_in_cbs
+        )
 
         # 6. Initialise all fan-in sets, pre-save the collector, submit arm roots.
         await asyncio.gather(

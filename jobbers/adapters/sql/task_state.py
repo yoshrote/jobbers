@@ -39,16 +39,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_STATUSES = frozenset(
-    [
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-        TaskStatus.STALLED,
-        TaskStatus.DROPPED,
-    ]
-)
-
 
 def _task_to_row(task: Task) -> dict[str, Any]:
     """Serialize a Task to a dict of column values."""
@@ -508,7 +498,9 @@ class SQLTaskState:
             task_result = await session.execute(
                 select(tasks.c.id).where(tasks.c.dag_run_id == dag_run_id_str)
             )
-            task_ids = [ULID.from_str(row.id) for row in task_result.all()]
+            # ULIDs sort lexicographically by creation time; sort here so task_ids
+            # is chronologically ordered regardless of the row order SQL returns.
+            task_ids = sorted(ULID.from_str(row.id) for row in task_result.all())
         return _ensure_utc_nn(run_row.submitted_at), task_ids
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
@@ -536,6 +528,20 @@ class SQLTaskState:
         dag_run_id_str = str(dag_run_id)
         async with self._sf() as session:
             async with session.begin():
+                # Lock the run's single dag_runs row as a mutex before reading/writing
+                # dag_run_pending. Without this, two siblings closing concurrently under
+                # READ COMMITTED (e.g. Postgres) can each run their COUNT before the
+                # other's UPDATE commits, so both compute a stale remaining > 0 and the
+                # fast-path sweep never fires. Locking this one anchor row serializes
+                # closers for the run without taking a lock proportional to the run's
+                # size (locking every dag_run_pending row would itself serialize what
+                # should be independent, concurrent completions). This is a no-op on
+                # SQLite, which has no concurrent-writer MVCC race to guard against here.
+                lock_stmt = select(dag_runs.c.dag_run_id).where(dag_runs.c.dag_run_id == dag_run_id_str)
+                if self._use_for_update:
+                    lock_stmt = lock_stmt.with_for_update()
+                await session.execute(lock_stmt)
+
                 result = await session.execute(
                     update(dag_run_pending)
                     .where(
@@ -575,7 +581,7 @@ class SQLTaskState:
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete terminal tasks older than ``max_age``."""
         cutoff = now - max_age
-        statuses = [s.value for s in _TERMINAL_STATUSES]
+        statuses = [s.value for s in TaskStatus.terminal_statuses()]
         async with self._sf() as session:
             async with session.begin():
                 await session.execute(

@@ -225,6 +225,7 @@ class StateManager:
 
             stale_pipes = []
             stale_saga_tasks: list[Task] = []
+            newly_stalled: list[Task] = []
             for (task_type, task_version), tasks in stale_tasks_by_type.items():
                 task_config = registry.get_task_config(task_type, task_version)
                 if task_config and task_config.max_heartbeat_interval:
@@ -234,6 +235,7 @@ class StateManager:
                             and (now - task.heartbeat_at) > task_config.max_heartbeat_interval
                         ):
                             task.set_status(TaskStatus.STALLED)
+                            newly_stalled.append(task)
                             if self._atomic_state is not None:
                                 pipe = self._atomic_state.pipeline(transaction=True)
                                 self._atomic_state.stage_save(pipe, task)
@@ -246,6 +248,13 @@ class StateManager:
             for stale_task in stale_saga_tasks:
                 await self.task_state.save_task(stale_task)
                 await self.task_state.remove_task_heartbeat(stale_task)
+
+            # A stalled task will never complete on its own, so it must close itself
+            # out of DAG-run tracking here — otherwise a DAG run containing it would
+            # never reach a pending count of zero via the normal completion path.
+            dag_stalled = [t for t in newly_stalled if t.dag_run_id is not None]
+            if dag_stalled:
+                await asyncio.gather(*(self.close_dag_run_task_and_sweep(t) for t in dag_stalled))
 
         await asyncio.gather(*clean_ops)
 
@@ -865,6 +874,60 @@ class StateManager:
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         """Mark task_id resolved in the DAG run's pending set; return the remaining count."""
         return await self.task_state.close_dag_run_task(dag_run_id, task_id)
+
+    async def sweep_dag_run(self, dag_run_id: ULID, *, fallback_task: Task | None = None) -> None:
+        """
+        Delete every task in a now-fully-terminal DAG run whose config says to clean up.
+
+        If the run's index is orphaned (already swept, e.g. by the age-based
+        ``clean_dag_runs`` purge racing this call), fall back to applying
+        *fallback_task*'s own ``cleanup_on`` policy to just that task.
+
+        **Precondition:** callers must only pass *fallback_task* once they have
+        independently confirmed the run is fully terminal (e.g. ``close_dag_run_task``
+        just returned a remaining count of 0 for it). This method does not — and, once
+        the run's index is orphaned, cannot — re-verify that on its own; passing
+        *fallback_task* for a run that still has siblings in flight would delete a
+        task those siblings may still depend on (e.g. via ``parent_results()``).
+        The only production caller, ``close_dag_run_task_and_sweep``, already
+        guarantees this.
+        """
+        run = await self.get_dag_run(dag_run_id)
+        if run is None:
+            if fallback_task is not None:
+                cfg = registry.get_task_config(fallback_task.name, fallback_task.version)
+                if cfg and cfg.cleanup_on and fallback_task.status in cfg.cleanup_on:
+                    await self.delete_task(fallback_task)
+            return
+
+        _, task_ids = run
+        sibling_tasks = await self.task_state.get_tasks_bulk(task_ids)
+        to_delete: list[Task] = []
+        for sibling in sibling_tasks:
+            if sibling is None:
+                continue
+            cfg = registry.get_task_config(sibling.name, sibling.version)
+            if cfg and cfg.cleanup_on and sibling.status in cfg.cleanup_on:
+                to_delete.append(sibling)
+        if to_delete:
+            await asyncio.gather(*(self.delete_task(t) for t in to_delete))
+
+    async def close_dag_run_task_and_sweep(self, task: Task) -> None:
+        """
+        Close *task* out of its DAG run's pending set and sweep siblings if the run just went terminal.
+
+        Used both by the normal task-completion path (``TaskProcessor._maybe_cleanup``)
+        and by the Cleaner's stale-heartbeat path, since a task moved straight to
+        STALLED never goes through normal completion and must close itself out here.
+        """
+        assert task.dag_run_id is not None  # noqa: S101
+        remaining = await self.close_dag_run_task(task.dag_run_id, task.id)
+        if remaining != 0:
+            # >0: DAG still in flight, the last task to close will trigger the sweep.
+            # -1: already closed (duplicate call) or the run's pending entry expired/was
+            # swept — either way, do not re-trigger the sweep from here.
+            return
+        await self.sweep_dag_run(task.dag_run_id, fallback_task=task)
 
     async def delete_task(self, task: Task) -> None:
         """Delete a task record and remove it from all indexes."""

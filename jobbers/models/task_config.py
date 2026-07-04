@@ -77,8 +77,7 @@ class TaskConfig(BaseModel):
     def _validate_cleanup_on(cls, v: frozenset[TaskStatus] | None) -> frozenset[TaskStatus] | None:
         if v is None:
             return v
-        _non_terminal = TaskStatus.active_statuses() | {TaskStatus.UNSUBMITTED}
-        invalid = v & _non_terminal
+        invalid = v - TaskStatus.terminal_statuses()
         if invalid:
             raise ValueError(f"cleanup_on may not contain non-terminal statuses: {invalid}")
         return v

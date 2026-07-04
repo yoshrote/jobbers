@@ -257,6 +257,220 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager_
     assert await redis.zscore("task-heartbeats:default", ULID1.bytes) is None
 
 
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_dag_task_closes_and_sweeps_run(redis, state_manager_real_ta):
+    """
+    A stale-heartbeat DAG task is marked STALLED and, as the run's only pending task, swept away.
+
+    Regression test: the Cleaner's stale-heartbeat path used to never call
+    close_dag_run_task at all, so a DAG run containing a stalled task could never
+    reach a pending count of zero via the fast path.
+    """
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    dag_run_id = ULID()
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+        dag_run_id=dag_run_id,
+        submitted_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task",
+        function=dummy_fn,
+        max_heartbeat_interval=dt.timedelta(minutes=5),
+        cleanup_on=frozenset({TaskStatus.STALLED}),
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    assert not await state_manager_real_ta.task_state.task_exists(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_dag_task_waits_for_pending_siblings(redis, state_manager_real_ta):
+    """A stalled DAG task with a still-pending sibling must not trigger the sweep."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    dag_run_id = ULID()
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+        dag_run_id=dag_run_id,
+        submitted_at=two_hours_ago,
+    )
+    sibling = Task(
+        id=ULID2,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.SUBMITTED,
+        dag_run_id=dag_run_id,
+        submitted_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=started)
+    await state_manager_real_ta.task_submit.submit_task(task=sibling)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task",
+        function=dummy_fn,
+        max_heartbeat_interval=dt.timedelta(minutes=5),
+        cleanup_on=frozenset({TaskStatus.STALLED}),
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert await state_manager_real_ta.task_state.task_exists(ULID2)
+
+
+# ── close_dag_run_task_and_sweep / sweep_dag_run ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_and_sweep_waits_when_siblings_pending(state_manager_real_ta):
+    """Remaining > 0 must not trigger a sweep — the still-pending sibling is untouched."""
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    task_b = Task(
+        id=ULID2,
+        name="my_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task_a)
+    await state_manager_real_ta.task_submit.submit_task(task=task_b)
+
+    cleanup_config = TaskConfig(
+        name="my_task", function=dummy_fn, cleanup_on=frozenset({TaskStatus.COMPLETED})
+    )
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.close_dag_run_task_and_sweep(task_a)
+
+    assert await state_manager_real_ta.task_state.task_exists(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_and_sweep_deletes_terminal_siblings_when_run_closes(state_manager_real_ta):
+    """When the last sibling closes, the sweep deletes every sibling whose status matches its cleanup_on."""
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    task_b = Task(
+        id=ULID2,
+        name="my_task",
+        version=1,
+        status=TaskStatus.FAILED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task_a)
+    await state_manager_real_ta.task_submit.submit_task(task=task_b)
+
+    cleanup_config = TaskConfig(
+        name="my_task", function=dummy_fn, cleanup_on=frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED})
+    )
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.close_dag_run_task_and_sweep(task_a)
+        await state_manager_real_ta.close_dag_run_task_and_sweep(task_b)
+
+    assert not await state_manager_real_ta.task_state.task_exists(ULID1)
+    assert not await state_manager_real_ta.task_state.task_exists(ULID2)
+
+
+@pytest.mark.asyncio
+async def test_sweep_dag_run_orphaned_index_falls_back_to_fallback_task(state_manager_real_ta):
+    """
+    An orphaned run index still cleans up the task that triggered the call, per its own cleanup_on.
+
+    Regression test: _sweep_dag_run used to just return when get_dag_run() found
+    nothing (e.g. clean_dag_runs concurrently swept the run's index), leaving the
+    completing task stuck instead of being reclaimed immediately.
+    """
+    dag_run_id = ULID()  # never registered via submit_task, so get_dag_run() -> None
+    task = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_state.save_task(task)
+
+    cleanup_config = TaskConfig(
+        name="my_task", function=dummy_fn, cleanup_on=frozenset({TaskStatus.COMPLETED})
+    )
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.sweep_dag_run(dag_run_id, fallback_task=task)
+
+    assert not await state_manager_real_ta.task_state.task_exists(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_sweep_dag_run_orphaned_index_skips_fallback_when_status_not_in_cleanup_on(
+    state_manager_real_ta,
+):
+    """Orphaned run index + fallback_task whose status doesn't match cleanup_on -> no deletion."""
+    dag_run_id = ULID()
+    task = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_state.save_task(task)
+
+    cleanup_config = TaskConfig(name="my_task", function=dummy_fn, cleanup_on=frozenset({TaskStatus.FAILED}))
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.sweep_dag_run(dag_run_id, fallback_task=task)
+
+    assert await state_manager_real_ta.task_state.task_exists(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_sweep_dag_run_orphaned_index_no_fallback_task_is_noop(state_manager_real_ta):
+    """Orphaned run index with no fallback_task is a plain no-op (no error)."""
+    dag_run_id = ULID()
+    await state_manager_real_ta.sweep_dag_run(dag_run_id)
+
+
 # ── fail_task ─────────────────────────────────────────────────────────────────
 
 
