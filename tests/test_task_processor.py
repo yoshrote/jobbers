@@ -1896,11 +1896,13 @@ async def test_maybe_cleanup_dag_task_deletes_when_all_siblings_terminal():
 @pytest.mark.asyncio
 async def test_maybe_cleanup_runs_after_dynamic_fanout_registers_arms():
     """
-    Regression test for an ordering hazard: _maybe_cleanup must run after post_process
-    spawns fan-out arms, so a dispatcher only closes itself out of the DAG run's pending
-    set once its own arms are already registered in that same set. If cleanup ran first
-    (as it used to), a dispatcher that looked like the last active task could trigger
-    cleanup before the arms it was about to spawn even existed.
+    Regression test for an ordering hazard with _maybe_cleanup.
+
+    _maybe_cleanup must run after post_process spawns fan-out arms, so a dispatcher
+    only closes itself out of the DAG run's pending set once its own arms are
+    already registered in that same set. If cleanup ran first (as it used to), a
+    dispatcher that looked like the last active task could trigger cleanup before
+    the arms it was about to spawn even existed.
     """
     dag_run_id = ULID()
     task = Task(

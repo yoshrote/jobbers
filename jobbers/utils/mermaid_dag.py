@@ -386,7 +386,7 @@ def _extract_edges_from_line(
         if not src_m or not dst_m:
             continue
         src, dst = src_m.group(1), dst_m.group(1)
-        if op == "-->" :
+        if op == "-->":
             success_edges.append(Edge(src, dst))
         elif op == "-.->":
             error_edges.append(Edge(src, dst))
@@ -567,9 +567,7 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
         if edge.src in arm_node_ids and edge.dst in arm_node_ids:
             arm_predecessors[edge.dst].append(edge.src)
 
-    arm_fan_in_collectors: set[str] = {
-        dst for dst, srcs in arm_predecessors.items() if len(srcs) >= 2
-    }
+    arm_fan_in_collectors: set[str] = {dst for dst, srcs in arm_predecessors.items() if len(srcs) >= 2}
     for edge in success_edges:
         if edge.src not in arm_node_ids or edge.dst not in arm_node_ids:
             continue
@@ -660,11 +658,7 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
     # that are not error targets and not arm nodes and not collectors.
     error_targets: set[str] = set(error_map.values())
     excluded = arm_node_ids | collector_ids | error_targets
-    roots = [
-        dag_nodes[nid]
-        for nid in all_ids
-        if not predecessors.get(nid) and nid not in excluded
-    ]
+    roots = [dag_nodes[nid] for nid in all_ids if not predecessors.get(nid) and nid not in excluded]
 
     if not roots:
         raise MermaidParseError(
@@ -732,7 +726,8 @@ def dag_spec_to_mermaid(
             edge_lines.append(f"    {src} {arrow} {dst}")
 
     def _walk_arm(s: DAGTaskSpec, collector: DAGTaskSpec) -> None:
-        """Walk an arm spec tree in expanded mode.
+        """
+        Walk an arm spec tree in expanded mode.
 
         Nodes with no ``SimpleCallback``/``FanInCallback`` successors are leaf nodes;
         they connect to *collector* via ``--o``.  Intermediate nodes emit ``-->``
@@ -752,27 +747,28 @@ def dag_spec_to_mermaid(
             _add_edge(sid, str(collector.id), "--o")
             _walk(collector)
         else:
-            for cb in arm_successors:
-                child_id = str(cb.task.id)
+            for arm_cb in arm_successors:
+                child_id = str(arm_cb.task.id)
                 _add_edge(sid, child_id, "-->")
-                if cb.error_callback is not None:
-                    _add_edge(sid, str(cb.error_callback.id), "-.->")
-                    _walk(cb.error_callback)
-                _walk_arm(cb.task, collector)
+                if arm_cb.error_callback is not None:
+                    _add_edge(sid, str(arm_cb.error_callback.id), "-.->")
+                    _walk(arm_cb.error_callback)
+                _walk_arm(arm_cb.task, collector)
 
         # Nested DynamicFanOutCallback inside an arm node (only reached in expanded mode).
-        for cb in s.dag_callbacks:
-            if isinstance(cb, DynamicFanOutCallback):
-                inner_arm_id = str(cb.arm_root.id)
+        for dag_cb in s.dag_callbacks:
+            if isinstance(dag_cb, DynamicFanOutCallback):
+                inner_arm_id = str(dag_cb.arm_root.id)
                 _add_edge(sid, inner_arm_id, "-->>")
-                if cb.error_callback is not None:
-                    _add_edge(sid, str(cb.error_callback.id), "-.->")
-                    _walk(cb.error_callback)
-                _walk_arm(cb.arm_root, cb.collector)
-                _walk(cb.collector)
+                if dag_cb.error_callback is not None:
+                    _add_edge(sid, str(dag_cb.error_callback.id), "-.->")
+                    _walk(dag_cb.error_callback)
+                _walk_arm(dag_cb.arm_root, dag_cb.collector)
+                _walk(dag_cb.collector)
 
     def _walk_compact_arm(s: DAGTaskSpec) -> None:
-        """Compact walk: show the arm fanout skeleton without expanding chain steps.
+        """
+        Compact walk: show the arm fanout skeleton without expanding chain steps.
 
         Recurses into nested ``DynamicFanOutCallback`` entries so their ``-->>`` / ``--o``
         structure is visible, but skips ``SimpleCallback`` / ``FanInCallback`` steps that

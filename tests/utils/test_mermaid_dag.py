@@ -585,15 +585,15 @@ def test_parse_fanout_single_step_arm() -> None:
 
 
 def test_parse_fanout_custom_items_key() -> None:
-    """A --\"batches\">> B; B --o C uses 'batches' as items_key."""
-    text = '''
+    r"""A --\"batches\">> B; B --o C uses 'batches' as items_key."""
+    text = """
     flowchart TD
         A["split_work"]
         B["process_batch"]
         C["merge_batches"]
         A --"batches">> B
         B --o C
-    '''
+    """
     roots = parse_mermaid_dag(text)
     spec = roots[0].to_spec()
     cb = spec.dag_callbacks[0]
@@ -741,8 +741,8 @@ def test_generator_fanout_emits_fanout_and_fanin_edges() -> None:
     assert isinstance(cb, DynamicFanOutCallback)
     arm_id = str(cb.arm_root.id)
     col_id = str(cb.collector.id)
-    assert any(f"-->>" in ln and arm_id in ln for ln in lines)
-    assert any(f"--o" in ln and col_id in ln for ln in lines)
+    assert any("-->>" in ln and arm_id in ln for ln in lines)
+    assert any("--o" in ln and col_id in ln for ln in lines)
 
 
 def test_generator_fanout_expanded_multi_step_arm() -> None:
@@ -770,14 +770,17 @@ def test_generator_fanout_expanded_multi_step_arm() -> None:
     lines = [ln.strip() for ln in diagram.splitlines()]
 
     # arm_root --> step is emitted
-    assert any(f"{arm_root_id} -->" in ln and arm_step_id in ln for ln in lines), \
+    assert any(f"{arm_root_id} -->" in ln and arm_step_id in ln for ln in lines), (
         "arm internal --> edge missing in expanded mode"
+    )
     # terminal (step) --o collector
-    assert any(f"{arm_step_id} --o" in ln and col_id in ln for ln in lines), \
+    assert any(f"{arm_step_id} --o" in ln and col_id in ln for ln in lines), (
         "terminal --o collector missing in expanded mode"
+    )
     # arm_root should NOT have --o directly to collector
-    assert not any(f"{arm_root_id} --o" in ln for ln in lines), \
+    assert not any(f"{arm_root_id} --o" in ln for ln in lines), (
         "arm_root should not connect directly to collector in expanded mode"
+    )
     # finish_processing node definition must be present
     assert "finish_processing" in diagram
 
@@ -805,7 +808,7 @@ def test_generator_fanout_compact_hides_arm_internals() -> None:
     lines = [ln.strip() for ln in diagram.splitlines()]
 
     # dispatcher -->> arm_root
-    assert any(f"-->>" in ln and arm_root_id in ln for ln in lines)
+    assert any("-->>" in ln and arm_root_id in ln for ln in lines)
     # arm_root --o collector (compact shorthand)
     assert any(f"{arm_root_id} --o" in ln and col_id in ln for ln in lines)
     # Internal step must NOT appear in the diagram
@@ -832,7 +835,7 @@ def test_generator_fanout_single_step_compact_and_expanded_equal() -> None:
     for expand in (True, False):
         diagram = dag_spec_to_mermaid(spec, expand_fanouts=expand)
         lines = [ln.strip() for ln in diagram.splitlines()]
-        assert any(f"-->>" in ln and arm_id in ln for ln in lines)
+        assert any("-->>" in ln and arm_id in ln for ln in lines)
         assert any(f"{arm_id} --o" in ln and col_id in ln for ln in lines)
 
 
@@ -857,7 +860,7 @@ def test_generator_fanout_compact_nested_shows_inner_fanout() -> None:
 
     outer_cb = spec.dag_callbacks[0]
     assert isinstance(outer_cb, DynamicFanOutCallback)
-    a_id = str(spec.id)
+    _a_id = str(spec.id)
     b_id = str(outer_cb.arm_root.id)
     c_id = str(outer_cb.collector.id)
     inner_cb = outer_cb.arm_root.dag_callbacks[0]
@@ -866,10 +869,10 @@ def test_generator_fanout_compact_nested_shows_inner_fanout() -> None:
     d_id = str(inner_cb.collector.id)
 
     # Outer: A -->> B; B --o C
-    assert any(f"-->>" in ln and b_id in ln for ln in lines), "A -->> B missing"
+    assert any("-->>" in ln and b_id in ln for ln in lines), "A -->> B missing"
     assert any(f"{b_id} --o" in ln and c_id in ln for ln in lines), "B --o C missing"
     # Inner: B -->> R; R --o D  (visible even in compact mode)
-    assert any(f"-->>" in ln and r_id in ln for ln in lines), "B -->> R missing"
+    assert any("-->>" in ln and r_id in ln for ln in lines), "B -->> R missing"
     assert any(f"{r_id} --o" in ln and d_id in ln for ln in lines), "R --o D missing"
     # process_batch node is present
     assert "process_batch" in diagram
