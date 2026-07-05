@@ -2086,6 +2086,51 @@ async def test_maybe_cleanup_skipped_for_non_terminal_status():
 
 
 @pytest.mark.asyncio
+async def test_maybe_cleanup_failed_dag_task_does_not_close_pending():
+    """
+    A DAG task that permanently FAILS must NOT close itself out of the DAG run's pending set.
+
+    A FAILED task never calls generate_callbacks(), so any FanInCallback/
+    DynamicFanOutCallback it carries never fires and the DAG can't complete on its
+    own. Closing it out of DAG_RUN_PENDING here would let the run's pending count
+    reach zero and trigger the sweep even though the DAG never actually finished —
+    the run must stay open (fan-in tracking and sibling records preserved within
+    their TTLs) instead.
+    """
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+
+    # No expected_exceptions configured, so any raised exception is unexpected and
+    # goes straight to handle_unexpected_exception -> FAILED, regardless of retries.
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        cleanup_on=frozenset({TaskStatus.COMPLETED}),
+    )
+
+    state_manager = _make_state_manager()
+    state_manager.close_dag_run_task_and_sweep = AsyncMock()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
+
+    assert task.status == TaskStatus.FAILED
+    state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.delete_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_maybe_cleanup_runs_after_dynamic_fanout_registers_arms():
     """
     Regression test for an ordering hazard with _maybe_cleanup.

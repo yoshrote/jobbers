@@ -62,3 +62,11 @@ def test_terminal_and_active_statuses_are_disjoint_and_exhaustive() -> None:
     assert TaskStatus.terminal_statuses() | TaskStatus.active_statuses() | {TaskStatus.UNSUBMITTED} == set(
         TaskStatus
     )
+
+
+def test_stuck_statuses() -> None:
+    assert TaskStatus.stuck_statuses() == {TaskStatus.FAILED, TaskStatus.STALLED}
+
+
+def test_stuck_statuses_is_a_subset_of_terminal_statuses() -> None:
+    assert TaskStatus.stuck_statuses() <= TaskStatus.terminal_statuses()

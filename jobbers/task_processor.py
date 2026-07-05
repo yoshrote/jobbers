@@ -260,12 +260,19 @@ class TaskProcessor:
         completion) detects when the whole run has gone terminal; the full
         sibling sweep then runs exactly once, when the counter reaches zero,
         instead of being redone from scratch on every one of the run's completions.
-        The counter-close-and-sweep logic lives on StateManager so the Cleaner's
-        stale-heartbeat path (which moves a task straight to STALLED, bypassing
-        normal completion) can trigger it too.
+
+        A DAG task in a stuck status (``TaskStatus.stuck_statuses()`` — FAILED or
+        STALLED) never closes out of the pending counter at all: such a task never
+        calls ``generate_callbacks()``, so its ``FanInCallback``/
+        ``DynamicFanOutCallback`` never fires and the DAG can't complete on its
+        own. Leaving the counter open preserves the run's fan-in tracking and
+        sibling task records (within their TTLs) instead of sweeping them away —
+        a foundation for a future DAG-resume mechanism.
         """
         if task.dag_run_id is None:
             await self._maybe_delete_self(task)
+            return
+        if task.status in TaskStatus.stuck_statuses():
             return
         await self.state_manager.close_dag_run_task_and_sweep(task)
 

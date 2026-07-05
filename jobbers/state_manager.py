@@ -225,36 +225,47 @@ class StateManager:
 
             stale_pipes = []
             stale_saga_tasks: list[Task] = []
-            newly_stalled: list[Task] = []
+            dlq_saga_tasks: list[Task] = []
             for (task_type, task_version), tasks in stale_tasks_by_type.items():
                 task_config = registry.get_task_config(task_type, task_version)
                 if task_config and task_config.max_heartbeat_interval:
+                    needs_dlq = task_config.dead_letter_policy == DeadLetterPolicy.SAVE
                     for task in tasks:
                         if (
                             task.heartbeat_at
                             and (now - task.heartbeat_at) > task_config.max_heartbeat_interval
                         ):
+                            # A stalled task never calls generate_callbacks(), so it
+                            # never closes out of its DAG run's pending counter — a
+                            # run containing it simply stays open (see
+                            # TaskProcessor._maybe_cleanup), preserving fan-in
+                            # tracking and sibling task records within their TTLs.
                             task.set_status(TaskStatus.STALLED)
-                            newly_stalled.append(task)
                             if self._atomic_state is not None:
                                 pipe = self._atomic_state.pipeline(transaction=True)
                                 self._atomic_state.stage_save(pipe, task)
                                 self._atomic_state.stage_remove_heartbeat(pipe, task)
+                                if needs_dlq and self._atomic_dlq is not None:
+                                    self._atomic_dlq.stage_add(pipe, task, now)
+                                elif needs_dlq:
+                                    dlq_saga_tasks.append(task)
                                 stale_pipes.append(pipe.execute())
                             else:
                                 stale_saga_tasks.append(task)
+                                if needs_dlq:
+                                    dlq_saga_tasks.append(task)
+                            if needs_dlq:
+                                logger.info("Task %s sent to dead letter queue.", task.id)
+                                tasks_dead_lettered.add(
+                                    1, {"queue": task.queue, "task": task.name, "version": task.version}
+                                )
             if stale_pipes:
                 await asyncio.gather(*stale_pipes)
             for stale_task in stale_saga_tasks:
                 await self.task_state.save_task(stale_task)
                 await self.task_state.remove_task_heartbeat(stale_task)
-
-            # A stalled task will never complete on its own, so it must close itself
-            # out of DAG-run tracking here — otherwise a DAG run containing it would
-            # never reach a pending count of zero via the normal completion path.
-            dag_stalled = [t for t in newly_stalled if t.dag_run_id is not None]
-            if dag_stalled:
-                await asyncio.gather(*(self.close_dag_run_task_and_sweep(t) for t in dag_stalled))
+            if dlq_saga_tasks:
+                await asyncio.gather(*(self.dead_queue.add_to_dlq(t, now) for t in dlq_saga_tasks))
 
         await asyncio.gather(*clean_ops)
 
@@ -916,9 +927,10 @@ class StateManager:
         """
         Close *task* out of its DAG run's pending set and sweep siblings if the run just went terminal.
 
-        Used both by the normal task-completion path (``TaskProcessor._maybe_cleanup``)
-        and by the Cleaner's stale-heartbeat path, since a task moved straight to
-        STALLED never goes through normal completion and must close itself out here.
+        Only called for tasks reaching a non-stuck terminal status (see
+        ``TaskProcessor._maybe_cleanup``) — FAILED/STALLED tasks never close out of
+        ``DAG_RUN_PENDING`` at all, so a run containing one simply never reaches a
+        pending count of zero and this method is never invoked for it.
         """
         assert task.dag_run_id is not None  # noqa: S101
         remaining = await self.close_dag_run_task(task.dag_run_id, task.id)

@@ -258,13 +258,18 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager_
 
 
 @pytest.mark.asyncio
-async def test_clean_stale_time_stalled_dag_task_closes_and_sweeps_run(redis, state_manager_real_ta):
+async def test_clean_stale_time_stalled_dag_task_leaves_run_open(redis, state_manager_real_ta):
     """
-    A stale-heartbeat DAG task is marked STALLED and, as the run's only pending task, swept away.
+    A stale-heartbeat DAG task is marked STALLED but never closes out of DAG_RUN_PENDING.
 
-    Regression test: the Cleaner's stale-heartbeat path used to never call
-    close_dag_run_task at all, so a DAG run containing a stalled task could never
-    reach a pending count of zero via the fast path.
+    Regression test: an earlier version of this Cleaner path called
+    close_dag_run_task_and_sweep for newly-stalled tasks, which would delete this
+    task (its own cleanup_on matches STALLED) once it looked like the run's last
+    pending task. A STALLED task never calls generate_callbacks(), so its
+    FanInCallback/DynamicFanOutCallback never fires and the DAG can't complete on
+    its own — the run must stay open (fan-in tracking and sibling records
+    preserved within their TTLs) instead of being swept away as if it had
+    completed normally.
     """
     two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
     dag_run_id = ULID()
@@ -279,46 +284,6 @@ async def test_clean_stale_time_stalled_dag_task_closes_and_sweeps_run(redis, st
         submitted_at=two_hours_ago,
     )
     await state_manager_real_ta.task_submit.submit_task(task=started)
-    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
-    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
-
-    stale_config = TaskConfig(
-        name="my_task",
-        function=dummy_fn,
-        max_heartbeat_interval=dt.timedelta(minutes=5),
-        cleanup_on=frozenset({TaskStatus.STALLED}),
-    )
-    with patch.object(registry, "get_task_config", return_value=stale_config):
-        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
-
-    assert not await state_manager_real_ta.task_state.task_exists(ULID1)
-
-
-@pytest.mark.asyncio
-async def test_clean_stale_time_stalled_dag_task_waits_for_pending_siblings(redis, state_manager_real_ta):
-    """A stalled DAG task with a still-pending sibling must not trigger the sweep."""
-    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
-    dag_run_id = ULID()
-    started = Task(
-        id=ULID1,
-        name="my_task",
-        queue="default",
-        status=TaskStatus.STARTED,
-        started_at=two_hours_ago,
-        heartbeat_at=two_hours_ago,
-        dag_run_id=dag_run_id,
-        submitted_at=two_hours_ago,
-    )
-    sibling = Task(
-        id=ULID2,
-        name="my_task",
-        queue="default",
-        status=TaskStatus.SUBMITTED,
-        dag_run_id=dag_run_id,
-        submitted_at=two_hours_ago,
-    )
-    await state_manager_real_ta.task_submit.submit_task(task=started)
-    await state_manager_real_ta.task_submit.submit_task(task=sibling)
     await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
     await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
 
@@ -334,7 +299,105 @@ async def test_clean_stale_time_stalled_dag_task_waits_for_pending_siblings(redi
     saved = await state_manager_real_ta.task_state.get_task(ULID1)
     assert saved is not None
     assert saved.status == TaskStatus.STALLED
-    assert await state_manager_real_ta.task_state.task_exists(ULID2)
+    # Never closed out of DAG_RUN_PENDING: close_dag_run_task still finds it
+    # pending and decrements successfully, instead of reporting -1 (already closed).
+    assert await state_manager_real_ta.close_dag_run_task(dag_run_id, ULID1) == 0
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_task_with_dlq_policy_moves_to_dlq(redis, state_manager_real_ta):
+    """A stale-heartbeat task with dead_letter_policy=SAVE is marked STALLED and sent to the DLQ."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+        submitted_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task",
+        function=dummy_fn,
+        max_heartbeat_interval=dt.timedelta(minutes=5),
+        dead_letter_policy=DeadLetterPolicy.SAVE,
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    dlq = await state_manager_real_ta.dead_queue.get_by_ids([str(ULID1)])
+    assert len(dlq) == 1
+    assert dlq[0].id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_task_without_dlq_policy_skips_dlq(redis, state_manager_real_ta):
+    """A stale-heartbeat task with the default (NONE) dead_letter_policy is not sent to the DLQ."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+        submitted_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert await state_manager_real_ta.dead_queue.get_by_ids([str(ULID1)]) == []
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_task_with_dlq_policy_saga_mode(saga_state_manager):
+    """Same DLQ-on-stall behavior holds in saga mode (non-atomic task-state backend)."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+    )
+    await saga_state_manager.task_state.save_task(started)
+    await saga_state_manager.task_state.update_task_heartbeat(started)
+    await saga_state_manager.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task",
+        function=dummy_fn,
+        max_heartbeat_interval=dt.timedelta(minutes=5),
+        dead_letter_policy=DeadLetterPolicy.SAVE,
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await saga_state_manager.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    dlq = await saga_state_manager.dead_queue.get_by_ids([str(ULID1)])
+    assert len(dlq) == 1
+    assert dlq[0].id == ULID1
 
 
 # ── close_dag_run_task_and_sweep / sweep_dag_run ──────────────────────────────
