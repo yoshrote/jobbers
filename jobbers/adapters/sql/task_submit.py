@@ -96,6 +96,31 @@ class SQLTaskSubmit:
                 task_row = task_result.first()
                 return _row_to_task(task_row) if task_row is not None else None
 
+    async def enqueue(self, task: Task) -> None:
+        """
+        Add an already-persisted task's ID to its queue (saga-safe re-enqueue).
+
+        Assumes the caller has already saved the task blob via
+        ``TaskStateProtocol.save_task()`` — unlike ``submit_task()``, this does not
+        upsert the ``tasks`` row, only ``task_queue`` and DAG-run registration.
+        """
+        assert task.submitted_at  # noqa: S101
+        task_id_str = str(task.id)
+        async with self._sf() as session:
+            async with session.begin():
+                result = await session.execute(
+                    update(task_queue)
+                    .where(task_queue.c.task_id == task_id_str)
+                    .values(queue=task.queue, submitted_at=task.submitted_at)
+                )
+                if result.rowcount == 0:  # type: ignore[attr-defined]
+                    await session.execute(
+                        insert(task_queue).values(
+                            task_id=task_id_str, queue=task.queue, submitted_at=task.submitted_at
+                        )
+                    )
+        await _register_dag_run(self._sf, task)
+
     async def submit_task(self, task: Task) -> bool:
         """Submit a task directly (non-staged)."""
         assert task.submitted_at  # noqa: S101

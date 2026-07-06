@@ -19,7 +19,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import get_task_config
-from jobbers.state_manager import StateManager, UserCancellationError
+from jobbers.state_manager import StateManager, TaskRateLimitedError, UserCancellationError
 from jobbers.utils.di import DependencyResolver
 from jobbers.utils.di import Depends as _Depends
 
@@ -451,7 +451,16 @@ class TaskProcessor:
             await self._delegate_outer_fan_in(
                 solo, dag_run_id, parent.id, fanout.collector.id, outer_fan_in_cbs
             )
-            await self.state_manager.submit_task(solo)
+            try:
+                await self.state_manager.submit_task(solo)
+            except TaskRateLimitedError:
+                logger.error(
+                    "Collector %s for dynamic fan-out from task %s was rejected by rate "
+                    "limiting; the fan-out cannot complete. Assign arm/collector queues "
+                    "without rate limiting.",
+                    solo.id,
+                    parent.id,
+                )
             return
 
         # 1. Find the terminal (leaf) nodes of each arm before wiring the collector.
@@ -515,7 +524,11 @@ class TaskProcessor:
     async def handle_system_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled.", task.id)
         task.shutdown()
-        await self.state_manager.save_task(task)
+        if task.status == TaskStatus.SUBMITTED:
+            # RESUBMIT policy: put it back in its queue rather than just saving the blob.
+            await self.state_manager.requeue_task(task)
+        else:
+            await self.state_manager.save_task(task)
 
     async def handle_user_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled by user.", task.id)

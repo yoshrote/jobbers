@@ -58,7 +58,7 @@ class TaskConfig(BaseModel):
     function: SerializableCallable
 
     # The tuple of expected exceptions that can be handled by the task processor
-    expected_exceptions: tuple[type[Exception]] | None = Field(default=None)
+    expected_exceptions: tuple[type[Exception], ...] | None = Field(default=None)
 
     # Pre-computed dependency graph for DI — populated by @register_task at decoration time.
     # Stored as list[Any] at runtime (list[DependencyNode]); serialised to qualified names for JSON.

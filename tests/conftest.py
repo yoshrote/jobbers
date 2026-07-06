@@ -238,16 +238,24 @@ class DummyTaskSubmit:
     """
     TaskSubmitProtocol stub that shares the _store dict with a DummyTaskState.
 
-    submit_task writes into the shared store so that get_task() on the paired
-    DummyTaskState immediately reflects submitted tasks.
+    submit_task/enqueue write into the shared store so that get_task() on the paired
+    DummyTaskState immediately reflects submitted tasks. Queue membership is tracked
+    separately in ``queued`` so saga-mode tests can assert a task was actually
+    enqueued, not just that its blob was saved.
     """
 
     def __init__(self, store: dict) -> None:
         self._store = store
+        self.queued: set[ULID] = set()
 
     async def submit_task(self, task: Task) -> bool:
         self._store[task.id] = task
+        self.queued.add(task.id)
         return True
+
+    async def enqueue(self, task: Task) -> None:
+        """Saga-safe re-enqueue: record queue membership without touching the blob store."""
+        self.queued.add(task.id)
 
     async def submit_rate_limited_task(self, task: Task, queue_config: object) -> bool:
         raise NotImplementedError("DummyTaskSubmit.submit_rate_limited_task")

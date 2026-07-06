@@ -621,6 +621,25 @@ class _SharedRedisTaskSubmitBase:
         """Extra KEYS[] args for SUBMIT_RATE_LIMITED_SCRIPT beyond the base 5 keys."""
         return []
 
+    async def enqueue(self, task: Task) -> None:
+        """
+        Add an already-persisted task's ID to its queue (saga-safe re-enqueue).
+
+        Assumes the caller has already saved the task blob via
+        ``TaskStateProtocol.save_task()`` — this only stages the queue-membership
+        ZADD and DAG-run registration, without rewriting the blob and without
+        ``submit_task()``'s "skip the ZADD if the blob already exists" guard (which
+        is what makes ``submit_task()`` unsafe to call for a task whose blob was
+        just saved, or that was already submitted once before, e.g. a requeue).
+        """
+        assert task.submitted_at  # noqa: S101
+        pipe = self._data_store.pipeline(transaction=True)
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        if task.dag_run_id is not None:
+            pipe.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): task.submitted_at.timestamp()}, nx=True)
+            pipe.sadd(self.DAG_RUN_PENDING(dag_run_id=task.dag_run_id), bytes(task.id))
+        await pipe.execute()
+
     async def submit_task(self, task: Task) -> bool:
         """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
         assert task.submitted_at  # noqa: S101

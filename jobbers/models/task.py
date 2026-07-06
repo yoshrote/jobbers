@@ -149,16 +149,19 @@ class Task(BaseModel):
             return
         match self.task_config.on_shutdown:
             case TaskShutdownPolicy.CONTINUE:
-                # NOOP: the task coroutine is wrapped in asyncio.shield(), so even if
-                # CancelledError propagates to the outer await, the inner coroutine keeps
-                # running. STARTED is the correct state to persist — the task is still
-                # in flight.
+                # NOOP: the worker never cancels CONTINUE-policy tasks on shutdown in
+                # the first place (see worker_proc.main) — they simply keep running to
+                # completion, so this handler only fires for CONTINUE in abnormal
+                # (non-graceful) termination paths. STARTED is the correct state to
+                # persist in that case — the task is still in flight.
                 pass
             case TaskShutdownPolicy.STOP:
                 self.set_status(TaskStatus.STALLED)
             case TaskShutdownPolicy.RESUBMIT:
-                # Direct assignment: shutdown-triggered resubmit should not increment retry_attempt
-                self.status = TaskStatus.UNSUBMITTED
+                # SUBMITTED, not a retry via UNSUBMITTED: this must not bump
+                # retry_attempt. TaskProcessor.handle_system_cancelled_task re-enqueues
+                # the task via requeue_task() right after calling shutdown().
+                self.set_status(TaskStatus.SUBMITTED)
 
     def should_retry(self) -> bool:
         if not self.task_config:

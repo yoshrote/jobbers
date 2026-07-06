@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import datetime as dt
+import logging
 from unittest.mock import ANY, AsyncMock, call, patch
 
 import pytest
@@ -20,7 +21,7 @@ from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
-from jobbers.state_manager import StateManager, UserCancellationError
+from jobbers.state_manager import StateManager, TaskRateLimitedError, UserCancellationError
 from jobbers.task_processor import TaskProcessor, _spec_to_dag_node
 
 
@@ -344,11 +345,13 @@ async def test_task_processor_cancelled_with_resubmit_policy():
         with pytest.raises(asyncio.CancelledError):
             await processor.process(task)
 
-    # Task should be marked for resubmission due to RESUBMIT policy
-    assert task.status == TaskStatus.UNSUBMITTED
+    # Task should be marked SUBMITTED and re-enqueued due to RESUBMIT policy
+    assert task.status == TaskStatus.SUBMITTED
     assert task.completed_at is None  # Should not be completed when resubmitted
-    # save_task called when starting and when handling cancellation
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    assert task.retry_attempt == 0  # resubmit-on-shutdown is not a retry
+    # save_task called once when starting; requeue_task called when handling cancellation
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.requeue_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -892,6 +895,33 @@ async def test_handle_dynamic_fanout_no_children_submits_collector_immediately()
     submitted = state_manager.submit_task.call_args[0][0]
     assert submitted.id == collector.id
     assert submitted.dag_run_id == dag_run_id
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_no_children_logs_and_does_not_raise_on_rate_limit(caplog):
+    """A rate-limited degenerate-collector submission is logged, not propagated."""
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    collector = DAGNode("aggregator")
+    fanout = DynamicFanOut(arms=[], collector=collector)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
+
+    processor = TaskProcessor(state_manager)
+    with caplog.at_level(logging.ERROR):
+        await processor._handle_dynamic_fanout(parent, fanout, [])  # must not raise
+
+    assert any("rejected by rate" in record.message for record in caplog.records)
 
 
 @pytest.mark.asyncio

@@ -7,11 +7,13 @@ import importlib
 import importlib.util
 import logging
 import os
+import signal
 import sys
 from typing import TYPE_CHECKING
 
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
 from jobbers.utils.otel import enable_otel
@@ -40,7 +42,30 @@ async def main() -> None:
     await task_generator.queues()  # warm up the refresh tag once
 
     semaphore = asyncio.Semaphore(num_concurrent)
-    active: set[asyncio.Task[None]] = set()
+    active: dict[asyncio.Task[None], Task] = {}
+    shutdown_event = asyncio.Event()
+    fetch_task: asyncio.Task[Task] | None = None
+
+    def _request_shutdown() -> None:
+        if shutdown_event.is_set():
+            return
+        logger.info("Shutdown signal received; draining in-flight tasks.")
+        shutdown_event.set()
+        # Interrupt a blocking queue pop immediately rather than waiting for the
+        # next loop iteration to notice the event.
+        if fetch_task is not None and not fetch_task.done():
+            fetch_task.cancel()
+
+    loop = asyncio.get_running_loop()
+    registered_signals: list[signal.Signals] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown)
+            registered_signals.append(sig)
+        except NotImplementedError:
+            # add_signal_handler is POSIX-only (e.g. unsupported on Windows);
+            # graceful shutdown is best-effort there.
+            logger.warning("Signal handling for %s is not supported on this platform.", sig.name)
 
     async def run_task(task: Task) -> None:
         logger.debug("Running task: %s[%sv%s]", task.id, task.name, task.version)
@@ -49,27 +74,47 @@ async def main() -> None:
         finally:
             semaphore.release()
 
+    def _on_task_done(done_task: asyncio.Task[None]) -> None:
+        active.pop(done_task, None)
+
     cancel_listener = asyncio.create_task(state_manager.run_cancel_listener())
     try:
-        while True:
+        while not shutdown_event.is_set():
             await semaphore.acquire()
-            try:
-                task = await anext(task_generator)
-            except StopAsyncIteration:
+            if shutdown_event.is_set():
                 semaphore.release()
                 break
+            fetch_task = asyncio.ensure_future(anext(task_generator))
+            try:
+                task = await fetch_task
+            except (StopAsyncIteration, asyncio.CancelledError):
+                semaphore.release()
+                break
+            finally:
+                fetch_task = None
             t = asyncio.create_task(run_task(task))
-            active.add(t)
-            t.add_done_callback(active.discard)
-        await asyncio.gather(*active, return_exceptions=True)
+            active[t] = task
+            t.add_done_callback(_on_task_done)
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
     finally:
         logger.info("Worker shutting down")
+        for sig in registered_signals:
+            loop.remove_signal_handler(sig)
         cancel_listener.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await cancel_listener
         task_generator.stop()
-        for t in active:
-            t.cancel()
+        for t, running_task in active.items():
+            policy = (
+                running_task.task_config.on_shutdown
+                if running_task.task_config is not None
+                else TaskShutdownPolicy.STOP
+            )
+            if policy == TaskShutdownPolicy.CONTINUE:
+                logger.info("Task %s has on_shutdown=continue; letting it finish.", running_task.id)
+            else:
+                t.cancel()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
 

@@ -38,7 +38,7 @@ class TaskWrapper:
         return self._func(**kwargs)
 
     async def submit(self, queue: str = "default", **params: Any) -> "Task":
-        """Create a Task and submit it to *queue*."""
+        """Create a Task and submit it to *queue*. Raises TaskRateLimitedError if the queue is at capacity."""
         task = Task(id=ULID(), name=self._name, version=self._version, queue=queue, parameters=params)
         await db.get_state_manager().submit_task(task)
         return task
@@ -62,7 +62,7 @@ def register_task(
     max_retries: int = 3,
     retry_delay: int | None = None,
     max_retry_delay: int | None = None,
-    expected_exceptions: tuple[type[Exception]] | None = None,
+    expected_exceptions: tuple[type[Exception], ...] | None = None,
     max_heartbeat_interval: dt.timedelta | None = None,
     backoff_strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
     dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE,

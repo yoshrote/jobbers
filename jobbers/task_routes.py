@@ -21,7 +21,7 @@ from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.protocols import RoutingBackendReadOnlyError
-from jobbers.state_manager import StateManager, TaskException
+from jobbers.state_manager import StateManager, TaskException, TaskRateLimitedError
 from jobbers.utils.mermaid_dag import MermaidParseError, dag_spec_to_mermaid, parse_mermaid_dag
 from jobbers.validation import ValidationError, validate_task
 
@@ -75,6 +75,8 @@ async def submit_task(task: Task) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(ex)) from ex
     try:
         await state_manager.submit_task(task)
+    except TaskRateLimitedError as ex:
+        raise HTTPException(status_code=429, detail=str(ex)) from ex
     except TaskException as ex:
         raise HTTPException(status_code=400, detail=f"Invalid task parameters: {ex}") from ex
     return {
@@ -535,7 +537,10 @@ async def submit_dag(request: SubmitDAGRequest) -> dict[str, Any]:
                 worklist.append(error_node)
 
     sm = db.get_state_manager()
-    dag_run_id, submitted = await sm.submit_dag(*roots)
+    try:
+        dag_run_id, submitted = await sm.submit_dag(*roots)
+    except TaskRateLimitedError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     return {"dag_run_id": str(dag_run_id), "root_task_ids": [str(t.id) for t in submitted]}
 
 

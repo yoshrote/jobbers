@@ -82,6 +82,12 @@ class UserCancellationError(Exception):
     pass
 
 
+class TaskRateLimitedError(TaskException):
+    """Raised by submit_task() when the queue's rate limiter rejects the submission."""
+
+    pass
+
+
 class StateManager:
     """Coordinator for managing task state across the job store."""
 
@@ -311,9 +317,13 @@ class StateManager:
                 self._atomic_dlq.stage_remove(pipe, task.id, task.queue, task.name)
             await pipe.execute()
         else:
-            # Saga: persist blobs (source of truth), then remove from DLQ.
-            # If remove fails, Cleaner reconciles DLQ entries for SUBMITTED/STARTED tasks.
+            # Saga: persist blobs (source of truth), then enqueue via the saga-safe
+            # enqueue() — not submit_task(), whose "skip if blob exists" guard would
+            # silently no-op the ZADD once save_task() has already written the blob.
+            # Then remove from DLQ. If remove fails, Cleaner reconciles DLQ entries
+            # for SUBMITTED/STARTED tasks.
             await asyncio.gather(*(self.task_state.save_task(t) for t in tasks))
+            await asyncio.gather(*(self.task_submit.enqueue(t) for t in tasks))
             for task in tasks:
                 await self.dead_queue.remove_from_dlq(task.id, task.queue, task.name)
         return tasks
@@ -518,7 +528,7 @@ class StateManager:
                     self.stage_submit_task(pipe, task, queue_config)
                 await pipe.execute()
                 if is_rate_limited:
-                    await self.submit_task(task)
+                    await self._dispatch_cron_root_task(entry, task)
             elif isinstance(self.cron_dag_scheduler, AtomicCronDAGSchedulerProtocol):
                 # Cross-backend: cron ops are atomic internally; task-state ops follow.
                 cron_pipe = self.cron_dag_scheduler.pipeline(transaction=True)
@@ -528,7 +538,7 @@ class StateManager:
                 await asyncio.gather(
                     *(self.task_state.init_fan_in(dag_run_id, k, ids) for k, ids in fan_ins.items())
                 )
-                await self.submit_task(task)
+                await self._dispatch_cron_root_task(entry, task)
             else:
                 # No pipeline support (e.g. StaticCronDAGScheduler): sequential calls.
                 await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
@@ -537,8 +547,27 @@ class StateManager:
                 await asyncio.gather(
                     *(self.task_state.init_fan_in(dag_run_id, k, ids) for k, ids in fan_ins.items())
                 )
-                await self.submit_task(task)
+                await self._dispatch_cron_root_task(entry, task)
             logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
+
+    async def _dispatch_cron_root_task(self, entry: CronDAGEntry, task: Task) -> None:
+        """
+        Submit a cron DAG's root task, swallowing (and logging) a rate-limit rejection.
+
+        The cron entry has already been rescheduled by the time this runs, so a
+        rejected root task only skips this one firing -- the entry's next run is
+        unaffected. Letting TaskRateLimitedError propagate here would crash the
+        Scheduler's dispatch loop, since it runs via an unguarded asyncio.gather().
+        """
+        try:
+            await self.submit_task(task)
+        except TaskRateLimitedError:
+            logger.warning(
+                "Cron entry %s's root task %s was rejected by queue '%s' rate limiting; skipping this run.",
+                entry.id,
+                task.id,
+                task.queue,
+            )
 
     async def request_task_cancellation(self, task_id: ULID) -> Task | None:
         """
@@ -642,8 +671,12 @@ class StateManager:
                 self._atomic_state.stage_submit_task(pipe, task)
             await pipe.execute()
         else:
-            # Saga: persist blobs first (source of truth), then enqueue via TaskQueueProtocol.
+            # Saga: persist blobs first (source of truth), then enqueue via the
+            # saga-safe enqueue() — not submit_task(), whose "skip if blob exists"
+            # guard would silently no-op the ZADD once save_task() has already
+            # written the blob.
             await asyncio.gather(*(self.task_state.save_task(t) for t in tasks))
+            await asyncio.gather(*(self.task_submit.enqueue(t) for t in tasks))
 
     async def requeue_task(self, task: Task) -> None:
         """
@@ -658,6 +691,7 @@ class StateManager:
         else:
             task.set_status(TaskStatus.SUBMITTED)
             await self.task_state.save_task(task)
+            await self.task_submit.enqueue(task)
 
     async def complete_cron_task(self, task: Task) -> None:
         """
@@ -813,18 +847,33 @@ class StateManager:
         return final
 
     async def submit_task(self, task: Task) -> None:
+        """
+        Resolve the task's queue and submit it, respecting rate limiting.
+
+        Raises TaskRateLimitedError if the queue's rate limiter rejects the
+        submission; the task's status is reverted to its pre-call value in that case.
+        """
         task.queue = await self.resolve_queue(task)
         queue_config = await self.get_queue_config(task.queue)
-        task.set_status(TaskStatus.SUBMITTED)
-        if (
+        is_rate_limited = bool(
             queue_config
             and queue_config.rate_numerator
             and queue_config.rate_denominator
             and queue_config.rate_period
-        ):
-            await self.task_submit.submit_rate_limited_task(task=task, queue_config=queue_config)
+        )
+        previous_status = task.status
+        # Must precede submit: sets submitted_at, which the adapters assert is present.
+        task.set_status(TaskStatus.SUBMITTED)
+        if is_rate_limited:
+            assert queue_config is not None  # noqa: S101
+            accepted = await self.task_submit.submit_rate_limited_task(task=task, queue_config=queue_config)
         else:
-            await self.task_submit.submit_task(task=task)
+            accepted = await self.task_submit.submit_task(task=task)
+        if not accepted:
+            task.status = previous_status
+            raise TaskRateLimitedError(
+                f"Queue '{task.queue}' rate limit exceeded; task {task.id} was not submitted."
+            )
 
     async def init_fan_in(
         self, dag_run_id: ULID, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400

@@ -80,8 +80,8 @@ def test_shutdown_continue_policy_is_noop():
     assert task.status == TaskStatus.STARTED
 
 
-def test_shutdown_resubmit_policy_sets_status_unsubmitted():
-    """shutdown() with RESUBMIT policy sets status to UNSUBMITTED without incrementing retry_attempt."""
+def test_shutdown_resubmit_policy_sets_status_submitted():
+    """shutdown() with RESUBMIT policy sets status to SUBMITTED without incrementing retry_attempt."""
 
     async def noop() -> None: ...
 
@@ -89,8 +89,8 @@ def test_shutdown_resubmit_policy_sets_status_unsubmitted():
     task.task_config = TaskConfig(name="t", function=noop, on_shutdown=TaskShutdownPolicy.RESUBMIT)
     before = task.retry_attempt
     task.shutdown()
-    assert task.status == TaskStatus.UNSUBMITTED
-    assert task.retry_attempt == before  # direct assignment, not set_status
+    assert task.status == TaskStatus.SUBMITTED
+    assert task.retry_attempt == before  # SUBMITTED, unlike UNSUBMITTED, doesn't bump retry_attempt
 
 
 # ── should_retry / should_schedule ───────────────────────────────────────────

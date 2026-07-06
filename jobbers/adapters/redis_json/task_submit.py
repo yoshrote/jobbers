@@ -37,10 +37,18 @@ _JSON_SUBMIT_SCRIPT = """
 
 _JSON_SUBMIT_RATE_LIMITED_SCRIPT = """
     local enqueued = 0
-    local exists = redis.call('EXISTS', KEYS[3])
     local numerator = tonumber(ARGV[2])
     redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-    if exists == 0 then
+    local already_tracked = redis.call('ZSCORE', KEYS[1], ARGV[4]) ~= false
+    if already_tracked then
+        -- Idempotent resubmit of an ID still inside the current rate-limit window:
+        -- refresh its window entry + blob, but don't consume a new slot or touch
+        -- the actual queue (mirrors submit_task()'s guard -- a resubmit must not
+        -- re-queue a task that may already be running or done).
+        redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+        redis.call('JSON.SET', KEYS[3], '$', ARGV[6])
+        enqueued = 1
+    else
         local count = redis.call('ZCARD', KEYS[1])
         if numerator ~= 0 and count < numerator then
             redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
@@ -48,9 +56,6 @@ _JSON_SUBMIT_RATE_LIMITED_SCRIPT = """
             redis.call('JSON.SET', KEYS[3], '$', ARGV[6])
             enqueued = 1
         end
-    else
-        redis.call('JSON.SET', KEYS[3], '$', ARGV[6])
-        enqueued = 1
     end
     if enqueued == 1 and ARGV[5] == '1' then
         redis.call('SADD', KEYS[4], ARGV[4])

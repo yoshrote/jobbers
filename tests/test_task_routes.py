@@ -14,7 +14,7 @@ from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-from jobbers.state_manager import TaskException
+from jobbers.state_manager import TaskException, TaskRateLimitedError
 from jobbers.task_routes import app
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -927,6 +927,32 @@ async def test_submit_task_raises_400_on_task_exception():
     assert "bad params" in response.json()["detail"]
 
 
+@pytest.mark.asyncio
+async def test_submit_task_raises_429_on_rate_limited_error():
+    """POST /submit-task returns 429 when the state manager raises TaskRateLimitedError."""
+    mock_sm = MagicMock()
+    mock_sm.get_routing_config = AsyncMock(return_value=None)
+    mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
+    mock_sm.submit_task = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
+
+    async def task_function(foo: int) -> None: ...
+
+    test_task_config = TaskConfig(name="Test Task", function=task_function)
+    task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
+
+    with (
+        patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm),
+        patch("jobbers.registry.get_task_config", return_value=test_task_config),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/submit-task", json=task_data.model_dump(mode="json", exclude_unset=True)
+            )
+
+    assert response.status_code == 429
+    assert "queue is full" in response.json()["detail"]
+
+
 # ── schedule_task route ───────────────────────────────────────────────────────
 
 RUN_AT = dt.datetime(2026, 3, 18, 12, 0, 0, tzinfo=dt.UTC)
@@ -1310,6 +1336,28 @@ async def test_submit_dag_with_unregistered_task_returns_400():
 
     assert response.status_code == 400
     assert "totally_unregistered_xyz" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_raises_429_on_rate_limited_error():
+    """POST /submit-dag returns 429 when the state manager raises TaskRateLimitedError."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    async def task_function(**kwargs: object) -> None: ...
+
+    test_task_config = TaskConfig(name="my_task", version=1, function=task_function)
+    mock_sm = MagicMock()
+    mock_sm.submit_dag = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
+
+    with (
+        patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm),
+        patch("jobbers.registry.get_task_config", return_value=test_task_config),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/submit-dag", json={"diagram": diagram})
+
+    assert response.status_code == 429
+    assert "queue is full" in response.json()["detail"]
 
 
 # ── PUT /cron-dags/{id} branches ─────────────────────────────────────────────

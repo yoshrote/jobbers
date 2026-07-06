@@ -177,6 +177,20 @@ class TaskSubmitProtocol(Protocol):  # pragma: no cover
         """Persist the task blob and enqueue it atomically.  Returns True on success."""
         ...
 
+    async def enqueue(self, task: Task) -> None:
+        """
+        Add an already-persisted task's ID to its queue; saga-mode counterpart to submit_task().
+
+        Assumes the caller already saved the task blob via ``TaskStateProtocol.save_task()``
+        (the first step of the saga). Unlike ``submit_task()``, this does not (re)persist the
+        blob and is not gated on the blob's absence, so it is safe to call both for a
+        brand-new submission (immediately after saving) and for re-enqueueing a task that
+        was already submitted before (e.g. requeue after cancellation, or DLQ resubmission).
+        Used by ``StateManager`` only in saga mode — the atomic pipeline mode instead stages
+        the equivalent ZADD via ``AtomicTaskStateProtocol.stage_submit_task``/``stage_requeue``.
+        """
+        ...
+
     async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
         """Check the sliding rate-limit window and enqueue only if under the limit."""
         ...

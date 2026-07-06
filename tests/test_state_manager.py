@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import datetime as dt
+import logging
 from collections import defaultdict
 from unittest.mock import AsyncMock, patch
 
@@ -23,7 +24,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
-from jobbers.state_manager import StateManager, TaskException, UserCancellationError
+from jobbers.state_manager import StateManager, TaskException, TaskRateLimitedError, UserCancellationError
 from tests.conftest import DummyCronDAGScheduler, DummyTaskSubmit
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -802,6 +803,30 @@ async def test_submit_task_rate_limited_branch(redis, state_manager_real_ta):
     assert bytes(ULID1) in members
 
 
+@pytest.mark.asyncio
+async def test_submit_task_raises_and_reverts_status_when_rate_limited(redis, state_manager_real_ta):
+    """submit_task raises TaskRateLimitedError and reverts task.status when the limit is exceeded."""
+    await state_manager_real_ta.routing.save_queue_config(
+        QueueConfig(
+            name="default",
+            rate_numerator=1,
+            rate_denominator=1,
+            rate_period=RatePeriod.MINUTE,
+        )
+    )
+    occupier = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED)
+    await state_manager_real_ta.submit_task(occupier)
+
+    rejected = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED)
+
+    with pytest.raises(TaskRateLimitedError):
+        await state_manager_real_ta.submit_task(rejected)
+
+    assert rejected.status == TaskStatus.UNSUBMITTED
+    members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID2) not in members
+
+
 # ── task_in_registry ──────────────────────────────────────────────────────────
 
 
@@ -1272,6 +1297,33 @@ async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queu
     mock_submit.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_swallows_rate_limit_rejection(state_manager, caplog):
+    """A rate-limited root task doesn't crash dispatch_cron_dag -- it's logged and skipped."""
+    await state_manager.routing.save_queue_config(
+        QueueConfig(name="default", rate_numerator=5, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    )
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="daily_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    with (
+        patch.object(
+            state_manager, "submit_task", side_effect=TaskRateLimitedError("queue is full")
+        ) as mock_submit,
+        caplog.at_level(logging.WARNING),
+    ):
+        await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)  # must not raise
+
+    mock_submit.assert_called_once()
+    assert any("rejected by queue" in record.message for record in caplog.records)
+
+
 # ── resolve_queue ─────────────────────────────────────────────────────────────
 
 
@@ -1581,7 +1633,7 @@ async def test_fail_task_no_dlq_saga_mode(saga_state_manager):
 
 @pytest.mark.asyncio
 async def test_resubmit_dead_tasks_saga_mode(saga_state_manager):
-    """resubmit_dead_tasks uses direct save + remove_from_dlq in saga mode."""
+    """resubmit_dead_tasks saves the blob, actually enqueues it, then removes from DLQ."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e"])
     await saga_state_manager.task_state.save_task(task)
     await _dlq_saga(saga_state_manager, task, FROZEN_TIME)
@@ -1591,7 +1643,38 @@ async def test_resubmit_dead_tasks_saga_mode(saga_state_manager):
     saved = await saga_state_manager.task_state.get_task(ULID1)
     assert saved is not None
     assert saved.status == TaskStatus.SUBMITTED
+    assert ULID1 in saga_state_manager.task_submit.queued
     assert await saga_state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
+
+
+@pytest.mark.asyncio
+async def test_submit_tasks_batch_saga_mode(saga_state_manager):
+    """submit_tasks_batch saves each blob and actually enqueues each task in saga mode."""
+    tasks = [
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED),
+        Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED),
+    ]
+
+    await saga_state_manager.submit_tasks_batch(tasks)
+
+    for task_id in (ULID1, ULID2):
+        saved = await saga_state_manager.task_state.get_task(task_id)
+        assert saved is not None
+        assert saved.status == TaskStatus.SUBMITTED
+        assert task_id in saga_state_manager.task_submit.queued
+
+
+@pytest.mark.asyncio
+async def test_requeue_task_saga_mode(saga_state_manager):
+    """requeue_task saves the blob and actually enqueues the task in saga mode."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+
+    await saga_state_manager.requeue_task(task)
+
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert ULID1 in saga_state_manager.task_submit.queued
 
 
 @pytest.mark.asyncio
