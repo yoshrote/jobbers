@@ -21,6 +21,7 @@ from ulid import ULID
 from jobbers.migrations.schema import (
     dag_run_pending,
     dag_runs,
+    fan_in_anchors,
     task_fan_in,
     task_queue,
     tasks,
@@ -228,6 +229,11 @@ class SQLTaskState:
         assert isinstance(pipe, SQLTransactionBatch)  # noqa: S101
 
         async def _insert_fan_in(s: AsyncSession) -> None:
+            async with s.begin_nested() as sp:
+                try:
+                    await s.execute(insert(fan_in_anchors).values(fan_in_key=fan_in_key))
+                except IntegrityError:
+                    await sp.rollback()
             for row in rows:
                 async with s.begin_nested() as sp:
                     try:
@@ -396,6 +402,11 @@ class SQLTaskState:
         now = dt.datetime.now(dt.UTC)
         async with self._sf() as session:
             async with session.begin():
+                async with session.begin_nested() as sp:
+                    try:
+                        await session.execute(insert(fan_in_anchors).values(fan_in_key=fan_in_key))
+                    except IntegrityError:
+                        await sp.rollback()
                 for pid in predecessor_ids:
                     async with session.begin_nested() as sp:
                         try:
@@ -416,6 +427,18 @@ class SQLTaskState:
         """
         async with self._sf() as session:
             async with session.begin():
+                # Lock this fan-in group's anchor row as a mutex before reading/writing
+                # task_fan_in, mirroring close_dag_run_task's dag_runs lock: without it,
+                # two predecessors completing concurrently under Postgres READ COMMITTED
+                # can each run their COUNT before the other's UPDATE commits, so both see
+                # a stale remaining > 0 and the collector never fires. No-op on SQLite.
+                lock_stmt = select(fan_in_anchors.c.fan_in_key).where(
+                    fan_in_anchors.c.fan_in_key == fan_in_key
+                )
+                if self._use_for_update:
+                    lock_stmt = lock_stmt.with_for_update()
+                await session.execute(lock_stmt)
+
                 result = await session.execute(
                     update(task_fan_in)
                     .where(

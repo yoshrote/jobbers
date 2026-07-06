@@ -43,4 +43,4 @@ class TaskStatus(StrEnum):
         untouched (fan-in tracking, sibling task records) so it can be manually resumed,
         instead of being swept away as if it had completed normally.
         """
-        return {cls.FAILED, cls.STALLED}
+        return {cls.FAILED, cls.STALLED, cls.CANCELLED, cls.DROPPED}

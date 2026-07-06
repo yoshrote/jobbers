@@ -429,7 +429,12 @@ class StateManager:
           already fired internally; caller should return immediately).
         - ``skipped=False`` and a ``stage_active_run(pipe, task_id)`` callable otherwise.
           Call it unconditionally during pipeline construction; it is a no-op for ALWAYS
-          policy and stages the NX guard for SKIP_IF_RUNNING.
+          policy and stages the active-run marker write for SKIP_IF_RUNNING.
+
+        Callers must already hold the entry's dispatch lock (see ``dispatch_cron_dag``)
+        before calling this — that lock, not this method, is what actually serializes
+        concurrent dispatchers, so the active-run marker write below is a plain
+        unconditional set (``nx=False``), not a race guard in its own right.
         """
         from jobbers.protocols import AtomicCronDAGSchedulerProtocol
 
@@ -452,11 +457,13 @@ class StateManager:
                     return
 
             if isinstance(self.cron_dag_scheduler, AtomicCronDAGSchedulerProtocol):
-                # Scheduler supports pipeline staging: NX guard goes into the pipeline.
+                # Scheduler supports pipeline staging. nx=False: the caller's dispatch
+                # lock already serializes concurrent dispatchers, so this is just a
+                # plain set, not a race guard (see _concurrency_guard's docstring).
                 _atomic_sched = self.cron_dag_scheduler  # narrow for mypy
 
                 def _stage_skip(pipe: TransactionHandle, task_id: ULID) -> None:
-                    _atomic_sched.stage_set_active_run(pipe, entry.id, task_id, nx=True)
+                    _atomic_sched.stage_set_active_run(pipe, entry.id, task_id, nx=False)
 
                 yield ConcurrencyStager(skipped=False, _stage_fn=_stage_skip)
             else:
@@ -479,7 +486,23 @@ class StateManager:
         pipeline *before* the root task is submitted.  A crash after the pipeline but
         before submit means the entry fires again on the next poll (tolerable duplicate),
         but the cron schedule is never permanently lost.
+
+        The whole method runs under a short-TTL dispatch lock (``try_acquire_dispatch_lock``)
+        so two dispatchers racing to fire the same due occurrence (e.g. during a rolling
+        scheduler restart) can't both submit a duplicate run — see
+        ``CronDAGSchedulerProtocol.try_acquire_dispatch_lock``'s docstring for why this is
+        a separate, much shorter-lived lock than the SKIP_IF_RUNNING active-run marker.
         """
+        if not await self.cron_dag_scheduler.try_acquire_dispatch_lock(entry.id):
+            logger.info("Cron entry %s: another dispatcher already claimed this run; skipping.", entry.id)
+            return
+        try:
+            await self._dispatch_cron_dag_locked(entry, run_at)
+        finally:
+            await self.cron_dag_scheduler.release_dispatch_lock(entry.id)
+
+    async def _dispatch_cron_dag_locked(self, entry: CronDAGEntry, run_at: dt.datetime) -> None:
+        """Run dispatch_cron_dag's body while its dispatch lock is held."""
         next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
 
         async with self._concurrency_guard(entry, next_run_at) as stager:
@@ -541,9 +564,10 @@ class StateManager:
                 await self._dispatch_cron_root_task(entry, task)
             else:
                 # No pipeline support (e.g. StaticCronDAGScheduler): sequential calls.
+                # nx=False: the dispatch lock already serializes concurrent dispatchers.
                 await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
                 if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
-                    await self.cron_dag_scheduler.set_active_run(entry.id, task.id, nx=True)
+                    await self.cron_dag_scheduler.set_active_run(entry.id, task.id, nx=False)
                 await asyncio.gather(
                     *(self.task_state.init_fan_in(dag_run_id, k, ids) for k, ids in fan_ins.items())
                 )

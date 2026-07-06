@@ -399,6 +399,7 @@ class DummyCronDAGScheduler:
     def __init__(self) -> None:
         self._entries: dict[ULID, tuple[CronDAGEntry, dt.datetime | None]] = {}
         self._active_runs: dict[ULID, str] = {}
+        self._dispatch_locks: dict[ULID, dt.datetime] = {}
 
     async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
         self._entries[entry.id] = (entry, next_run_at)
@@ -450,6 +451,17 @@ class DummyCronDAGScheduler:
 
     async def clear_active_run(self, cron_id: ULID) -> None:
         self._active_runs.pop(cron_id, None)
+
+    async def try_acquire_dispatch_lock(self, cron_id: ULID, ttl: int = 60) -> bool:
+        now = dt.datetime.now(dt.UTC)
+        expires_at = self._dispatch_locks.get(cron_id)
+        if expires_at is not None and expires_at > now:
+            return False
+        self._dispatch_locks[cron_id] = now + dt.timedelta(seconds=ttl)
+        return True
+
+    async def release_dispatch_lock(self, cron_id: ULID) -> None:
+        self._dispatch_locks.pop(cron_id, None)
 
 
 def _make_state_manager(

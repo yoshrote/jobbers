@@ -1198,6 +1198,36 @@ async def test_dispatch_cron_dag_skip_if_running_skips_when_active(redis, state_
 
 
 @pytest.mark.asyncio
+async def test_dispatch_cron_dag_skips_when_dispatch_lock_lost(redis, state_manager):
+    """
+    dispatch_cron_dag does nothing at all if another dispatcher already holds the lock.
+
+    Distinct from the SKIP_IF_RUNNING "previous run still active" skip: this is the
+    dispatch-lock guard against two dispatchers racing to fire the same due occurrence
+    (e.g. during a scheduler restart), and applies regardless of concurrency_policy.
+    """
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="unguarded_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    with patch.object(
+        state_manager.cron_dag_scheduler, "try_acquire_dispatch_lock", AsyncMock(return_value=False)
+    ) as mock_acquire:
+        await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    mock_acquire.assert_awaited_once_with(entry.id)
+    # Nothing should have been submitted or rescheduled -- the method returned immediately.
+    stored = state_manager.task_state._store
+    assert len(stored) == 0
+    members = await redis.zrange("cron-schedule", 0, -1)
+    assert bytes(entry.id) not in members
+
+
+@pytest.mark.asyncio
 async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_skipping(redis, state_manager):
     """dispatch_cron_dag records the new root task when concurrency_policy=SKIP_IF_RUNNING and no prior run is active."""
     spec = DAGTaskSpec(name="my_job", queue="default")

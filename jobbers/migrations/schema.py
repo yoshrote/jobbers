@@ -120,6 +120,16 @@ task_fan_in = Table(
 
 Index("idx_task_fan_in_created", task_fan_in.c.created_at)
 
+# Pure lock anchor, one row per fan_in_key, holding no data of its own -- mirrors
+# rate_limit_anchors below. task_fan_in has no natural one-row-per-fan_in_key anchor
+# (its rows are per-predecessor membership rows), so fan_in_complete locks this
+# instead, the same way close_dag_run_task locks the single dag_runs row for a run.
+fan_in_anchors = Table(
+    "fan_in_anchors",
+    metadata,
+    Column("fan_in_key", String, primary_key=True),
+)
+
 dag_runs = Table(
     "dag_runs",
     metadata,
@@ -234,6 +244,21 @@ cron_dag_active_runs = Table(
     Column("expires_at", DateTime(timezone=True), nullable=False),
 )
 
+# Short-TTL mutex guarding one dispatch attempt for a cron entry -- distinct from (and
+# much shorter-lived than) cron_dag_active_runs, which tracks how long a *dispatched
+# run* is expected to take. Self-heals via expires_at if a dispatcher crashes mid-op.
+cron_dispatch_locks = Table(
+    "cron_dispatch_locks",
+    metadata,
+    Column(
+        "cron_id",
+        String(26),
+        ForeignKey("cron_dag_entries.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+)
+
 # ---------------------------------------------------------------------------
 # TABLE_GROUPS — maps feature name → list of tables for selective migrations
 # ---------------------------------------------------------------------------
@@ -244,6 +269,7 @@ TABLE_GROUPS: dict[str, list[Table]] = {
         tasks,
         task_queue,
         task_fan_in,
+        fan_in_anchors,
         dag_runs,
         dag_run_pending,
         rate_limit_anchors,
@@ -251,5 +277,5 @@ TABLE_GROUPS: dict[str, list[Table]] = {
     ],
     "dead_letter": [dead_letter_queue],
     "task_schedule": [task_schedule],
-    "cron_dag": [cron_dag_entries, cron_dag_active_runs],
+    "cron_dag": [cron_dag_entries, cron_dag_active_runs, cron_dispatch_locks],
 }

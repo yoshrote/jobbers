@@ -34,6 +34,8 @@ class RedisCronDAGScheduler:
     - `cron-dag:{cron_id}` hash — serialised CronDAGEntry fields.
     - `cron-schedule` sorted set — member: cron_id bytes, score: next_run_at Unix timestamp.
     - `cron-active:{id}` string — active root task ID for skip_if_running entries (with TTL).
+    - `cron-dispatch-lock:{id}` string — short-TTL mutex guarding one dispatch attempt (see
+      `try_acquire_dispatch_lock`); distinct from `cron-active:{id}`'s much longer TTL.
 
     The efficient "what's due?" query is a single ZRANGEBYSCORE on `cron-schedule`,
     giving O(log N + K) where N = total entries and K = entries due now.
@@ -42,6 +44,7 @@ class RedisCronDAGScheduler:
     CRON_DAG_KEY = "cron-dag:{cron_id}".format
     CRON_SCHEDULE = "cron-schedule"
     CRON_ACTIVE_KEY = "cron-active:{cron_id}".format
+    CRON_DISPATCH_LOCK_KEY = "cron-dispatch-lock:{cron_id}".format
 
     # Atomically acquire up to ARGV[2] entries with score <= ARGV[1] (now).
     # Returns flat list: [cron_id_bytes, score_str, cron_id_bytes, score_str, ...]
@@ -203,6 +206,17 @@ class RedisCronDAGScheduler:
         """Return the next scheduled run time for a cron entry, or None if not scheduled."""
         score = await self.data_store.zscore(self.CRON_SCHEDULE, bytes(cron_id))
         return dt.datetime.fromtimestamp(score, dt.UTC) if score is not None else None
+
+    async def try_acquire_dispatch_lock(self, cron_id: ULID, ttl: int = 60) -> bool:
+        """Atomically claim the short-lived dispatch lock for a cron entry. See protocol docstring."""
+        result = await self.data_store.set(
+            self.CRON_DISPATCH_LOCK_KEY(cron_id=str(cron_id)), "1", ex=ttl, nx=True
+        )
+        return result is not None
+
+    async def release_dispatch_lock(self, cron_id: ULID) -> None:
+        """Release the dispatch lock for a cron entry, if held."""
+        await self.data_store.delete(self.CRON_DISPATCH_LOCK_KEY(cron_id=str(cron_id)))
 
     async def list(
         self, offset: int = 0, limit: int = 50

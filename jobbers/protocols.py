@@ -439,6 +439,24 @@ class CronDAGSchedulerProtocol(Protocol):  # pragma: no cover
         self, offset: int = 0, limit: int = 50
     ) -> tuple[list[tuple[CronDAGEntry, dt.datetime]], int]: ...
 
+    async def try_acquire_dispatch_lock(self, cron_id: ULID, ttl: int = 60) -> bool:
+        """
+        Atomically claim the right to dispatch this cron entry's current due run.
+
+        Returns True if claimed, False if another dispatcher already holds it.
+        Distinct from (and much shorter-lived than) the active-run marker set by
+        ``set_active_run`` — this only guards the brief window of the dispatch
+        operation itself (reschedule + fan-in init + submit), not how long the
+        dispatched DAG run takes to execute. Guards against two scheduler instances
+        racing to dispatch the same due occurrence (e.g. during a rolling restart);
+        self-heals via TTL if a dispatcher crashes mid-operation without releasing it.
+        """
+        ...
+
+    async def release_dispatch_lock(self, cron_id: ULID) -> None:
+        """Release a dispatch lock held via try_acquire_dispatch_lock, if any."""
+        ...
+
 
 @runtime_checkable
 class AtomicCronDAGSchedulerProtocol(CronDAGSchedulerProtocol, Protocol):  # pragma: no cover

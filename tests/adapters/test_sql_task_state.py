@@ -219,6 +219,38 @@ async def test_close_dag_run_task_locks_dag_runs_anchor_not_every_pending_row(se
     assert "dag_run_pending" not in lock_statement
 
 
+@pytest.mark.asyncio
+async def test_fan_in_complete_locks_fan_in_anchor_not_task_fan_in(session_factory):
+    """
+    fan_in_complete's serializing lock targets the fan-in group's fan_in_anchors row.
+
+    Regression test for the missing lock this test pins: without it, two predecessors
+    completing concurrently under Postgres READ COMMITTED could each run their COUNT
+    before the other's UPDATE commits, so both see a stale remaining > 0 and the
+    collector never fires. Mirrors close_dag_run_task's dag_runs anchor lock. Can't be
+    observed behaviourally under SQLite's single-connection test fixture, so it's
+    pinned by inspecting the compiled lock statement instead.
+    """
+    state = SQLTaskState(session_factory)
+    dag_run_id = ULID()
+    fan_in_key = "fan-in-key-1"
+    await state.init_fan_in(dag_run_id, fan_in_key, {ULID1, ULID2})
+
+    original_execute = AsyncSession.execute
+    captured_statements: list[str] = []
+
+    async def _capturing_execute(self, statement, *args, **kwargs):
+        captured_statements.append(str(statement))
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", _capturing_execute):
+        await state.fan_in_complete(dag_run_id, fan_in_key, ULID1)
+
+    lock_statement = captured_statements[0]
+    assert "FROM fan_in_anchors" in lock_statement
+    assert "task_fan_in" not in lock_statement
+
+
 # ── transaction atomicity ─────────────────────────────────────────────────────
 
 

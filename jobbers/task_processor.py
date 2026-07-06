@@ -101,6 +101,7 @@ tasks_processed = meter.create_counter("tasks_processed", unit="1")
 tasks_retried = meter.create_counter("tasks_retried", unit="1")
 execution_time = meter.create_histogram("task_execution_time", unit="ms")
 end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms")
+post_process_failures = meter.create_counter("post_process_failures", unit="1")
 
 
 class TaskProcessor:
@@ -217,14 +218,20 @@ class TaskProcessor:
             )
 
         if task.status == TaskStatus.COMPLETED:
-            await self.post_process(task, dynamic_fanout)
+            try:
+                await self.post_process(task, dynamic_fanout)
+            except Exception as exc:
+                await self._handle_post_process_failure(task, exc)
         else:
             # Only FAILED triggers error callbacks. CANCELLED means the user
             # deliberately stopped the task; STALLED and DROPPED are system-level
             # outcomes where the task function never ran to completion — firing an
             # error callback would be surprising and is intentionally not supported.
             if task.status == TaskStatus.FAILED:
-                await self.post_process_error(task)
+                try:
+                    await self.post_process_error(task)
+                except Exception as exc:
+                    await self._handle_post_process_failure(task, exc)
 
         # Runs after post_process/post_process_error so any fan-out arms this task
         # spawned are already registered in the DAG run before this task is closed
@@ -333,6 +340,22 @@ class TaskProcessor:
             for cb in error_callbacks:
                 cb.queue = await self.state_manager.resolve_queue(cb)
             await self.state_manager.submit_tasks_batch(error_callbacks)
+
+    async def _handle_post_process_failure(self, task: Task, exc: Exception) -> None:
+        """
+        Record a failure from post_process/post_process_error without disturbing status.
+
+        The task's terminal status (COMPLETED/FAILED) is already correctly persisted, so
+        this must not change it. Without this handler, an exception here (a transient
+        store error, or generate_callbacks()'s ValueError for a FanInCallback missing
+        dag_run_id) would propagate out of process() uncaught, leaving a task record that
+        looks COMPLETED/FAILED with no indication its DAG continuation (fan-out arms,
+        callbacks) never actually got wired up.
+        """
+        logger.exception("Post-processing failed for task %s (status=%s): %s", task.id, task.status, exc)
+        task.errors.append(f"post_process failed: {exc}")
+        post_process_failures.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
+        await self.state_manager.save_task(task)
 
     async def _handle_declarative_fanout(self, parent: Task, cb: DynamicFanOutCallback) -> None:
         """

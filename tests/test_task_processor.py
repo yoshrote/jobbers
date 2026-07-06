@@ -1357,6 +1357,35 @@ async def test_post_process_triggers_dag_callbacks():
 
 
 @pytest.mark.asyncio
+async def test_process_completed_task_records_post_process_failure_without_raising():
+    """A post_process failure is logged, recorded on the task, and does not propagate."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=TaskResult(results={}))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch("jobbers.task_processor.post_process_failures") as mock_counter,
+    ):
+        processor = TaskProcessor(state_manager)
+        with patch.object(processor, "post_process", AsyncMock(side_effect=RuntimeError("boom"))):
+            result_task = await processor.process(task)  # must not raise
+
+    assert result_task.status == TaskStatus.COMPLETED
+    assert any("post_process failed" in e and "boom" in e for e in result_task.errors)
+    assert state_manager.save_task.call_count >= 2  # once on start, once from the failure handler
+    mock_counter.add.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
     """post_process delegates to _handle_dynamic_fanout when a DynamicFanOut is passed."""
     parent = Task(
@@ -1608,6 +1637,34 @@ async def test_post_process_error_no_error_callbacks_does_nothing():
     await processor.post_process_error(task)
 
     state_manager.submit_tasks_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_failed_task_records_post_process_error_failure_without_raising():
+    """A post_process_error failure is logged, recorded on the task, and does not propagate."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10, max_retries=0)
+
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch("jobbers.task_processor.post_process_failures") as mock_counter,
+    ):
+        processor = TaskProcessor(state_manager)
+        with patch.object(processor, "post_process_error", AsyncMock(side_effect=RuntimeError("kaboom"))):
+            result_task = await processor.process(task)  # must not raise
+
+    assert result_task.status == TaskStatus.FAILED
+    assert any("post_process failed" in e and "kaboom" in e for e in result_task.errors)
+    mock_counter.add.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -2158,6 +2215,36 @@ async def test_maybe_cleanup_failed_dag_task_does_not_close_pending():
     assert task.status == TaskStatus.FAILED
     state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
     state_manager.delete_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.CANCELLED, TaskStatus.DROPPED])
+async def test_maybe_cleanup_stuck_dag_task_does_not_close_pending(status):
+    """
+    A DAG task that ends CANCELLED or DROPPED must NOT close itself out of the DAG run's pending set.
+
+    Both share FAILED/STALLED's defect (now reflected in stuck_statuses()): the task
+    never calls generate_callbacks(), so any FanInCallback/DynamicFanOutCallback it
+    carries never fires. Closing it out of DAG_RUN_PENDING here would let the run's
+    pending count reach zero and trigger the sibling sweep even though the collector
+    this task belonged to can now never fire.
+    """
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=status,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    state_manager = _make_state_manager()
+    state_manager.close_dag_run_task_and_sweep = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor._maybe_cleanup(task)
+
+    state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
