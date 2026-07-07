@@ -44,7 +44,7 @@ async def test_set_client_replaces_existing_client():
     new_client = AsyncMock()
 
     with patch("jobbers.db._client", old_client):
-        set_client(new_client)
+        await set_client(new_client)
 
         # Ensure the old client is closed
         old_client.close.assert_called_once()

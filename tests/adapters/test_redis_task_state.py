@@ -14,6 +14,7 @@ Section 3 — RedisDeadQueue edge case (``msgpack_dead_queue`` fixture).
 
 import datetime as dt
 import json
+from unittest.mock import patch
 
 import pytest
 from ulid import ULID
@@ -864,3 +865,41 @@ async def test_clean_orphaned_entries_removes_stale_name_index_member(msgpack_de
     assert removed == 1
     assert await dq.data_store.smembers(dq.DLQ_NAME(name="my_task")) == set()
     assert not await dq.data_store.exists(dq.DLQ_NAME(name="my_task"))
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_entries_preserves_concurrently_added_valid_member(msgpack_dead_queue):
+    """
+    A valid member added to the index set after the stale-membership snapshot survives.
+
+    _clean_stale_index_members() snapshots a dlq-queue:*/dlq-name:* set's membership, then
+    removes whichever of those *snapshotted* members are stale. It must never delete the
+    whole key outright (even when every snapshotted member was stale), since a concurrent
+    add_to_dlq() landing a new, still-valid member in between would otherwise be wiped out
+    along with the stale entries.
+    """
+    dq = msgpack_dead_queue
+    stale_task = make_task(task_id=ULID1, queue="q1")
+    await _add_to_dlq(dq, stale_task, FROZEN_TIME)
+    # Make the only current member of dlq-queue:q1 stale (remove it from the DLQ proper, but
+    # leave the index set itself untouched -- like a stale-queue remove_from_dlq() would).
+    await dq.remove_from_dlq(stale_task.id, queue="wrong-queue", name=stale_task.name)
+    assert await dq.data_store.smembers(dq.DLQ_QUEUE(queue="q1")) == {bytes(stale_task.id)}
+
+    # Inject a "concurrent" add_to_dlq landing right after _clean_stale_index_members() takes
+    # its membership snapshot (the smembers() call below) but before it acts on that snapshot --
+    # exactly the window the old code's unconditional DELETE was vulnerable to.
+    new_task = make_task(task_id=ULID2, queue="q1")
+    original_smembers = dq.data_store.smembers
+
+    async def smembers_then_concurrent_add(key, *args, **kwargs):
+        result = await original_smembers(key, *args, **kwargs)
+        if key == dq.DLQ_QUEUE(queue="q1").encode():
+            await _add_to_dlq(dq, new_task, FROZEN_TIME)
+        return result
+
+    with patch.object(dq.data_store, "smembers", side_effect=smembers_then_concurrent_add):
+        removed = await dq.clean_orphaned_entries()
+
+    assert removed == 1
+    assert await dq.data_store.smembers(dq.DLQ_QUEUE(queue="q1")) == {bytes(new_task.id)}

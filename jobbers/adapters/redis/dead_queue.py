@@ -250,10 +250,11 @@ class RedisDeadQueue:
             stale = [m for m, score in zip(member_list, scores) if score is None]
             if not stale:
                 continue
-            pipe = self.data_store.pipeline(transaction=True)
-            pipe.srem(raw_key, *stale)
-            if len(stale) == len(member_list):
-                pipe.delete(raw_key)
-            await pipe.execute()
+            # SREM removes exactly the snapshotted-stale members and nothing else; Redis
+            # auto-deletes the set once its last member is gone, so there's no need (and no
+            # safe way) to separately DELETE raw_key here -- a concurrent add_to_dlq landing
+            # a new, valid member between the smembers() snapshot above and this SREM would
+            # otherwise be wiped out by an unconditional DELETE.
+            await self.data_store.srem(raw_key, *stale)
             removed += len(stale)
         return removed

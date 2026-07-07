@@ -100,6 +100,13 @@ class RedisJSONQueueConfigAdapter:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         await self._client.json().set(self.QUEUE_KEY(name=queue_config.name), "$", _pack(queue_config))
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        """Insert a new queue config. Returns False (no changes made) if the name already exists."""
+        created = await self._client.json().set(
+            self.QUEUE_KEY(name=queue_config.name), "$", _pack(queue_config), nx=True
+        )
+        return bool(created)
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         # Remove queue from all role docs first so that a crash after this point leaves
         # an orphaned-but-valid queue config rather than roles referencing a deleted queue.
@@ -151,6 +158,13 @@ class RedisJSONQueueConfigAdapter:
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
         await self._client.json().set(self.ROLE_KEY(name=role), "$", {"queues": list(queues_set)})
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        """Insert a new role with its queues. Returns False (no changes made) if the role already exists."""
+        created = await self._client.json().set(
+            self.ROLE_KEY(name=role), "$", {"queues": list(queues_set)}, nx=True
+        )
+        return bool(created)
 
     async def get_all_roles(self) -> list[str]:
         results = await self._client.ft(self.ROLE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
@@ -229,6 +243,9 @@ class RedisJSONRoutingBackend:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         await self._qca.save_queue_config(queue_config)
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        return await self._qca.create_queue_config(queue_config)
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         return await self._qca.delete_queue(queue_name)
 
@@ -240,6 +257,9 @@ class RedisJSONRoutingBackend:
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
         await self._qca.save_role(role, queues_set)
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        return await self._qca.create_role(role, queues_set)
 
     async def get_all_roles(self) -> list[str]:
         return await self._qca.get_all_roles()

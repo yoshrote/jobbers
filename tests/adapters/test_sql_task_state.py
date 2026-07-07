@@ -12,10 +12,12 @@ import datetime as dt
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from jobbers.adapters.sql import SQLTaskState, SQLTaskSubmit
+from jobbers.migrations.schema import task_queue
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
@@ -267,3 +269,34 @@ async def test_multiple_stages_commit_atomically(session_factory):
     ids = {t.id for t in await state.get_all_tasks(TaskPagination(queue="default"))}
     assert ULID1 in ids
     assert ULID2 in ids
+
+
+@pytest.mark.asyncio
+async def test_submit_task_rolls_back_task_queue_write_if_dag_run_registration_fails(session_factory):
+    """
+    submit_task's task_queue write and DAG-run registration commit atomically.
+
+    Regression test: _register_dag_run used to run in its own separate transaction after
+    the task+queue write already committed. A crash/failure during DAG-run registration
+    left a running, queued task with no corresponding dag_runs row, corrupting DAG
+    completion bookkeeping. Folding registration into the same transaction means a failure
+    here rolls back the task_queue write too, instead of leaving that inconsistency.
+    """
+    submit = SQLTaskSubmit(session_factory)
+    dag_run_id = ULID()
+    task = make_task(ULID1, submitted_at=FROZEN_TIME)
+    task.dag_run_id = dag_run_id
+
+    original_execute = AsyncSession.execute
+
+    async def _failing_execute(self, statement, *args, **kwargs):
+        if "INSERT INTO dag_runs" in str(statement):
+            raise RuntimeError("boom")
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", _failing_execute), pytest.raises(RuntimeError, match="boom"):
+        await submit.submit_task(task)
+
+    async with session_factory() as session:
+        result = await session.execute(select(task_queue).where(task_queue.c.task_id == str(ULID1)))
+        assert result.first() is None

@@ -153,12 +153,22 @@ class StaticRoutingBackend:
             "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
         )
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        raise RoutingBackendReadOnlyError(
+            "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
+        )
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         raise RoutingBackendReadOnlyError(
             "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
         )
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
+        raise RoutingBackendReadOnlyError(
+            "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
+        )
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
         raise RoutingBackendReadOnlyError(
             "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
         )

@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 
@@ -21,3 +22,19 @@ from jobbers.models.queue_config import QueueConfig, RatePeriod
 def test_period_in_seconds(rate_period, rate_denominator, expected_seconds):
     config = QueueConfig(name="test_queue", rate_denominator=rate_denominator, rate_period=rate_period)
     assert config.period_in_seconds() == expected_seconds
+
+
+# ---------------------------------------------------------------------------
+# max_concurrent
+# ---------------------------------------------------------------------------
+
+
+def test_max_concurrent_zero_is_accepted():
+    """0 is a valid value -- it means unlimited, same as None (not "blocked")."""
+    config = QueueConfig(name="test_queue", max_concurrent=0)
+    assert config.max_concurrent == 0
+
+
+def test_max_concurrent_negative_is_rejected():
+    with pytest.raises(ValidationError):
+        QueueConfig(name="test_queue", max_concurrent=-1)

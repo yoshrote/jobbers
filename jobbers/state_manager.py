@@ -807,6 +807,13 @@ class StateManager:
         self.invalidate_queue_config(queue_config.name)
         await self.bump_refresh_tags_for_queue(queue_config.name)
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        """Atomically create a new queue config. Returns False if the name already exists."""
+        created = await self.routing.create_queue_config(queue_config)
+        if created:
+            self.invalidate_queue_config(queue_config.name)
+        return created
+
     async def save_routing_config(self, routing_config: RoutingConfig) -> None:
         """Save routing config, invalidate local cache entry, and bump routing version."""
         await self.routing.save_routing_config(routing_config)
@@ -839,6 +846,13 @@ class StateManager:
     async def save_role(self, role: str, queues_set: set[str]) -> None:
         await self.routing.save_role(role, queues_set)
         await self.routing_notifications.bump_refresh_tag(role)
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        """Atomically create a new role. Returns False if the role already exists."""
+        created = await self.routing.create_role(role, queues_set)
+        if created:
+            await self.routing_notifications.bump_refresh_tag(role)
+        return created
 
     async def delete_queue(self, queue_name: str) -> None:
         self.invalidate_queue_config(queue_name)
@@ -1056,6 +1070,8 @@ class SubmissionRateLimiter:
         queues = list(task_queues)
         configs = await asyncio.gather(*(self._get_queue_config(q) for q in queues))
         for queue, config in zip(queues, configs, strict=True):
+            # Deliberately truthy, not `is not None`: max_concurrent=0 means unlimited,
+            # same as None -- see QueueConfig.max_concurrent's docstring.
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
                     queues_to_use.add(queue)

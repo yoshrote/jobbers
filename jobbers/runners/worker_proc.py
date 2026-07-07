@@ -16,7 +16,7 @@ from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
-from jobbers.utils.otel import enable_otel
+from jobbers.utils.otel import enable_otel, shutdown_otel
 
 if TYPE_CHECKING:
     from jobbers.models.task import Task
@@ -152,4 +152,7 @@ def run() -> None:
 
     _load_task_module(args.task_module)
 
-    asyncio.run(main(), debug=True)
+    try:
+        asyncio.run(main(), debug=True)
+    finally:
+        shutdown_otel()

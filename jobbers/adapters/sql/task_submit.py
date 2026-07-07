@@ -29,26 +29,30 @@ if TYPE_CHECKING:
     from jobbers.models.task import Task
 
 
-async def _register_dag_run(session_factory: async_sessionmaker[AsyncSession], task: Task) -> None:
-    """Register the task's DAG run in ``dag_runs`` and its pending entry, if it isn't already tracked."""
+async def _register_dag_run(session: AsyncSession, task: Task) -> None:
+    """
+    Register the task's DAG run in ``dag_runs`` and its pending entry, if it isn't already tracked.
+
+    Operates on a session already inside an open transaction (mirrors
+    ``SQLTaskState.stage_submit_task``'s identical inline closure) so callers can fold this
+    into their own transaction instead of committing it separately.
+    """
     if task.dag_run_id is None:
         return
     dag_run_id_str = str(task.dag_run_id)
     task_id_str = str(task.id)
-    async with session_factory() as session:
-        async with session.begin():
-            existing = await session.execute(select(dag_runs).where(dag_runs.c.dag_run_id == dag_run_id_str))
-            if existing.first() is None:
-                await session.execute(
-                    insert(dag_runs).values(dag_run_id=dag_run_id_str, submitted_at=task.submitted_at)
-                )
-            async with session.begin_nested() as sp:
-                try:
-                    await session.execute(
-                        insert(dag_run_pending).values(dag_run_id=dag_run_id_str, task_id=task_id_str)
-                    )
-                except IntegrityError:
-                    await sp.rollback()
+    existing = await session.execute(select(dag_runs).where(dag_runs.c.dag_run_id == dag_run_id_str))
+    if existing.first() is None:
+        await session.execute(
+            insert(dag_runs).values(dag_run_id=dag_run_id_str, submitted_at=task.submitted_at)
+        )
+    async with session.begin_nested() as sp:
+        try:
+            await session.execute(
+                insert(dag_run_pending).values(dag_run_id=dag_run_id_str, task_id=task_id_str)
+            )
+        except IntegrityError:
+            await sp.rollback()
 
 
 class SQLTaskSubmit:
@@ -119,7 +123,7 @@ class SQLTaskSubmit:
                             task_id=task_id_str, queue=task.queue, submitted_at=task.submitted_at
                         )
                     )
-        await _register_dag_run(self._sf, task)
+                await _register_dag_run(session, task)
 
     async def submit_task(self, task: Task) -> bool:
         """Submit a task directly (non-staged)."""
@@ -140,7 +144,7 @@ class SQLTaskSubmit:
                             task_id=task_id_str, queue=task.queue, submitted_at=task.submitted_at
                         )
                     )
-        await _register_dag_run(self._sf, task)
+                await _register_dag_run(session, task)
         return True
 
     async def submit_rate_limited_task(self, task: Task, queue_config: QueueConfig) -> bool:
@@ -229,7 +233,7 @@ class SQLTaskSubmit:
                         insert(task_queue).values(task_id=task_id_str, queue=queue_name, submitted_at=now)
                     )
 
-        await _register_dag_run(self._sf, task)
+                await _register_dag_run(session, task)
         return True
 
     async def clean_rate_limiter(

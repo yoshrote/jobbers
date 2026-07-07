@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from jobbers.runners.cleaner_proc import cleaner
+from jobbers.runners.cleaner_proc import cleaner, run
 
 # ── cleaner ───────────────────────────────────────────────────────────────────
 
@@ -153,3 +153,23 @@ async def test_cleaner_passes_clean_orphaned_dlq():
 
     _, kwargs = state_manager.clean.call_args
     assert kwargs["clean_orphaned_dlq"] is True
+
+
+# ── run() otel shutdown ───────────────────────────────────────────────────────
+
+
+def test_run_calls_shutdown_otel_even_on_failure():
+    """run() must flush/shut down otel providers even if run_until_complete() raises."""
+    mock_loop = MagicMock()
+    mock_loop.run_until_complete.side_effect = RuntimeError("boom")
+
+    with (
+        patch("sys.argv", ["jobbers_cleaner"]),
+        patch("jobbers.runners.cleaner_proc.enable_otel"),
+        patch("jobbers.runners.cleaner_proc.asyncio.get_event_loop", return_value=mock_loop),
+        patch("jobbers.runners.cleaner_proc.shutdown_otel") as mock_shutdown,
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        run()
+
+    mock_shutdown.assert_called_once()

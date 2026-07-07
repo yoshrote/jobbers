@@ -1,5 +1,6 @@
 import datetime as dt
 import logging
+import types
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, get_type_hints
 
@@ -140,7 +141,18 @@ class Task(BaseModel):
                 continue
             # Strip Annotated wrapper before isinstance (Annotated is not a valid isinstance target)
             raw_type = get_args(hint)[0] if get_origin(hint) is Annotated else hint
-            if not isinstance(self.parameters[param], raw_type):
+            # Parameterized generics (list[str], dict[str, int], ...) aren't valid isinstance
+            # targets either -- fall back to their origin (list, dict, ...) for a shallow check.
+            # X | Y unions ARE valid isinstance targets directly, so leave those alone.
+            origin = get_origin(raw_type)
+            check_type = origin if isinstance(origin, type) and origin is not types.UnionType else raw_type
+            try:
+                matches = isinstance(self.parameters[param], check_type)
+            except TypeError:
+                # Some hints (e.g. Literal[...], TypeVar) still aren't runtime-checkable even
+                # after the above -- skip validation for this param rather than crash.
+                continue
+            if not matches:
                 return False
         return True
 

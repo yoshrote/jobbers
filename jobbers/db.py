@@ -61,10 +61,10 @@ def get_client() -> redis.Redis:
     return _client
 
 
-def set_client(new_client: redis.Redis) -> redis.Redis:
+async def set_client(new_client: redis.Redis) -> redis.Redis:
     global _client
     if _client is not None:
-        _client.close()
+        await _client.close()
 
     _client = new_client
     return _client

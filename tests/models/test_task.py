@@ -703,6 +703,53 @@ def test_valid_task_params_still_checks_provided_params():
     assert task.valid_task_params() is False
 
 
+# ── valid_task_params: parameterized generics ─────────────────────────────────
+
+
+def test_valid_task_params_parameterized_generic_shallow_checks_origin():
+    """A list[str]/dict[str, int] hint doesn't crash -- it's shallow-checked against its origin."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+
+    def fn(items: list[str], mapping: dict[str, int]) -> None: ...
+
+    task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
+
+    task.parameters = {"items": ["a", "b"], "mapping": {"a": 1}}
+    assert task.valid_task_params() is True
+
+    task.parameters = {"items": "not_a_list", "mapping": {"a": 1}}
+    assert task.valid_task_params() is False
+
+
+def test_valid_task_params_union_hint_still_validated():
+    """X | Y union hints don't go through the generic-origin path -- isinstance already handles them."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+
+    def fn(x: int | str) -> None: ...
+
+    task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
+
+    task.parameters = {"x": 5}
+    assert task.valid_task_params() is True
+    task.parameters = {"x": "five"}
+    assert task.valid_task_params() is True
+    task.parameters = {"x": 5.0}
+    assert task.valid_task_params() is False
+
+
+def test_valid_task_params_literal_hint_skips_validation():
+    """Literal[...] isn't runtime-checkable via isinstance even after origin substitution -- skip, don't crash."""
+    from typing import Literal
+
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+
+    def fn(mode: Literal["a", "b"]) -> None: ...
+
+    task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
+    task.parameters = {"mode": "anything"}
+    assert task.valid_task_params() is True
+
+
 def test_to_dict_round_trip_preserves_inject_flag():
     """inject_parent_results survives a to_dict/from_dict round-trip."""
     task = _make_full_task(inject_parent_results=True)

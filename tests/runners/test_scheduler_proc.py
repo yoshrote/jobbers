@@ -12,7 +12,7 @@ from jobbers.models.cron_dag import CronDAGEntry
 from jobbers.models.dag import DAGTaskSpec
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
-from jobbers.runners.scheduler_proc import main
+from jobbers.runners.scheduler_proc import main, run
 
 PAST = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 
@@ -70,6 +70,30 @@ async def test_scheduler_dispatches_due_task():
     state_manager.dispatch_scheduled_task.assert_called_once_with(task)
     # Sleep should only happen after the task was dispatched and the next poll found nothing
     assert sleep_calls == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_passes_empty_queues_when_role_has_none():
+    """A role with zero queues must not fall back to 'match any queue' for next_due_bulk."""
+    state_manager = make_state_manager_with_tasks([])
+    state_manager.get_queues = AsyncMock(return_value=set())
+
+    async def fake_sleep(interval: float) -> None:
+        raise asyncio.CancelledError  # stop the loop after first idle
+
+    with (
+        patch("jobbers.runners.scheduler_proc.db.init_state_manager", return_value=state_manager),
+        patch("jobbers.runners.scheduler_proc.asyncio.sleep", side_effect=fake_sleep),
+    ):
+        try:
+            await main(
+                poll_interval=1.0, config_interval=dt.timedelta(minutes=5), role="empty_role", batch_size=1
+            )
+        except asyncio.CancelledError:
+            pass
+
+    call_kwargs = state_manager.task_scheduler.next_due_bulk.call_args_list[0].kwargs
+    assert call_kwargs["queues"] == []
 
 
 @pytest.mark.asyncio
@@ -231,3 +255,20 @@ async def test_scheduler_handles_mixed_enabled_and_disabled_cron_entries():
 
     state_manager.dispatch_cron_dag.assert_called_once_with(enabled_entry, PAST)
     state_manager.reschedule_cron_entries_bulk.assert_awaited_once_with([(disabled_entry, PAST)])
+
+
+# ── run() otel shutdown ───────────────────────────────────────────────────────
+
+
+def test_run_calls_shutdown_otel_even_on_failure():
+    """run() must flush/shut down otel providers even if asyncio.run() raises."""
+    with (
+        patch("sys.argv", ["jobbers_scheduler"]),
+        patch("jobbers.runners.scheduler_proc.enable_otel"),
+        patch("jobbers.runners.scheduler_proc.asyncio.run", side_effect=RuntimeError("boom")),
+        patch("jobbers.runners.scheduler_proc.shutdown_otel") as mock_shutdown,
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        run()
+
+    mock_shutdown.assert_called_once()

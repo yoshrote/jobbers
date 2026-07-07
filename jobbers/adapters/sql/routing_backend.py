@@ -12,6 +12,7 @@ import json
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from jobbers.migrations.schema import (
     queues,
@@ -87,6 +88,23 @@ class SQLQueueConfigAdapter:
                     )
                 )
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        """Insert a new queue config. Returns False (no changes made) if the name already exists."""
+        try:
+            async with self._session_factory.begin() as session:
+                await session.execute(
+                    insert(queues).values(
+                        name=queue_config.name,
+                        max_concurrent=queue_config.max_concurrent,
+                        rate_numerator=queue_config.rate_numerator,
+                        rate_denominator=queue_config.rate_denominator,
+                        rate_period=queue_config.rate_period,
+                    )
+                )
+        except IntegrityError:
+            return False
+        return True
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         """Delete a queue and cascade to role_queues. Returns affected role names."""
         async with self._session_factory.begin() as session:
@@ -131,6 +149,20 @@ class SQLQueueConfigAdapter:
                     insert(role_queues),
                     [{"role": role, "queue": q} for q in queues_set],
                 )
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        """Insert a new role with its queues. Returns False (no changes made) if the role already exists."""
+        try:
+            async with self._session_factory.begin() as session:
+                await session.execute(insert(roles).values(name=role))
+                if queues_set:
+                    await session.execute(
+                        insert(role_queues),
+                        [{"role": role, "queue": q} for q in queues_set],
+                    )
+        except IntegrityError:
+            return False
+        return True
 
     async def get_all_roles(self) -> list[str]:
         async with self._session_factory() as session:
@@ -256,6 +288,9 @@ class SQLRoutingBackend:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         await self._qca.save_queue_config(queue_config)
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        return await self._qca.create_queue_config(queue_config)
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         return await self._qca.delete_queue(queue_name)
 
@@ -267,6 +302,9 @@ class SQLRoutingBackend:
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
         await self._qca.save_role(role, queues_set)
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        return await self._qca.create_role(role, queues_set)
 
     async def get_all_roles(self) -> list[str]:
         return await self._qca.get_all_roles()

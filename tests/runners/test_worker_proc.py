@@ -14,7 +14,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
-from jobbers.runners.worker_proc import _load_task_module, main
+from jobbers.runners.worker_proc import _load_task_module, main, run
 
 # ── _load_task_module ─────────────────────────────────────────────────────────
 
@@ -212,3 +212,20 @@ async def test_main_sigterm_respects_on_shutdown_policy():
     assert continue_completed.is_set()
 
     gen_instance.stop.assert_called_once()
+
+
+# ── run() otel shutdown ───────────────────────────────────────────────────────
+
+
+def test_run_calls_shutdown_otel_even_on_failure():
+    """run() must flush/shut down otel providers even if asyncio.run() raises."""
+    with (
+        patch("sys.argv", ["jobbers_worker", "os"]),
+        patch("jobbers.runners.worker_proc.enable_otel"),
+        patch("jobbers.runners.worker_proc.asyncio.run", side_effect=RuntimeError("boom")),
+        patch("jobbers.runners.worker_proc.shutdown_otel") as mock_shutdown,
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        run()
+
+    mock_shutdown.assert_called_once()

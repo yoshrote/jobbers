@@ -6,7 +6,7 @@ import sys
 
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
-from jobbers.utils.otel import enable_otel
+from jobbers.utils.otel import enable_otel, shutdown_otel
 
 parser = argparse.ArgumentParser(description="Jobbers Cleaner")
 parser.add_argument(
@@ -99,4 +99,7 @@ def run() -> None:
     args = parser.parse_args()
 
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(cleaner(args))
+    try:
+        loop.run_until_complete(cleaner(args))
+    finally:
+        shutdown_otel()

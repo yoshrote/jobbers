@@ -40,6 +40,8 @@ Queues are the primary unit of traffic control. Each queue has two independent r
 
 No more than `max_concurrent` tasks from this queue will run at the same time across a single worker. The `TaskGenerator` checks the worker's live per-queue active count before offering that queue for the next fetch. A queue at its cap is temporarily excluded from the round; it re-enters as soon as a slot opens.
 
+`max_concurrent: 0` and omitting the field entirely (`null`) both mean **unlimited** concurrency for that queue — not "block this queue." Negative values are rejected at the API/model level.
+
 This is enforced in memory by `StateManager.current_tasks_by_queue` — a dict updated atomically when tasks start and finish via the `task_in_registry()` context manager.
 
 ### Per-Queue Rate Limiting

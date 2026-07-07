@@ -12,7 +12,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.task_routes import app
-from jobbers.utils.otel import enable_otel
+from jobbers.utils.otel import enable_otel, shutdown_otel
 
 ENABLE_OTEL = True
 
@@ -54,7 +54,11 @@ def run() -> None:
 
     _load_task_module(args.task_module)
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    finally:
+        if ENABLE_OTEL:
+            shutdown_otel()
 
 
 if __name__ == "__main__":

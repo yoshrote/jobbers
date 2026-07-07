@@ -606,6 +606,12 @@ class DummyRoutingBackend:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         self._queues[queue_config.name] = queue_config
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        if queue_config.name in self._queues:
+            return False
+        self._queues[queue_config.name] = queue_config
+        return True
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         self._queues.pop(queue_name, None)
         affected = []
@@ -625,6 +631,12 @@ class DummyRoutingBackend:
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
         self._roles[role] = set(queues_set)
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        if role in self._roles:
+            return False
+        self._roles[role] = set(queues_set)
+        return True
 
     async def get_all_roles(self) -> list[str]:
         return sorted(self._roles)

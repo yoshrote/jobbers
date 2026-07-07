@@ -338,3 +338,54 @@ async def test_get_roles_for_queue_returns_empty_when_no_matching_role(queue_con
     await queue_config_adapter.save_role("r", {"other_q"})
     roles = await queue_config_adapter.get_roles_for_queue("missing_q")
     assert roles == []
+
+
+# ── create_queue_config / create_role (atomic, name-uniqueness-based) ─────────
+
+
+@pytest.mark.asyncio
+async def test_create_queue_config_succeeds_when_absent(queue_config_adapter):
+    created = await queue_config_adapter.create_queue_config(QueueConfig(name="new_q", max_concurrent=3))
+    assert created is True
+    result = await queue_config_adapter.get_queue_config("new_q")
+    assert result is not None
+    assert result.max_concurrent == 3
+
+
+@pytest.mark.asyncio
+async def test_create_queue_config_fails_when_already_exists(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="dup_q", max_concurrent=1))
+    created = await queue_config_adapter.create_queue_config(QueueConfig(name="dup_q", max_concurrent=99))
+    assert created is False
+    # The existing config must be untouched by the failed create.
+    result = await queue_config_adapter.get_queue_config("dup_q")
+    assert result is not None
+    assert result.max_concurrent == 1
+
+
+@pytest.mark.asyncio
+async def test_create_role_succeeds_when_absent(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    created = await queue_config_adapter.create_role("new_role", {"q1"})
+    assert created is True
+    assert await queue_config_adapter.get_queues("new_role") == {"q1"}
+
+
+@pytest.mark.asyncio
+async def test_create_role_fails_when_already_exists(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q1"))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q2"))
+    await queue_config_adapter.save_role("dup_role", {"q1"})
+    created = await queue_config_adapter.create_role("dup_role", {"q2"})
+    assert created is False
+    # The existing role's queues must be untouched by the failed create.
+    assert await queue_config_adapter.get_queues("dup_role") == {"q1"}
+
+
+@pytest.mark.asyncio
+async def test_create_role_fails_when_already_exists_with_zero_queues(queue_config_adapter):
+    """A role that exists with no queues assigned must not look like 'doesn't exist'."""
+    created_first = await queue_config_adapter.create_role("empty_role", set())
+    assert created_first is True
+    created_second = await queue_config_adapter.create_role("empty_role", set())
+    assert created_second is False

@@ -119,7 +119,7 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     full DAG structure rooted at this task.
     """
     logger.info("Getting task status for task ID %s", task_id)
-    task_uid: ULID = ULID.from_str(task_id)
+    task_uid: ULID = _parse_ulid(task_id, "task_id")
     task = await db.get_task_adapter().get_task(task_uid)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -146,7 +146,7 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
 async def cancel_task(task_id: str) -> dict[str, Any]:
     """Cancel a running task by publishing to its cancellation channel."""
     logger.info("Requesting cancellation for task ID %s", task_id)
-    task_uid: ULID = ULID.from_str(task_id)
+    task_uid: ULID = _parse_ulid(task_id, "task_id")
     sm = db.get_state_manager()
     try:
         task = await sm.request_task_cancellation(task_uid)
@@ -173,6 +173,9 @@ async def cancel_tasks(request: BulkCancelRequest) -> dict[str, Any]:
     async def _cancel_one(task_id_str: str) -> dict[str, Any]:
         try:
             task_uid: ULID = ULID.from_str(task_id_str)
+        except ValueError:
+            return {"task_id": task_id_str, "status": "error", "detail": f"Invalid task_id: {task_id_str!r}"}
+        try:
             task = await sm.request_task_cancellation(task_uid)
         except TaskException as ex:
             return {"task_id": task_id_str, "status": "error", "detail": str(ex)}
@@ -223,10 +226,9 @@ async def get_all_queues() -> dict[str, Any]:
 async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
     """Create a new queue with its configuration. Returns 409 if the queue already exists."""
     sm = db.get_state_manager()
-    existing = await sm.get_queue_config(queue_config.name)
-    if existing is not None:
+    created = await sm.create_queue_config(queue_config)
+    if not created:
         raise HTTPException(status_code=409, detail=f"Queue '{queue_config.name}' already exists.")
-    await sm.save_queue_config(queue_config)
     return {"message": "Queue created successfully", "queue": queue_config.model_dump(mode="json")}
 
 
@@ -386,6 +388,33 @@ async def get_scheduled_tasks(filter_query: Annotated[TaskPagination, Query()]) 
     return {"tasks": summaries}
 
 
+def _parse_ulid(raw: str, field_name: str = "id") -> ULID:
+    try:
+        return ULID.from_str(raw)
+    except ValueError as ex:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw!r}") from ex
+
+
+def _validate_dag_against_registry(roots: list[Any]) -> None:
+    """Walk all reachable nodes (not just roots) and validate each against the registry."""
+    visited: set[int] = set()
+    worklist: list[Any] = list(roots)
+    while worklist:
+        node = worklist.pop()
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        if not registry.get_task_config(node._name, node._version):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown task '{node._name}@{node._version}'. Register it with @register_task before submitting.",
+            )
+        for successor, _, error_node, _ in node._successors:
+            worklist.append(successor)
+            if error_node is not None:
+                worklist.append(error_node)
+
+
 async def _require_role(role_name: str, sm: StateManager) -> None:
     all_roles = await sm.get_all_roles()
     if role_name not in all_roles:
@@ -418,11 +447,10 @@ class RoleRequest(BaseModel):
 async def create_role(role: RoleRequest) -> dict[str, Any]:
     """Create a new role with an initial set of queues. Returns 409 if the role already exists."""
     sm = db.get_state_manager()
-    existing = await sm.get_queues(role.name)
-    if existing:
-        raise HTTPException(status_code=409, detail=f"Role '{role.name}' already exists.")
     await _require_queues_exist(role.queues, sm)
-    await sm.save_role(role.name, set(role.queues))
+    created = await sm.create_role(role.name, set(role.queues))
+    if not created:
+        raise HTTPException(status_code=409, detail=f"Role '{role.name}' already exists.")
     return {"message": "Role created successfully", "role": role.name, "queues": sorted(role.queues)}
 
 
@@ -518,23 +546,7 @@ async def submit_dag(request: SubmitDAGRequest) -> dict[str, Any]:
     except MermaidParseError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Walk all reachable nodes (not just roots) and validate each against the registry.
-    visited: set[int] = set()
-    worklist: list[Any] = list(roots)
-    while worklist:
-        node = worklist.pop()
-        if id(node) in visited:
-            continue
-        visited.add(id(node))
-        if not registry.get_task_config(node._name, node._version):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown task '{node._name}@{node._version}'. Register it with @register_task before submitting.",
-            )
-        for successor, _, error_node, _ in node._successors:
-            worklist.append(successor)
-            if error_node is not None:
-                worklist.append(error_node)
+    _validate_dag_against_registry(roots)
 
     sm = db.get_state_manager()
     try:
@@ -584,6 +596,7 @@ async def create_cron_dag(request: CronDAGRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if len(roots) != 1:
         raise HTTPException(status_code=400, detail="Cron DAGs must have exactly one root node.")
+    _validate_dag_against_registry(roots)
 
     dag_spec = roots[0].to_spec()
     entry = CronDAGEntry(
@@ -613,7 +626,7 @@ async def list_cron_dags(offset: int = 0, limit: int = 50) -> dict[str, Any]:
 @app.get("/cron-dags/{cron_id}")
 async def get_cron_dag(cron_id: str) -> dict[str, Any]:
     """Retrieve a single cron-scheduled DAG entry by ID."""
-    uid = ULID.from_str(cron_id)
+    uid = _parse_ulid(cron_id, "cron_id")
     sm = db.get_state_manager()
     entry = await sm.cron_dag_scheduler.get(uid)
     if entry is None:
@@ -630,7 +643,7 @@ async def update_cron_dag(cron_id: str, request: CronDAGRequest) -> dict[str, An
     The entry ``id`` and ``created_at`` are preserved; the schedule is reset
     to the next occurrence of the (possibly updated) cron expression.
     """
-    uid = ULID.from_str(cron_id)
+    uid = _parse_ulid(cron_id, "cron_id")
     sm = db.get_state_manager()
     existing = await sm.cron_dag_scheduler.get(uid)
     if existing is None:
@@ -643,6 +656,7 @@ async def update_cron_dag(cron_id: str, request: CronDAGRequest) -> dict[str, An
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if len(roots) != 1:
         raise HTTPException(status_code=400, detail="Cron DAGs must have exactly one root node.")
+    _validate_dag_against_registry(roots)
 
     dag_spec = roots[0].to_spec()
     updated = CronDAGEntry(
@@ -662,7 +676,7 @@ async def update_cron_dag(cron_id: str, request: CronDAGRequest) -> dict[str, An
 @app.delete("/cron-dags/{cron_id}", status_code=200)
 async def delete_cron_dag(cron_id: str) -> dict[str, Any]:
     """Delete a cron-scheduled DAG entry. Returns 404 if not found."""
-    uid = ULID.from_str(cron_id)
+    uid = _parse_ulid(cron_id, "cron_id")
     sm = db.get_state_manager()
     entry = await sm.cron_dag_scheduler.get(uid)
     if entry is None:
@@ -688,7 +702,7 @@ async def list_dags(pagination: Annotated[DAGRunPagination, Query()]) -> dict[st
 @app.get("/dags/{dag_run_id}")
 async def get_dag(dag_run_id: str) -> dict[str, Any]:
     """Get details of a single DAG run including the IDs of all tasks within it."""
-    uid = ULID.from_str(dag_run_id)
+    uid = _parse_ulid(dag_run_id, "dag_run_id")
     sm = db.get_state_manager()
     result = await sm.get_dag_run(uid)
     if result is None:

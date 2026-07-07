@@ -2,8 +2,8 @@ import logging
 import os
 import platform
 
-from opentelemetry import trace
-from opentelemetry._logs import set_logger_provider
+from opentelemetry import metrics, trace
+from opentelemetry._logs import get_logger_provider, set_logger_provider
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
     OTLPLogExporter,
 )
@@ -60,3 +60,26 @@ def enable_otel(handlers: list[logging.Handler], service_name: str = "jobbers") 
     setup_tracer(resource)
 
     handlers.append(otel_handler)
+
+
+def shutdown_otel() -> None:
+    """
+    Flush and shut down the tracer/meter/logger providers set up by enable_otel().
+
+    Safe to call even if enable_otel() was never called: the SDK's default proxy
+    providers have no shutdown() method at all, so each call is guarded with hasattr.
+    Call this once, late in each runner's shutdown path -- without it, the batch
+    processors enable_otel() wires up buffer spans/metrics/logs and export them on a
+    timer, so anything not yet exported is silently dropped on process exit.
+    """
+    tracer_provider = trace.get_tracer_provider()
+    if hasattr(tracer_provider, "shutdown"):
+        tracer_provider.shutdown()
+
+    meter_provider = metrics.get_meter_provider()
+    if hasattr(meter_provider, "shutdown"):
+        meter_provider.shutdown()
+
+    logger_provider = get_logger_provider()
+    if hasattr(logger_provider, "shutdown"):
+        logger_provider.shutdown()

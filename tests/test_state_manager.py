@@ -138,6 +138,18 @@ async def test_concurrency_limits_with_limits(state_manager, rate_limiter):
 
 
 @pytest.mark.asyncio
+async def test_concurrency_limits_max_concurrent_zero_is_unlimited(state_manager, rate_limiter):
+    """max_concurrent=0 means unlimited, same as None -- not "block this queue"."""
+    await state_manager.routing.save_queue_config(QueueConfig(name="queue1", max_concurrent=0))
+
+    task_queues = ["queue1"]
+    current_tasks_by_queue = {"queue1": {ULID(), ULID(), ULID()}}
+
+    result = await rate_limiter.concurrency_limits(task_queues, current_tasks_by_queue)
+    assert result == {"queue1"}
+
+
+@pytest.mark.asyncio
 async def test_concurrency_limits_empty_queues(state_manager, rate_limiter):
     await state_manager.routing.save_queue_config(QueueConfig(name="queue1", max_concurrent=1))
     await state_manager.routing.save_queue_config(QueueConfig(name="queue2", max_concurrent=1))
