@@ -729,10 +729,22 @@ def dag_spec_to_mermaid(
         """
         Walk an arm spec tree in expanded mode.
 
-        Nodes with no ``SimpleCallback``/``FanInCallback`` successors are leaf nodes;
-        they connect to *collector* via ``--o``.  Intermediate nodes emit ``-->``
-        to their successors.  Nested ``DynamicFanOutCallback`` entries on arm nodes
-        are also expanded recursively.
+        Nodes with no ``SimpleCallback``/``FanInCallback`` successors *and* no nested
+        ``DynamicFanOutCallback`` are true leaf nodes; they connect to *collector* via
+        ``--o``.  Intermediate nodes emit ``-->`` to their successors.  A node that is
+        itself a dispatcher (has a nested ``DynamicFanOutCallback``) is never a leaf of
+        *this* arm — dynamic fan-outs are generated automatically from a predictable
+        shape, so that shape is checked up front rather than inferred from the absence
+        of ordinary successors. Its inner arm is expanded recursively, and the inner
+        collector continues *this* arm's chain (walked via ``_walk_arm``, not ``_walk``)
+        so the eventual leaf — the inner collector itself, or whatever follows it — is
+        the one that connects to the outer *collector*, not the dispatcher.
+
+        Note this function does *not* call ``_walk(collector)`` itself: a *collector*
+        passed in here may be an inner collector that still needs ``_walk_arm`` treatment
+        (see the nested-fanout branch below), so walking it as a plain node is the
+        caller's responsibility once this function returns — mirrors how the top-level
+        ``_walk`` already does this for the outermost ``DynamicFanOutCallback``.
         """
         sid = str(s.id)
         if sid in visited:
@@ -741,30 +753,32 @@ def dag_spec_to_mermaid(
         node_lines[sid] = _node_line(s)
 
         arm_successors = [cb for cb in s.dag_callbacks if isinstance(cb, (SimpleCallback, FanInCallback))]
+        nested_fanouts = [cb for cb in s.dag_callbacks if isinstance(cb, DynamicFanOutCallback)]
 
-        if not arm_successors:
+        if not arm_successors and not nested_fanouts:
             # Leaf: arm ends here — connect to the outer collector.
             _add_edge(sid, str(collector.id), "--o")
-            _walk(collector)
-        else:
-            for arm_cb in arm_successors:
-                child_id = str(arm_cb.task.id)
-                _add_edge(sid, child_id, "-->")
-                if arm_cb.error_callback is not None:
-                    _add_edge(sid, str(arm_cb.error_callback.id), "-.->")
-                    _walk(arm_cb.error_callback)
-                _walk_arm(arm_cb.task, collector)
+            return
 
-        # Nested DynamicFanOutCallback inside an arm node (only reached in expanded mode).
-        for dag_cb in s.dag_callbacks:
-            if isinstance(dag_cb, DynamicFanOutCallback):
-                inner_arm_id = str(dag_cb.arm_root.id)
-                _add_edge(sid, inner_arm_id, "-->>")
-                if dag_cb.error_callback is not None:
-                    _add_edge(sid, str(dag_cb.error_callback.id), "-.->")
-                    _walk(dag_cb.error_callback)
-                _walk_arm(dag_cb.arm_root, dag_cb.collector)
-                _walk(dag_cb.collector)
+        for arm_cb in arm_successors:
+            child_id = str(arm_cb.task.id)
+            _add_edge(sid, child_id, "-->")
+            if arm_cb.error_callback is not None:
+                _add_edge(sid, str(arm_cb.error_callback.id), "-.->")
+                _walk(arm_cb.error_callback)
+            _walk_arm(arm_cb.task, collector)
+
+        for dag_cb in nested_fanouts:
+            inner_arm_id = str(dag_cb.arm_root.id)
+            _add_edge(sid, inner_arm_id, "-->>")
+            if dag_cb.error_callback is not None:
+                _add_edge(sid, str(dag_cb.error_callback.id), "-.->")
+                _walk(dag_cb.error_callback)
+            _walk_arm(dag_cb.arm_root, dag_cb.collector)
+            # The inner collector continues this (outer) arm's chain rather than being
+            # walked as a plain node -- see the docstring note above.
+            _walk_arm(dag_cb.collector, collector)
+            _walk_arm(dag_cb.collector, collector)
 
     def _walk_compact_arm(s: DAGTaskSpec) -> None:
         """

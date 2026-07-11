@@ -911,3 +911,59 @@ def test_generator_fanout_expanded_round_trip() -> None:
     arm_cb2 = cb2.arm_root.dag_callbacks[0]
     assert isinstance(arm_cb2, SimpleCallback)
     assert arm_cb2.task.name == "finish_processing"
+
+
+def test_generator_fanout_expanded_nested_no_spurious_edge() -> None:
+    """
+    Expanded mode does not draw a spurious edge from a nested dispatcher to the outer collector.
+
+    Regression test: _walk_arm's leaf-detection only counted SimpleCallback/FanInCallback
+    successors, so a node whose only callback was a nested DynamicFanOutCallback (i.e. it is
+    itself a dispatcher) was misclassified as a terminal leaf of the *outer* arm -- drawing a
+    bogus `dispatcher --o outer_collector` edge while leaving the real inner collector
+    disconnected. The inner collector must instead continue the outer arm's chain, so the true
+    terminal (the inner collector itself, here) is what connects to the outer collector.
+    """
+    text = """
+    flowchart TD
+        A["split_batches"]
+        B["process_batch"]
+        R["process_record"]
+        D["aggregate_batch"]
+        C["aggregate_all"]
+        A -->> B
+        B -->> R
+        R --o D
+        D --o C
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    outer_cb = spec.dag_callbacks[0]
+    assert isinstance(outer_cb, DynamicFanOutCallback)
+    b_id = str(outer_cb.arm_root.id)
+    c_id = str(outer_cb.collector.id)
+    inner_cb = outer_cb.arm_root.dag_callbacks[0]
+    assert isinstance(inner_cb, DynamicFanOutCallback)
+    d_id = str(inner_cb.collector.id)
+
+    diagram = dag_spec_to_mermaid(spec, expand_fanouts=True)
+    lines = [ln.strip() for ln in diagram.splitlines()]
+
+    # The spurious edge: the dispatcher (B) must NOT connect directly to the outer collector.
+    assert not any(f"{b_id} --o" in ln and c_id in ln for ln in lines), (
+        "process_batch should not connect directly to aggregate_all in expanded mode"
+    )
+    # The real terminal: the inner collector (D) connects onward to the outer collector (C).
+    assert any(f"{d_id} --o" in ln and c_id in ln for ln in lines), (
+        "aggregate_batch --o aggregate_all missing in expanded mode"
+    )
+
+    # Round-trip: re-parsing the expanded diagram must reconstruct the same nested structure.
+    roots2 = parse_mermaid_dag(diagram)
+    spec2 = roots2[0].to_spec()
+    outer_cb2 = spec2.dag_callbacks[0]
+    assert isinstance(outer_cb2, DynamicFanOutCallback)
+    assert outer_cb2.collector.name == "aggregate_all"
+    inner_cb2 = outer_cb2.arm_root.dag_callbacks[0]
+    assert isinstance(inner_cb2, DynamicFanOutCallback)
+    assert inner_cb2.collector.name == "aggregate_batch"
