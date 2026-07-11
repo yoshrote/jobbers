@@ -300,3 +300,31 @@ async def test_submit_task_rolls_back_task_queue_write_if_dag_run_registration_f
     async with session_factory() as session:
         result = await session.execute(select(task_queue).where(task_queue.c.task_id == str(ULID1)))
         assert result.first() is None
+
+
+@pytest.mark.asyncio
+async def test_read_for_watch_closes_session_on_failure(session_factory):
+    """
+    read_for_watch() closes and discards its batch's session if its own SELECT raises.
+
+    Regression test: read_for_watch() calls pipe._get_session() directly, opening a session
+    and beginning a transaction *outside* SQLTransactionBatch.execute()'s own try/finally. If
+    the SELECT itself raised (lock timeout, transient DB error), the exception propagated
+    without ever reaching execute() or its cleanup, leaking a pooled connection.
+    """
+    state = SQLTaskState(session_factory)
+    task = make_task(ULID1, submitted_at=FROZEN_TIME)
+    await state.save_task(task)
+
+    pipe = state.pipeline(transaction=True)
+    original_execute = AsyncSession.execute
+
+    async def _failing_execute(self, statement, *args, **kwargs):
+        if "FROM tasks" in str(statement):
+            raise RuntimeError("boom")
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", _failing_execute), pytest.raises(RuntimeError, match="boom"):
+        await state.read_for_watch(pipe, ULID1)
+
+    assert pipe._session is None

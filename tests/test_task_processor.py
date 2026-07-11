@@ -70,6 +70,57 @@ async def test_task_processor_success():
 
 
 @pytest.mark.asyncio
+async def test_execution_time_metric_excludes_retry_backoff_wait():
+    """
+    Uses retried_at (start of the final attempt), not started_at (start of the very first attempt).
+
+    Regression test: a retried task's recorded execution_time previously spanned every retry's
+    backoff wait (completed_at - started_at), not just the attempt that actually finished.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.UNSUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = _make_state_manager()
+    failing_function = AsyncMock(side_effect=ValueError("boom"))
+    failing_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=failing_function,
+        timeout=10,
+        max_retries=3,
+        expected_exceptions=(ValueError,),
+    )
+
+    with patch("jobbers.task_processor.get_task_config", return_value=failing_config):
+        retried_task = await TaskProcessor(state_manager).process(task)
+
+    assert retried_task.status == TaskStatus.SUBMITTED
+    # Simulate a long backoff wait between the first (failed) attempt and the retry: a bug
+    # using started_at instead of retried_at would show up as a huge (wrong) execution_time.
+    retried_task.started_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+
+    succeeding_function = AsyncMock(return_value=TaskResult(results={"ok": True}))
+    succeeding_config = TaskConfig(
+        name="test_task", version=1, function=succeeding_function, timeout=10, max_retries=3
+    )
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=succeeding_config),
+        patch("jobbers.task_processor.execution_time") as mock_execution_time,
+    ):
+        completed_task = await TaskProcessor(state_manager).process(retried_task)
+
+    assert completed_task.status == TaskStatus.COMPLETED
+    mock_execution_time.record.assert_called_once()
+    recorded_ms = mock_execution_time.record.call_args[0][0]
+    assert recorded_ms < 5000  # well under the ~1 hour backoff gap; only the 2nd attempt counted
+
+
+@pytest.mark.asyncio
 async def test_task_processor_dropped_task():
     """Test that TaskProcessor handles a dropped task."""
     task = Task(

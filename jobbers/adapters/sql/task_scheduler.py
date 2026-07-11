@@ -172,13 +172,18 @@ class SQLTaskScheduler:
         """Fetch scheduled entries matching the given filter criteria."""
         from ulid import ULID
 
-        stmt = select(task_schedule).order_by(task_schedule.c.run_at)
+        # Order by task_id (not run_at) so the sort order matches the start_after cursor field --
+        # Redis's implementation does the same (sorted(score_map.keys()), i.e. by task_id), so this
+        # also brings SQL's pagination semantics in line with Redis's instead of diverging from it.
+        stmt = select(task_schedule).order_by(task_schedule.c.task_id)
         if queue is not None:
             stmt = stmt.where(task_schedule.c.queue == queue)
         if start_after is not None:
             cursor = str(ULID.from_str(start_after))
             stmt = stmt.where(task_schedule.c.task_id > cursor)
-        stmt = stmt.limit(limit * 10)  # over-fetch to allow name/version filtering
+        # No over-fetch heuristic: scan all queue/cursor-matching rows before applying
+        # name/version filters in Python, mirroring Redis's exhaustive-scan-then-filter
+        # approach so a low match-rate filter can't silently drop real matches.
         async with self._sf() as session:
             result = await session.execute(stmt)
             rows = result.all()

@@ -250,7 +250,14 @@ class SQLTaskState:
         stmt = select(tasks).where(tasks.c.id == str(task_id))
         if self._use_for_update:
             stmt = stmt.with_for_update()
-        result = await session.execute(stmt)
+        try:
+            result = await session.execute(stmt)
+        except Exception:
+            # This SELECT runs outside execute()'s own try/finally (the session must stay
+            # open for later staged writes in the same transaction on success), so a failure
+            # here must close the session itself or the connection leaks from the pool.
+            await pipe.abort()
+            raise
         row = result.first()
         return _row_to_task(row) if row is not None else None
 

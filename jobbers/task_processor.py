@@ -206,9 +206,14 @@ class TaskProcessor:
 
         # Metrics recording
         tasks_processed.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
-        if task.started_at and task.completed_at:
+        # Use retried_at (set at the start of the most recent retry attempt) instead of
+        # started_at (set once, at the very first attempt) when present, so a retried task's
+        # execution_time reflects only the attempt that actually finished -- not the full
+        # first-start-to-completion span, which would otherwise include every retry's backoff wait.
+        execution_start = task.retried_at or task.started_at
+        if execution_start and task.completed_at:
             execution_time.record(
-                (task.completed_at - task.started_at).total_seconds() * 1000,
+                (task.completed_at - execution_start).total_seconds() * 1000,
                 {"queue": task.queue, "task": task.name, "status": task.status},
             )
         if task.submitted_at and task.completed_at:

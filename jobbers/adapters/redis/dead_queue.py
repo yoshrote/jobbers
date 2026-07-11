@@ -136,7 +136,25 @@ class RedisDeadQueue:
                     "Awaitable[set[bytes]]",
                     self.data_store.smembers(self.DLQ_NAME(name=task_name)),
                 )
-            id_bytes = list(raw_ids)
+            if not raw_ids:
+                return []
+            # SINTER/SMEMBERS return an unordered set. Sort by each member's failed_at score in
+            # the main `dlq` sorted set (the same source the unfiltered path above reads from)
+            # so the filtered path returns newest-first too, matching RedisJSON's ordering.
+            # This also naturally drops stale/orphaned index members (score None) up front.
+            id_list = list(raw_ids)
+            score_pipe = self.data_store.pipeline(transaction=False)
+            for member in id_list:
+                score_pipe.zscore(self.DLQ, member)
+            scores: list[float | None] = await score_pipe.execute()
+            id_bytes = [
+                member
+                for member, _ in sorted(
+                    ((m, s) for m, s in zip(id_list, scores) if s is not None),
+                    key=lambda pair: pair[1],
+                    reverse=True,
+                )
+            ]
         if not id_bytes:
             return []
         ulid_list = [ULID.from_bytes(b) for b in id_bytes]

@@ -10,7 +10,7 @@ import datetime as dt
 import json
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
@@ -370,9 +370,11 @@ class SQLCronDAGScheduler:
         """
         async with self._sf() as session:
             count_result = await session.execute(
-                select(cron_dag_entries).where(cron_dag_entries.c.next_run_at.is_not(None))
+                select(func.count()).where(cron_dag_entries.c.next_run_at.is_not(None))
             )
-            total = len(count_result.all())
+            total = count_result.scalar()
+            if total is None:
+                return [], 0
 
             result = await session.execute(
                 select(cron_dag_entries)

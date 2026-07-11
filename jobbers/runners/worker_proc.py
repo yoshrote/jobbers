@@ -20,6 +20,7 @@ from jobbers.utils.otel import enable_otel, shutdown_otel
 
 if TYPE_CHECKING:
     from jobbers.models.task import Task
+    from jobbers.state_manager import StateManager
 
 logger = logging.getLogger(__name__)
 """
@@ -31,6 +32,21 @@ Important environment variables:
 Rate limiting should be implemented by limiting the creation of tasks rather
 than on the consumption of tasks.
 """
+
+
+async def _run_cancel_listener_supervised(state_manager: StateManager) -> None:
+    """Run the cancellation listener, restarting it (with a short backoff) if it dies unexpectedly."""
+    while True:
+        try:
+            await state_manager.run_cancel_listener()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Cancellation listener crashed; restarting in 1s. "
+                "Task cancellation was unavailable in the meantime."
+            )
+            await asyncio.sleep(1)
 
 
 async def main() -> None:
@@ -77,7 +93,7 @@ async def main() -> None:
     def _on_task_done(done_task: asyncio.Task[None]) -> None:
         active.pop(done_task, None)
 
-    cancel_listener = asyncio.create_task(state_manager.run_cancel_listener())
+    cancel_listener = asyncio.create_task(_run_cancel_listener_supervised(state_manager))
     try:
         while not shutdown_event.is_set():
             await semaphore.acquire()

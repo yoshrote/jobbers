@@ -14,7 +14,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
-from jobbers.runners.worker_proc import _load_task_module, main, run
+from jobbers.runners.worker_proc import _load_task_module, _run_cancel_listener_supervised, main, run
 
 # ── _load_task_module ─────────────────────────────────────────────────────────
 
@@ -54,6 +54,52 @@ def test_load_task_module_invalid_path_raises():
     """A non-existent absolute path raises ImportError."""
     with pytest.raises((ImportError, FileNotFoundError)):
         _load_task_module("/nonexistent/path/tasks.py")
+
+
+# ── _run_cancel_listener_supervised ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_listener_supervised_restarts_after_unexpected_failure(caplog):
+    """
+    The listener is restarted (with a logged error) if it dies with anything but CancelledError.
+
+    Regression test: previously the worker created the cancel-listener task and never
+    supervised it, so an unexpected failure (e.g. a dropped Redis pub/sub connection) silently
+    disabled task cancellation for the rest of the worker's life with no log and no restart.
+    """
+    calls = 0
+
+    async def flaky_listener() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("pubsub connection dropped")
+        raise asyncio.CancelledError
+
+    state_manager = MagicMock()
+    state_manager.run_cancel_listener = AsyncMock(side_effect=flaky_listener)
+
+    with (
+        patch("jobbers.runners.worker_proc.asyncio.sleep", new=AsyncMock()),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await _run_cancel_listener_supervised(state_manager)
+
+    assert calls == 2
+    assert "Cancellation listener crashed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_listener_supervised_propagates_cancellation_immediately():
+    """A CancelledError on the first attempt propagates without being treated as a crash."""
+    state_manager = MagicMock()
+    state_manager.run_cancel_listener = AsyncMock(side_effect=asyncio.CancelledError)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_cancel_listener_supervised(state_manager)
+
+    state_manager.run_cancel_listener.assert_awaited_once()
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

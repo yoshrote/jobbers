@@ -10,7 +10,6 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.redis import RedisDeadQueue
 from jobbers.adapters.sql import SQLDeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
@@ -208,11 +207,6 @@ async def test_get_by_filter_no_criteria_sorted_by_failed_at_desc(dead_queue):
 async def test_get_by_filter_with_criteria_sorted_by_failed_at_desc(dead_queue):
     """get_by_filter returns results newest-first when a queue or task_name filter is applied."""
     dq, adapter = dead_queue
-    if isinstance(dq, RedisDeadQueue):
-        pytest.xfail(
-            "RedisDeadQueue uses Redis sets for filtered lookups (sinter/smembers), "
-            "which have no ordering guarantee; results are not sorted by failed_at."
-        )
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", queue="q1")
     await adapter.save_task(t1)
