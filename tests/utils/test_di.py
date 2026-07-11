@@ -1,7 +1,8 @@
 """Tests for jobbers.di — FastAPI-style dependency injection."""
 
-from collections.abc import AsyncGenerator, Generator
-from typing import Annotated
+import asyncio
+from collections.abc import AsyncGenerator, Callable, Generator
+from typing import Annotated, Any
 
 import pytest
 from ulid import ULID
@@ -387,6 +388,60 @@ async def test_dependency_overrides_restores_after_context():
     async with DependencyResolver(graph) as resolver:
         cache = await resolver.resolve_all()
 
+    assert cache[real_db] == "real"
+
+
+@pytest.mark.asyncio
+async def test_dependency_overrides_isolated_across_concurrent_tasks():
+    """
+    Overrides set by one concurrently-running coroutine must not leak into another's.
+
+    This holds even when both coroutines override the same provider key.
+
+    Regression test: the old implementation stored overrides in a single shared dict.
+    Two coroutines running concurrently in the same event loop (e.g. via
+    asyncio.gather(), a natural way to test a task under concurrent load) and each
+    overriding the same provider with a different replacement could corrupt each
+    other: a later dict.update() clobbers the earlier value, and either coroutine's
+    cleanup (a plain dict.pop()) removes the *other's* still-active entry regardless
+    of whose value is currently there.
+    """
+
+    async def real_db() -> str:
+        return "real"
+
+    async def fake_a() -> str:
+        return "a"
+
+    async def fake_b() -> str:
+        return "b"
+
+    async def task_func(db: Annotated[str, Depends(real_db)]) -> None: ...
+
+    graph = inspect_task_dependencies(task_func)
+    results: dict[str, str] = {}
+
+    async def run(name: str, fake: Callable[[], Any], delay_before: float, delay_after: float) -> None:
+        with dependency_overrides({real_db: fake}):
+            # Yield control so the other coroutine's overlapping `with` block runs
+            # in between -- this is exactly the interleaving window that let the old
+            # shared-dict implementation corrupt a sibling's override.
+            await asyncio.sleep(delay_before)
+            async with DependencyResolver(graph) as resolver:
+                cache = await resolver.resolve_all()
+            await asyncio.sleep(delay_after)
+        results[name] = cache[real_db]
+
+    await asyncio.gather(
+        run("a", fake_a, 0.01, 0),
+        run("b", fake_b, 0, 0.01),
+    )
+
+    assert results == {"a": "a", "b": "b"}
+
+    # Once both concurrent overrides have exited, ambient state is back to the real provider.
+    async with DependencyResolver(graph) as resolver:
+        cache = await resolver.resolve_all()
     assert cache[real_db] == "real"
 
 

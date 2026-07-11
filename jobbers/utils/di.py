@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin, get_type_hints
 
@@ -157,7 +158,16 @@ def get_injected_param_names(func: Callable[..., Any]) -> frozenset[str]:
 # Runtime override registry (test hook)
 # ---------------------------------------------------------------------------
 
-_dependency_overrides: dict[Callable[..., Any], Callable[..., Any]] = {}
+# A ContextVar, not a plain module-global dict: each asyncio Task gets its own copy
+# of the current binding at creation time, and dependency_overrides() below rebinds
+# (rather than mutates) the dict on every call. This means two coroutines running
+# concurrently in the same event loop -- e.g. two task invocations under
+# asyncio.gather() in one test -- can each hold their own overrides for the same
+# provider without one clobbering or prematurely popping the other's entry.
+_EMPTY_OVERRIDES: dict[Callable[..., Any], Callable[..., Any]] = {}
+_dependency_overrides_var: ContextVar[dict[Callable[..., Any], Callable[..., Any]]] = ContextVar(
+    "dependency_overrides", default=_EMPTY_OVERRIDES
+)
 
 
 @contextlib.contextmanager
@@ -176,12 +186,12 @@ def dependency_overrides(
         with dependency_overrides({get_db: fake_db}):
             await process_payment.submit(...)
     """
-    _dependency_overrides.update(overrides)
+    merged = {**_dependency_overrides_var.get(), **overrides}
+    token = _dependency_overrides_var.set(merged)
     try:
         yield
     finally:
-        for key in overrides:
-            _dependency_overrides.pop(key, None)
+        _dependency_overrides_var.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -239,15 +249,17 @@ class DependencyResolver:
         Walk the graph in topological order (leaves first); each node is resolved
         at most once — shared deps yield the same instance to all consumers.
         """
+        overrides = _dependency_overrides_var.get()
         for node in self._graph:
-            effective = _dependency_overrides.get(node.provider, node.provider)
+            effective = overrides.get(node.provider, node.provider)
             if effective in self._cache or node.provider in self._cache:
                 continue
             await self._resolve_node(node)
         return self._cache
 
     async def _resolve_node(self, node: DependencyNode) -> Any:
-        effective = _dependency_overrides.get(node.provider, node.provider)
+        overrides = _dependency_overrides_var.get()
+        effective = overrides.get(node.provider, node.provider)
         if effective in self._cache:
             self._cache[node.provider] = self._cache[effective]
             return self._cache[node.provider]
@@ -257,7 +269,7 @@ class DependencyResolver:
         # Resolve sub-dep kwargs first
         sub_kwargs: dict[str, Any] = {}
         for kwarg_name, sub_provider in node.dep_params.items():
-            effective_sub = _dependency_overrides.get(sub_provider, sub_provider)
+            effective_sub = overrides.get(sub_provider, sub_provider)
             if effective_sub not in self._cache and sub_provider not in self._cache:
                 sub_node = next((n for n in self._graph if n.provider == sub_provider), None)
                 if sub_node is not None:
