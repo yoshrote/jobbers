@@ -763,6 +763,32 @@ async def test_get_all_tasks_task_id_order(msgpack_adapter):
     assert [r.id for r in results] == [ULID1, ULID2, ULID3]
 
 
+@pytest.mark.xfail(
+    reason=(
+        "RedisTaskState's get_all_tasks over-fetches only limit*5 raw queue positions before "
+        "Python-side name/version/status filtering. A low match-rate filter (more than limit*5 "
+        "non-matching entries ahead of a real match) can silently drop the match entirely instead "
+        "of finding it, unlike SQL/RedisJSON which filter server-side with no such window."
+    ),
+    strict=True,
+)
+@pytest.mark.asyncio
+async def test_get_all_tasks_name_filter_drops_match_beyond_overfetch_window(msgpack_adapter):
+    """Tripwire: a match beyond the limit*5 over-fetch window is silently dropped, not found."""
+    state, submit = msgpack_adapter
+    for i in range(30):
+        await submit.submit_task(
+            make_task(ULID(), name="other_task", submitted_at=FROZEN_TIME + dt.timedelta(seconds=i))
+        )
+    match = make_task(ULID(), name="target_task", submitted_at=FROZEN_TIME + dt.timedelta(seconds=30))
+    await submit.submit_task(match)
+
+    results = await state.get_all_tasks(
+        TaskPagination(queue="default", task_name="target_task", limit=1, offset=0)
+    )
+    assert [r.id for r in results] == [match.id]
+
+
 @pytest.mark.asyncio
 async def test_clean_terminal_tasks_skips_none_blob(msgpack_adapter, redis):
     """A task:* key that returns no data is silently skipped."""

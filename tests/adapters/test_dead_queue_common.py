@@ -73,6 +73,34 @@ async def test_get_by_ids_multiple(dead_queue):
 
 
 @pytest.mark.asyncio
+async def test_get_by_ids_preserves_requested_order(dead_queue):
+    """
+    get_by_ids returns results in the order the caller's task_ids list specifies.
+
+    Tripwire: SQLDeadQueue.get_by_ids uses a plain `WHERE id IN (...)` with no
+    ORDER BY, so it returns rows in whatever order SQLite/Postgres happens to pick
+    (observed: primary-key/insertion order) rather than the caller's order. Plain
+    Redis and RedisJSON both preserve the caller's order by construction (they walk
+    the requested ID list directly). No current caller relies on ordering here
+    (bulk resubmit treats the result as an unordered batch), but the divergence is
+    real and should be closed before anything starts depending on it.
+    """
+    dq, adapter = dead_queue
+    if isinstance(dq, SQLDeadQueue):
+        pytest.xfail("SQLDeadQueue.get_by_ids has no ORDER BY; result order does not match the request")
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    t3 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03")
+    for t in (t1, t2, t3):
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
+
+    requested = [str(t3.id), str(t1.id), str(t2.id)]
+    results = await dq.get_by_ids(requested)
+    assert [str(r.id) for r in results] == requested
+
+
+@pytest.mark.asyncio
 async def test_get_by_ids_returns_only_matching(dead_queue):
     dq, adapter = dead_queue
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
