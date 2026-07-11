@@ -232,7 +232,7 @@ async def test_main_sigterm_respects_on_shutdown_policy():
     state_manager = _make_state_manager()
     remaining = iter([stop_task, continue_task])
 
-    async def fake_anext() -> Task:
+    async def fake_anext(_self: object = None) -> Task:
         try:
             return next(remaining)
         except StopIteration:
