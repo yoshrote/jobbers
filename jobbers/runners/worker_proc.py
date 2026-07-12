@@ -111,7 +111,7 @@ async def main() -> None:
             t = asyncio.create_task(run_task(task))
             active[t] = task
             t.add_done_callback(_on_task_done)
-        if active:
+        if active and not shutdown_event.is_set():
             await asyncio.gather(*active, return_exceptions=True)
     finally:
         logger.info("Worker shutting down")
