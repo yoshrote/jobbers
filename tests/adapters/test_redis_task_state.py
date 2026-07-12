@@ -13,6 +13,8 @@ Section 3 — RedisDeadQueue edge case (``msgpack_dead_queue`` fixture).
 """
 
 import datetime as dt
+import json
+from unittest.mock import patch
 
 import pytest
 from ulid import ULID
@@ -527,32 +529,106 @@ async def test_stage_register_dag_run_noop_when_no_dag_run_id(redis_task_adapter
 
 @pytest.mark.asyncio
 async def test_stage_init_fan_in_creates_tracking_and_members_sets(redis_task_adapter):
-    """stage_init_fan_in writes a tracking set and a permanent members set."""
+    """stage_init_fan_in writes a remaining-count field and a permanent members-list field."""
     state, submit = redis_task_adapter
+    dag_run_id = ULID()
     fan_in_key = "fan-in:test"
     predecessor_ids = {ULID1, ULID2}
     pipe = state.data_store.pipeline(transaction=True)
-    state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
+    state.stage_init_fan_in(pipe, dag_run_id, fan_in_key, predecessor_ids)
     await pipe.execute()
-    tracking = await state.data_store.smembers(fan_in_key)
-    members = await state.data_store.smembers(f"{fan_in_key}:members")
-    expected = {str(ULID1).encode(), str(ULID2).encode()}
-    assert tracking == expected
-    assert members == expected
+    remaining = await state.data_store.hget(
+        state.DAG_RUN_FANIN(dag_run_id=dag_run_id), f"remaining:{fan_in_key}"
+    )
+    members_raw = await state.data_store.hget(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id), fan_in_key)
+    assert int(remaining) == len(predecessor_ids)
+    assert set(json.loads(members_raw)) == {str(ULID1), str(ULID2)}
 
 
 @pytest.mark.asyncio
 async def test_init_fan_in_creates_tracking_and_members_sets(redis_task_adapter):
-    """init_fan_in writes the same sets as stage_init_fan_in but executes immediately."""
+    """init_fan_in writes the same Hash fields as stage_init_fan_in but executes immediately."""
     state, submit = redis_task_adapter
+    dag_run_id = ULID()
     fan_in_key = "fan-in:direct"
     predecessor_ids = {ULID1, ULID2, ULID3}
-    await state.init_fan_in(fan_in_key, predecessor_ids)
-    tracking = await state.data_store.smembers(fan_in_key)
-    members = await state.data_store.smembers(f"{fan_in_key}:members")
-    expected = {str(uid).encode() for uid in predecessor_ids}
-    assert tracking == expected
-    assert members == expected
+    await state.init_fan_in(dag_run_id, fan_in_key, predecessor_ids)
+    remaining = await state.data_store.hget(
+        state.DAG_RUN_FANIN(dag_run_id=dag_run_id), f"remaining:{fan_in_key}"
+    )
+    members_raw = await state.data_store.hget(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id), fan_in_key)
+    assert int(remaining) == len(predecessor_ids)
+    assert set(json.loads(members_raw)) == {str(uid) for uid in predecessor_ids}
+
+
+@pytest.mark.asyncio
+async def test_init_fan_in_sets_ttl_on_first_call(redis_task_adapter):
+    """
+    The first init_fan_in call for a dag_run_id must actually set a TTL on both hashes.
+
+    Regression guard for the NX+GT combo: EXPIRE ... GT alone is a no-op on a key
+    with no existing TTL (Redis treats "no TTL" as infinite for GT purposes), which
+    would silently leave the fan-in hashes permanent. NX must fire first to
+    establish the initial expiry.
+    """
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:first", {ULID1}, ttl=100)
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id)) > 0
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id)) > 0
+
+
+@pytest.mark.asyncio
+async def test_init_fan_in_members_ttl_is_double_the_countdown_ttl(redis_task_adapter):
+    """The members hash gets 2x the countdown hash's ttl, as a read-after-expiry safety margin."""
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:margin", {ULID1}, ttl=100)
+    countdown_ttl = await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id))
+    members_ttl = await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id))
+    assert members_ttl > countdown_ttl
+
+
+@pytest.mark.asyncio
+async def test_init_fan_in_does_not_shrink_ttl_for_shorter_later_registration(redis_task_adapter):
+    """
+    A later collector registered with a shorter ttl must not shrink the shared hash's expiry.
+
+    Regression test: nested fan-outs share one DAG_RUN_FANIN/DAG_RUN_FANIN_MEMBERS
+    hash per dag_run_id. Plain EXPIRE overwrites the TTL on every call, so a second
+    collector with the (shorter) default ttl used to truncate an earlier collector's
+    longer, still-pending window — silently losing that collector's fan-in tracking
+    before it ever resolves.
+    """
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:long-lived", {ULID1}, ttl=200000)
+    long_ttl = await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id))
+
+    await state.init_fan_in(dag_run_id, "fan-in:short-lived", {ULID2}, ttl=100)
+
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id)) >= long_ttl - 5
+    assert (
+        await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id)) >= (long_ttl * 2) - 5
+    )
+    # Both fan-in keys' fields must still be present -- registering the second
+    # collector must not have dropped or reset the first collector's data.
+    remaining = await state.data_store.hget(
+        state.DAG_RUN_FANIN(dag_run_id=dag_run_id), "remaining:fan-in:long-lived"
+    )
+    assert int(remaining) == 1
+
+
+@pytest.mark.asyncio
+async def test_init_fan_in_extends_ttl_for_longer_later_registration(redis_task_adapter):
+    """A second collector registered with a longer ttl extends the shared hash's expiry."""
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:short-first", {ULID1}, ttl=100)
+    await state.init_fan_in(dag_run_id, "fan-in:long-second", {ULID2}, ttl=200000)
+
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id)) > 100
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id)) > 200
 
 
 @pytest.mark.asyncio
@@ -687,6 +763,32 @@ async def test_get_all_tasks_task_id_order(msgpack_adapter):
     assert [r.id for r in results] == [ULID1, ULID2, ULID3]
 
 
+@pytest.mark.xfail(
+    reason=(
+        "RedisTaskState's get_all_tasks over-fetches only limit*5 raw queue positions before "
+        "Python-side name/version/status filtering. A low match-rate filter (more than limit*5 "
+        "non-matching entries ahead of a real match) can silently drop the match entirely instead "
+        "of finding it, unlike SQL/RedisJSON which filter server-side with no such window."
+    ),
+    strict=True,
+)
+@pytest.mark.asyncio
+async def test_get_all_tasks_name_filter_drops_match_beyond_overfetch_window(msgpack_adapter):
+    """Tripwire: a match beyond the limit*5 over-fetch window is silently dropped, not found."""
+    state, submit = msgpack_adapter
+    for i in range(30):
+        await submit.submit_task(
+            make_task(ULID(), name="other_task", submitted_at=FROZEN_TIME + dt.timedelta(seconds=i))
+        )
+    match = make_task(ULID(), name="target_task", submitted_at=FROZEN_TIME + dt.timedelta(seconds=30))
+    await submit.submit_task(match)
+
+    results = await state.get_all_tasks(
+        TaskPagination(queue="default", task_name="target_task", limit=1, offset=0)
+    )
+    assert [r.id for r in results] == [match.id]
+
+
 @pytest.mark.asyncio
 async def test_clean_terminal_tasks_skips_none_blob(msgpack_adapter, redis):
     """A task:* key that returns no data is silently skipped."""
@@ -789,3 +891,41 @@ async def test_clean_orphaned_entries_removes_stale_name_index_member(msgpack_de
     assert removed == 1
     assert await dq.data_store.smembers(dq.DLQ_NAME(name="my_task")) == set()
     assert not await dq.data_store.exists(dq.DLQ_NAME(name="my_task"))
+
+
+@pytest.mark.asyncio
+async def test_clean_orphaned_entries_preserves_concurrently_added_valid_member(msgpack_dead_queue):
+    """
+    A valid member added to the index set after the stale-membership snapshot survives.
+
+    _clean_stale_index_members() snapshots a dlq-queue:*/dlq-name:* set's membership, then
+    removes whichever of those *snapshotted* members are stale. It must never delete the
+    whole key outright (even when every snapshotted member was stale), since a concurrent
+    add_to_dlq() landing a new, still-valid member in between would otherwise be wiped out
+    along with the stale entries.
+    """
+    dq = msgpack_dead_queue
+    stale_task = make_task(task_id=ULID1, queue="q1")
+    await _add_to_dlq(dq, stale_task, FROZEN_TIME)
+    # Make the only current member of dlq-queue:q1 stale (remove it from the DLQ proper, but
+    # leave the index set itself untouched -- like a stale-queue remove_from_dlq() would).
+    await dq.remove_from_dlq(stale_task.id, queue="wrong-queue", name=stale_task.name)
+    assert await dq.data_store.smembers(dq.DLQ_QUEUE(queue="q1")) == {bytes(stale_task.id)}
+
+    # Inject a "concurrent" add_to_dlq landing right after _clean_stale_index_members() takes
+    # its membership snapshot (the smembers() call below) but before it acts on that snapshot --
+    # exactly the window the old code's unconditional DELETE was vulnerable to.
+    new_task = make_task(task_id=ULID2, queue="q1")
+    original_smembers = dq.data_store.smembers
+
+    async def smembers_then_concurrent_add(key, *args, **kwargs):
+        result = await original_smembers(key, *args, **kwargs)
+        if key == dq.DLQ_QUEUE(queue="q1").encode():
+            await _add_to_dlq(dq, new_task, FROZEN_TIME)
+        return result
+
+    with patch.object(dq.data_store, "smembers", side_effect=smembers_then_concurrent_add):
+        removed = await dq.clean_orphaned_entries()
+
+    assert removed == 1
+    assert await dq.data_store.smembers(dq.DLQ_QUEUE(queue="q1")) == {bytes(new_task.id)}

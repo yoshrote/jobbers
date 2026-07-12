@@ -9,11 +9,15 @@ get_next_task) is exercised here only as test setup for state operations.
 """
 
 import datetime as dt
+from unittest.mock import patch
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from ulid import ULID
 
 from jobbers.adapters.sql import SQLTaskState, SQLTaskSubmit
+from jobbers.migrations.schema import task_queue
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
@@ -124,12 +128,13 @@ async def test_stage_save_upserts(session_factory):
 async def test_stage_init_fan_in_creates_members(session_factory):
     """stage_init_fan_in via SQLTransactionBatch → get_fan_in_members returns the set."""
     state = SQLTaskState(session_factory)
+    dag_run_id = ULID()
     fan_in_key = "fan-in:sql-test"
     predecessor_ids = {ULID1, ULID2, ULID3}
     pipe = state.pipeline(transaction=True)
-    state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)
+    state.stage_init_fan_in(pipe, dag_run_id, fan_in_key, predecessor_ids)
     await pipe.execute()
-    assert set(await state.get_fan_in_members(fan_in_key)) == predecessor_ids
+    assert set(await state.get_fan_in_members(dag_run_id, fan_in_key)) == predecessor_ids
 
 
 # ── clean ─────────────────────────────────────────────────────────────────────
@@ -171,6 +176,83 @@ async def test_clean_noop_when_no_age_params(session_factory):
     assert await state.task_exists(ULID1)
 
 
+# ── close_dag_run_task ────────────────────────────────────────────────────────
+#
+# Decreasing-count/idempotency protocol behaviour is covered once, against all
+# three backends, by test_task_state_common.py's test_close_dag_run_task_*
+# tests. The test below only pins the SQL-specific locking implementation
+# detail (which table the serializing FOR UPDATE targets) that those common
+# tests can't see and don't need to.
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_locks_dag_runs_anchor_not_every_pending_row(session_factory):
+    """
+    close_dag_run_task's serializing lock targets the run's single dag_runs row.
+
+    Regression test: an earlier version of this lock selected FOR UPDATE over every
+    dag_run_pending row in the run (unfiltered by task_id), which serializes every
+    concurrent sibling completion in the run instead of just the read-then-write for
+    one task -- a severe throughput cost for large fan-outs on Postgres. Locking the
+    run's one dag_runs row gives the same serialization guarantee without a lock
+    that grows with the run's size. This can't be observed behaviourally under
+    SQLite's single-connection test fixture, so it's pinned by inspecting the
+    compiled lock statement instead.
+    """
+    state = SQLTaskState(session_factory)
+    submit = SQLTaskSubmit(session_factory)
+    dag_run_id = ULID()
+    task = make_task(ULID1, submitted_at=FROZEN_TIME)
+    task.dag_run_id = dag_run_id
+    await submit.submit_task(task)
+
+    original_execute = AsyncSession.execute
+    captured_statements: list[str] = []
+
+    async def _capturing_execute(self, statement, *args, **kwargs):
+        captured_statements.append(str(statement))
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", _capturing_execute):
+        await state.close_dag_run_task(dag_run_id, ULID1)
+
+    lock_statement = captured_statements[0]
+    assert "FROM dag_runs" in lock_statement
+    assert "dag_run_pending" not in lock_statement
+
+
+@pytest.mark.asyncio
+async def test_fan_in_complete_locks_fan_in_anchor_not_task_fan_in(session_factory):
+    """
+    fan_in_complete's serializing lock targets the fan-in group's fan_in_anchors row.
+
+    Regression test for the missing lock this test pins: without it, two predecessors
+    completing concurrently under Postgres READ COMMITTED could each run their COUNT
+    before the other's UPDATE commits, so both see a stale remaining > 0 and the
+    collector never fires. Mirrors close_dag_run_task's dag_runs anchor lock. Can't be
+    observed behaviourally under SQLite's single-connection test fixture, so it's
+    pinned by inspecting the compiled lock statement instead.
+    """
+    state = SQLTaskState(session_factory)
+    dag_run_id = ULID()
+    fan_in_key = "fan-in-key-1"
+    await state.init_fan_in(dag_run_id, fan_in_key, {ULID1, ULID2})
+
+    original_execute = AsyncSession.execute
+    captured_statements: list[str] = []
+
+    async def _capturing_execute(self, statement, *args, **kwargs):
+        captured_statements.append(str(statement))
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", _capturing_execute):
+        await state.fan_in_complete(dag_run_id, fan_in_key, ULID1)
+
+    lock_statement = captured_statements[0]
+    assert "FROM fan_in_anchors" in lock_statement
+    assert "task_fan_in" not in lock_statement
+
+
 # ── transaction atomicity ─────────────────────────────────────────────────────
 
 
@@ -187,3 +269,62 @@ async def test_multiple_stages_commit_atomically(session_factory):
     ids = {t.id for t in await state.get_all_tasks(TaskPagination(queue="default"))}
     assert ULID1 in ids
     assert ULID2 in ids
+
+
+@pytest.mark.asyncio
+async def test_submit_task_rolls_back_task_queue_write_if_dag_run_registration_fails(session_factory):
+    """
+    submit_task's task_queue write and DAG-run registration commit atomically.
+
+    Regression test: _register_dag_run used to run in its own separate transaction after
+    the task+queue write already committed. A crash/failure during DAG-run registration
+    left a running, queued task with no corresponding dag_runs row, corrupting DAG
+    completion bookkeeping. Folding registration into the same transaction means a failure
+    here rolls back the task_queue write too, instead of leaving that inconsistency.
+    """
+    submit = SQLTaskSubmit(session_factory)
+    dag_run_id = ULID()
+    task = make_task(ULID1, submitted_at=FROZEN_TIME)
+    task.dag_run_id = dag_run_id
+
+    original_execute = AsyncSession.execute
+
+    async def _failing_execute(self, statement, *args, **kwargs):
+        if "INSERT INTO dag_runs" in str(statement):
+            raise RuntimeError("boom")
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", _failing_execute), pytest.raises(RuntimeError, match="boom"):
+        await submit.submit_task(task)
+
+    async with session_factory() as session:
+        result = await session.execute(select(task_queue).where(task_queue.c.task_id == str(ULID1)))
+        assert result.first() is None
+
+
+@pytest.mark.asyncio
+async def test_read_for_watch_closes_session_on_failure(session_factory):
+    """
+    read_for_watch() closes and discards its batch's session if its own SELECT raises.
+
+    Regression test: read_for_watch() calls pipe._get_session() directly, opening a session
+    and beginning a transaction *outside* SQLTransactionBatch.execute()'s own try/finally. If
+    the SELECT itself raised (lock timeout, transient DB error), the exception propagated
+    without ever reaching execute() or its cleanup, leaking a pooled connection.
+    """
+    state = SQLTaskState(session_factory)
+    task = make_task(ULID1, submitted_at=FROZEN_TIME)
+    await state.save_task(task)
+
+    pipe = state.pipeline(transaction=True)
+    original_execute = AsyncSession.execute
+
+    async def _failing_execute(self, statement, *args, **kwargs):
+        if "FROM tasks" in str(statement):
+            raise RuntimeError("boom")
+        return await original_execute(self, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", _failing_execute), pytest.raises(RuntimeError, match="boom"):
+        await state.read_for_watch(pipe, ULID1)
+
+    assert pipe._session is None

@@ -15,6 +15,8 @@ Jobbers splits task storage across four independent Protocol classes defined in 
 | `TaskQueueProtocol` | Yes | Active queue membership: enqueue, blocking pop, remove from queue, rate limiting |
 | `TaskSchedulerProtocol` | Yes | Delayed/scheduled task queue: add at a future time, pop due tasks |
 
+See [dag-run-completion-tracking.md](dag-run-completion-tracking.md) for how DAG-run completion and fan-in state are tracked efficiently for large, deeply nested dynamic fan-outs.
+
 These are separate concerns. `TaskStateProtocol` is the durable source of truth for a task's lifecycle. `TaskQueueProtocol` is ephemeral membership data — a task's presence in a queue says "a worker should pick this up", not "this task exists". `TaskSubmitProtocol` groups the three operations (`submit_task`, `submit_rate_limited_task`, `get_next_task`) that atomically touch both state and queue via Lua scripts. `TaskSchedulerProtocol` is a timed trigger that eventually moves a task back into `TaskQueueProtocol`.
 
 The current production adapters implement all three on a single Redis instance, which allows `StateManager` to use MULTI/EXEC transactions across all three in one round trip. The protocol split exists so that future adapters can use different backends for each layer without redesigning `StateManager`.

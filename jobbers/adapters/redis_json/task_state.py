@@ -132,16 +132,3 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
         else:
             results.sort(key=lambda t: t.id)
         return results
-
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
-        """Return (submitted_at, task_ids) for a DAG run using the RediSearch index."""
-        score: float | None = await self.data_store.zscore(self.DAG_RUNS, bytes(dag_run_id))
-        if score is None:
-            return None
-        submitted_at = dt.datetime.fromtimestamp(score, dt.UTC)
-
-        escaped = _escape_tag(str(dag_run_id))
-        q = SearchQuery(f"@dag_run_id:{{{escaped}}}").no_content().paging(0, 10000)
-        search_results = await self.data_store.ft(self.INDEX_NAME).search(q)
-        task_ids = [ULID.from_str(doc.id.removeprefix("task:")) for doc in search_results.docs]
-        return submitted_at, task_ids

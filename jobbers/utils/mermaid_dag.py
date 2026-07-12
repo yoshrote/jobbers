@@ -124,16 +124,47 @@ from __future__ import annotations
 import base64
 import json
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 from ulid import ULID
 
-from jobbers.models.dag import DAGNode, DAGTaskSpec
+from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOutCallback, FanInCallback, SimpleCallback
 from jobbers.models.task_status import TaskStatus
 
 
 class MermaidParseError(ValueError):
     """Raised when mermaid DAG text cannot be parsed into a DAGNode graph."""
+
+
+class Edge(NamedTuple):
+    """A directed edge between two mermaid node identifiers."""
+
+    src: str
+    dst: str
+
+
+class ParsedLabel(NamedTuple):
+    """Parsed components of a mermaid node label."""
+
+    name: str
+    version: int
+    queue: str
+    params: dict[str, Any]
+
+
+class FanOutEdge(NamedTuple):
+    """A ``-->>`` edge: dispatcher fans out into arm_root; items_key names the results list."""
+
+    src: str
+    dst: str
+    items_key: str = "items"
+
+
+class FanInEdge(NamedTuple):
+    """A ``--o`` edge: arm terminal fans into collector."""
+
+    src: str
+    dst: str
 
 
 # ── Regex patterns ─────────────────────────────────────────────────────────────
@@ -266,9 +297,9 @@ def _parse_params(raw: str) -> dict[str, Any]:
     return result
 
 
-def _parse_label(label: str) -> tuple[str, int, str, dict[str, Any]]:
+def _parse_label(label: str) -> ParsedLabel:
     """
-    Parse a node label into ``(task_name, version, queue, parameters)``.
+    Parse a node label into a :class:`ParsedLabel`.
 
     Strips the reserved ``{status}`` suffix before parsing so that
     output diagrams can be fed back in without modification.
@@ -284,7 +315,7 @@ def _parse_label(label: str) -> tuple[str, int, str, dict[str, Any]]:
     queue = m.group("queue") or "default"
     params_str = m.group("params") or ""
     params = _parse_params(params_str) if params_str.strip() else {}
-    return name, version, queue, params
+    return ParsedLabel(name, version, queue, params)
 
 
 def _serialize_params(params: dict[str, Any]) -> str:
@@ -322,45 +353,71 @@ def _serialize_params(params: dict[str, Any]) -> str:
 
 def _extract_edges_from_line(
     line: str,
-    success_edges: list[tuple[str, str]],
-    error_edges: list[tuple[str, str]],
+    success_edges: list[Edge],
+    error_edges: list[Edge],
+    fanout_edges: list[FanOutEdge],
+    fanin_edges: list[FanInEdge],
 ) -> None:
     """
-    Parse ``-->`` and ``-.->`` edge patterns from a cleaned mermaid line.
+    Parse edge patterns from a cleaned mermaid line.
 
     Handles chained edges on one line (``A --> B --> C``) and mixed
     inline node+edge syntax after node labels have been stripped.
+
+    Supported operators:
+
+    - ``-->``         success callback (or fan-in when dest has ≥ 2 sources)
+    - ``-.->``        error callback
+    - ``-->>``        dynamic fan-out (dispatcher → arm root); optional label sets items_key
+    - ``--"key">>``   dynamic fan-out with explicit items_key
+    - ``--o``         fan-in boundary (arm terminal → collector)
     """
-    # Split on edge operators, preserving the operator tokens.
-    tokens = re.split(r"\s*(-->|-\.->)\s*", line)
-    for i in range(1, len(tokens) - 1, 2):
+    # Split on edge operators in longest-match order so -->> is matched before -->.
+    tokens = re.split(r'\s*(--"([^"]*)">>|-->>|--o|-\.->|-->)\s*', line)
+    # re.split with a group produces: [pre, full_match, group1, post, full_match, group1, post, ...]
+    # stride is 3 (full_match + one capture group).
+    i = 1
+    while i < len(tokens) - 1:
         op = tokens[i]
-        src_m = re.search(r"\b(\w+)\s*$", tokens[i - 1])
-        dst_m = re.match(r"\s*(\w+)", tokens[i + 1])
+        label_cap = tokens[i + 1]  # the captured label inside --"...">> or None
+        src_m = re.search(r"\b(\w+)\s*$", tokens[i - 1] if i >= 1 else "")
+        dst_m = re.match(r"\s*(\w+)", tokens[i + 2])
+        i += 3
         if not src_m or not dst_m:
             continue
         src, dst = src_m.group(1), dst_m.group(1)
         if op == "-->":
-            success_edges.append((src, dst))
+            success_edges.append(Edge(src, dst))
         elif op == "-.->":
-            error_edges.append((src, dst))
+            error_edges.append(Edge(src, dst))
+        elif op == "-->>":
+            fanout_edges.append(FanOutEdge(src, dst, "items"))
+        elif op.startswith('--"') and op.endswith(">>"):
+            items_key = label_cap or "items"
+            fanout_edges.append(FanOutEdge(src, dst, items_key))
+        elif op == "--o":
+            fanin_edges.append(FanInEdge(src, dst))
 
 
 def _lex_mermaid(
     text: str,
-) -> tuple[dict[str, str], list[tuple[str, str]], list[tuple[str, str]]]:
+) -> tuple[dict[str, str], list[Edge], list[Edge], list[FanOutEdge], list[FanInEdge]]:
     """
     Extract node definitions and edges from mermaid flowchart text.
 
-    Returns ``(node_labels, success_edges, error_edges)`` where:
+    Returns ``(node_labels, success_edges, error_edges, fanout_edges, fanin_edges)`` where:
 
     - ``node_labels`` maps node identifier → raw label string
-    - ``success_edges`` is a list of ``(src, dst)`` for ``-->`` edges
-    - ``error_edges`` is a list of ``(src, dst)`` for ``-.->`` edges
+    - ``success_edges`` is a list of ``Edge(src, dst)`` for ``-->`` edges
+    - ``error_edges`` is a list of ``Edge(src, dst)`` for ``-.->`` edges
+    - ``fanout_edges`` is a list of ``FanOutEdge(src, dst, items_key)`` for ``-->>`` edges
+    - ``fanin_edges`` is a list of ``FanInEdge(src, dst)`` for ``--o`` edges
     """
     node_labels: dict[str, str] = {}
-    success_edges: list[tuple[str, str]] = []
-    error_edges: list[tuple[str, str]] = []
+    success_edges: list[Edge] = []
+    error_edges: list[Edge] = []
+    fanout_edges: list[FanOutEdge] = []
+    fanin_edges: list[FanInEdge] = []
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -372,9 +429,9 @@ def _lex_mermaid(
         # Strip node definitions and class suffixes, then extract edges.
         cleaned = _NODE_RE.sub(lambda m: m.group(1), line)
         cleaned = _CLASS_SUFFIX_RE.sub("", cleaned)
-        _extract_edges_from_line(cleaned, success_edges, error_edges)
+        _extract_edges_from_line(cleaned, success_edges, error_edges, fanout_edges, fanin_edges)
 
-    return node_labels, success_edges, error_edges
+    return node_labels, success_edges, error_edges, fanout_edges, fanin_edges
 
 
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -392,21 +449,45 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
     :raises MermaidParseError: If the text contains invalid node labels, multiple
         error callbacks on the same source, or no reachable root nodes.
     """
-    node_labels, success_edges, error_edges = _lex_mermaid(text)
+    node_labels, success_edges, error_edges, fanout_edges, fanin_edges = _lex_mermaid(text)
 
-    if not node_labels and not success_edges:
+    all_edge_count = len(success_edges) + len(fanout_edges) + len(fanin_edges)
+    if not node_labels and not all_edge_count:
         raise MermaidParseError("No nodes found in the mermaid text.")
+
+    # Validate fanout/fanin pairings up-front.
+    # Each dispatcher may have at most one -->> edge; each --o target identifies one collector.
+    fanout_dispatchers: dict[str, FanOutEdge] = {}
+    for fo in fanout_edges:
+        if fo.src in fanout_dispatchers:
+            raise MermaidParseError(
+                f"Node '{fo.src}' has multiple '-->>'' fan-out edges; at most one is allowed."
+            )
+        fanout_dispatchers[fo.src] = fo
+
+    fanin_map: dict[str, FanInEdge] = {}  # arm_terminal → FanInEdge
+    for fi in fanin_edges:
+        if fi.src in fanin_map:
+            raise MermaidParseError(
+                f"Node '{fi.src}' has multiple '--o'' fan-in edges; at most one is allowed."
+            )
+        fanin_map[fi.src] = fi
 
     # Auto-register nodes that appear only in edges (no explicit label definition).
     all_ids: set[str] = set(node_labels)
-    for src, dst in success_edges + error_edges:
-        for nid in (src, dst):
+    for edge in (
+        list(success_edges)
+        + list(error_edges)
+        + [Edge(fo.src, fo.dst) for fo in fanout_edges]
+        + [Edge(fi.src, fi.dst) for fi in fanin_edges]
+    ):
+        for nid in (edge.src, edge.dst):
             if nid not in all_ids:
                 node_labels[nid] = nid  # label defaults to the node identifier
                 all_ids.add(nid)
 
-    # Parse each label → (task_name, version, queue, parameters).
-    parsed: dict[str, tuple[str, int, str, dict[str, Any]]] = {}
+    # Parse each label → ParsedLabel(name, version, queue, params).
+    parsed: dict[str, ParsedLabel] = {}
     for nid, label in node_labels.items():
         try:
             parsed[nid] = _parse_label(label)
@@ -417,7 +498,7 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
     # All queue names referenced by this DAG are known at this point; collect them
     # with a set comprehension and resolve in a single query rather than per-node:
     #
-    #   queue_names = {queue for _, _, queue, _ in parsed.values()}
+    #   queue_names = {pl.queue for pl in parsed.values()}
     #   unknown = queue_names - await state_manager.get_known_queue_names(queue_names)
     #   if unknown:
     #       raise MermaidParseError(f"Unknown queues: {', '.join(sorted(unknown))}")
@@ -429,38 +510,155 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
 
     # Build DAGNode objects with pre-assigned ULIDs.
     dag_nodes: dict[str, DAGNode] = {
-        nid: DAGNode(name, version=version, queue=queue, parameters=params, task_id=ULID())
-        for nid, (name, version, queue, params) in parsed.items()
+        nid: DAGNode(pl.name, version=pl.version, queue=pl.queue, parameters=pl.params, task_id=ULID())
+        for nid, pl in parsed.items()
     }
 
-    # Compute in-degrees for fan-in detection.
+    # Nodes that are part of a fanout arm subgraph: arm roots and any nodes reachable
+    # from them via --> edges up to (but not including) the collector.
+    arm_root_ids: set[str] = {fo.dst for fo in fanout_edges}
+    collector_ids: set[str] = {fi.dst for fi in fanin_edges}
+
+    # Identify arm-internal edges: --> edges whose source is an arm root or
+    # reachable from one, and whose destination is not a collector.
+    # We do a BFS from each arm root through --> edges to find all arm nodes.
+    arm_node_ids: set[str] = set(arm_root_ids)
+    changed = True
+    while changed:
+        changed = False
+        for edge in success_edges:
+            if edge.src in arm_node_ids and edge.dst not in collector_ids:
+                if edge.dst not in arm_node_ids:
+                    arm_node_ids.add(edge.dst)
+                    changed = True
+
+    # Compute in-degrees for fan-in detection among non-arm, non-fanout edges.
     predecessors: dict[str, list[str]] = {nid: [] for nid in all_ids}
-    for src, dst in success_edges:
-        predecessors[dst].append(src)
+    for edge in success_edges:
+        if edge.src not in arm_node_ids and edge.dst not in arm_node_ids:
+            predecessors[edge.dst].append(edge.src)
 
     # Build error-callback map: source → error target (at most one per source).
     error_map: dict[str, str] = {}
-    for src, dst in error_edges:
-        if src in error_map and error_map[src] != dst:
-            raise MermaidParseError(f"Node '{src}' has multiple '-.->'' error edges; at most one is allowed.")
-        error_map[src] = dst
+    for edge in error_edges:
+        if edge.src in error_map and error_map[edge.src] != edge.dst:
+            raise MermaidParseError(
+                f"Node '{edge.src}' has multiple '-.->'' error edges; at most one is allowed."
+            )
+        error_map[edge.src] = edge.dst
 
-    # Fan-in collectors: destinations with ≥ 2 incoming success edges.
+    # Fan-in collectors: destinations with ≥ 2 incoming non-arm success edges.
     fan_in_collectors: set[str] = {dst for dst, srcs in predecessors.items() if len(srcs) >= 2}
 
-    # Wire edges.  Each (src, dst) success edge is processed exactly once.
-    for src, dst in success_edges:
-        error_nid = error_map.get(src)
+    # Wire non-arm success edges.
+    for edge in success_edges:
+        if edge.src in arm_node_ids or edge.dst in arm_node_ids:
+            continue  # arm-internal edges are wired into the arm spec below
+        error_nid = error_map.get(edge.src)
         on_error = dag_nodes[error_nid] if error_nid else None
-        if dst in fan_in_collectors:
-            # Individual merge call so each predecessor can carry its own on_error.
-            DAGNode.merge(dag_nodes[src], into=dag_nodes[dst], on_error=on_error)
+        if edge.dst in fan_in_collectors:
+            DAGNode.merge(dag_nodes[edge.src], into=dag_nodes[edge.dst], on_error=on_error)
         else:
-            dag_nodes[src].then(dag_nodes[dst], on_error=on_error)
+            dag_nodes[edge.src].then(dag_nodes[edge.dst], on_error=on_error)
 
-    # Roots: nodes with no incoming success edges that are not error targets.
+    # Wire arm-internal success edges.
+    arm_predecessors: dict[str, list[str]] = {nid: [] for nid in arm_node_ids}
+    for edge in success_edges:
+        if edge.src in arm_node_ids and edge.dst in arm_node_ids:
+            arm_predecessors[edge.dst].append(edge.src)
+
+    arm_fan_in_collectors: set[str] = {dst for dst, srcs in arm_predecessors.items() if len(srcs) >= 2}
+    for edge in success_edges:
+        if edge.src not in arm_node_ids or edge.dst not in arm_node_ids:
+            continue
+        error_nid = error_map.get(edge.src)
+        on_error = dag_nodes[error_nid] if error_nid else None
+        if edge.dst in arm_fan_in_collectors:
+            DAGNode.merge(dag_nodes[edge.src], into=dag_nodes[edge.dst], on_error=on_error)
+        else:
+            dag_nodes[edge.src].then(dag_nodes[edge.dst], on_error=on_error)
+
+    # Build DynamicFanOutCallback on each dispatcher node.
+    # The arm_root spec and collector spec are serialised from their DAGNodes.
+    #
+    # For nested fanouts (arm_root is itself a dispatcher) two things are required:
+    #
+    # 1. Collector finding: the outer collector is found by following the --o chain —
+    #    inner_terminal --o inner_collector --o outer_collector.
+    # 2. Processing order: inner dispatchers must be processed before outer ones so that
+    #    arm_root.to_spec() captures the inner DynamicFanOutCallback already added to
+    #    the arm_root DAGNode.
+    def _find_arm_collector(arm_root_id: str) -> str | None:
+        # If arm_root is also a dispatcher, find its inner collector then follow the
+        # next --o edge to reach this dispatcher's outer collector.
+        if arm_root_id in fanout_dispatchers:
+            inner_root = fanout_dispatchers[arm_root_id].dst
+            inner_col = _find_arm_collector(inner_root)
+            if inner_col is not None and inner_col in fanin_map:
+                return fanin_map[inner_col].dst
+            return None
+        # Non-dispatcher arm root: BFS through success edges to find the terminal
+        # with a --o edge into a collector.
+        bfs_seen: set[str] = set()
+        queue = [arm_root_id]
+        while queue:
+            node = queue.pop(0)
+            if node in bfs_seen:
+                continue
+            bfs_seen.add(node)
+            if node in fanin_map and fanin_map[node].dst in collector_ids:
+                return fanin_map[node].dst
+            for edge in success_edges:
+                if edge.src == node and edge.dst not in collector_ids:
+                    queue.append(edge.dst)
+        return None
+
+    def _topo_dispatchers() -> list[str]:
+        """Return dispatcher IDs innermost-first so arm_root.to_spec() sees nested callbacks."""
+        result: list[str] = []
+        visiting: set[str] = set()
+        done: set[str] = set()
+
+        def _visit(did: str) -> None:
+            if did in done or did in visiting:
+                return
+            visiting.add(did)
+            arm_root_id = fanout_dispatchers[did].dst
+            if arm_root_id in fanout_dispatchers:
+                _visit(arm_root_id)
+            visiting.discard(did)
+            done.add(did)
+            result.append(did)
+
+        for did in fanout_dispatchers:
+            _visit(did)
+        return result
+
+    for dispatcher_id in _topo_dispatchers():
+        fo = fanout_dispatchers[dispatcher_id]
+        arm_root_node = dag_nodes[fo.dst]
+        collector_id = _find_arm_collector(fo.dst)
+        if collector_id is None:
+            raise MermaidParseError(
+                f"Fan-out from '{dispatcher_id}' has no '--o'' fan-in boundary edge. "
+                "Add a '--o' edge from the arm terminal to a collector node."
+            )
+        collector_node = dag_nodes[collector_id]
+        error_nid = error_map.get(dispatcher_id)
+        on_error_spec = dag_nodes[error_nid].to_spec() if error_nid else None
+        cb = DynamicFanOutCallback(
+            arm_root=arm_root_node.to_spec(),
+            collector=collector_node.to_spec(),
+            items_key=fo.items_key,
+            error_callback=on_error_spec,
+        )
+        dag_nodes[dispatcher_id].add_fanout_callback(cb)
+
+    # Roots: dispatcher nodes and top-level nodes with no incoming non-arm success edges
+    # that are not error targets and not arm nodes and not collectors.
     error_targets: set[str] = set(error_map.values())
-    roots = [dag_nodes[nid] for nid in all_ids if not predecessors[nid] and nid not in error_targets]
+    excluded = arm_node_ids | collector_ids | error_targets
+    roots = [dag_nodes[nid] for nid in all_ids if not predecessors.get(nid) and nid not in excluded]
 
     if not roots:
         raise MermaidParseError(
@@ -492,6 +690,7 @@ def _spec_label(spec: DAGTaskSpec, status: TaskStatus | None) -> str:
 def dag_spec_to_mermaid(
     spec: DAGTaskSpec,
     task_statuses: dict[str, TaskStatus] | None = None,
+    expand_fanouts: bool = True,
 ) -> str:
     """
     Generate a mermaid ``flowchart TD`` diagram from a :class:`~jobbers.models.dag.DAGTaskSpec` tree.
@@ -501,6 +700,10 @@ def dag_spec_to_mermaid(
         :class:`~jobbers.models.task_status.TaskStatus` for colour-coding.
         When provided, a ``{STATUS}`` section is appended to each label and
         ``:::classname`` suffixes are added.
+    :param expand_fanouts: When ``True`` (default), arm chains are expanded: internal
+        ``-->`` edges are emitted and the leaf arm node connects to the collector via
+        ``--o``.  When ``False``, each fan-out is shown compactly as submitted —
+        ``dispatcher -->> arm_root --o collector`` — without drilling into arm internals.
     :returns: Mermaid text including a ``classDef`` block (always present for
         frontend rendering convenience, even when no statuses are supplied).
     """
@@ -509,30 +712,129 @@ def dag_spec_to_mermaid(
     edge_seen: set[tuple[str, str, str]] = set()
     visited: set[str] = set()
 
+    def _node_line(s: DAGTaskSpec) -> str:
+        sid = str(s.id)
+        status = task_statuses.get(sid) if task_statuses else None
+        label = _spec_label(s, status)
+        class_sfx = f":::{_STATUS_CLASS[status]}" if status else ""
+        return f'    {sid}["{label}"]{class_sfx}'
+
+    def _add_edge(src: str, dst: str, arrow: str) -> None:
+        key = (src, dst, arrow)
+        if key not in edge_seen:
+            edge_seen.add(key)
+            edge_lines.append(f"    {src} {arrow} {dst}")
+
+    def _walk_arm(s: DAGTaskSpec, collector: DAGTaskSpec) -> None:
+        """
+        Walk an arm spec tree in expanded mode.
+
+        Nodes with no ``SimpleCallback``/``FanInCallback`` successors *and* no nested
+        ``DynamicFanOutCallback`` are true leaf nodes; they connect to *collector* via
+        ``--o``.  Intermediate nodes emit ``-->`` to their successors.  A node that is
+        itself a dispatcher (has a nested ``DynamicFanOutCallback``) is never a leaf of
+        *this* arm — dynamic fan-outs are generated automatically from a predictable
+        shape, so that shape is checked up front rather than inferred from the absence
+        of ordinary successors. Its inner arm is expanded recursively, and the inner
+        collector continues *this* arm's chain (walked via ``_walk_arm``, not ``_walk``)
+        so the eventual leaf — the inner collector itself, or whatever follows it — is
+        the one that connects to the outer *collector*, not the dispatcher.
+
+        Note this function does *not* call ``_walk(collector)`` itself: a *collector*
+        passed in here may be an inner collector that still needs ``_walk_arm`` treatment
+        (see the nested-fanout branch below), so walking it as a plain node is the
+        caller's responsibility once this function returns — mirrors how the top-level
+        ``_walk`` already does this for the outermost ``DynamicFanOutCallback``.
+        """
+        sid = str(s.id)
+        if sid in visited:
+            return
+        visited.add(sid)
+        node_lines[sid] = _node_line(s)
+
+        arm_successors = [cb for cb in s.dag_callbacks if isinstance(cb, (SimpleCallback, FanInCallback))]
+        nested_fanouts = [cb for cb in s.dag_callbacks if isinstance(cb, DynamicFanOutCallback)]
+
+        if not arm_successors and not nested_fanouts:
+            # Leaf: arm ends here — connect to the outer collector.
+            _add_edge(sid, str(collector.id), "--o")
+            return
+
+        for arm_cb in arm_successors:
+            child_id = str(arm_cb.task.id)
+            _add_edge(sid, child_id, "-->")
+            if arm_cb.error_callback is not None:
+                _add_edge(sid, str(arm_cb.error_callback.id), "-.->")
+                _walk(arm_cb.error_callback)
+            _walk_arm(arm_cb.task, collector)
+
+        for dag_cb in nested_fanouts:
+            inner_arm_id = str(dag_cb.arm_root.id)
+            _add_edge(sid, inner_arm_id, "-->>")
+            if dag_cb.error_callback is not None:
+                _add_edge(sid, str(dag_cb.error_callback.id), "-.->")
+                _walk(dag_cb.error_callback)
+            _walk_arm(dag_cb.arm_root, dag_cb.collector)
+            # The inner collector continues this (outer) arm's chain rather than being
+            # walked as a plain node -- see the docstring note above.
+            _walk_arm(dag_cb.collector, collector)
+            _walk_arm(dag_cb.collector, collector)
+
+    def _walk_compact_arm(s: DAGTaskSpec) -> None:
+        """
+        Compact walk: show the arm fanout skeleton without expanding chain steps.
+
+        Recurses into nested ``DynamicFanOutCallback`` entries so their ``-->>`` / ``--o``
+        structure is visible, but skips ``SimpleCallback`` / ``FanInCallback`` steps that
+        are repeated per arm instance at runtime.
+        """
+        sid = str(s.id)
+        if sid in visited:
+            return
+        visited.add(sid)
+        node_lines[sid] = _node_line(s)
+        for cb in s.dag_callbacks:
+            if isinstance(cb, DynamicFanOutCallback):
+                inner_arm_id = str(cb.arm_root.id)
+                _add_edge(sid, inner_arm_id, "-->>")
+                if cb.error_callback is not None:
+                    _add_edge(sid, str(cb.error_callback.id), "-.->")
+                    _walk(cb.error_callback)
+                _walk_compact_arm(cb.arm_root)
+                _add_edge(inner_arm_id, str(cb.collector.id), "--o")
+                _walk(cb.collector)
+
     def _walk(s: DAGTaskSpec) -> None:
         sid = str(s.id)
         if sid in visited:
             return
         visited.add(sid)
-
-        status = task_statuses.get(sid) if task_statuses else None
-        label = _spec_label(s, status)
-        class_sfx = f":::{_STATUS_CLASS[status]}" if status else ""
-        node_lines[sid] = f'    {sid}["{label}"]{class_sfx}'
+        node_lines[sid] = _node_line(s)
 
         for cb in s.dag_callbacks:
+            if isinstance(cb, DynamicFanOutCallback):
+                arm_id = str(cb.arm_root.id)
+                col_id = str(cb.collector.id)
+                _add_edge(sid, arm_id, "-->>")
+                if cb.error_callback is not None:
+                    _add_edge(sid, str(cb.error_callback.id), "-.->")
+                    _walk(cb.error_callback)
+                if expand_fanouts:
+                    _walk_arm(cb.arm_root, cb.collector)
+                else:
+                    # Compact: walk nested fanout structure but skip chain steps.
+                    _walk_compact_arm(cb.arm_root)
+                    _add_edge(arm_id, col_id, "--o")
+                _walk(cb.collector)
+                continue
+
+            if not isinstance(cb, (SimpleCallback, FanInCallback)):
+                continue
             child_id = str(cb.task.id)
-            edge_key = (sid, child_id, "-->")
-            if edge_key not in edge_seen:
-                edge_seen.add(edge_key)
-                edge_lines.append(f"    {sid} --> {child_id}")
+            _add_edge(sid, child_id, "-->")
 
             if cb.error_callback is not None:
-                err_id = str(cb.error_callback.id)
-                err_key = (sid, err_id, "-.->")
-                if err_key not in edge_seen:
-                    edge_seen.add(err_key)
-                    edge_lines.append(f"    {sid} -.-> {err_id}")
+                _add_edge(sid, str(cb.error_callback.id), "-.->")
                 _walk(cb.error_callback)
 
             _walk(cb.task)

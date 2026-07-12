@@ -4,7 +4,14 @@ import msgpack
 import pytest
 from ulid import ULID
 
-from jobbers.utils.serialization import default, deserialize, ext_hook, serialize
+from jobbers.utils.serialization import (
+    MSGPACK_INT_MAX,
+    MSGPACK_INT_MIN,
+    default,
+    deserialize,
+    ext_hook,
+    serialize,
+)
 
 
 def test_default_with_datetime():
@@ -25,6 +32,25 @@ def test_default_with_unknown_type():
     obj = CustomType()
     with pytest.raises(TypeError, match=f"Unknown type: {obj!r}"):
         default(obj)
+
+
+@pytest.mark.parametrize("obj", [MSGPACK_INT_MAX + 1, MSGPACK_INT_MIN - 1, 2**64, -(2**63) - 1])
+def test_default_with_out_of_range_int_raises_overflow_error(obj):
+    """default() raises a clear OverflowError for ints msgpack can't represent, not a generic TypeError."""
+    with pytest.raises(OverflowError, match="outside the range msgpack can represent"):
+        default(obj)
+
+
+@pytest.mark.parametrize("obj", [MSGPACK_INT_MAX, MSGPACK_INT_MIN, 0])
+def test_serialize_round_trips_boundary_ints(obj):
+    """Ints at msgpack's native boundary serialize fine -- default() is never even called for these."""
+    assert deserialize(serialize(obj)) == obj
+
+
+def test_serialize_out_of_range_int_raises_overflow_error():
+    """The full serialize() path surfaces the same clear error for an oversized int."""
+    with pytest.raises(OverflowError, match="outside the range msgpack can represent"):
+        serialize(2**64)
 
 
 def test_ext_hook_with_datetime_code():

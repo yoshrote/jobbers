@@ -82,6 +82,12 @@ class UserCancellationError(Exception):
     pass
 
 
+class TaskRateLimitedError(TaskException):
+    """Raised by submit_task() when the queue's rate limiter rejects the submission."""
+
+    pass
+
+
 class StateManager:
     """Coordinator for managing task state across the job store."""
 
@@ -225,27 +231,47 @@ class StateManager:
 
             stale_pipes = []
             stale_saga_tasks: list[Task] = []
+            dlq_saga_tasks: list[Task] = []
             for (task_type, task_version), tasks in stale_tasks_by_type.items():
                 task_config = registry.get_task_config(task_type, task_version)
                 if task_config and task_config.max_heartbeat_interval:
+                    needs_dlq = task_config.dead_letter_policy == DeadLetterPolicy.SAVE
                     for task in tasks:
                         if (
                             task.heartbeat_at
                             and (now - task.heartbeat_at) > task_config.max_heartbeat_interval
                         ):
+                            # A stalled task never calls generate_callbacks(), so it
+                            # never closes out of its DAG run's pending counter — a
+                            # run containing it simply stays open (see
+                            # TaskProcessor._maybe_cleanup), preserving fan-in
+                            # tracking and sibling task records within their TTLs.
                             task.set_status(TaskStatus.STALLED)
                             if self._atomic_state is not None:
                                 pipe = self._atomic_state.pipeline(transaction=True)
                                 self._atomic_state.stage_save(pipe, task)
                                 self._atomic_state.stage_remove_heartbeat(pipe, task)
+                                if needs_dlq and self._atomic_dlq is not None:
+                                    self._atomic_dlq.stage_add(pipe, task, now)
+                                elif needs_dlq:
+                                    dlq_saga_tasks.append(task)
                                 stale_pipes.append(pipe.execute())
                             else:
                                 stale_saga_tasks.append(task)
+                                if needs_dlq:
+                                    dlq_saga_tasks.append(task)
+                            if needs_dlq:
+                                logger.info("Task %s sent to dead letter queue.", task.id)
+                                tasks_dead_lettered.add(
+                                    1, {"queue": task.queue, "task": task.name, "version": task.version}
+                                )
             if stale_pipes:
                 await asyncio.gather(*stale_pipes)
             for stale_task in stale_saga_tasks:
                 await self.task_state.save_task(stale_task)
                 await self.task_state.remove_task_heartbeat(stale_task)
+            if dlq_saga_tasks:
+                await asyncio.gather(*(self.dead_queue.add_to_dlq(t, now) for t in dlq_saga_tasks))
 
         await asyncio.gather(*clean_ops)
 
@@ -291,9 +317,13 @@ class StateManager:
                 self._atomic_dlq.stage_remove(pipe, task.id, task.queue, task.name)
             await pipe.execute()
         else:
-            # Saga: persist blobs (source of truth), then remove from DLQ.
-            # If remove fails, Cleaner reconciles DLQ entries for SUBMITTED/STARTED tasks.
+            # Saga: persist blobs (source of truth), then enqueue via the saga-safe
+            # enqueue() — not submit_task(), whose "skip if blob exists" guard would
+            # silently no-op the ZADD once save_task() has already written the blob.
+            # Then remove from DLQ. If remove fails, Cleaner reconciles DLQ entries
+            # for SUBMITTED/STARTED tasks.
             await asyncio.gather(*(self.task_state.save_task(t) for t in tasks))
+            await asyncio.gather(*(self.task_submit.enqueue(t) for t in tasks))
             for task in tasks:
                 await self.dead_queue.remove_from_dlq(task.id, task.queue, task.name)
         return tasks
@@ -399,7 +429,12 @@ class StateManager:
           already fired internally; caller should return immediately).
         - ``skipped=False`` and a ``stage_active_run(pipe, task_id)`` callable otherwise.
           Call it unconditionally during pipeline construction; it is a no-op for ALWAYS
-          policy and stages the NX guard for SKIP_IF_RUNNING.
+          policy and stages the active-run marker write for SKIP_IF_RUNNING.
+
+        Callers must already hold the entry's dispatch lock (see ``dispatch_cron_dag``)
+        before calling this — that lock, not this method, is what actually serializes
+        concurrent dispatchers, so the active-run marker write below is a plain
+        unconditional set (``nx=False``), not a race guard in its own right.
         """
         from jobbers.protocols import AtomicCronDAGSchedulerProtocol
 
@@ -422,11 +457,13 @@ class StateManager:
                     return
 
             if isinstance(self.cron_dag_scheduler, AtomicCronDAGSchedulerProtocol):
-                # Scheduler supports pipeline staging: NX guard goes into the pipeline.
+                # Scheduler supports pipeline staging. nx=False: the caller's dispatch
+                # lock already serializes concurrent dispatchers, so this is just a
+                # plain set, not a race guard (see _concurrency_guard's docstring).
                 _atomic_sched = self.cron_dag_scheduler  # narrow for mypy
 
                 def _stage_skip(pipe: TransactionHandle, task_id: ULID) -> None:
-                    _atomic_sched.stage_set_active_run(pipe, entry.id, task_id, nx=True)
+                    _atomic_sched.stage_set_active_run(pipe, entry.id, task_id, nx=False)
 
                 yield ConcurrencyStager(skipped=False, _stage_fn=_stage_skip)
             else:
@@ -449,7 +486,23 @@ class StateManager:
         pipeline *before* the root task is submitted.  A crash after the pipeline but
         before submit means the entry fires again on the next poll (tolerable duplicate),
         but the cron schedule is never permanently lost.
+
+        The whole method runs under a short-TTL dispatch lock (``try_acquire_dispatch_lock``)
+        so two dispatchers racing to fire the same due occurrence (e.g. during a rolling
+        scheduler restart) can't both submit a duplicate run — see
+        ``CronDAGSchedulerProtocol.try_acquire_dispatch_lock``'s docstring for why this is
+        a separate, much shorter-lived lock than the SKIP_IF_RUNNING active-run marker.
         """
+        if not await self.cron_dag_scheduler.try_acquire_dispatch_lock(entry.id):
+            logger.info("Cron entry %s: another dispatcher already claimed this run; skipping.", entry.id)
+            return
+        try:
+            await self._dispatch_cron_dag_locked(entry, run_at)
+        finally:
+            await self.cron_dag_scheduler.release_dispatch_lock(entry.id)
+
+    async def _dispatch_cron_dag_locked(self, entry: CronDAGEntry, run_at: dt.datetime) -> None:
+        """Run dispatch_cron_dag's body while its dispatch lock is held."""
         next_run_at = croniter(entry.cron_expr, run_at).get_next(dt.datetime)
 
         async with self._concurrency_guard(entry, next_run_at) as stager:
@@ -460,6 +513,7 @@ class StateManager:
             fan_ins = collect_fan_in_keys(fresh_spec)
             queue_config = await self.get_queue_config(fresh_spec.queue)
 
+            dag_run_id = ULID()
             task = Task(
                 id=fresh_spec.id,
                 name=fresh_spec.name,
@@ -468,7 +522,7 @@ class StateManager:
                 parameters=fresh_spec.parameters,
                 dag_callbacks=fresh_spec.dag_callbacks,
                 cron_id=entry.id,
-                dag_run_id=ULID(),
+                dag_run_id=dag_run_id,
             )
 
             is_rate_limited = bool(
@@ -490,28 +544,54 @@ class StateManager:
                 self._atomic_cron.stage_reschedule(pipe, entry.id, next_run_at)
                 stager.stage_active_run(pipe, task.id)
                 for fan_in_key, predecessor_ids in fan_ins.items():
-                    self._atomic_state.stage_init_fan_in(pipe, fan_in_key, predecessor_ids)  # type: ignore[union-attr]
+                    self._atomic_state.stage_init_fan_in(  # type: ignore[union-attr]
+                        pipe, dag_run_id, fan_in_key, predecessor_ids
+                    )
                 if not is_rate_limited:
                     self.stage_submit_task(pipe, task, queue_config)
                 await pipe.execute()
                 if is_rate_limited:
-                    await self.submit_task(task)
+                    await self._dispatch_cron_root_task(entry, task)
             elif isinstance(self.cron_dag_scheduler, AtomicCronDAGSchedulerProtocol):
                 # Cross-backend: cron ops are atomic internally; task-state ops follow.
                 cron_pipe = self.cron_dag_scheduler.pipeline(transaction=True)
                 self.cron_dag_scheduler.stage_reschedule(cron_pipe, entry.id, next_run_at)
                 stager.stage_active_run(cron_pipe, task.id)
                 await cron_pipe.execute()
-                await asyncio.gather(*(self.task_state.init_fan_in(k, ids) for k, ids in fan_ins.items()))
-                await self.submit_task(task)
+                await asyncio.gather(
+                    *(self.task_state.init_fan_in(dag_run_id, k, ids) for k, ids in fan_ins.items())
+                )
+                await self._dispatch_cron_root_task(entry, task)
             else:
                 # No pipeline support (e.g. StaticCronDAGScheduler): sequential calls.
+                # nx=False: the dispatch lock already serializes concurrent dispatchers.
                 await self.cron_dag_scheduler.reschedule(entry.id, next_run_at)
                 if entry.concurrency_policy == ConcurrencyPolicy.SKIP_IF_RUNNING:
-                    await self.cron_dag_scheduler.set_active_run(entry.id, task.id, nx=True)
-                await asyncio.gather(*(self.task_state.init_fan_in(k, ids) for k, ids in fan_ins.items()))
-                await self.submit_task(task)
+                    await self.cron_dag_scheduler.set_active_run(entry.id, task.id, nx=False)
+                await asyncio.gather(
+                    *(self.task_state.init_fan_in(dag_run_id, k, ids) for k, ids in fan_ins.items())
+                )
+                await self._dispatch_cron_root_task(entry, task)
             logger.info("Cron entry %s dispatched as task %s (run_at=%s).", entry.id, task.id, run_at)
+
+    async def _dispatch_cron_root_task(self, entry: CronDAGEntry, task: Task) -> None:
+        """
+        Submit a cron DAG's root task, swallowing (and logging) a rate-limit rejection.
+
+        The cron entry has already been rescheduled by the time this runs, so a
+        rejected root task only skips this one firing -- the entry's next run is
+        unaffected. Letting TaskRateLimitedError propagate here would crash the
+        Scheduler's dispatch loop, since it runs via an unguarded asyncio.gather().
+        """
+        try:
+            await self.submit_task(task)
+        except TaskRateLimitedError:
+            logger.warning(
+                "Cron entry %s's root task %s was rejected by queue '%s' rate limiting; skipping this run.",
+                entry.id,
+                task.id,
+                task.queue,
+            )
 
     async def request_task_cancellation(self, task_id: ULID) -> Task | None:
         """
@@ -615,8 +695,12 @@ class StateManager:
                 self._atomic_state.stage_submit_task(pipe, task)
             await pipe.execute()
         else:
-            # Saga: persist blobs first (source of truth), then enqueue via TaskQueueProtocol.
+            # Saga: persist blobs first (source of truth), then enqueue via the
+            # saga-safe enqueue() — not submit_task(), whose "skip if blob exists"
+            # guard would silently no-op the ZADD once save_task() has already
+            # written the blob.
             await asyncio.gather(*(self.task_state.save_task(t) for t in tasks))
+            await asyncio.gather(*(self.task_submit.enqueue(t) for t in tasks))
 
     async def requeue_task(self, task: Task) -> None:
         """
@@ -631,6 +715,7 @@ class StateManager:
         else:
             task.set_status(TaskStatus.SUBMITTED)
             await self.task_state.save_task(task)
+            await self.task_submit.enqueue(task)
 
     async def complete_cron_task(self, task: Task) -> None:
         """
@@ -722,6 +807,13 @@ class StateManager:
         self.invalidate_queue_config(queue_config.name)
         await self.bump_refresh_tags_for_queue(queue_config.name)
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        """Atomically create a new queue config. Returns False if the name already exists."""
+        created = await self.routing.create_queue_config(queue_config)
+        if created:
+            self.invalidate_queue_config(queue_config.name)
+        return created
+
     async def save_routing_config(self, routing_config: RoutingConfig) -> None:
         """Save routing config, invalidate local cache entry, and bump routing version."""
         await self.routing.save_routing_config(routing_config)
@@ -755,6 +847,13 @@ class StateManager:
         await self.routing.save_role(role, queues_set)
         await self.routing_notifications.bump_refresh_tag(role)
 
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        """Atomically create a new role. Returns False if the role already exists."""
+        created = await self.routing.create_role(role, queues_set)
+        if created:
+            await self.routing_notifications.bump_refresh_tag(role)
+        return created
+
     async def delete_queue(self, queue_name: str) -> None:
         self.invalidate_queue_config(queue_name)
         affected_roles = await self.routing.delete_queue(queue_name)
@@ -786,21 +885,38 @@ class StateManager:
         return final
 
     async def submit_task(self, task: Task) -> None:
+        """
+        Resolve the task's queue and submit it, respecting rate limiting.
+
+        Raises TaskRateLimitedError if the queue's rate limiter rejects the
+        submission; the task's status is reverted to its pre-call value in that case.
+        """
         task.queue = await self.resolve_queue(task)
         queue_config = await self.get_queue_config(task.queue)
-        task.set_status(TaskStatus.SUBMITTED)
-        if (
+        is_rate_limited = bool(
             queue_config
             and queue_config.rate_numerator
             and queue_config.rate_denominator
             and queue_config.rate_period
-        ):
-            await self.task_submit.submit_rate_limited_task(task=task, queue_config=queue_config)
+        )
+        previous_status = task.status
+        # Must precede submit: sets submitted_at, which the adapters assert is present.
+        task.set_status(TaskStatus.SUBMITTED)
+        if is_rate_limited:
+            assert queue_config is not None  # noqa: S101
+            accepted = await self.task_submit.submit_rate_limited_task(task=task, queue_config=queue_config)
         else:
-            await self.task_submit.submit_task(task=task)
+            accepted = await self.task_submit.submit_task(task=task)
+        if not accepted:
+            task.status = previous_status
+            raise TaskRateLimitedError(
+                f"Queue '{task.queue}' rate limit exceeded; task {task.id} was not submitted."
+            )
 
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
-        await self.task_state.init_fan_in(fan_in_key, predecessor_ids, ttl)
+    async def init_fan_in(
+        self, dag_run_id: ULID, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+    ) -> None:
+        await self.task_state.init_fan_in(dag_run_id, fan_in_key, predecessor_ids, ttl)
 
     async def add_cron_dag(self, entry: CronDAGEntry) -> None:
         """
@@ -835,9 +951,9 @@ class StateManager:
             for key, ids in root.fan_in_predecessors().items():
                 all_fan_ins.setdefault(key, set()).update(ids)
 
-        await asyncio.gather(*(self.init_fan_in(k, ids) for k, ids in all_fan_ins.items()))
-
         dag_run_id = ULID()
+        await asyncio.gather(*(self.init_fan_in(dag_run_id, k, ids) for k, ids in all_fan_ins.items()))
+
         submitted: list[Task] = []
         for root in roots:
             task = root.to_task(dag_run_id=dag_run_id)
@@ -852,6 +968,65 @@ class StateManager:
     async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
         """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
         return await self.task_state.get_dag_run(dag_run_id)
+
+    async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
+        """Mark task_id resolved in the DAG run's pending set; return the remaining count."""
+        return await self.task_state.close_dag_run_task(dag_run_id, task_id)
+
+    async def sweep_dag_run(self, dag_run_id: ULID, *, fallback_task: Task | None = None) -> None:
+        """
+        Delete every task in a now-fully-terminal DAG run whose config says to clean up.
+
+        If the run's index is orphaned (already swept, e.g. by the age-based
+        ``clean_dag_runs`` purge racing this call), fall back to applying
+        *fallback_task*'s own ``cleanup_on`` policy to just that task.
+
+        **Precondition:** callers must only pass *fallback_task* once they have
+        independently confirmed the run is fully terminal (e.g. ``close_dag_run_task``
+        just returned a remaining count of 0 for it). This method does not — and, once
+        the run's index is orphaned, cannot — re-verify that on its own; passing
+        *fallback_task* for a run that still has siblings in flight would delete a
+        task those siblings may still depend on (e.g. via ``parent_results()``).
+        The only production caller, ``close_dag_run_task_and_sweep``, already
+        guarantees this.
+        """
+        run = await self.get_dag_run(dag_run_id)
+        if run is None:
+            if fallback_task is not None:
+                cfg = registry.get_task_config(fallback_task.name, fallback_task.version)
+                if cfg and cfg.cleanup_on and fallback_task.status in cfg.cleanup_on:
+                    await self.delete_task(fallback_task)
+            return
+
+        _, task_ids = run
+        sibling_tasks = await self.task_state.get_tasks_bulk(task_ids)
+        to_delete: list[Task] = []
+        for sibling in sibling_tasks:
+            if sibling is None:
+                continue
+            cfg = registry.get_task_config(sibling.name, sibling.version)
+            if cfg and cfg.cleanup_on and sibling.status in cfg.cleanup_on:
+                to_delete.append(sibling)
+        if to_delete:
+            await asyncio.gather(*(self.delete_task(t) for t in to_delete))
+
+    async def close_dag_run_task_and_sweep(self, task: Task) -> None:
+        """
+        Close *task* out of its DAG run's pending set and sweep siblings if the run just went terminal.
+
+        Only called for tasks reaching a non-stuck terminal status (see
+        ``TaskProcessor._maybe_cleanup``) — FAILED/STALLED tasks never close out of
+        ``DAG_RUN_PENDING`` at all, so a run containing one simply never reaches a
+        pending count of zero and this method is never invoked for it.
+        """
+        assert task.dag_run_id is not None  # noqa: S101
+        remaining = await self.close_dag_run_task(task.dag_run_id, task.id)
+        if remaining != 0:
+            # >0: DAG still in flight, the last task to close will trigger the sweep.
+            # -1: already closed (duplicate call) or the run's pending entry expired/was
+            # swept — either way, do not re-trigger the sweep from here.
+            return
+        await self.sweep_dag_run(task.dag_run_id, fallback_task=task)
 
     async def delete_task(self, task: Task) -> None:
         """Delete a task record and remove it from all indexes."""
@@ -895,6 +1070,8 @@ class SubmissionRateLimiter:
         queues = list(task_queues)
         configs = await asyncio.gather(*(self._get_queue_config(q) for q in queues))
         for queue, config in zip(queues, configs, strict=True):
+            # Deliberately truthy, not `is not None`: max_concurrent=0 means unlimited,
+            # same as None -- see QueueConfig.max_concurrent's docstring.
             if config and config.max_concurrent:
                 if len(current_tasks_by_queue[queue]) < config.max_concurrent:
                     queues_to_use.add(queue)

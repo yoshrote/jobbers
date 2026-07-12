@@ -14,7 +14,7 @@ Concrete adapters inherit ``SharedTaskAdapterMixin`` and implement:
   - Storage primitives: ``_load_raw``, ``_load_raw_watch``, ``_stage_store``,
     ``_stage_load``
   - Serialization: ``pack``, ``unpack``
-  - Backend-specific queries: ``ensure_index``, ``get_all_tasks``, ``get_dag_run``
+  - Backend-specific queries: ``ensure_index``, ``get_all_tasks``
 
 Concrete submit classes inherit ``_SharedRedisTaskSubmitBase`` and define:
   - Lua script class attributes: ``SUBMIT_SCRIPT``, ``SUBMIT_RATE_LIMITED_SCRIPT``
@@ -24,6 +24,7 @@ Concrete submit classes inherit ``_SharedRedisTaskSubmitBase`` and define:
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -60,23 +61,73 @@ class SharedTaskAdapterMixin(ABC):
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     DLQ_MISSING_DATA = "dlq-missing-data"
     DAG_RUNS = "dag-runs"
-    DAG_RUN_TASKS = "dag-run:{dag_run_id}:tasks".format
+    # Per-DAG-run structures — flat key count regardless of task count or fan-out nesting depth.
+    DAG_RUN_PENDING = "dag-run:{dag_run_id}:pending".format  # Set: task IDs submitted, not yet closed.
+    DAG_RUN_CLOSED = "dag-run:{dag_run_id}:closed".format  # Set: task IDs that have closed.
+    # Hash: "remaining:{fan_in_key}" -> int countdown,
+    #       "pending:{fan_in_key}:{predecessor_id}" -> "1" (one field per uncompleted predecessor).
+    DAG_RUN_FANIN = "dag-run:{dag_run_id}:fanin".format
+    # Hash: "{fan_in_key}" -> JSON list of permanent predecessor ULID strings.
+    DAG_RUN_FANIN_MEMBERS = "dag-run:{dag_run_id}:fanin-members".format
 
-    # Atomically remove task_id from fan-in set and return remaining count.
-    # Returns {removed=0, remaining=-1} if the ID was not a member (already
-    # processed or key expired), so callers can distinguish a real zero-remaining
-    # from a false zero caused by a missing/expired key.
-    _FAN_IN_SCRIPT = """
+    # Atomically remove task_id from the run's pending set, record it as closed, and
+    # return the remaining pending count. Returns {removed=0, remaining=-1} if the ID
+    # was not pending (already closed, or the run's pending key expired/was swept).
+    _CLOSE_DAG_RUN_TASK_SCRIPT = """
         local removed = redis.call('SREM', KEYS[1], ARGV[1])
         if removed == 0 then
             return {0, -1}
         end
+        redis.call('SADD', KEYS[2], ARGV[1])
         return {removed, redis.call('SCARD', KEYS[1])}
+    """
+
+    # Atomically close one predecessor for one fan_in_key within the run's shared fan-in
+    # Hash. HDEL on the per-predecessor "pending" field mirrors the old per-collector
+    # Set's SREM-on-a-member exactly: it returns 0 (and hence the {0, -1} sentinel) both
+    # when this ID was never a registered predecessor and when it already closed.
+    _FAN_IN_HASH_SCRIPT = """
+        local pending_field = 'pending:' .. ARGV[1] .. ':' .. ARGV[2]
+        if redis.call('HDEL', KEYS[1], pending_field) == 0 then
+            return {0, -1}
+        end
+        local remaining_field = 'remaining:' .. ARGV[1]
+        local remaining = redis.call('HINCRBY', KEYS[1], remaining_field, -1)
+        return {1, remaining}
+    """
+
+    # Atomically swap old_id for new_id for one fan_in_key: renames the "pending" field in
+    # the fan-in Hash (KEYS[1]) so the new id's future close is recognised, and rewrites the
+    # JSON-encoded predecessor list in the members Hash (KEYS[2]). Used by delegate_fan_in
+    # when a nested DynamicFanOut transfers outer fan-in responsibility to a grandcollector.
+    # Does not touch the remaining count — a delegated ID hasn't closed yet, only its
+    # identity within the pending/members tracking changes.
+    _DELEGATE_FAN_IN_HASH_SCRIPT = """
+        local old_pending = 'pending:' .. ARGV[1] .. ':' .. ARGV[2]
+        local new_pending = 'pending:' .. ARGV[1] .. ':' .. ARGV[3]
+        if redis.call('HEXISTS', KEYS[1], old_pending) == 1 then
+            redis.call('HDEL', KEYS[1], old_pending)
+            redis.call('HSET', KEYS[1], new_pending, '1')
+        end
+
+        local blob = redis.call('HGET', KEYS[2], ARGV[1])
+        if blob then
+            local members = cjson.decode(blob)
+            for i, m in ipairs(members) do
+                if m == ARGV[2] then
+                    members[i] = ARGV[3]
+                end
+            end
+            redis.call('HSET', KEYS[2], ARGV[1], cjson.encode(members))
+        end
+        return 1
     """
 
     def __init__(self, data_store: Redis) -> None:
         self.data_store: Redis = data_store
-        self._fan_in_script = self.data_store.register_script(self._FAN_IN_SCRIPT)
+        self._close_dag_run_task_script = self.data_store.register_script(self._CLOSE_DAG_RUN_TASK_SCRIPT)
+        self._fan_in_hash_script = self.data_store.register_script(self._FAN_IN_HASH_SCRIPT)
+        self._delegate_fan_in_hash_script = self.data_store.register_script(self._DELEGATE_FAN_IN_HASH_SCRIPT)
 
     @property
     def backend_key(self) -> str:
@@ -122,10 +173,6 @@ class SharedTaskAdapterMixin(ABC):
     @abstractmethod
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Return a page of tasks matching the pagination filters."""
-
-    @abstractmethod
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
-        """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
 
     # ---------------------------------------------------------------------------
     # Shared implementations (identical across all backends)
@@ -230,13 +277,7 @@ class SharedTaskAdapterMixin(ABC):
 
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete blobs, heartbeat entries, and type-index members for old terminal tasks."""
-        terminal_statuses = {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.STALLED,
-            TaskStatus.DROPPED,
-        }
+        terminal_statuses = TaskStatus.terminal_statuses()
         cutoff = now - max_age
         async for raw_key in self.data_store.scan_iter("task:*"):
             key_str = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
@@ -290,6 +331,7 @@ class SharedTaskAdapterMixin(ABC):
         score = task.submitted_at.timestamp()
         p: Any = pipe
         p.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): score}, nx=True)
+        p.sadd(self.DAG_RUN_PENDING(dag_run_id=task.dag_run_id), bytes(task.id))
 
     async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
         """Return a paginated list of DAG runs ordered by submission time (oldest first)."""
@@ -305,12 +347,42 @@ class SharedTaskAdapterMixin(ABC):
             for dag_id_bytes, score in raw
         ], total
 
+    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
+        """Return (submitted_at, task_ids) for a DAG run via SUNION(pending, closed)."""
+        score: float | None = await self.data_store.zscore(self.DAG_RUNS, bytes(dag_run_id))
+        if score is None:
+            return None
+        submitted_at = dt.datetime.fromtimestamp(score, dt.UTC)
+        raw_ids = cast(
+            "set[bytes]",
+            await self.data_store.sunion(
+                [self.DAG_RUN_PENDING(dag_run_id=dag_run_id), self.DAG_RUN_CLOSED(dag_run_id=dag_run_id)]
+            ),
+        )
+        # SUNION has no ordering guarantee; ULIDs sort lexicographically by creation
+        # time, so sorting restores the submission-order guarantee callers rely on
+        # (e.g. the /dags/{dag_run_id} response) at no extra I/O cost.
+        task_ids = sorted(ULID.from_bytes(b) for b in raw_ids)
+        return submitted_at, task_ids
+
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
-        """Remove DAG run index entries older than ``max_age``."""
+        """Remove DAG run index entries and all their per-run structures older than ``max_age``."""
         cutoff = (now - max_age).timestamp()
         stale = cast("list[bytes]", await self.data_store.zrange(self.DAG_RUNS, "-inf", cutoff, byscore=True))
-        if stale:
-            await self.data_store.zrem(self.DAG_RUNS, *stale)
+        if not stale:
+            return
+        pipe = self.data_store.pipeline(transaction=False)
+        pipe.zrem(self.DAG_RUNS, *stale)
+        for dag_id_bytes in stale:
+            try:
+                dag_run_id = ULID.from_bytes(dag_id_bytes)
+            except ValueError:
+                continue
+            pipe.delete(self.DAG_RUN_PENDING(dag_run_id=dag_run_id))
+            pipe.delete(self.DAG_RUN_CLOSED(dag_run_id=dag_run_id))
+            pipe.delete(self.DAG_RUN_FANIN(dag_run_id=dag_run_id))
+            pipe.delete(self.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id))
+        await pipe.execute()
 
     async def save_task(self, task: Task) -> None:
         """Save task state to the Redis data store."""
@@ -369,7 +441,9 @@ class SharedTaskAdapterMixin(ABC):
         """Return all tasks currently present in any heartbeat sorted set."""
         task_id_bytes: set[bytes] = set()
         for queue in queues:
-            members = cast("list[bytes]", await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1))
+            members = cast(
+                "list[bytes]", await self.data_store.zrange(self.HEARTBEAT_SCORES(queue=queue), 0, -1)
+            )
             task_id_bytes.update(members)
         if not task_id_bytes:
             return []
@@ -395,33 +469,75 @@ class SharedTaskAdapterMixin(ABC):
                 yield task
 
     def stage_init_fan_in(
-        self, pipe: TransactionHandle, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+        self,
+        pipe: TransactionHandle,
+        dag_run_id: ULID,
+        fan_in_key: str,
+        predecessor_ids: set[ULID],
+        ttl: int = 86400,
     ) -> None:
-        """Queue fan-in set initialisation commands onto *pipe* without executing."""
+        """Queue fan-in initialisation commands onto *pipe* without executing."""
         p: Any = pipe
-        members_key = f"{fan_in_key}:members"
-        encoded = [str(pid).encode() for pid in predecessor_ids]
-        p.sadd(fan_in_key, *encoded)
-        p.expire(fan_in_key, ttl)
-        p.sadd(members_key, *encoded)
-        p.expire(members_key, ttl * 2)
+        fanin_key = self.DAG_RUN_FANIN(dag_run_id=dag_run_id)
+        members_key = self.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id)
+        pending_fields: dict[str, str] = {f"remaining:{fan_in_key}": str(len(predecessor_ids))}
+        for pid in predecessor_ids:
+            pending_fields[f"pending:{fan_in_key}:{pid}"] = "1"
+        p.hset(fanin_key, mapping=pending_fields)
+        # Both hashes are shared by every collector registered under this dag_run_id.
+        # NX sets the expiry the first time the key is created; GT then only ever
+        # extends it on later calls, so a later collector's shorter ttl can never
+        # shrink the expiry out from under an earlier, still-pending collector's
+        # tracking data (plain EXPIRE would overwrite, not extend).
+        p.expire(fanin_key, ttl, nx=True)
+        p.expire(fanin_key, ttl, gt=True)
+        p.hset(members_key, fan_in_key, json.dumps([str(pid) for pid in predecessor_ids]))
+        # Members data must outlive the countdown by a margin so get_fan_in_members
+        # can still succeed even if read right as the countdown key expires.
+        p.expire(members_key, ttl * 2, nx=True)
+        p.expire(members_key, ttl * 2, gt=True)
 
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
-        """Pre-populate a fan-in tracking set in Redis."""
+    async def init_fan_in(
+        self, dag_run_id: ULID, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+    ) -> None:
+        """Pre-populate a fan-in countdown and its permanent member list."""
         pipe = self.data_store.pipeline(transaction=True)
-        self.stage_init_fan_in(pipe, fan_in_key, predecessor_ids, ttl)
+        self.stage_init_fan_in(pipe, dag_run_id, fan_in_key, predecessor_ids, ttl)
         await pipe.execute()
 
-    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
-        """Atomically remove *task_id* from the fan-in set and return the remaining count."""
-        results: list[int] = await self._fan_in_script(keys=[fan_in_key], args=[str(task_id).encode()])
+    async def fan_in_complete(self, dag_run_id: ULID, fan_in_key: str, task_id: ULID) -> int:
+        """Atomically close *task_id* for *fan_in_key* and return the remaining count."""
+        results: list[int] = await self._fan_in_hash_script(
+            keys=[self.DAG_RUN_FANIN(dag_run_id=dag_run_id)],
+            args=[fan_in_key.encode(), str(task_id).encode()],
+        )
         return int(results[1])
 
-    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]:
+    async def get_fan_in_members(self, dag_run_id: ULID, fan_in_key: str) -> list[ULID]:
         """Return the permanent list of predecessor IDs for a fan-in collector."""
-        members_key = f"{fan_in_key}:members"
-        raw: set[bytes] = await cast("Awaitable[set[bytes]]", self.data_store.smembers(members_key))
-        return [ULID.from_str(m.decode()) for m in raw]
+        raw = await self.data_store.hget(self.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id), fan_in_key)
+        if raw is None:
+            return []
+        decoded = raw.decode() if isinstance(raw, bytes) else raw
+        return [ULID.from_str(s) for s in json.loads(decoded)]
+
+    async def delegate_fan_in(self, dag_run_id: ULID, fan_in_key: str, old_id: ULID, new_id: ULID) -> None:
+        """Atomically swap *old_id* for *new_id* in the fan-in pending tracking and members list."""
+        await self._delegate_fan_in_hash_script(
+            keys=[
+                self.DAG_RUN_FANIN(dag_run_id=dag_run_id),
+                self.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id),
+            ],
+            args=[fan_in_key, str(old_id), str(new_id)],
+        )
+
+    async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
+        """Atomically move task_id from the DAG run's pending set to closed; return the remaining count."""
+        results: list[int] = await self._close_dag_run_task_script(
+            keys=[self.DAG_RUN_PENDING(dag_run_id=dag_run_id), self.DAG_RUN_CLOSED(dag_run_id=dag_run_id)],
+            args=[bytes(task_id)],
+        )
+        return int(results[1])
 
     async def task_exists(self, task_id: ULID) -> bool:
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
@@ -484,7 +600,7 @@ class _SharedRedisTaskSubmitBase:
     TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     DAG_RUNS = "dag-runs"
-    DAG_RUN_TASKS = "dag-run:{dag_run_id}:tasks".format
+    DAG_RUN_PENDING = "dag-run:{dag_run_id}:pending".format
     DLQ_MISSING_DATA = "dlq-missing-data"
 
     def __init__(
@@ -504,6 +620,25 @@ class _SharedRedisTaskSubmitBase:
     def _extra_rate_limited_keys(self, task: Task) -> list[str]:
         """Extra KEYS[] args for SUBMIT_RATE_LIMITED_SCRIPT beyond the base 5 keys."""
         return []
+
+    async def enqueue(self, task: Task) -> None:
+        """
+        Add an already-persisted task's ID to its queue (saga-safe re-enqueue).
+
+        Assumes the caller has already saved the task blob via
+        ``TaskStateProtocol.save_task()`` — this only stages the queue-membership
+        ZADD and DAG-run registration, without rewriting the blob and without
+        ``submit_task()``'s "skip the ZADD if the blob already exists" guard (which
+        is what makes ``submit_task()`` unsafe to call for a task whose blob was
+        just saved, or that was already submitted once before, e.g. a requeue).
+        """
+        assert task.submitted_at  # noqa: S101
+        pipe = self._data_store.pipeline(transaction=True)
+        pipe.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
+        if task.dag_run_id is not None:
+            pipe.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): task.submitted_at.timestamp()}, nx=True)
+            pipe.sadd(self.DAG_RUN_PENDING(dag_run_id=task.dag_run_id), bytes(task.id))
+        await pipe.execute()
 
     async def submit_task(self, task: Task) -> bool:
         """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""

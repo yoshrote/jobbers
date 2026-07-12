@@ -6,6 +6,7 @@ from jobbers.models.dag import (
     DAGNode,
     DAGTaskSpec,
     DynamicFanOut,
+    DynamicFanOutCallback,
     FanInCallback,
     SimpleCallback,
     TaskResult,
@@ -195,6 +196,71 @@ def test_fresh_copy_then_collect_fan_in_keys_no_old_ids():
     assert new_predecessor_id in fan_ins[f"dag:fan-in:{new_collector_id}"]
 
 
+def test_collect_fan_in_keys_walks_into_dynamic_fanout_collector():
+    """
+    A static fan-in reachable through a dynamic fan-out's collector must be pre-populated.
+
+    Regression test: the old code `continue`d past every DynamicFanOutCallback
+    without ever visiting cb.collector, so any static fan-in downstream of a
+    dynamic-fanout collector (e.g. `collector --> grand_collector` in a mermaid
+    diagram) was under-counted at DAG-submission time — that fan-in could then
+    fire before the collector's own branch actually completed.
+    """
+    grand_collector = make_spec("grand_collector")
+    fan_key = f"dag:fan-in:{grand_collector.id}"
+    collector = DAGTaskSpec(
+        name="collector",
+        dag_callbacks=[FanInCallback(task=grand_collector, fan_in_key=fan_key)],
+    )
+    arm_root = make_spec("arm_root")
+    fanout_cb = DynamicFanOutCallback(arm_root=arm_root, collector=collector, items_key="items")
+    dispatcher = DAGTaskSpec(name="dispatcher", dag_callbacks=[fanout_cb])
+
+    result = collect_fan_in_keys(dispatcher)
+    assert result == {fan_key: {collector.id}}
+
+
+def test_collect_fan_in_keys_does_not_walk_into_arm_root():
+    """Arm-root fan-ins are intentionally NOT pre-populated — initialised at runtime by the processor."""
+    inner_collector = make_spec("inner_collector")
+    inner_fan_key = f"dag:fan-in:{inner_collector.id}"
+    arm_step = DAGTaskSpec(
+        name="arm_step",
+        dag_callbacks=[FanInCallback(task=inner_collector, fan_in_key=inner_fan_key)],
+    )
+    arm_root = DAGTaskSpec(name="arm_root", dag_callbacks=[SimpleCallback(task=arm_step)])
+    collector = make_spec("collector")
+    fanout_cb = DynamicFanOutCallback(arm_root=arm_root, collector=collector, items_key="items")
+    dispatcher = DAGTaskSpec(name="dispatcher", dag_callbacks=[fanout_cb])
+
+    result = collect_fan_in_keys(dispatcher)
+    assert inner_fan_key not in result
+
+
+def test_dag_node_fan_in_predecessors_walks_into_fanout_collector():
+    """
+    DAGNode.fan_in_predecessors must include fan-ins reachable through a fan-out collector.
+
+    A DynamicFanOutCallback's collector is a fully-resolved DAGTaskSpec subtree
+    (attached via add_fanout_callback), not a DAGNode, so fan_in_predecessors has
+    to delegate to collect_fan_in_keys for it rather than only walking _successors.
+    """
+    grand_collector = make_spec("grand_collector")
+    fan_key = f"dag:fan-in:{grand_collector.id}"
+    collector_spec = DAGTaskSpec(
+        name="collector",
+        dag_callbacks=[FanInCallback(task=grand_collector, fan_in_key=fan_key)],
+    )
+    arm_root_spec = make_spec("arm_root")
+    fanout_cb = DynamicFanOutCallback(arm_root=arm_root_spec, collector=collector_spec, items_key="items")
+
+    dispatcher_node = DAGNode("dispatcher")
+    dispatcher_node.add_fanout_callback(fanout_cb)
+
+    preds = dispatcher_node.fan_in_predecessors()
+    assert preds == {fan_key: {collector_spec.id}}
+
+
 # ── TaskResult ────────────────────────────────────────────────────────────────
 
 
@@ -213,7 +279,7 @@ def test_task_result_with_results():
 def test_task_result_with_fanout():
     children = [DAGNode("child")]
     collector = DAGNode("collect")
-    fanout = DynamicFanOut(children=children, collector=collector)
+    fanout = DynamicFanOut(arms=children, collector=collector)
     tr = TaskResult(results={}, fanout=fanout)
     assert tr.fanout is fanout
 
@@ -299,6 +365,100 @@ def test_dag_node_fan_in_predecessors_multiple():
     preds = root.fan_in_predecessors()
     expected_key = f"dag:fan-in:{collector.id}"
     assert preds[expected_key] == {b1.id, b2.id}
+
+
+def test_dag_node_fan_in_predecessors_chain_before_merge():
+    """fan_in_predecessors walks the full subgraph, so chains before a merge are traversed correctly."""
+    # root → step_1 → b1 \
+    #      → step_2 → b2 / → collector
+    # The fan-in edge is on b1 and b2 (direct predecessors of collector).
+    collector = DAGNode("collector")
+    b1 = DAGNode("b1")
+    b2 = DAGNode("b2")
+    step1 = DAGNode("step1")
+    step2 = DAGNode("step2")
+    root = DAGNode("root")
+    step1.then(b1)
+    step2.then(b2)
+    root.then(step1, step2)
+    DAGNode.merge(b1, b2, into=collector)
+
+    preds = root.fan_in_predecessors()
+    expected_key = f"dag:fan-in:{collector.id}"
+    assert preds[expected_key] == {b1.id, b2.id}
+
+
+# ── DAGNode.find_terminals ────────────────────────────────────────────────────
+
+
+def test_find_terminals_single_node():
+    """A node with no successors is its own terminal."""
+    node = DAGNode("task")
+    assert DAGNode.find_terminals([node]) == [node]
+
+
+def test_find_terminals_linear_chain():
+    """find_terminals follows .then() chains to the leaf node."""
+    root = DAGNode("a")
+    mid = DAGNode("b")
+    leaf = DAGNode("c")
+    root.then(mid.then(leaf))
+    assert DAGNode.find_terminals([root]) == [leaf]
+
+
+def test_find_terminals_diamond():
+    """find_terminals resolves to the merge target for a diamond sub-graph."""
+    root = DAGNode("root")
+    b1 = DAGNode("branch_1")
+    b2 = DAGNode("branch_2")
+    merger = DAGNode("merge_node")
+    root.then(b1, b2)
+    DAGNode.merge(b1, b2, into=merger)
+    assert DAGNode.find_terminals([root]) == [merger]
+
+
+def test_find_terminals_multiple_roots():
+    """Each root contributes its own terminal(s) without cross-contamination."""
+    root_a = DAGNode("a")
+    leaf_a = DAGNode("a_leaf")
+    root_a.then(leaf_a)
+    root_b = DAGNode("b")  # single-step arm
+    terminals = DAGNode.find_terminals([root_a, root_b])
+    assert {t.id for t in terminals} == {leaf_a.id, root_b.id}
+
+
+def test_find_terminals_deduplicates_shared_merge_target():
+    """Two branches that converge on the same merge node produce one terminal entry."""
+    b1 = DAGNode("b1")
+    b2 = DAGNode("b2")
+    merger = DAGNode("merger")
+    root = DAGNode("root")
+    root.then(b1, b2)
+    DAGNode.merge(b1, b2, into=merger)
+    terminals = DAGNode.find_terminals([root])
+    assert terminals == [merger]
+
+
+def test_find_terminals_treats_nested_dispatcher_as_its_own_terminal():
+    """
+    An arm that is itself a nested dispatcher is intentionally its own terminal here.
+
+    This is by design, not a gap: the outer collector's FanInCallback is wired to this
+    node provisionally; if the nested DynamicFanOutCallback's own propagate_fan_in is
+    True (the default), _handle_declarative_fanout delegates that FanInCallback to the
+    nested collector at runtime once this node actually executes and reveals its nested
+    fan-out. If propagate_fan_in is False, this node completing — not its nested tree
+    completing — is exactly what the caller asked to close the outer fan-in.
+    """
+    dispatcher = DAGNode("dispatcher")
+    dispatcher.add_fanout_callback(
+        DynamicFanOutCallback(
+            arm_root=make_spec("inner_arm"),
+            collector=make_spec("inner_collector"),
+            items_key="items",
+        )
+    )
+    assert DAGNode.find_terminals([dispatcher]) == [dispatcher]
 
 
 # ── error callbacks ───────────────────────────────────────────────────────────

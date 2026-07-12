@@ -10,11 +10,11 @@ import datetime as dt
 import json
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
-from jobbers.migrations.schema import cron_dag_active_runs, cron_dag_entries
+from jobbers.migrations.schema import cron_dag_active_runs, cron_dag_entries, cron_dispatch_locks
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
 from jobbers.models.dag import DAGTaskSpec
 from jobbers.utils.sql_transaction import SQLTransactionBatch
@@ -305,6 +305,50 @@ class SQLCronDAGScheduler:
                     delete(cron_dag_active_runs).where(cron_dag_active_runs.c.cron_id == str(cron_id))
                 )
 
+    async def try_acquire_dispatch_lock(self, cron_id: ULID, ttl: int = 60) -> bool:
+        """
+        Atomically claim the short-lived dispatch lock for a cron entry.
+
+        Locks any existing row for cron_id (SELECT ... FOR UPDATE, skipped on SQLite)
+        before deciding whether to claim it, so a concurrent claimant can't race between
+        the expiry check and the write -- unlike set_active_run's plain INSERT-based NX
+        check, this correctly reclaims an expired row instead of failing forever once
+        any row exists.
+        """
+        cron_id_str = str(cron_id)
+        now = dt.datetime.now(dt.UTC)
+        expires_at = now + dt.timedelta(seconds=ttl)
+        async with self._sf() as session:
+            async with session.begin():
+                lock_stmt = select(cron_dispatch_locks.c.expires_at).where(
+                    cron_dispatch_locks.c.cron_id == cron_id_str
+                )
+                if self._use_for_update:
+                    lock_stmt = lock_stmt.with_for_update()
+                result = await session.execute(lock_stmt)
+                row = result.first()
+                if row is not None and _ensure_utc_cron(row.expires_at) > now:
+                    return False
+                if row is None:
+                    await session.execute(
+                        insert(cron_dispatch_locks).values(cron_id=cron_id_str, expires_at=expires_at)
+                    )
+                else:
+                    await session.execute(
+                        update(cron_dispatch_locks)
+                        .where(cron_dispatch_locks.c.cron_id == cron_id_str)
+                        .values(expires_at=expires_at)
+                    )
+                return True
+
+    async def release_dispatch_lock(self, cron_id: ULID) -> None:
+        """Release the dispatch lock for a cron entry, if held."""
+        async with self._sf() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(cron_dispatch_locks).where(cron_dispatch_locks.c.cron_id == str(cron_id))
+                )
+
     async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None:
         """Return the next scheduled run time, or None if not scheduled (acquired or missing)."""
         async with self._sf() as session:
@@ -326,9 +370,11 @@ class SQLCronDAGScheduler:
         """
         async with self._sf() as session:
             count_result = await session.execute(
-                select(cron_dag_entries).where(cron_dag_entries.c.next_run_at.is_not(None))
+                select(func.count()).where(cron_dag_entries.c.next_run_at.is_not(None))
             )
-            total = len(count_result.all())
+            total = count_result.scalar()
+            if total is None:
+                return [], 0
 
             result = await session.execute(
                 select(cron_dag_entries)

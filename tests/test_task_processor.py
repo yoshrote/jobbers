@@ -1,19 +1,28 @@
 import asyncio
 import contextlib
 import datetime as dt
+import logging
 from unittest.mock import ANY, AsyncMock, call, patch
 
 import pytest
 from ulid import ULID
 
 from jobbers.adapters.redis import RedisTaskScheduler
-from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOut, SimpleCallback, TaskResult
+from jobbers.models.dag import (
+    DAGNode,
+    DAGTaskSpec,
+    DynamicFanOut,
+    DynamicFanOutCallback,
+    FanInCallback,
+    SimpleCallback,
+    TaskResult,
+)
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
-from jobbers.state_manager import StateManager, UserCancellationError
-from jobbers.task_processor import TaskProcessor
+from jobbers.state_manager import StateManager, TaskRateLimitedError, UserCancellationError
+from jobbers.task_processor import TaskProcessor, _spec_to_dag_node
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +67,57 @@ async def test_task_processor_success():
     assert result_task.results == {"result": "success"}
     # save_task called once when starting; complete_task called when done
     state_manager.save_task.assert_has_calls([call(task), call(task)])
+
+
+@pytest.mark.asyncio
+async def test_execution_time_metric_excludes_retry_backoff_wait():
+    """
+    Uses retried_at (start of the final attempt), not started_at (start of the very first attempt).
+
+    Regression test: a retried task's recorded execution_time previously spanned every retry's
+    backoff wait (completed_at - started_at), not just the attempt that actually finished.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.UNSUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = _make_state_manager()
+    failing_function = AsyncMock(side_effect=ValueError("boom"))
+    failing_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=failing_function,
+        timeout=10,
+        max_retries=3,
+        expected_exceptions=(ValueError,),
+    )
+
+    with patch("jobbers.task_processor.get_task_config", return_value=failing_config):
+        retried_task = await TaskProcessor(state_manager).process(task)
+
+    assert retried_task.status == TaskStatus.SUBMITTED
+    # Simulate a long backoff wait between the first (failed) attempt and the retry: a bug
+    # using started_at instead of retried_at would show up as a huge (wrong) execution_time.
+    retried_task.started_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=1)
+
+    succeeding_function = AsyncMock(return_value=TaskResult(results={"ok": True}))
+    succeeding_config = TaskConfig(
+        name="test_task", version=1, function=succeeding_function, timeout=10, max_retries=3
+    )
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=succeeding_config),
+        patch("jobbers.task_processor.execution_time") as mock_execution_time,
+    ):
+        completed_task = await TaskProcessor(state_manager).process(retried_task)
+
+    assert completed_task.status == TaskStatus.COMPLETED
+    mock_execution_time.record.assert_called_once()
+    recorded_ms = mock_execution_time.record.call_args[0][0]
+    assert recorded_ms < 5000  # well under the ~1 hour backoff gap; only the 2nd attempt counted
 
 
 @pytest.mark.asyncio
@@ -336,11 +396,13 @@ async def test_task_processor_cancelled_with_resubmit_policy():
         with pytest.raises(asyncio.CancelledError):
             await processor.process(task)
 
-    # Task should be marked for resubmission due to RESUBMIT policy
-    assert task.status == TaskStatus.UNSUBMITTED
+    # Task should be marked SUBMITTED and re-enqueued due to RESUBMIT policy
+    assert task.status == TaskStatus.SUBMITTED
     assert task.completed_at is None  # Should not be completed when resubmitted
-    # save_task called when starting and when handling cancellation
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    assert task.retry_attempt == 0  # resubmit-on-shutdown is not a retry
+    # save_task called once when starting; requeue_task called when handling cancellation
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.requeue_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -821,7 +883,7 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     c1 = DAGNode("worker_a")
     c2 = DAGNode("worker_b")
     collector = DAGNode("aggregator")
-    fanout = DynamicFanOut(children=[c1, c2], collector=collector)
+    fanout = DynamicFanOut(arms=[c1, c2], collector=collector)
 
     state_manager = _make_state_manager()
     state_manager.init_fan_in = AsyncMock()
@@ -832,11 +894,13 @@ async def test_handle_dynamic_fanout_submits_children_and_presaves_collector():
     state_manager.get_queue_config = AsyncMock(return_value=None)
 
     processor = TaskProcessor(state_manager)
-    await processor._handle_dynamic_fanout(parent, fanout)
+    await processor._handle_dynamic_fanout(parent, fanout, [])
 
-    # init_fan_in called once with correct key and both child IDs
+    # init_fan_in called once with the run's dag_run_id, correct key, and both child IDs
     fan_in_key = f"dag:fan-in:{collector.id}"
-    state_manager.init_fan_in.assert_awaited_once_with(fan_in_key, {c1.id, c2.id}, ttl=fanout.fan_in_ttl)
+    state_manager.init_fan_in.assert_awaited_once_with(
+        dag_run_id, fan_in_key, {c1.id, c2.id}, ttl=fanout.fan_in_ttl
+    )
     # collector pre-saved once with parent_ids == all child IDs
     state_manager.save_task.assert_awaited_once()
     saved_task = state_manager.save_task.call_args[0][0]
@@ -867,7 +931,7 @@ async def test_handle_dynamic_fanout_no_children_submits_collector_immediately()
         dag_run_id=dag_run_id,
     )
     collector = DAGNode("aggregator")
-    fanout = DynamicFanOut(children=[], collector=collector)
+    fanout = DynamicFanOut(arms=[], collector=collector)
 
     state_manager = _make_state_manager()
     state_manager.init_fan_in = AsyncMock()
@@ -875,13 +939,392 @@ async def test_handle_dynamic_fanout_no_children_submits_collector_immediately()
     state_manager.submit_task = AsyncMock()
 
     processor = TaskProcessor(state_manager)
-    await processor._handle_dynamic_fanout(parent, fanout)
+    await processor._handle_dynamic_fanout(parent, fanout, [])
 
     state_manager.init_fan_in.assert_not_called()
     state_manager.submit_task.assert_awaited_once()
     submitted = state_manager.submit_task.call_args[0][0]
     assert submitted.id == collector.id
     assert submitted.dag_run_id == dag_run_id
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_no_children_logs_and_does_not_raise_on_rate_limit(caplog):
+    """A rate-limited degenerate-collector submission is logged, not propagated."""
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    collector = DAGNode("aggregator")
+    fanout = DynamicFanOut(arms=[], collector=collector)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
+
+    processor = TaskProcessor(state_manager)
+    with caplog.at_level(logging.ERROR):
+        await processor._handle_dynamic_fanout(parent, fanout, [])  # must not raise
+
+    assert any("rejected by rate" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_no_children_with_outer_fan_in_still_delegates():
+    """
+    Degenerate (zero-arm) fan-out must still delegate outer fan-in callbacks to the solo collector.
+
+    Regression test: the zero-arm early return used to submit the collector without
+    ever calling delegate_fan_in, so an outer fan-in waiting on the parent would
+    never be closed and would hang forever.
+    """
+    dag_run_id = ULID()
+    outer_fan_in_key = "dag:fan-in:outer-collector"
+    outer_fan_in_cb = FanInCallback(
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
+        fan_in_key=outer_fan_in_key,
+    )
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        dag_callbacks=[outer_fan_in_cb],
+    )
+    collector = DAGNode("aggregator")
+    fanout = DynamicFanOut(arms=[], collector=collector, propagate_fan_in=True)
+
+    state_manager = _make_state_manager()
+    state_manager.submit_task = AsyncMock()
+    state_manager.task_state.delegate_fan_in = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout, [outer_fan_in_cb])
+
+    state_manager.task_state.delegate_fan_in.assert_awaited_once_with(
+        dag_run_id, outer_fan_in_key, parent.id, collector.id
+    )
+    state_manager.submit_task.assert_awaited_once()
+    submitted = state_manager.submit_task.call_args[0][0]
+    assert submitted.id == collector.id
+    assert outer_fan_in_cb in submitted.dag_callbacks
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_multi_step_arms_wires_fan_in_to_terminals():
+    """Fan-in is attached to terminal (leaf) nodes, not arm roots, for multi-step arms."""
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    # arm: root_a → step_a (terminal); root_b is single-step (its own terminal)
+    root_a = DAGNode("root_a")
+    step_a = DAGNode("step_a")
+    root_a.then(step_a)
+    root_b = DAGNode("root_b")
+    collector = DAGNode("aggregator")
+    fanout = DynamicFanOut(arms=[root_a, root_b], collector=collector)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout, [])
+
+    # Collector fan-in must wait for {step_a, root_b} — the *terminals* — not {root_a, root_b}.
+    collector_fan_in_key = f"dag:fan-in:{collector.id}"
+    init_calls = {call[0][1]: call[0][2] for call in state_manager.init_fan_in.call_args_list}
+    assert all(call[0][0] == dag_run_id for call in state_manager.init_fan_in.call_args_list)
+    assert collector_fan_in_key in init_calls
+    assert init_calls[collector_fan_in_key] == {step_a.id, root_b.id}
+
+    # Arm roots are submitted (not terminals); step_a's callbacks wire it to the collector.
+    arm_tasks = state_manager.submit_tasks_batch.call_args[0][0]
+    assert {t.id for t in arm_tasks} == {root_a.id, root_b.id}
+
+    # Verify the callback chain is baked correctly into root_a_task so that at
+    # execution time root_a → (submits) step_a → (decrements fan-in) → collector.
+    arm_tasks_by_id = {t.id: t for t in arm_tasks}
+    root_a_task = arm_tasks_by_id[root_a.id]
+    assert len(root_a_task.dag_callbacks) == 1
+    assert isinstance(root_a_task.dag_callbacks[0], SimpleCallback)
+    step_a_spec = root_a_task.dag_callbacks[0].task
+    assert step_a_spec.id == step_a.id
+    fan_in_cbs = [cb for cb in step_a_spec.dag_callbacks if isinstance(cb, FanInCallback)]
+    assert len(fan_in_cbs) == 1
+    assert fan_in_cbs[0].fan_in_key == collector_fan_in_key
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_arm_with_static_diamond_inits_both_fan_ins():
+    """An arm with a static diamond sub-graph initialises both the inner and outer fan-in sets."""
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    # arm_A: arm_root → (b1, b2) → merge_node   (static diamond within the arm)
+    arm_root = DAGNode("arm_root")
+    b1 = DAGNode("branch_1")
+    b2 = DAGNode("branch_2")
+    merge_node = DAGNode("merge_node")
+    arm_root.then(b1, b2)
+    DAGNode.merge(b1, b2, into=merge_node)
+    # arm_B: single-step
+    arm_b = DAGNode("arm_b")
+    collector = DAGNode("collector")
+    fanout = DynamicFanOut(arms=[arm_root, arm_b], collector=collector)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout, [])
+
+    outer_key = f"dag:fan-in:{collector.id}"
+    inner_key = f"dag:fan-in:{merge_node.id}"
+    init_calls = {c[0][1]: c[0][2] for c in state_manager.init_fan_in.call_args_list}
+    assert all(c[0][0] == dag_run_id for c in state_manager.init_fan_in.call_args_list)
+
+    # Outer fan-in: collector waits for the terminal of arm_A (merge_node) and arm_b.
+    assert init_calls[outer_key] == {merge_node.id, arm_b.id}
+    # Inner (static) fan-in within arm_A: merge_node waits for b1 and b2.
+    assert init_calls[inner_key] == {b1.id, b2.id}
+
+    # Only arm roots are submitted — the branch and merge nodes are interior.
+    arm_tasks = state_manager.submit_tasks_batch.call_args[0][0]
+    assert {t.id for t in arm_tasks} == {arm_root.id, arm_b.id}
+
+    # Verify the full callback chain baked into arm_root_task:
+    #   arm_root → SimpleCallback(b1), SimpleCallback(b2)
+    #   b1 → FanInCallback(inner_key, merge_node)
+    #   merge_node → FanInCallback(outer_key, collector)
+    arm_tasks_by_id = {t.id: t for t in arm_tasks}
+    arm_root_task = arm_tasks_by_id[arm_root.id]
+    child_ids = {cb.task.id for cb in arm_root_task.dag_callbacks if isinstance(cb, SimpleCallback)}
+    assert child_ids == {b1.id, b2.id}
+
+    b1_spec = next(
+        cb.task
+        for cb in arm_root_task.dag_callbacks
+        if isinstance(cb, SimpleCallback) and cb.task.id == b1.id
+    )
+    inner_cbs = [cb for cb in b1_spec.dag_callbacks if isinstance(cb, FanInCallback)]
+    assert len(inner_cbs) == 1
+    assert inner_cbs[0].fan_in_key == inner_key
+
+    merge_spec = inner_cbs[0].task
+    assert merge_spec.id == merge_node.id
+    outer_cbs = [cb for cb in merge_spec.dag_callbacks if isinstance(cb, FanInCallback)]
+    assert len(outer_cbs) == 1
+    assert outer_cbs[0].fan_in_key == outer_key
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_with_outer_fan_in_delegates_to_collector():
+    """When the parent has outer FanInCallbacks the collector inherits them and delegate_fan_in is called."""
+    dag_run_id = ULID()
+    outer_fan_in_key = "dag:fan-in:outer-collector"
+    outer_fan_in_cb = FanInCallback(
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
+        fan_in_key=outer_fan_in_key,
+    )
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        dag_callbacks=[outer_fan_in_cb],
+    )
+    arm = DAGNode("arm_task")
+    collector = DAGNode("inner_collect")
+    fanout = DynamicFanOut(arms=[arm], collector=collector, propagate_fan_in=True)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+    state_manager.task_state.delegate_fan_in = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_dynamic_fanout(parent, fanout, [outer_fan_in_cb])
+
+    # delegate_fan_in must swap parent.id → collector.id in the outer fan-in set.
+    state_manager.task_state.delegate_fan_in.assert_awaited_once_with(
+        dag_run_id, outer_fan_in_key, parent.id, collector.id
+    )
+
+    # The collector task must carry the outer fan-in callback.
+    saved_collector = state_manager.save_task.call_args[0][0]
+    assert saved_collector.id == collector.id
+    assert outer_fan_in_cb in saved_collector.dag_callbacks
+
+
+@pytest.mark.asyncio
+async def test_handle_dynamic_fanout_propagate_fan_in_false_skips_delegation():
+    """propagate_fan_in=False means outer fan-in callbacks are NOT transferred to the collector."""
+    dag_run_id = ULID()
+    outer_fan_in_key = "dag:fan-in:outer-collector"
+    outer_fan_in_cb = FanInCallback(
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
+        fan_in_key=outer_fan_in_key,
+    )
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        dag_callbacks=[outer_fan_in_cb],
+    )
+    arm = DAGNode("arm_task")
+    collector = DAGNode("inner_collect")
+    # opt-out: the parent task's FanInCallback should fire immediately, not be delegated
+    fanout = DynamicFanOut(arms=[arm], collector=collector, propagate_fan_in=False)
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_task = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+    state_manager.task_state.delegate_fan_in = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    # With propagate_fan_in=False, post_process passes outer_fan_in_cbs=[]
+    await processor._handle_dynamic_fanout(parent, fanout, [])
+
+    # No delegation — delegate_fan_in must not be called.
+    state_manager.task_state.delegate_fan_in.assert_not_awaited()
+
+    # The collector must NOT carry the outer fan-in callback.
+    saved_collector = state_manager.save_task.call_args[0][0]
+    assert outer_fan_in_cb not in saved_collector.dag_callbacks
+
+
+# ── declarative fan-out / _spec_to_dag_node (nested fan-out) ─────────────────
+
+
+def test_spec_to_dag_node_preserves_nested_dynamic_fanout_callback():
+    """
+    _spec_to_dag_node must reattach a DynamicFanOutCallback found on a spec node.
+
+    Regression test: nested declarative fan-outs (a mermaid arm task that is itself
+    a dispatcher) were previously lost when _handle_declarative_fanout rebuilt a
+    DAGNode tree from the stored DAGTaskSpec — the rebuilt arm task's dag_callbacks
+    no longer contained the inner DynamicFanOutCallback, so the nested fan-out never
+    fired when that arm task actually executed.
+    """
+    arm_spec = DAGTaskSpec(id=ULID(), name="inner_arm", queue="default", version=1, parameters={})
+    collector_spec = DAGTaskSpec(id=ULID(), name="inner_collector", queue="default", version=1, parameters={})
+    inner_fanout_cb = DynamicFanOutCallback(arm_root=arm_spec, collector=collector_spec, items_key="items")
+
+    dispatcher_spec = DAGTaskSpec(
+        id=ULID(),
+        name="dispatcher",
+        queue="default",
+        version=1,
+        parameters={},
+        dag_callbacks=[inner_fanout_cb],
+    )
+
+    node = _spec_to_dag_node(dispatcher_spec)
+    task = node.to_task()
+
+    fanout_cbs = [cb for cb in task.dag_callbacks if isinstance(cb, DynamicFanOutCallback)]
+    assert len(fanout_cbs) == 1
+    assert fanout_cbs[0].arm_root.name == "inner_arm"
+    assert fanout_cbs[0].collector.name == "inner_collector"
+
+
+@pytest.mark.asyncio
+async def test_handle_declarative_fanout_preserves_nested_dispatch_on_arm_task():
+    """
+    An arm task that is itself a nested dispatcher keeps its own DynamicFanOutCallback.
+
+    End-to-end regression test for the canonical nested-fanout mermaid example
+    (A -->> B; B -->> R; R --o D; D --o C): when outer dispatcher A completes and
+    _handle_declarative_fanout rebuilds/submits arm B, B's submitted task must still
+    carry the inner DynamicFanOutCallback — otherwise B's own dispatch to R/D is
+    silently dropped when B executes.
+    """
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="outer_dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        results={"items": [{}]},
+    )
+
+    inner_arm_spec = DAGTaskSpec(id=ULID(), name="inner_worker", queue="default", version=1, parameters={})
+    inner_collector_spec = DAGTaskSpec(
+        id=ULID(), name="inner_collector", queue="default", version=1, parameters={}
+    )
+    inner_fanout_cb = DynamicFanOutCallback(
+        arm_root=inner_arm_spec, collector=inner_collector_spec, items_key="items"
+    )
+
+    # The outer arm template ("process_batch") is itself a nested dispatcher.
+    outer_arm_root = DAGTaskSpec(
+        id=ULID(),
+        name="process_batch",
+        queue="default",
+        version=1,
+        parameters={},
+        dag_callbacks=[inner_fanout_cb],
+    )
+    outer_collector_spec = DAGTaskSpec(
+        id=ULID(), name="aggregate_all", queue="default", version=1, parameters={}
+    )
+    outer_cb = DynamicFanOutCallback(
+        arm_root=outer_arm_root, collector=outer_collector_spec, items_key="items"
+    )
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_tasks_batch = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_declarative_fanout(parent, outer_cb)
+
+    state_manager.submit_tasks_batch.assert_awaited_once()
+    submitted_arms = state_manager.submit_tasks_batch.call_args[0][0]
+    assert len(submitted_arms) == 1
+    arm_task = submitted_arms[0]
+    nested_cbs = [cb for cb in arm_task.dag_callbacks if isinstance(cb, DynamicFanOutCallback)]
+    assert len(nested_cbs) == 1, "the arm task must still carry its own nested DynamicFanOutCallback"
+    assert nested_cbs[0].arm_root.name == "inner_worker"
 
 
 @pytest.mark.asyncio
@@ -965,6 +1408,35 @@ async def test_post_process_triggers_dag_callbacks():
 
 
 @pytest.mark.asyncio
+async def test_process_completed_task_records_post_process_failure_without_raising():
+    """A post_process failure is logged, recorded on the task, and does not propagate."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(return_value=TaskResult(results={}))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch("jobbers.task_processor.post_process_failures") as mock_counter,
+    ):
+        processor = TaskProcessor(state_manager)
+        with patch.object(processor, "post_process", AsyncMock(side_effect=RuntimeError("boom"))):
+            result_task = await processor.process(task)  # must not raise
+
+    assert result_task.status == TaskStatus.COMPLETED
+    assert any("post_process failed" in e and "boom" in e for e in result_task.errors)
+    assert state_manager.save_task.call_count >= 2  # once on start, once from the failure handler
+    mock_counter.add.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
     """post_process delegates to _handle_dynamic_fanout when a DynamicFanOut is passed."""
     parent = Task(
@@ -974,7 +1446,7 @@ async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
         status=TaskStatus.COMPLETED,
         queue="default",
     )
-    fanout = DynamicFanOut(children=[DAGNode("child")], collector=DAGNode("collect"))
+    fanout = DynamicFanOut(arms=[DAGNode("child")], collector=DAGNode("collect"))
 
     state_manager = _make_state_manager()
     processor = TaskProcessor(state_manager)
@@ -982,7 +1454,54 @@ async def test_post_process_with_dynamic_fanout_calls_handle_dynamic_fanout():
     with patch.object(processor, "_handle_dynamic_fanout", new_callable=AsyncMock) as mock_fanout:
         await processor.post_process(parent, dynamic_fanout=fanout)
 
-    mock_fanout.assert_awaited_once_with(parent, fanout)
+    mock_fanout.assert_awaited_once_with(parent, fanout, [])
+
+
+@pytest.mark.asyncio
+async def test_post_process_declarative_fanout_skips_delegated_outer_fan_in():
+    """
+    An outer fan-in member that is also a declarative dispatcher must not re-decrement its delegated key.
+
+    Regression test: post_process's skip_fan_in_keys was only ever computed from
+    the programmatic `dynamic_fanout` parameter, never from a declarative
+    DynamicFanOutCallback's own propagate_fan_in — so a nested-declarative
+    dispatcher that was also an outer fan-in member always fell through to
+    generate_callbacks, hit the already-renamed key, and logged a spurious
+    "skipping collector" warning plus a wasted round trip on every completion.
+    """
+    dag_run_id = ULID()
+    outer_fan_in_key = "dag:fan-in:outer-collector"
+    outer_fan_in_cb = FanInCallback(
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
+        fan_in_key=outer_fan_in_key,
+    )
+    inner_fanout_cb = DynamicFanOutCallback(
+        arm_root=DAGTaskSpec(name="inner_worker", queue="default"),
+        collector=DAGTaskSpec(name="inner_collector", queue="default"),
+        items_key="items",
+    )
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        dag_callbacks=[outer_fan_in_cb, inner_fanout_cb],
+    )
+
+    state_manager = _make_state_manager()
+    state_manager.task_state.fan_in_complete = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    with patch.object(processor, "_handle_declarative_fanout", new_callable=AsyncMock) as mock_declarative:
+        await processor.post_process(parent)
+
+    mock_declarative.assert_awaited_once_with(parent, inner_fanout_cb)
+    # The outer FanInCallback's key must be skipped here -- _handle_declarative_fanout
+    # (mocked above, but exercised for real in test_handle_declarative_fanout_*) is
+    # responsible for delegating it via delegate_fan_in instead.
+    state_manager.task_state.fan_in_complete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1169,6 +1688,34 @@ async def test_post_process_error_no_error_callbacks_does_nothing():
     await processor.post_process_error(task)
 
     state_manager.submit_tasks_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_process_failed_task_records_post_process_error_failure_without_raising():
+    """A post_process_error failure is logged, recorded on the task, and does not propagate."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10, max_retries=0)
+
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch("jobbers.task_processor.post_process_failures") as mock_counter,
+    ):
+        processor = TaskProcessor(state_manager)
+        with patch.object(processor, "post_process_error", AsyncMock(side_effect=RuntimeError("kaboom"))):
+            result_task = await processor.process(task)  # must not raise
+
+    assert result_task.status == TaskStatus.FAILED
+    assert any("post_process failed" in e and "kaboom" in e for e in result_task.errors)
+    mock_counter.add.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -1591,11 +2138,16 @@ async def test_maybe_cleanup_standalone_no_cleanup_on():
 
 
 @pytest.mark.asyncio
-async def test_maybe_cleanup_dag_task_waits_when_siblings_still_active():
-    """DAG task is NOT deleted when a sibling is still in an active state."""
+async def test_maybe_cleanup_dag_task_delegates_to_state_manager():
+    """
+    DAG tasks delegate to StateManager.close_dag_run_task_and_sweep.
+
+    The counter-close-and-sweep logic itself now lives on StateManager (so the
+    Cleaner's stale-heartbeat path can trigger it too, see test_state_manager.py) —
+    TaskProcessor just needs to call it exactly once per DAG-task completion.
+    """
     dag_run_id = ULID()
     task_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
-    sibling_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
 
     task = Task(
         id=task_id,
@@ -1605,12 +2157,9 @@ async def test_maybe_cleanup_dag_task_waits_when_siblings_still_active():
         queue="default",
         dag_run_id=dag_run_id,
     )
-    # Sibling is still STARTED (active).
-    sibling = Task(id=sibling_id, name="test_task", version=1, status=TaskStatus.STARTED, queue="default")
 
     state_manager = _make_state_manager()
-    state_manager.get_dag_run = AsyncMock(return_value=(dt.datetime.now(dt.UTC), [task_id, sibling_id]))
-    state_manager.task_state.get_tasks_bulk = AsyncMock(return_value=[task, sibling])
+    state_manager.close_dag_run_task_and_sweep = AsyncMock()
 
     task_function = AsyncMock(return_value=None)
     task_config = TaskConfig(
@@ -1625,36 +2174,80 @@ async def test_maybe_cleanup_dag_task_waits_when_siblings_still_active():
         await processor.process(task)
 
     assert task.status == TaskStatus.COMPLETED
+    state_manager.close_dag_run_task_and_sweep.assert_awaited_once_with(task)
     state_manager.delete_task.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_maybe_cleanup_dag_task_deletes_when_all_siblings_terminal():
-    """When all DAG tasks are terminal, all those with matching cleanup_on are deleted."""
-    dag_run_id = ULID()
-    task_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
-    sibling_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+async def test_maybe_cleanup_skipped_for_non_terminal_status():
+    """
+    A DAG task that retries (non-terminal status) must NOT close itself out of the DAG run's pending set.
 
+    Regression test: process() used to call _maybe_cleanup unconditionally, so a
+    task hitting a retryable exception (status SCHEDULED/UNSUBMITTED, not done)
+    would still call close_dag_run_task_and_sweep, permanently marking it closed
+    before it had actually finished.
+    """
+    dag_run_id = ULID()
     task = Task(
-        id=task_id,
+        id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
         version=1,
         status=TaskStatus.SUBMITTED,
         queue="default",
         dag_run_id=dag_run_id,
     )
-    sibling = Task(id=sibling_id, name="test_task", version=1, status=TaskStatus.COMPLETED, queue="default")
+
+    task_function = AsyncMock(side_effect=ValueError("transient"))
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        max_retries=3,
+        expected_exceptions=(ValueError,),
+        cleanup_on=frozenset({TaskStatus.COMPLETED}),
+    )
 
     state_manager = _make_state_manager()
-    state_manager.get_dag_run = AsyncMock(return_value=(dt.datetime.now(dt.UTC), [task_id, sibling_id]))
+    state_manager.close_dag_run_task_and_sweep = AsyncMock()
 
-    async def _get_tasks_bulk(ids: list) -> list:
-        # After process() runs, task status is COMPLETED; return both as terminal.
-        return [task, sibling]
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
 
-    state_manager.task_state.get_tasks_bulk = AsyncMock(side_effect=_get_tasks_bulk)
+    # No retry_delay configured means immediate retry: _handle_retry sets UNSUBMITTED,
+    # then queue_retry_task re-queues it as SUBMITTED — either way, not terminal.
+    assert task.status == TaskStatus.SUBMITTED
+    state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.delete_task.assert_not_awaited()
 
-    task_function = AsyncMock(return_value=None)
+
+@pytest.mark.asyncio
+async def test_maybe_cleanup_failed_dag_task_does_not_close_pending():
+    """
+    A DAG task that permanently FAILS must NOT close itself out of the DAG run's pending set.
+
+    A FAILED task never calls generate_callbacks(), so any FanInCallback/
+    DynamicFanOutCallback it carries never fires and the DAG can't complete on its
+    own. Closing it out of DAG_RUN_PENDING here would let the run's pending count
+    reach zero and trigger the sweep even though the DAG never actually finished —
+    the run must stay open (fan-in tracking and sibling records preserved within
+    their TTLs) instead.
+    """
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+
+    # No expected_exceptions configured, so any raised exception is unexpected and
+    # goes straight to handle_unexpected_exception -> FAILED, regardless of retries.
+    task_function = AsyncMock(side_effect=ValueError("boom"))
     task_config = TaskConfig(
         name="test_task",
         version=1,
@@ -1662,12 +2255,94 @@ async def test_maybe_cleanup_dag_task_deletes_when_all_siblings_terminal():
         timeout=10,
         cleanup_on=frozenset({TaskStatus.COMPLETED}),
     )
-    with (
-        patch("jobbers.task_processor.get_task_config", return_value=task_config),
-        patch("jobbers.task_processor.registry.get_task_config", return_value=task_config),
-    ):
+
+    state_manager = _make_state_manager()
+    state_manager.close_dag_run_task_and_sweep = AsyncMock()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        await processor.process(task)
+
+    assert task.status == TaskStatus.FAILED
+    state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.delete_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.CANCELLED, TaskStatus.DROPPED])
+async def test_maybe_cleanup_stuck_dag_task_does_not_close_pending(status):
+    """
+    A DAG task that ends CANCELLED or DROPPED must NOT close itself out of the DAG run's pending set.
+
+    Both share FAILED/STALLED's defect (now reflected in stuck_statuses()): the task
+    never calls generate_callbacks(), so any FanInCallback/DynamicFanOutCallback it
+    carries never fires. Closing it out of DAG_RUN_PENDING here would let the run's
+    pending count reach zero and trigger the sibling sweep even though the collector
+    this task belonged to can now never fire.
+    """
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=status,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+    state_manager = _make_state_manager()
+    state_manager.close_dag_run_task_and_sweep = AsyncMock()
+
+    processor = TaskProcessor(state_manager)
+    await processor._maybe_cleanup(task)
+
+    state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_cleanup_runs_after_dynamic_fanout_registers_arms():
+    """
+    Regression test for an ordering hazard with _maybe_cleanup.
+
+    _maybe_cleanup must run after post_process spawns fan-out arms, so a dispatcher
+    only closes itself out of the DAG run's pending set once its own arms are
+    already registered in that same set. If cleanup ran first (as it used to), a
+    dispatcher that looked like the last active task could trigger cleanup before
+    the arms it was about to spawn even existed.
+    """
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatcher",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_run_id=dag_run_id,
+    )
+
+    def _dispatch(**kwargs):
+        arm = DAGNode("worker")
+        collector = DAGNode("aggregator")
+        return TaskResult(results={}, fanout=DynamicFanOut(arms=[arm], collector=collector))
+
+    task_function = AsyncMock(side_effect=_dispatch)
+    task_config = TaskConfig(
+        name="dispatcher",
+        version=1,
+        function=task_function,
+        timeout=10,
+        cleanup_on=frozenset({TaskStatus.COMPLETED}),
+    )
+
+    state_manager = _make_state_manager()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+    state_manager.close_dag_run_task_and_sweep = AsyncMock()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         await processor.process(task)
 
     assert task.status == TaskStatus.COMPLETED
-    assert state_manager.delete_task.await_count == 2
+    call_names = [c[0] for c in state_manager.mock_calls]
+    submit_index = call_names.index("submit_tasks_batch")
+    close_index = call_names.index("close_dag_run_task_and_sweep")
+    assert submit_index < close_index, "arms must be registered before the dispatcher closes out of the run"

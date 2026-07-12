@@ -1,5 +1,6 @@
 import datetime as dt
 import logging
+import types
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Any, Self, get_args, get_origin, get_type_hints
 
@@ -10,7 +11,7 @@ from ulid import ULID
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.utils.di import get_injected_param_names
 
-from .dag import DAGCallback, DAGTaskSpec, FanInCallback, SimpleCallback, TaskResult
+from .dag import DAGCallback, DAGTaskSpec, DynamicFanOutCallback, FanInCallback, SimpleCallback, TaskResult
 from .task_config import TaskConfig
 from .task_status import TaskStatus
 
@@ -140,7 +141,18 @@ class Task(BaseModel):
                 continue
             # Strip Annotated wrapper before isinstance (Annotated is not a valid isinstance target)
             raw_type = get_args(hint)[0] if get_origin(hint) is Annotated else hint
-            if not isinstance(self.parameters[param], raw_type):
+            # Parameterized generics (list[str], dict[str, int], ...) aren't valid isinstance
+            # targets either -- fall back to their origin (list, dict, ...) for a shallow check.
+            # X | Y unions ARE valid isinstance targets directly, so leave those alone.
+            origin = get_origin(raw_type)
+            check_type = origin if isinstance(origin, type) and origin is not types.UnionType else raw_type
+            try:
+                matches = isinstance(self.parameters[param], check_type)
+            except TypeError:
+                # Some hints (e.g. Literal[...], TypeVar) still aren't runtime-checkable even
+                # after the above -- skip validation for this param rather than crash.
+                continue
+            if not matches:
                 return False
         return True
 
@@ -149,16 +161,19 @@ class Task(BaseModel):
             return
         match self.task_config.on_shutdown:
             case TaskShutdownPolicy.CONTINUE:
-                # NOOP: the task coroutine is wrapped in asyncio.shield(), so even if
-                # CancelledError propagates to the outer await, the inner coroutine keeps
-                # running. STARTED is the correct state to persist — the task is still
-                # in flight.
+                # NOOP: the worker never cancels CONTINUE-policy tasks on shutdown in
+                # the first place (see worker_proc.main) — they simply keep running to
+                # completion, so this handler only fires for CONTINUE in abnormal
+                # (non-graceful) termination paths. STARTED is the correct state to
+                # persist in that case — the task is still in flight.
                 pass
             case TaskShutdownPolicy.STOP:
                 self.set_status(TaskStatus.STALLED)
             case TaskShutdownPolicy.RESUBMIT:
-                # Direct assignment: shutdown-triggered resubmit should not increment retry_attempt
-                self.status = TaskStatus.UNSUBMITTED
+                # SUBMITTED, not a retry via UNSUBMITTED: this must not bump
+                # retry_attempt. TaskProcessor.handle_system_cancelled_task re-enqueues
+                # the task via requeue_task() right after calling shutdown().
+                self.set_status(TaskStatus.SUBMITTED)
 
     def should_retry(self) -> bool:
         if not self.task_config:
@@ -206,7 +221,11 @@ class Task(BaseModel):
             if cb.error_callback is not None
         ]
 
-    async def generate_callbacks(self, ta: "TaskStateProtocol") -> list[Self]:
+    async def generate_callbacks(
+        self,
+        ta: "TaskStateProtocol",
+        skip_fan_in_keys: "frozenset[str] | set[str]" = frozenset(),
+    ) -> list[Self]:
         """
         Generate tasks to submit after this task completes.
 
@@ -218,16 +237,32 @@ class Task(BaseModel):
 
         Returns -1 from `fan_in_complete` when the ID was not a member (already
         processed or key expired); in that case the collector is not submitted.
+
+        ``skip_fan_in_keys`` is the set of ``fan_in_key`` values that should NOT
+        be decremented by this task.  Used when the processor has delegated those
+        outer fan-in callbacks to a grandcollector, so the grandcollector's
+        completion — not this task's — decrements the outer set.
         """
         results: list[Self] = []
         for cb in self.dag_callbacks:
             match cb:
+                case DynamicFanOutCallback():
+                    # Handled separately by TaskProcessor.post_process; skip here.
+                    continue
                 case SimpleCallback():
                     results.append(self._build_callback_task(cb.task, [self.id], cb.inject_parent_results))
                 case FanInCallback():
-                    remaining = await ta.fan_in_complete(cb.fan_in_key, self.id)
+                    if cb.fan_in_key in skip_fan_in_keys:
+                        continue
+                    if self.dag_run_id is None:
+                        raise ValueError(
+                            f"Task {self.id} has a FanInCallback (key={cb.fan_in_key!r}) but no "
+                            "dag_run_id. Fan-in tracking is scoped per DAG run — submit via "
+                            "submit_dag()/dispatch_cron_dag() or dynamic fan-out, which assign one."
+                        )
+                    remaining = await ta.fan_in_complete(self.dag_run_id, cb.fan_in_key, self.id)
                     if remaining == 0:
-                        member_ids = await ta.get_fan_in_members(cb.fan_in_key)
+                        member_ids = await ta.get_fan_in_members(self.dag_run_id, cb.fan_in_key)
                         results.append(
                             self._build_callback_task(cb.task, member_ids, cb.inject_parent_results)
                         )

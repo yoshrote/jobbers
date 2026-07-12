@@ -8,6 +8,7 @@ Fixtures:
   that call ``add()`` or ``remove()`` since the static backend raises ReadOnly.
 """
 
+import asyncio
 import datetime as dt
 
 import pytest
@@ -242,6 +243,64 @@ async def test_get_active_run_returns_none_when_unset(mutable_cron_dag_scheduler
     entry = make_entry()
     await mutable_cron_dag_scheduler.add(entry, FUTURE)
     assert await mutable_cron_dag_scheduler.get_active_run(entry.id) is None
+
+
+# ── dispatch lock ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_dispatch_lock_succeeds_when_free(mutable_cron_dag_scheduler):
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, FUTURE)
+    assert await mutable_cron_dag_scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is True
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_dispatch_lock_fails_when_held(mutable_cron_dag_scheduler):
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, FUTURE)
+    assert await mutable_cron_dag_scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is True
+    assert await mutable_cron_dag_scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is False
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_dispatch_lock_succeeds_after_release(mutable_cron_dag_scheduler):
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, FUTURE)
+    assert await mutable_cron_dag_scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is True
+    await mutable_cron_dag_scheduler.release_dispatch_lock(entry.id)
+    assert await mutable_cron_dag_scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is True
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_dispatch_lock_succeeds_after_ttl_expiry(mutable_cron_dag_scheduler):
+    """A dispatch lock self-heals via its TTL even without an explicit release."""
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, FUTURE)
+    assert await mutable_cron_dag_scheduler.try_acquire_dispatch_lock(entry.id, ttl=1) is True
+    await asyncio.sleep(1.2)
+    assert await mutable_cron_dag_scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is True
+
+
+@pytest.mark.asyncio
+async def test_release_dispatch_lock_is_a_noop_when_unheld(mutable_cron_dag_scheduler):
+    entry = make_entry()
+    await mutable_cron_dag_scheduler.add(entry, FUTURE)
+    await mutable_cron_dag_scheduler.release_dispatch_lock(entry.id)  # must not raise
+
+
+# ── static backend: dispatch lock ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_static_dispatch_lock_acquire_and_release():
+    """Static dispatch lock is in-process only (see StaticCronDAGScheduler's docstring)."""
+    entry = make_entry()
+    scheduler = StaticCronDAGScheduler(entries=[entry])
+    assert await scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is True
+    assert await scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is False
+    await scheduler.release_dispatch_lock(entry.id)
+    assert await scheduler.try_acquire_dispatch_lock(entry.id, ttl=60) is True
 
 
 # ── list ──────────────────────────────────────────────────────────────────────

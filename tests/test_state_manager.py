@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import datetime as dt
+import logging
 from collections import defaultdict
 from unittest.mock import AsyncMock, patch
 
@@ -23,7 +24,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
-from jobbers.state_manager import StateManager, TaskException, UserCancellationError
+from jobbers.state_manager import StateManager, TaskException, TaskRateLimitedError, UserCancellationError
 from tests.conftest import DummyCronDAGScheduler, DummyTaskSubmit
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -134,6 +135,18 @@ async def test_concurrency_limits_with_limits(state_manager, rate_limiter):
 
     result = await rate_limiter.concurrency_limits(task_queues, current_tasks_by_queue)
     assert result == {"queue2"}
+
+
+@pytest.mark.asyncio
+async def test_concurrency_limits_max_concurrent_zero_is_unlimited(state_manager, rate_limiter):
+    """max_concurrent=0 means unlimited, same as None -- not "block this queue"."""
+    await state_manager.routing.save_queue_config(QueueConfig(name="queue1", max_concurrent=0))
+
+    task_queues = ["queue1"]
+    current_tasks_by_queue = {"queue1": {ULID(), ULID(), ULID()}}
+
+    result = await rate_limiter.concurrency_limits(task_queues, current_tasks_by_queue)
+    assert result == {"queue1"}
 
 
 @pytest.mark.asyncio
@@ -255,6 +268,283 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager_
     assert saved is not None
     assert saved.status == TaskStatus.STALLED
     assert await redis.zscore("task-heartbeats:default", ULID1.bytes) is None
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_dag_task_leaves_run_open(redis, state_manager_real_ta):
+    """
+    A stale-heartbeat DAG task is marked STALLED but never closes out of DAG_RUN_PENDING.
+
+    Regression test: an earlier version of this Cleaner path called
+    close_dag_run_task_and_sweep for newly-stalled tasks, which would delete this
+    task (its own cleanup_on matches STALLED) once it looked like the run's last
+    pending task. A STALLED task never calls generate_callbacks(), so its
+    FanInCallback/DynamicFanOutCallback never fires and the DAG can't complete on
+    its own — the run must stay open (fan-in tracking and sibling records
+    preserved within their TTLs) instead of being swept away as if it had
+    completed normally.
+    """
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    dag_run_id = ULID()
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+        dag_run_id=dag_run_id,
+        submitted_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task",
+        function=dummy_fn,
+        max_heartbeat_interval=dt.timedelta(minutes=5),
+        cleanup_on=frozenset({TaskStatus.STALLED}),
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    # Never closed out of DAG_RUN_PENDING: close_dag_run_task still finds it
+    # pending and decrements successfully, instead of reporting -1 (already closed).
+    assert await state_manager_real_ta.close_dag_run_task(dag_run_id, ULID1) == 0
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_task_with_dlq_policy_moves_to_dlq(redis, state_manager_real_ta):
+    """A stale-heartbeat task with dead_letter_policy=SAVE is marked STALLED and sent to the DLQ."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+        submitted_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task",
+        function=dummy_fn,
+        max_heartbeat_interval=dt.timedelta(minutes=5),
+        dead_letter_policy=DeadLetterPolicy.SAVE,
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    dlq = await state_manager_real_ta.dead_queue.get_by_ids([str(ULID1)])
+    assert len(dlq) == 1
+    assert dlq[0].id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_task_without_dlq_policy_skips_dlq(redis, state_manager_real_ta):
+    """A stale-heartbeat task with the default (NONE) dead_letter_policy is not sent to the DLQ."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+        submitted_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert await state_manager_real_ta.dead_queue.get_by_ids([str(ULID1)]) == []
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_stalled_task_with_dlq_policy_saga_mode(saga_state_manager):
+    """Same DLQ-on-stall behavior holds in saga mode (non-atomic task-state backend)."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+    )
+    await saga_state_manager.task_state.save_task(started)
+    await saga_state_manager.task_state.update_task_heartbeat(started)
+    await saga_state_manager.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task",
+        function=dummy_fn,
+        max_heartbeat_interval=dt.timedelta(minutes=5),
+        dead_letter_policy=DeadLetterPolicy.SAVE,
+    )
+    with patch.object(registry, "get_task_config", return_value=stale_config):
+        await saga_state_manager.clean(stale_time=dt.timedelta(minutes=30))
+
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    dlq = await saga_state_manager.dead_queue.get_by_ids([str(ULID1)])
+    assert len(dlq) == 1
+    assert dlq[0].id == ULID1
+
+
+# ── close_dag_run_task_and_sweep / sweep_dag_run ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_and_sweep_waits_when_siblings_pending(state_manager_real_ta):
+    """Remaining > 0 must not trigger a sweep — the still-pending sibling is untouched."""
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    task_b = Task(
+        id=ULID2,
+        name="my_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task_a)
+    await state_manager_real_ta.task_submit.submit_task(task=task_b)
+
+    cleanup_config = TaskConfig(
+        name="my_task", function=dummy_fn, cleanup_on=frozenset({TaskStatus.COMPLETED})
+    )
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.close_dag_run_task_and_sweep(task_a)
+
+    assert await state_manager_real_ta.task_state.task_exists(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_and_sweep_deletes_terminal_siblings_when_run_closes(state_manager_real_ta):
+    """When the last sibling closes, the sweep deletes every sibling whose status matches its cleanup_on."""
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    task_b = Task(
+        id=ULID2,
+        name="my_task",
+        version=1,
+        status=TaskStatus.FAILED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task_a)
+    await state_manager_real_ta.task_submit.submit_task(task=task_b)
+
+    cleanup_config = TaskConfig(
+        name="my_task", function=dummy_fn, cleanup_on=frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED})
+    )
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.close_dag_run_task_and_sweep(task_a)
+        await state_manager_real_ta.close_dag_run_task_and_sweep(task_b)
+
+    assert not await state_manager_real_ta.task_state.task_exists(ULID1)
+    assert not await state_manager_real_ta.task_state.task_exists(ULID2)
+
+
+@pytest.mark.asyncio
+async def test_sweep_dag_run_orphaned_index_falls_back_to_fallback_task(state_manager_real_ta):
+    """
+    An orphaned run index still cleans up the task that triggered the call, per its own cleanup_on.
+
+    Regression test: _sweep_dag_run used to just return when get_dag_run() found
+    nothing (e.g. clean_dag_runs concurrently swept the run's index), leaving the
+    completing task stuck instead of being reclaimed immediately.
+    """
+    dag_run_id = ULID()  # never registered via submit_task, so get_dag_run() -> None
+    task = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_state.save_task(task)
+
+    cleanup_config = TaskConfig(
+        name="my_task", function=dummy_fn, cleanup_on=frozenset({TaskStatus.COMPLETED})
+    )
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.sweep_dag_run(dag_run_id, fallback_task=task)
+
+    assert not await state_manager_real_ta.task_state.task_exists(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_sweep_dag_run_orphaned_index_skips_fallback_when_status_not_in_cleanup_on(
+    state_manager_real_ta,
+):
+    """Orphaned run index + fallback_task whose status doesn't match cleanup_on -> no deletion."""
+    dag_run_id = ULID()
+    task = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_state.save_task(task)
+
+    cleanup_config = TaskConfig(name="my_task", function=dummy_fn, cleanup_on=frozenset({TaskStatus.FAILED}))
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.sweep_dag_run(dag_run_id, fallback_task=task)
+
+    assert await state_manager_real_ta.task_state.task_exists(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_sweep_dag_run_orphaned_index_no_fallback_task_is_noop(state_manager_real_ta):
+    """Orphaned run index with no fallback_task is a plain no-op (no error)."""
+    dag_run_id = ULID()
+    await state_manager_real_ta.sweep_dag_run(dag_run_id)
 
 
 # ── fail_task ─────────────────────────────────────────────────────────────────
@@ -523,6 +813,30 @@ async def test_submit_task_rate_limited_branch(redis, state_manager_real_ta):
     assert count == 1
     members = await redis.zrange("task-queues:default", 0, -1)
     assert bytes(ULID1) in members
+
+
+@pytest.mark.asyncio
+async def test_submit_task_raises_and_reverts_status_when_rate_limited(redis, state_manager_real_ta):
+    """submit_task raises TaskRateLimitedError and reverts task.status when the limit is exceeded."""
+    await state_manager_real_ta.routing.save_queue_config(
+        QueueConfig(
+            name="default",
+            rate_numerator=1,
+            rate_denominator=1,
+            rate_period=RatePeriod.MINUTE,
+        )
+    )
+    occupier = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED)
+    await state_manager_real_ta.submit_task(occupier)
+
+    rejected = Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED)
+
+    with pytest.raises(TaskRateLimitedError):
+        await state_manager_real_ta.submit_task(rejected)
+
+    assert rejected.status == TaskStatus.UNSUBMITTED
+    members = await redis.zrange("task-queues:default", 0, -1)
+    assert bytes(ULID2) not in members
 
 
 # ── task_in_registry ──────────────────────────────────────────────────────────
@@ -829,11 +1143,11 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 
     state_manager.init_fan_in = AsyncMock()
 
-    _, submitted = await state_manager.submit_dag(branch_a, branch_b)
+    dag_run_id, submitted = await state_manager.submit_dag(branch_a, branch_b)
 
-    # init_fan_in must be called with the collector's fan-in key
+    # init_fan_in must be called with the run's dag_run_id and the collector's fan-in key
     fan_in_key = f"dag:fan-in:{collector.id}"
-    state_manager.init_fan_in.assert_awaited_once_with(fan_in_key, {branch_a.id, branch_b.id})
+    state_manager.init_fan_in.assert_awaited_once_with(dag_run_id, fan_in_key, {branch_a.id, branch_b.id})
     assert len(submitted) == 2
 
 
@@ -893,6 +1207,36 @@ async def test_dispatch_cron_dag_skip_if_running_skips_when_active(redis, state_
     # Entry must still be rescheduled
     members = await redis.zrange("cron-schedule", 0, -1)
     assert bytes(entry.id) in members
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_skips_when_dispatch_lock_lost(redis, state_manager):
+    """
+    dispatch_cron_dag does nothing at all if another dispatcher already holds the lock.
+
+    Distinct from the SKIP_IF_RUNNING "previous run still active" skip: this is the
+    dispatch-lock guard against two dispatchers racing to fire the same due occurrence
+    (e.g. during a scheduler restart), and applies regardless of concurrency_policy.
+    """
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="unguarded_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    with patch.object(
+        state_manager.cron_dag_scheduler, "try_acquire_dispatch_lock", AsyncMock(return_value=False)
+    ) as mock_acquire:
+        await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    mock_acquire.assert_awaited_once_with(entry.id)
+    # Nothing should have been submitted or rescheduled -- the method returned immediately.
+    stored = state_manager.task_state._store
+    assert len(stored) == 0
+    members = await redis.zrange("cron-schedule", 0, -1)
+    assert bytes(entry.id) not in members
 
 
 @pytest.mark.asyncio
@@ -993,6 +1337,33 @@ async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queu
 
     mock_stage.assert_not_called()
     mock_submit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_swallows_rate_limit_rejection(state_manager, caplog):
+    """A rate-limited root task doesn't crash dispatch_cron_dag -- it's logged and skipped."""
+    await state_manager.routing.save_queue_config(
+        QueueConfig(name="default", rate_numerator=5, rate_denominator=1, rate_period=RatePeriod.MINUTE)
+    )
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(
+        name="daily_job",
+        cron_expr="0 0 * * *",
+        dag_spec=spec,
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+
+    with (
+        patch.object(
+            state_manager, "submit_task", side_effect=TaskRateLimitedError("queue is full")
+        ) as mock_submit,
+        caplog.at_level(logging.WARNING),
+    ):
+        await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)  # must not raise
+
+    mock_submit.assert_called_once()
+    assert any("rejected by queue" in record.message for record in caplog.records)
 
 
 # ── resolve_queue ─────────────────────────────────────────────────────────────
@@ -1304,7 +1675,7 @@ async def test_fail_task_no_dlq_saga_mode(saga_state_manager):
 
 @pytest.mark.asyncio
 async def test_resubmit_dead_tasks_saga_mode(saga_state_manager):
-    """resubmit_dead_tasks uses direct save + remove_from_dlq in saga mode."""
+    """resubmit_dead_tasks saves the blob, actually enqueues it, then removes from DLQ."""
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["e"])
     await saga_state_manager.task_state.save_task(task)
     await _dlq_saga(saga_state_manager, task, FROZEN_TIME)
@@ -1314,7 +1685,38 @@ async def test_resubmit_dead_tasks_saga_mode(saga_state_manager):
     saved = await saga_state_manager.task_state.get_task(ULID1)
     assert saved is not None
     assert saved.status == TaskStatus.SUBMITTED
+    assert ULID1 in saga_state_manager.task_submit.queued
     assert await saga_state_manager.dead_queue.get_by_ids([str(ULID1)]) == []
+
+
+@pytest.mark.asyncio
+async def test_submit_tasks_batch_saga_mode(saga_state_manager):
+    """submit_tasks_batch saves each blob and actually enqueues each task in saga mode."""
+    tasks = [
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED),
+        Task(id=ULID2, name="my_task", queue="default", status=TaskStatus.UNSUBMITTED),
+    ]
+
+    await saga_state_manager.submit_tasks_batch(tasks)
+
+    for task_id in (ULID1, ULID2):
+        saved = await saga_state_manager.task_state.get_task(task_id)
+        assert saved is not None
+        assert saved.status == TaskStatus.SUBMITTED
+        assert task_id in saga_state_manager.task_submit.queued
+
+
+@pytest.mark.asyncio
+async def test_requeue_task_saga_mode(saga_state_manager):
+    """requeue_task saves the blob and actually enqueues the task in saga mode."""
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+
+    await saga_state_manager.requeue_task(task)
+
+    saved = await saga_state_manager.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert ULID1 in saga_state_manager.task_submit.queued
 
 
 @pytest.mark.asyncio

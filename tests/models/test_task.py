@@ -80,8 +80,8 @@ def test_shutdown_continue_policy_is_noop():
     assert task.status == TaskStatus.STARTED
 
 
-def test_shutdown_resubmit_policy_sets_status_unsubmitted():
-    """shutdown() with RESUBMIT policy sets status to UNSUBMITTED without incrementing retry_attempt."""
+def test_shutdown_resubmit_policy_sets_status_submitted():
+    """shutdown() with RESUBMIT policy sets status to SUBMITTED without incrementing retry_attempt."""
 
     async def noop() -> None: ...
 
@@ -89,8 +89,8 @@ def test_shutdown_resubmit_policy_sets_status_unsubmitted():
     task.task_config = TaskConfig(name="t", function=noop, on_shutdown=TaskShutdownPolicy.RESUBMIT)
     before = task.retry_attempt
     task.shutdown()
-    assert task.status == TaskStatus.UNSUBMITTED
-    assert task.retry_attempt == before  # direct assignment, not set_status
+    assert task.status == TaskStatus.SUBMITTED
+    assert task.retry_attempt == before  # SUBMITTED, unlike UNSUBMITTED, doesn't bump retry_attempt
 
 
 # ── should_retry / should_schedule ───────────────────────────────────────────
@@ -343,6 +343,7 @@ async def test_generate_callbacks_fan_in_collector_has_member_parent_ids():
         version=1,
         queue="default",
         status=TaskStatus.COMPLETED,
+        dag_run_id=ULID(),
         dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
     )
     children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=0, fan_in_members=[p1, p2]))
@@ -361,6 +362,7 @@ async def test_generate_callbacks_fan_in_not_last_returns_nothing():
         version=1,
         queue="default",
         status=TaskStatus.COMPLETED,
+        dag_run_id=ULID(),
         dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
     )
     children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=1))
@@ -379,6 +381,7 @@ async def test_generate_callbacks_fan_in_last_creates_collector():
         version=1,
         queue="default",
         status=TaskStatus.COMPLETED,
+        dag_run_id=ULID(),
         dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key)],
     )
     children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=0))
@@ -600,7 +603,7 @@ def test_make_result_empty_parent_ids_for_root_task():
 def test_make_result_passes_fanout_through():
     """make_result() includes a fanout when provided."""
     task = Task(id=ULID1, name="dispatcher", version=1, queue="default", status=TaskStatus.STARTED)
-    fanout = DynamicFanOut(children=[DAGNode("child")], collector=DAGNode("collect"))
+    fanout = DynamicFanOut(arms=[DAGNode("child")], collector=DAGNode("collect"))
     result = task.make_result(results={}, fanout=fanout)
 
     assert isinstance(result, TaskResult)
@@ -666,6 +669,7 @@ async def test_generate_callbacks_fan_in_propagates_inject_flag():
         version=1,
         queue="default",
         status=TaskStatus.COMPLETED,
+        dag_run_id=ULID(),
         dag_callbacks=[FanInCallback(task=collector_spec, fan_in_key=fan_in_key, inject_parent_results=True)],
     )
     children = await task.generate_callbacks(_make_adapter(fan_in_complete_return=0, fan_in_members=[p1]))
@@ -697,6 +701,53 @@ def test_valid_task_params_still_checks_provided_params():
     task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
     task.parameters = {"x": "not_an_int"}
     assert task.valid_task_params() is False
+
+
+# ── valid_task_params: parameterized generics ─────────────────────────────────
+
+
+def test_valid_task_params_parameterized_generic_shallow_checks_origin():
+    """A list[str]/dict[str, int] hint doesn't crash -- it's shallow-checked against its origin."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+
+    def fn(items: list[str], mapping: dict[str, int]) -> None: ...
+
+    task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
+
+    task.parameters = {"items": ["a", "b"], "mapping": {"a": 1}}
+    assert task.valid_task_params() is True
+
+    task.parameters = {"items": "not_a_list", "mapping": {"a": 1}}
+    assert task.valid_task_params() is False
+
+
+def test_valid_task_params_union_hint_still_validated():
+    """X | Y union hints don't go through the generic-origin path -- isinstance already handles them."""
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+
+    def fn(x: int | str) -> None: ...
+
+    task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
+
+    task.parameters = {"x": 5}
+    assert task.valid_task_params() is True
+    task.parameters = {"x": "five"}
+    assert task.valid_task_params() is True
+    task.parameters = {"x": 5.0}
+    assert task.valid_task_params() is False
+
+
+def test_valid_task_params_literal_hint_skips_validation():
+    """Literal[...] isn't runtime-checkable via isinstance even after origin substitution -- skip, don't crash."""
+    from typing import Literal
+
+    task = Task(id=ULID1, name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+
+    def fn(mode: Literal["a", "b"]) -> None: ...
+
+    task.task_config = TaskConfig(name="t", version=1, function=fn, timeout=10)
+    task.parameters = {"mode": "anything"}
+    assert task.valid_task_params() is True
 
 
 def test_to_dict_round_trip_preserves_inject_flag():

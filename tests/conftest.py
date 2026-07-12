@@ -116,13 +116,15 @@ class DummyTaskState:
     async def remove_task_heartbeat(self, task: Task) -> None:
         self._heartbeats.pop(task.id, None)
 
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: object, ttl: int = 86400) -> None:
+    async def init_fan_in(
+        self, dag_run_id: ULID, fan_in_key: str, predecessor_ids: object, ttl: int = 86400
+    ) -> None:
         pass
 
-    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
+    async def fan_in_complete(self, dag_run_id: ULID, fan_in_key: str, task_id: ULID) -> int:
         raise NotImplementedError("DummyTaskState.fan_in_complete")
 
-    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]:
+    async def get_fan_in_members(self, dag_run_id: ULID, fan_in_key: str) -> list[ULID]:
         raise NotImplementedError("DummyTaskState.get_fan_in_members")
 
     async def get_dag_runs(self, pagination: object) -> object:
@@ -133,6 +135,9 @@ class DummyTaskState:
 
     async def clean_dag_runs(self, now: object, max_age: object) -> None:
         raise NotImplementedError("DummyTaskState.clean_dag_runs")
+
+    async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
+        raise NotImplementedError("DummyTaskState.close_dag_run_task")
 
     async def ensure_index(self) -> None:
         raise NotImplementedError("DummyTaskState.ensure_index")
@@ -219,25 +224,38 @@ class AtomicDummyTaskState(DummyTaskState):
         return True
 
     def stage_init_fan_in(
-        self, pipe: object, fan_in_key: str, predecessor_ids: object, ttl: int = 86400
+        self, pipe: object, dag_run_id: ULID, fan_in_key: str, predecessor_ids: object, ttl: int = 86400
     ) -> None:
         pass
+
+    async def delegate_fan_in(
+        self, dag_run_id: ULID, fan_in_key: str, old_id: object, new_id: object
+    ) -> None:
+        pass  # no in-memory fan-in tracking; tests that exercise this go through real adapters
 
 
 class DummyTaskSubmit:
     """
     TaskSubmitProtocol stub that shares the _store dict with a DummyTaskState.
 
-    submit_task writes into the shared store so that get_task() on the paired
-    DummyTaskState immediately reflects submitted tasks.
+    submit_task/enqueue write into the shared store so that get_task() on the paired
+    DummyTaskState immediately reflects submitted tasks. Queue membership is tracked
+    separately in ``queued`` so saga-mode tests can assert a task was actually
+    enqueued, not just that its blob was saved.
     """
 
     def __init__(self, store: dict) -> None:
         self._store = store
+        self.queued: set[ULID] = set()
 
     async def submit_task(self, task: Task) -> bool:
         self._store[task.id] = task
+        self.queued.add(task.id)
         return True
+
+    async def enqueue(self, task: Task) -> None:
+        """Saga-safe re-enqueue: record queue membership without touching the blob store."""
+        self.queued.add(task.id)
 
     async def submit_rate_limited_task(self, task: Task, queue_config: object) -> bool:
         raise NotImplementedError("DummyTaskSubmit.submit_rate_limited_task")
@@ -381,6 +399,7 @@ class DummyCronDAGScheduler:
     def __init__(self) -> None:
         self._entries: dict[ULID, tuple[CronDAGEntry, dt.datetime | None]] = {}
         self._active_runs: dict[ULID, str] = {}
+        self._dispatch_locks: dict[ULID, dt.datetime] = {}
 
     async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
         self._entries[entry.id] = (entry, next_run_at)
@@ -432,6 +451,17 @@ class DummyCronDAGScheduler:
 
     async def clear_active_run(self, cron_id: ULID) -> None:
         self._active_runs.pop(cron_id, None)
+
+    async def try_acquire_dispatch_lock(self, cron_id: ULID, ttl: int = 60) -> bool:
+        now = dt.datetime.now(dt.UTC)
+        expires_at = self._dispatch_locks.get(cron_id)
+        if expires_at is not None and expires_at > now:
+            return False
+        self._dispatch_locks[cron_id] = now + dt.timedelta(seconds=ttl)
+        return True
+
+    async def release_dispatch_lock(self, cron_id: ULID) -> None:
+        self._dispatch_locks.pop(cron_id, None)
 
 
 def _make_state_manager(
@@ -576,6 +606,12 @@ class DummyRoutingBackend:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         self._queues[queue_config.name] = queue_config
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        if queue_config.name in self._queues:
+            return False
+        self._queues[queue_config.name] = queue_config
+        return True
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         self._queues.pop(queue_name, None)
         affected = []
@@ -595,6 +631,12 @@ class DummyRoutingBackend:
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
         self._roles[role] = set(queues_set)
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        if role in self._roles:
+            return False
+        self._roles[role] = set(queues_set)
+        return True
 
     async def get_all_roles(self) -> list[str]:
         return sorted(self._roles)

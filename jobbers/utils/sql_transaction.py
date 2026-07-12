@@ -38,6 +38,12 @@ class SQLTransactionBatch:
             await self._session.begin()
         return self._session
 
+    async def abort(self) -> None:
+        """Close and discard the session after a failure outside execute()'s own try/finally."""
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
     def add_op(self, op: Callable[[AsyncSession], Awaitable[None]]) -> None:
         """Append a coroutine-returning callable to the batch."""
         self._ops.append(op)

@@ -58,6 +58,15 @@ class RedisQueueConfigAdapter:
         pipe.sadd(self.QUEUES_INDEX, queue_config.name)
         await pipe.execute()
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        """Insert a new queue config. Returns False (no changes made) if the name already exists."""
+        payload = _pack(queue_config)
+        created = await self._client.set(self.QUEUE_KEY(name=queue_config.name), payload, nx=True)
+        if not created:
+            return False
+        await self._client.sadd(self.QUEUES_INDEX, queue_config.name)
+        return True
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         # Remove queue from all role sets first so that a crash after this point leaves
         # an orphaned-but-valid queue config rather than roles referencing a deleted queue.
@@ -93,6 +102,18 @@ class RedisQueueConfigAdapter:
             pipe.sadd(self.ROLE_QUEUES_KEY(name=role), *queues_set)
         pipe.sadd(self.ROLES_INDEX, role)
         await pipe.execute()
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        """Insert a new role with its queues. Returns False (no changes made) if the role already exists."""
+        # SADD's return value (count actually added) is the atomic arbiter of the race: only one
+        # concurrent caller can ever see 1 for a given role name, so it's safe to gate the queue
+        # membership write on it without a separate lock.
+        added: int = await self._client.sadd(self.ROLES_INDEX, role)
+        if not added:
+            return False
+        if queues_set:
+            await self._client.sadd(self.ROLE_QUEUES_KEY(name=role), *queues_set)
+        return True
 
     async def get_all_roles(self) -> list[str]:
         raw = cast("set[bytes]", await self._client.smembers(self.ROLES_INDEX))
@@ -158,7 +179,8 @@ class RedisTaskRoutingConfigAdapter:
 
     async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
         raw = cast(
-            "bytes | None", await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version))
+            "bytes | None",
+            await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version)),
         )
         if raw is None:
             return None
@@ -200,6 +222,9 @@ class RedisRoutingBackend:
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
         await self._qca.save_queue_config(queue_config)
 
+    async def create_queue_config(self, queue_config: QueueConfig) -> bool:
+        return await self._qca.create_queue_config(queue_config)
+
     async def delete_queue(self, queue_name: str) -> list[str]:
         return await self._qca.delete_queue(queue_name)
 
@@ -211,6 +236,9 @@ class RedisRoutingBackend:
 
     async def save_role(self, role: str, queues_set: set[str]) -> None:
         await self._qca.save_role(role, queues_set)
+
+    async def create_role(self, role: str, queues_set: set[str]) -> bool:
+        return await self._qca.create_role(role, queues_set)
 
     async def get_all_roles(self) -> list[str]:
         return await self._qca.get_all_roles()

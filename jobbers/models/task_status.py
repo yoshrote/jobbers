@@ -26,3 +26,21 @@ class TaskStatus(StrEnum):
     @classmethod
     def active_statuses(cls) -> set["TaskStatus"]:
         return {cls.SUBMITTED, cls.STARTED, cls.SCHEDULED}
+
+    @classmethod
+    def terminal_statuses(cls) -> set["TaskStatus"]:
+        return {cls.COMPLETED, cls.FAILED, cls.CANCELLED, cls.STALLED, cls.DROPPED}
+
+    @classmethod
+    def stuck_statuses(cls) -> set["TaskStatus"]:
+        """
+        Terminal statuses that indicate a DAG run may need operator intervention to resume.
+
+        A task in one of these statuses never calls ``generate_callbacks()``, so any
+        ``FanInCallback``/``DynamicFanOutCallback`` it carries never fires — the DAG's
+        collector is permanently blocked until the task is retried. Used to gate the
+        automatic cleanup-on-completion sweep: a run containing a stuck task is left
+        untouched (fan-in tracking, sibling task records) so it can be manually resumed,
+        instead of being swept away as if it had completed normally.
+        """
+        return {cls.FAILED, cls.STALLED, cls.CANCELLED, cls.DROPPED}

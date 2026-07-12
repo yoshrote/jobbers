@@ -61,10 +61,10 @@ def get_client() -> redis.Redis:
     return _client
 
 
-def set_client(new_client: redis.Redis) -> redis.Redis:
+async def set_client(new_client: redis.Redis) -> redis.Redis:
     global _client
     if _client is not None:
-        _client.close()
+        await _client.close()
 
     _client = new_client
     return _client
@@ -136,7 +136,8 @@ def register_routing_backend(backend: RoutingBackendProtocol) -> None:
 async def _get_or_create_sql(features: set[str]) -> async_sessionmaker[AsyncSession]:
     """Initialize the shared SQLAlchemy engine and session factory (idempotent)."""
     global _engine, _session_factory
-    if _session_factory is not None:
+    if _session_factory is not None and _engine is not None:
+        await run_migrations(_engine, features=features)
         return _session_factory
 
     db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
@@ -160,21 +161,28 @@ async def _create_routing_backend(client: redis.Redis) -> RoutingBackendProtocol
         return _pre_registered_routing_backend
 
     backend_type = os.environ.get("ROUTING_BACKEND", "sql")
+    backend: RoutingBackendProtocol
 
-    if backend_type == "redis":
-        return RedisRoutingBackend(client)
+    match backend_type:
+        case "redis":
+            backend = RedisRoutingBackend(client)
+        case "redis_json":
+            backend = RedisJSONRoutingBackend(client)
+            await backend.ensure_indexes()
+        case "sql":
+            sf = await _get_or_create_sql({"routing"})
+            backend = SQLRoutingBackend(sf)
+        case "static":
+            static_config_file = os.environ.get("STATIC_CONFIG_FILE")
+            backend = (
+                StaticRoutingBackend.from_file(static_config_file)
+                if static_config_file
+                else StaticRoutingBackend()
+            )
+        case _:
+            raise ValueError(f"Unknown routing backend type: {backend_type}")
 
-    if backend_type == "redis_json":
-        backend = RedisJSONRoutingBackend(client)
-        await backend.ensure_indexes()
-        return backend
-
-    if backend_type == "static" and os.environ.get("STATIC_CONFIG_FILE") is not None:
-        return StaticRoutingBackend.from_file(os.environ["STATIC_CONFIG_FILE"])
-
-    # sql (default) — initialize SQLAlchemy
-    sf = await _get_or_create_sql({"routing"})
-    return SQLRoutingBackend(sf)
+    return backend
 
 
 async def init_state_manager() -> StateManager:

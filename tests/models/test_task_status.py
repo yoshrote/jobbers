@@ -44,3 +44,34 @@ def test_from_bytes_with_invalid_bytes() -> None:
     """Test from_bytes with invalid bytes input."""
     with pytest.raises(ValueError, match="is not a valid TaskStatus"):
         TaskStatus.from_bytes(b"invalid_status")
+
+
+def test_terminal_statuses() -> None:
+    assert TaskStatus.terminal_statuses() == {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.STALLED,
+        TaskStatus.DROPPED,
+    }
+
+
+def test_terminal_and_active_statuses_are_disjoint_and_exhaustive() -> None:
+    """Every status is either terminal, active, or UNSUBMITTED — no status is both terminal and active."""
+    assert TaskStatus.terminal_statuses() & TaskStatus.active_statuses() == set()
+    assert TaskStatus.terminal_statuses() | TaskStatus.active_statuses() | {TaskStatus.UNSUBMITTED} == set(
+        TaskStatus
+    )
+
+
+def test_stuck_statuses() -> None:
+    assert TaskStatus.stuck_statuses() == {
+        TaskStatus.FAILED,
+        TaskStatus.STALLED,
+        TaskStatus.CANCELLED,
+        TaskStatus.DROPPED,
+    }
+
+
+def test_stuck_statuses_is_a_subset_of_terminal_statuses() -> None:
+    assert TaskStatus.stuck_statuses() <= TaskStatus.terminal_statuses()

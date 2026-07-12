@@ -10,7 +10,6 @@ import datetime as dt
 import pytest
 from ulid import ULID
 
-from jobbers.adapters.redis import RedisDeadQueue
 from jobbers.adapters.sql import SQLDeadQueue
 from jobbers.models.task import Task
 from jobbers.models.task_status import TaskStatus
@@ -71,6 +70,34 @@ async def test_get_by_ids_multiple(dead_queue):
 
     results = await dq.get_by_ids([str(t1.id), str(t2.id)])
     assert {r.id for r in results} == {t1.id, t2.id}
+
+
+@pytest.mark.asyncio
+async def test_get_by_ids_preserves_requested_order(dead_queue):
+    """
+    get_by_ids returns results in the order the caller's task_ids list specifies.
+
+    Tripwire: SQLDeadQueue.get_by_ids uses a plain `WHERE id IN (...)` with no
+    ORDER BY, so it returns rows in whatever order SQLite/Postgres happens to pick
+    (observed: primary-key/insertion order) rather than the caller's order. Plain
+    Redis and RedisJSON both preserve the caller's order by construction (they walk
+    the requested ID list directly). No current caller relies on ordering here
+    (bulk resubmit treats the result as an unordered batch), but the divergence is
+    real and should be closed before anything starts depending on it.
+    """
+    dq, adapter = dead_queue
+    if isinstance(dq, SQLDeadQueue):
+        pytest.xfail("SQLDeadQueue.get_by_ids has no ORDER BY; result order does not match the request")
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    t3 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG03")
+    for t in (t1, t2, t3):
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
+
+    requested = [str(t3.id), str(t1.id), str(t2.id)]
+    results = await dq.get_by_ids(requested)
+    assert [str(r.id) for r in results] == requested
 
 
 @pytest.mark.asyncio
@@ -208,11 +235,6 @@ async def test_get_by_filter_no_criteria_sorted_by_failed_at_desc(dead_queue):
 async def test_get_by_filter_with_criteria_sorted_by_failed_at_desc(dead_queue):
     """get_by_filter returns results newest-first when a queue or task_name filter is applied."""
     dq, adapter = dead_queue
-    if isinstance(dq, RedisDeadQueue):
-        pytest.xfail(
-            "RedisDeadQueue uses Redis sets for filtered lookups (sinter/smembers), "
-            "which have no ordering guarantee; results are not sorted by failed_at."
-        )
     t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01", queue="q1")
     t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02", queue="q1")
     await adapter.save_task(t1)

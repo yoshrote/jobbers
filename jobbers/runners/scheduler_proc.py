@@ -21,7 +21,7 @@ from opentelemetry import metrics
 
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
-from jobbers.utils.otel import enable_otel
+from jobbers.utils.otel import enable_otel, shutdown_otel
 
 if TYPE_CHECKING:
     from jobbers.state_manager import StateManager
@@ -46,7 +46,11 @@ async def main(poll_interval: float, config_interval: dt.timedelta, role: str, b
             queues = list(await state_manager.get_queues(role))
             queues_fetched_at = now
         task_entries, cron_entries = await asyncio.gather(
-            state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues if queues else None),
+            # queues=queues, not `queues if queues else None`: an empty list here means
+            # "this role has no queues assigned right now" and must dispatch nothing, per
+            # next_due_bulk's own contract (None = any queue, [] = none). Collapsing an
+            # empty role's queues to None would dispatch scheduled tasks system-wide.
+            state_manager.task_scheduler.next_due_bulk(batch_size, queues=queues),
             state_manager.cron_dag_scheduler.next_due_bulk(batch_size),
         )
 
@@ -107,4 +111,7 @@ def run() -> None:
     role = os.environ.get("SCHEDULER_ROLE", "default")
     config_interval = dt.timedelta(minutes=int(os.environ.get("SCHEDULER_CONFIG_REFRESH_INTERVAL", "3")))
 
-    asyncio.run(main(poll_interval, config_interval, role, batch_size))
+    try:
+        asyncio.run(main(poll_interval, config_interval, role, batch_size))
+    finally:
+        shutdown_otel()

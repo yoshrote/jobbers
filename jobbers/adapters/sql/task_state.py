@@ -19,7 +19,9 @@ from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
 from jobbers.migrations.schema import (
+    dag_run_pending,
     dag_runs,
+    fan_in_anchors,
     task_fan_in,
     task_queue,
     tasks,
@@ -37,16 +39,6 @@ if TYPE_CHECKING:
     from jobbers.protocols import TransactionHandle
 
 logger = logging.getLogger(__name__)
-
-_TERMINAL_STATUSES = frozenset(
-    [
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-        TaskStatus.STALLED,
-        TaskStatus.DROPPED,
-    ]
-)
 
 
 def _task_to_row(task: Task) -> dict[str, Any]:
@@ -195,6 +187,7 @@ class SQLTaskState:
         if task.dag_run_id is not None and task.submitted_at is not None:
             dag_run_id_str = str(task.dag_run_id)
             submitted_at = task.submitted_at
+            task_id_str = str(task.id)
 
             async def _register_dag_run(s: AsyncSession) -> None:
                 existing = await s.execute(select(dag_runs).where(dag_runs.c.dag_run_id == dag_run_id_str))
@@ -202,6 +195,13 @@ class SQLTaskState:
                     await s.execute(
                         insert(dag_runs).values(dag_run_id=dag_run_id_str, submitted_at=submitted_at)
                     )
+                async with s.begin_nested() as sp:
+                    try:
+                        await s.execute(
+                            insert(dag_run_pending).values(dag_run_id=dag_run_id_str, task_id=task_id_str)
+                        )
+                    except IntegrityError:
+                        await sp.rollback()
 
             pipe.add_op(_register_dag_run)
 
@@ -216,14 +216,24 @@ class SQLTaskState:
         pipe.add_op(_remove)
 
     def stage_init_fan_in(
-        self, pipe: TransactionHandle, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+        self,
+        pipe: TransactionHandle,
+        dag_run_id: ULID,
+        fan_in_key: str,
+        predecessor_ids: set[ULID],
+        ttl: int = 86400,
     ) -> None:
-        """Stage INSERT of predecessor task-ids into task_fan_in."""
+        """Stage INSERT of predecessor task-ids into task_fan_in (dag_run_id unused: fan_in_key is already unique)."""
         now = dt.datetime.now(dt.UTC)
         rows = [{"fan_in_key": fan_in_key, "task_id": str(pid), "created_at": now} for pid in predecessor_ids]
         assert isinstance(pipe, SQLTransactionBatch)  # noqa: S101
 
         async def _insert_fan_in(s: AsyncSession) -> None:
+            async with s.begin_nested() as sp:
+                try:
+                    await s.execute(insert(fan_in_anchors).values(fan_in_key=fan_in_key))
+                except IntegrityError:
+                    await sp.rollback()
             for row in rows:
                 async with s.begin_nested() as sp:
                     try:
@@ -240,7 +250,14 @@ class SQLTaskState:
         stmt = select(tasks).where(tasks.c.id == str(task_id))
         if self._use_for_update:
             stmt = stmt.with_for_update()
-        result = await session.execute(stmt)
+        try:
+            result = await session.execute(stmt)
+        except Exception:
+            # This SELECT runs outside execute()'s own try/finally (the session must stay
+            # open for later staged writes in the same transaction on success), so a failure
+            # here must close the session itself or the connection leaks from the pool.
+            await pipe.abort()
+            raise
         row = result.first()
         return _row_to_task(row) if row is not None else None
 
@@ -385,11 +402,18 @@ class SQLTaskState:
 
     # ── Fan-in ─────────────────────────────────────────────────────────────
 
-    async def init_fan_in(self, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400) -> None:
-        """Persist fan-in predecessor set (TTL is ignored for SQL)."""
+    async def init_fan_in(
+        self, dag_run_id: ULID, fan_in_key: str, predecessor_ids: set[ULID], ttl: int = 86400
+    ) -> None:
+        """Persist fan-in predecessor set (TTL and dag_run_id are ignored for SQL)."""
         now = dt.datetime.now(dt.UTC)
         async with self._sf() as session:
             async with session.begin():
+                async with session.begin_nested() as sp:
+                    try:
+                        await session.execute(insert(fan_in_anchors).values(fan_in_key=fan_in_key))
+                    except IntegrityError:
+                        await sp.rollback()
                 for pid in predecessor_ids:
                     async with session.begin_nested() as sp:
                         try:
@@ -401,14 +425,27 @@ class SQLTaskState:
                         except IntegrityError:
                             await sp.rollback()
 
-    async def fan_in_complete(self, fan_in_key: str, task_id: ULID) -> int:
+    async def fan_in_complete(self, dag_run_id: ULID, fan_in_key: str, task_id: ULID) -> int:
         """
         Mark task_id complete in the fan-in set and return remaining (incomplete) count.
 
-        Returns -1 if task_id was not a member or was already completed.
+        Returns -1 if task_id was not a member or was already completed. dag_run_id is
+        unused for SQL — fan_in_key is already unique.
         """
         async with self._sf() as session:
             async with session.begin():
+                # Lock this fan-in group's anchor row as a mutex before reading/writing
+                # task_fan_in, mirroring close_dag_run_task's dag_runs lock: without it,
+                # two predecessors completing concurrently under Postgres READ COMMITTED
+                # can each run their COUNT before the other's UPDATE commits, so both see
+                # a stale remaining > 0 and the collector never fires. No-op on SQLite.
+                lock_stmt = select(fan_in_anchors.c.fan_in_key).where(
+                    fan_in_anchors.c.fan_in_key == fan_in_key
+                )
+                if self._use_for_update:
+                    lock_stmt = lock_stmt.with_for_update()
+                await session.execute(lock_stmt)
+
                 result = await session.execute(
                     update(task_fan_in)
                     .where(
@@ -430,13 +467,35 @@ class SQLTaskState:
                 )
                 return count_result.scalar() or 0
 
-    async def get_fan_in_members(self, fan_in_key: str) -> list[ULID]:
-        """Return all predecessor IDs for a fan-in key."""
+    async def get_fan_in_members(self, dag_run_id: ULID, fan_in_key: str) -> list[ULID]:
+        """Return all predecessor IDs for a fan-in key (dag_run_id unused for SQL)."""
         async with self._sf() as session:
             result = await session.execute(
                 select(task_fan_in.c.task_id).where(task_fan_in.c.fan_in_key == fan_in_key)
             )
             return [ULID.from_str(row.task_id) for row in result.all()]
+
+    async def delegate_fan_in(self, dag_run_id: ULID, fan_in_key: str, old_id: ULID, new_id: ULID) -> None:
+        """Replace *old_id* with *new_id* in the fan-in set for *fan_in_key* (dag_run_id unused for SQL)."""
+        old_str = str(old_id)
+        new_str = str(new_id)
+        now = dt.datetime.now(dt.UTC)
+        async with self._sf() as session:
+            async with session.begin():
+                # DELETE old row and INSERT new one — avoids mutating the composite PK in place.
+                await session.execute(
+                    delete(task_fan_in).where(
+                        task_fan_in.c.fan_in_key == fan_in_key,
+                        task_fan_in.c.task_id == old_str,
+                    )
+                )
+                async with session.begin_nested() as sp:
+                    try:
+                        await session.execute(
+                            insert(task_fan_in).values(fan_in_key=fan_in_key, task_id=new_str, created_at=now)
+                        )
+                    except IntegrityError:
+                        await sp.rollback()  # new_id already present — idempotent
 
     # ── DAG run index ───────────────────────────────────────────────────────
 
@@ -469,15 +528,70 @@ class SQLTaskState:
             task_result = await session.execute(
                 select(tasks.c.id).where(tasks.c.dag_run_id == dag_run_id_str)
             )
-            task_ids = [ULID.from_str(row.id) for row in task_result.all()]
+            # ULIDs sort lexicographically by creation time; sort here so task_ids
+            # is chronologically ordered regardless of the row order SQL returns.
+            task_ids = sorted(ULID.from_str(row.id) for row in task_result.all())
         return _ensure_utc_nn(run_row.submitted_at), task_ids
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
-        """Delete DAG run entries older than ``max_age``."""
+        """Delete DAG run entries (and their pending rows) older than ``max_age``."""
         cutoff = now - max_age
         async with self._sf() as session:
             async with session.begin():
+                stale_result = await session.execute(
+                    select(dag_runs.c.dag_run_id).where(dag_runs.c.submitted_at < cutoff)
+                )
+                stale_ids = [row.dag_run_id for row in stale_result.all()]
                 await session.execute(delete(dag_runs).where(dag_runs.c.submitted_at < cutoff))
+                if stale_ids:
+                    await session.execute(
+                        delete(dag_run_pending).where(dag_run_pending.c.dag_run_id.in_(stale_ids))
+                    )
+
+    async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
+        """
+        Mark task_id resolved in the DAG run's pending set and return the remaining count.
+
+        Returns -1 if task_id was not pending (already closed, or the run's pending
+        rows were swept by clean_dag_runs).
+        """
+        dag_run_id_str = str(dag_run_id)
+        async with self._sf() as session:
+            async with session.begin():
+                # Lock the run's single dag_runs row as a mutex before reading/writing
+                # dag_run_pending. Without this, two siblings closing concurrently under
+                # READ COMMITTED (e.g. Postgres) can each run their COUNT before the
+                # other's UPDATE commits, so both compute a stale remaining > 0 and the
+                # fast-path sweep never fires. Locking this one anchor row serializes
+                # closers for the run without taking a lock proportional to the run's
+                # size (locking every dag_run_pending row would itself serialize what
+                # should be independent, concurrent completions). This is a no-op on
+                # SQLite, which has no concurrent-writer MVCC race to guard against here.
+                lock_stmt = select(dag_runs.c.dag_run_id).where(dag_runs.c.dag_run_id == dag_run_id_str)
+                if self._use_for_update:
+                    lock_stmt = lock_stmt.with_for_update()
+                await session.execute(lock_stmt)
+
+                result = await session.execute(
+                    update(dag_run_pending)
+                    .where(
+                        dag_run_pending.c.dag_run_id == dag_run_id_str,
+                        dag_run_pending.c.task_id == str(task_id),
+                        dag_run_pending.c.closed == False,  # noqa: E712
+                    )
+                    .values(closed=True)
+                )
+                if result.rowcount == 0:  # type: ignore[attr-defined]
+                    return -1
+                count_result = await session.execute(
+                    select(func.count())
+                    .select_from(dag_run_pending)
+                    .where(
+                        dag_run_pending.c.dag_run_id == dag_run_id_str,
+                        dag_run_pending.c.closed == False,  # noqa: E712
+                    )
+                )
+                return count_result.scalar() or 0
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -497,7 +611,7 @@ class SQLTaskState:
     async def clean_terminal_tasks(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete terminal tasks older than ``max_age``."""
         cutoff = now - max_age
-        statuses = [s.value for s in _TERMINAL_STATUSES]
+        statuses = [s.value for s in TaskStatus.terminal_statuses()]
         async with self._sf() as session:
             async with session.begin():
                 await session.execute(

@@ -27,6 +27,15 @@ class StaticCronDAGScheduler:
     ``RoutingBackendReadOnlyError``.  Runtime state (next_run_at tracking and active-run
     markers) lives in in-memory dicts protected by an ``asyncio.Lock``, so state resets
     on process restart.
+
+    **Multi-instance caveat:** ``try_acquire_dispatch_lock``/``release_dispatch_lock``
+    (used to prevent two dispatchers from racing to submit the same cron entry's run)
+    only coordinate *within this one process* — unlike the Redis/SQL backends, whose
+    locks live in storage shared across processes, this scheduler's dispatch lock is a
+    private, in-memory dict per instance. Running more than one scheduler process with
+    ``CRON_DAG_SCHEDULER_BACKEND=static`` provides **no protection at all** against
+    duplicate dispatch, even briefly (e.g. during a rolling restart) — do not run more
+    than one scheduler instance against this backend.
     """
 
     def __init__(
@@ -37,6 +46,7 @@ class StaticCronDAGScheduler:
         self._entries: dict[ULID, CronDAGEntry] = {e.id: e for e in (entries or [])}
         self._next_run_at: dict[ULID, dt.datetime] = dict(initial_next_run_at or {})
         self._active_runs: dict[ULID, str] = {}
+        self._dispatch_locks: dict[ULID, dt.datetime] = {}
         self._lock = asyncio.Lock()
 
     async def add(self, entry: CronDAGEntry, next_run_at: dt.datetime) -> None:
@@ -89,6 +99,20 @@ class StaticCronDAGScheduler:
     async def clear_active_run(self, cron_id: ULID) -> None:
         async with self._lock:
             self._active_runs.pop(cron_id, None)
+
+    async def try_acquire_dispatch_lock(self, cron_id: ULID, ttl: int = 60) -> bool:
+        """Claim the dispatch lock in-process only — see class docstring's multi-instance caveat."""
+        now = dt.datetime.now(dt.UTC)
+        async with self._lock:
+            expires_at = self._dispatch_locks.get(cron_id)
+            if expires_at is not None and expires_at > now:
+                return False
+            self._dispatch_locks[cron_id] = now + dt.timedelta(seconds=ttl)
+            return True
+
+    async def release_dispatch_lock(self, cron_id: ULID) -> None:
+        async with self._lock:
+            self._dispatch_locks.pop(cron_id, None)
 
     async def get_next_run_at(self, cron_id: ULID) -> dt.datetime | None:
         return self._next_run_at.get(cron_id)

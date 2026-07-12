@@ -14,7 +14,7 @@ from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
-from jobbers.state_manager import TaskException
+from jobbers.state_manager import TaskException, TaskRateLimitedError
 from jobbers.task_routes import app
 
 ULID1 = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -135,6 +135,75 @@ async def test_get_task_status_not_found():
         assert response.status_code == 404
         assert response.json() == {"detail": "Task not found"}
         mock_task_adapter.get_task.assert_called_once_with(ULID1)
+
+
+@pytest.mark.asyncio
+async def test_get_task_status_malformed_id_returns_400():
+    """A malformed task ID returns 400, not a bare 500."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/task-status/not-a-ulid")
+
+    assert response.status_code == 400
+    assert "not-a-ulid" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_malformed_id_returns_400():
+    """A malformed task ID returns 400, not a bare 500."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/task/not-a-ulid/cancel")
+
+    assert response.status_code == 400
+    assert "not-a-ulid" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_tasks_malformed_id_does_not_abort_whole_batch(state_manager):
+    """One malformed ID in a bulk cancel returns a per-item error, not a 500 for the whole batch."""
+    good_task = Task(
+        id=ULID1,
+        name="Test Task",
+        status="started",
+        submitted_at=dt.datetime.now(dt.UTC),
+        parameters={},
+    )
+    await state_manager.task_state.save_task(good_task)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/tasks/cancel", json={"task_ids": [str(ULID1), "not-a-ulid"]})
+
+    assert response.status_code == 200
+    results = {r["task_id"]: r for r in response.json()["results"]}
+    assert results[str(ULID1)]["status"] == "cancellation_requested"
+    assert results["not-a-ulid"]["status"] == "error"
+    assert "not-a-ulid" in results["not-a-ulid"]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_get_cron_dag_malformed_id_returns_400():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/cron-dags/not-a-ulid")
+
+    assert response.status_code == 400
+    assert "not-a-ulid" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_delete_cron_dag_malformed_id_returns_400():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete("/cron-dags/not-a-ulid")
+
+    assert response.status_code == 400
+    assert "not-a-ulid" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_get_dag_malformed_id_returns_400():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/dags/not-a-ulid")
+
+    assert response.status_code == 400
+    assert "not-a-ulid" in response.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -542,22 +611,21 @@ async def test_cancel_tasks_mixed_results():
 async def test_create_queue():
     """POST /queues creates a new queue."""
     mock_sm = MagicMock()
-    mock_sm.get_queue_config = AsyncMock(return_value=None)
-    mock_sm.save_queue_config = AsyncMock()
+    mock_sm.create_queue_config = AsyncMock(return_value=True)
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/queues", json={"name": "myqueue"})
 
     assert response.status_code == 201
-    mock_sm.save_queue_config.assert_called_once()
+    mock_sm.create_queue_config.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_create_queue_conflict_returns_409():
     """POST /queues returns 409 when the queue already exists."""
     mock_sm = MagicMock()
-    mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="myqueue"))
+    mock_sm.create_queue_config = AsyncMock(return_value=False)
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -708,23 +776,23 @@ async def test_get_active_tasks_no_filter_uses_all_queues(state_manager):
 async def test_create_role():
     """POST /roles creates a new role."""
     mock_sm = MagicMock()
-    mock_sm.get_queues = AsyncMock(return_value=set())
     mock_sm.get_all_queues = AsyncMock(return_value=["default"])
-    mock_sm.save_role = AsyncMock()
+    mock_sm.create_role = AsyncMock(return_value=True)
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             response = await client.post("/roles", json={"name": "myrole", "queues": ["default"]})
 
     assert response.status_code == 201
-    mock_sm.save_role.assert_called_once()
+    mock_sm.create_role.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_create_role_conflict_returns_409():
     """POST /roles returns 409 when the role already exists."""
     mock_sm = MagicMock()
-    mock_sm.get_queues = AsyncMock(return_value={"default"})
+    mock_sm.get_all_queues = AsyncMock(return_value=["default"])
+    mock_sm.create_role = AsyncMock(return_value=False)
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -925,6 +993,32 @@ async def test_submit_task_raises_400_on_task_exception():
 
     assert response.status_code == 400
     assert "bad params" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_submit_task_raises_429_on_rate_limited_error():
+    """POST /submit-task returns 429 when the state manager raises TaskRateLimitedError."""
+    mock_sm = MagicMock()
+    mock_sm.get_routing_config = AsyncMock(return_value=None)
+    mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
+    mock_sm.submit_task = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
+
+    async def task_function(foo: int) -> None: ...
+
+    test_task_config = TaskConfig(name="Test Task", function=task_function)
+    task_data = Task(id=ULID1, name="Test Task", status="unsubmitted", parameters={"foo": 42})
+
+    with (
+        patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm),
+        patch("jobbers.registry.get_task_config", return_value=test_task_config),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/submit-task", json=task_data.model_dump(mode="json", exclude_unset=True)
+            )
+
+    assert response.status_code == 429
+    assert "queue is full" in response.json()["detail"]
 
 
 # ── schedule_task route ───────────────────────────────────────────────────────
@@ -1193,7 +1287,6 @@ async def test_set_queues_rejects_unknown_queue():
 async def test_create_role_rejects_unknown_queue():
     """POST /roles returns 400 when any requested queue does not exist."""
     mock_sm = MagicMock()
-    mock_sm.get_queues = AsyncMock(return_value=set())
     mock_sm.get_all_queues = AsyncMock(return_value=["default"])
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -1202,7 +1295,26 @@ async def test_create_role_rejects_unknown_queue():
 
     assert response.status_code == 400
     assert "nope" in response.json()["detail"]
-    mock_sm.save_role.assert_not_called()
+    mock_sm.create_role.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_role_conflict_returns_409_when_existing_role_has_zero_queues(state_manager):
+    """
+    POST /roles returns 409 even if the existing role currently has no queues assigned.
+
+    Previously the existence check used get_queues(), which is falsy for a role with zero
+    queues -- indistinguishable from "doesn't exist" -- so re-"creating" it silently reset it.
+    """
+    await state_manager.routing.save_queue_config(QueueConfig(name="default"))
+    await state_manager.routing.save_role("myrole", set())
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/roles", json={"name": "myrole", "queues": ["default"]})
+
+    assert response.status_code == 409
+    # The existing (empty) role must be untouched by the rejected create.
+    assert await state_manager.routing.get_queues("myrole") == set()
 
 
 @pytest.mark.asyncio
@@ -1312,6 +1424,28 @@ async def test_submit_dag_with_unregistered_task_returns_400():
     assert "totally_unregistered_xyz" in response.json()["detail"]
 
 
+@pytest.mark.asyncio
+async def test_submit_dag_raises_429_on_rate_limited_error():
+    """POST /submit-dag returns 429 when the state manager raises TaskRateLimitedError."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    async def task_function(**kwargs: object) -> None: ...
+
+    test_task_config = TaskConfig(name="my_task", version=1, function=task_function)
+    mock_sm = MagicMock()
+    mock_sm.submit_dag = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
+
+    with (
+        patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm),
+        patch("jobbers.registry.get_task_config", return_value=test_task_config),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/submit-dag", json={"diagram": diagram})
+
+    assert response.status_code == 429
+    assert "queue is full" in response.json()["detail"]
+
+
 # ── PUT /cron-dags/{id} branches ─────────────────────────────────────────────
 
 
@@ -1363,3 +1497,44 @@ async def test_update_cron_dag_invalid_cron_expr_returns_400():
 
     assert response.status_code == 400
     assert "cron" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_create_cron_dag_with_unregistered_task_returns_400():
+    """POST /cron-dags returns 400 when the diagram references a task not in the registry."""
+    diagram = 'flowchart TD\n  A["totally_unregistered_xyz@1"]'
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/cron-dags",
+            json={"name": "bad", "cron_expr": "0 * * * *", "diagram": diagram},
+        )
+
+    assert response.status_code == 400
+    assert "totally_unregistered_xyz" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_cron_dag_with_unregistered_task_returns_400():
+    """PUT /cron-dags/{id} returns 400 when the diagram references a task not in the registry."""
+    from jobbers.models.cron_dag import CronDAGEntry
+    from jobbers.models.dag import DAGTaskSpec
+
+    existing = CronDAGEntry(
+        name="existing",
+        cron_expr="0 * * * *",
+        dag_spec=DAGTaskSpec(name="my_task"),
+    )
+    mock_sm = MagicMock()
+    mock_sm.cron_dag_scheduler.get = AsyncMock(return_value=existing)
+    diagram = 'flowchart TD\n  A["totally_unregistered_xyz@1"]'
+
+    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.put(
+                f"/cron-dags/{existing.id}",
+                json={"name": "updated", "cron_expr": "0 * * * *", "diagram": diagram},
+            )
+
+    assert response.status_code == 400
+    assert "totally_unregistered_xyz" in response.json()["detail"]

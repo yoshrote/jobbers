@@ -820,6 +820,37 @@ async def test_get_dag_run_returns_submitted_at_and_task_ids(task_adapter):
     assert set(task_ids) == {ULID2, ULID3}
 
 
+@pytest.mark.asyncio
+async def test_get_dag_run_task_ids_are_chronologically_ordered(task_adapter):
+    """
+    get_dag_run's task_ids come back in submission (ULID) order, regardless of backend.
+
+    Regression test: the plain-Redis backend used to guarantee this via a
+    sorted-set read; after consolidating to a Set union, the order became
+    arbitrary. ULIDs sort lexicographically by creation time, so sorting the
+    result restores the ordering guarantee callers (e.g. GET /dags/{dag_run_id})
+    rely on, without any extra I/O.
+    """
+    state, submit = task_adapter
+    dag_run_id = ULID1
+    # Explicit timestamps (not back-to-back ULID() calls) so ordering is
+    # deterministic rather than relying on ULID()'s random tie-breaking bits
+    # within the same millisecond.
+    earliest = ULID.from_datetime(FROZEN_TIME)
+    middle = ULID.from_datetime(FROZEN_TIME + dt.timedelta(seconds=1))
+    latest = ULID.from_datetime(FROZEN_TIME + dt.timedelta(seconds=2))
+    # Register deliberately out of chronological order.
+    for tid in (latest, earliest, middle):
+        task = make_task(tid, submitted_at=FROZEN_TIME)
+        task.dag_run_id = dag_run_id
+        await submit.submit_task(task)
+
+    result = await state.get_dag_run(dag_run_id)
+    assert result is not None
+    _, task_ids = result
+    assert task_ids == [earliest, middle, latest]
+
+
 # ── clean_dag_runs ────────────────────────────────────────────────────────────
 
 
@@ -849,6 +880,50 @@ async def test_clean_dag_runs_keeps_recent_entries(task_adapter):
     assert runs[0][0] == ULID1
 
 
+# ── close_dag_run_task ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_returns_decreasing_remaining_count(task_adapter):
+    """Each submitted task in a run registers as pending; closing decrements to 0 on the last one."""
+    state, submit = task_adapter
+    dag_run_id = ULID1
+    task_a = make_task(ULID2, submitted_at=FROZEN_TIME)
+    task_b = make_task(ULID3, submitted_at=FROZEN_TIME)
+    task_a.dag_run_id = dag_run_id
+    task_b.dag_run_id = dag_run_id
+    await submit.submit_task(task_a)
+    await submit.submit_task(task_b)
+
+    assert await state.close_dag_run_task(dag_run_id, ULID2) == 1
+    assert await state.close_dag_run_task(dag_run_id, ULID3) == 0
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_returns_minus_one_when_already_closed(task_adapter):
+    """Closing the same task twice is idempotent: the second call returns -1."""
+    state, submit = task_adapter
+    dag_run_id = ULID1
+    task = make_task(ULID2, submitted_at=FROZEN_TIME)
+    task.dag_run_id = dag_run_id
+    await submit.submit_task(task)
+
+    assert await state.close_dag_run_task(dag_run_id, ULID2) == 0
+    assert await state.close_dag_run_task(dag_run_id, ULID2) == -1
+
+
+@pytest.mark.asyncio
+async def test_close_dag_run_task_returns_minus_one_for_unregistered_task(task_adapter):
+    """Closing a task that was never registered as pending in the run returns -1."""
+    state, submit = task_adapter
+    dag_run_id = ULID1
+    task = make_task(ULID2, submitted_at=FROZEN_TIME)
+    task.dag_run_id = dag_run_id
+    await submit.submit_task(task)
+
+    assert await state.close_dag_run_task(dag_run_id, ULID3) == -1
+
+
 # ── fan-in ────────────────────────────────────────────────────────────────────
 
 
@@ -856,40 +931,70 @@ async def test_clean_dag_runs_keeps_recent_entries(task_adapter):
 async def test_init_fan_in_creates_expected_members(task_adapter):
     """init_fan_in persists the predecessor set; get_fan_in_members returns it."""
     state, submit = task_adapter
+    dag_run_id = ULID()
     fan_in_key = "fan-in:init-test"
     predecessor_ids = {ULID1, ULID2, ULID3}
-    await state.init_fan_in(fan_in_key, predecessor_ids)
-    assert set(await state.get_fan_in_members(fan_in_key)) == predecessor_ids
+    await state.init_fan_in(dag_run_id, fan_in_key, predecessor_ids)
+    assert set(await state.get_fan_in_members(dag_run_id, fan_in_key)) == predecessor_ids
 
 
 @pytest.mark.asyncio
 async def test_fan_in_complete_returns_remaining_count(task_adapter):
-    """fan_in_complete decrements the tracking set and returns the remaining count."""
+    """fan_in_complete decrements the countdown and returns the remaining count."""
     state, submit = task_adapter
+    dag_run_id = ULID()
     fan_in_key = "fan-in:countdown"
-    await state.init_fan_in(fan_in_key, {ULID1, ULID2})
-    assert await state.fan_in_complete(fan_in_key, ULID1) == 1
-    assert await state.fan_in_complete(fan_in_key, ULID2) == 0
+    await state.init_fan_in(dag_run_id, fan_in_key, {ULID1, ULID2})
+    assert await state.fan_in_complete(dag_run_id, fan_in_key, ULID1) == 1
+    assert await state.fan_in_complete(dag_run_id, fan_in_key, ULID2) == 0
 
 
 @pytest.mark.asyncio
 async def test_fan_in_complete_returns_minus_one_for_unknown_id(task_adapter):
-    """fan_in_complete returns -1 when the task ID is not a member of the set."""
+    """fan_in_complete returns -1 when the task ID is not a member of the fan-in."""
     state, submit = task_adapter
-    await state.init_fan_in("fan-in:unknown", {ULID1})
-    assert await state.fan_in_complete("fan-in:unknown", ULID2) == -1
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:unknown", {ULID1})
+    assert await state.fan_in_complete(dag_run_id, "fan-in:unknown", ULID2) == -1
 
 
 @pytest.mark.asyncio
 async def test_get_fan_in_members_returns_predecessor_ids(task_adapter):
     """get_fan_in_members returns the permanent predecessor set for a fan-in key."""
     state, submit = task_adapter
+    dag_run_id = ULID()
     fan_in_key = "fan-in:members-test"
     predecessor_ids = {ULID1, ULID2, ULID3}
-    await state.init_fan_in(fan_in_key, predecessor_ids)
+    await state.init_fan_in(dag_run_id, fan_in_key, predecessor_ids)
     for uid in predecessor_ids:
-        await state.fan_in_complete(fan_in_key, uid)
-    assert set(await state.get_fan_in_members(fan_in_key)) == predecessor_ids
+        await state.fan_in_complete(dag_run_id, fan_in_key, uid)
+    assert set(await state.get_fan_in_members(dag_run_id, fan_in_key)) == predecessor_ids
+
+
+@pytest.mark.asyncio
+async def test_delegate_fan_in_swaps_id_in_tracking_and_members_sets(task_adapter):
+    """delegate_fan_in atomically replaces old_id with new_id in both tracking and members."""
+    state, _ = task_adapter
+    dag_run_id = ULID()
+    fan_in_key = "fan-in:delegate-test"
+    new_id = ULID4
+
+    # Initialise with ULID1 and ULID2 so there are two predecessors.
+    await state.init_fan_in(dag_run_id, fan_in_key, {ULID1, ULID2})
+
+    # Delegate ULID1 → new_id (simulating a nested fanout where new_id's
+    # grandcollector will report completion instead of ULID1).
+    await state.delegate_fan_in(dag_run_id, fan_in_key, ULID1, new_id)
+
+    # The tracking set should now contain ULID2 and new_id (not ULID1).
+    # Completing ULID2 leaves 1 remaining; new_id completes the set.
+    assert await state.fan_in_complete(dag_run_id, fan_in_key, ULID2) == 1
+    assert await state.fan_in_complete(dag_run_id, fan_in_key, new_id) == 0
+
+    # The members set must also contain new_id so the collector gets the right parent_ids.
+    members = set(await state.get_fan_in_members(dag_run_id, fan_in_key))
+    assert new_id in members
+    assert ULID1 not in members
 
 
 # ── compare_and_set_status ────────────────────────────────────────────────────

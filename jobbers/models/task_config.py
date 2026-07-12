@@ -58,7 +58,7 @@ class TaskConfig(BaseModel):
     function: SerializableCallable
 
     # The tuple of expected exceptions that can be handled by the task processor
-    expected_exceptions: tuple[type[Exception]] | None = Field(default=None)
+    expected_exceptions: tuple[type[Exception], ...] | None = Field(default=None)
 
     # Pre-computed dependency graph for DI — populated by @register_task at decoration time.
     # Stored as list[Any] at runtime (list[DependencyNode]); serialised to qualified names for JSON.
@@ -77,8 +77,7 @@ class TaskConfig(BaseModel):
     def _validate_cleanup_on(cls, v: frozenset[TaskStatus] | None) -> frozenset[TaskStatus] | None:
         if v is None:
             return v
-        _non_terminal = TaskStatus.active_statuses() | {TaskStatus.UNSUBMITTED}
-        invalid = v & _non_terminal
+        invalid = v - TaskStatus.terminal_statuses()
         if invalid:
             raise ValueError(f"cleanup_on may not contain non-terminal statuses: {invalid}")
         return v

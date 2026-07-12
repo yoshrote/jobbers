@@ -288,6 +288,75 @@ async def test_get_by_filter_cursor_pagination(scheduler, dummy_task_adapter):
     assert results[0][0].id == t2.id
 
 
+@pytest.mark.asyncio
+async def test_get_by_filter_pagination_consistent_when_task_id_and_run_at_order_differ(
+    scheduler, dummy_task_adapter
+):
+    """
+    Cursor pagination must not skip or duplicate rows when task_id order and run_at order differ.
+
+    Regression test: SQLTaskScheduler.get_by_filter previously ordered results by run_at but
+    paginated using a task_id cursor -- the two are uncorrelated, so a task whose task_id was
+    smaller than an already-yielded cursor but whose run_at came later could be silently
+    skipped forever. Ordering (and cursoring) consistently by task_id, matching Redis's own
+    task_id-based ordering, fixes this.
+    """
+    t_low_id_late_run = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t_high_id_early_run = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    await dummy_task_adapter.save_task(t_low_id_late_run)
+    await dummy_task_adapter.save_task(t_high_id_early_run)
+    await schedule(scheduler, t_low_id_late_run, PAST + dt.timedelta(hours=2))
+    await schedule(scheduler, t_high_id_early_run, PAST)
+
+    page1 = await scheduler.get_by_filter(queue="default", limit=1)
+    assert len(page1) == 1
+    assert page1[0][0].id == t_low_id_late_run.id
+
+    page2 = await scheduler.get_by_filter(queue="default", limit=1, start_after=str(page1[0][0].id))
+    assert len(page2) == 1
+    assert page2[0][0].id == t_high_id_early_run.id
+
+    page3 = await scheduler.get_by_filter(queue="default", limit=1, start_after=str(page2[0][0].id))
+    assert page3 == []
+
+
+@pytest.mark.asyncio
+async def test_get_by_filter_name_filter_does_not_drop_matches_beyond_old_heuristic_cutoff(
+    scheduler, dummy_task_adapter
+):
+    """
+    A name filter must not silently drop a real match when many non-matching rows precede it.
+
+    Regression test: SQLTaskScheduler.get_by_filter previously capped its initial SELECT to
+    limit*10 rows before applying the name/version filter in Python. With limit=1 that's a
+    10-row cutoff -- a match sorted (by task_id) after more than 10 non-matching rows was
+    silently dropped instead of being found.
+    """
+    for i in range(12):
+        other = Task(
+            id=f"01JQC31AJP7TSA9X8AEP64X{i:03d}",
+            name="other_task",
+            version=1,
+            queue="default",
+            status=TaskStatus.SCHEDULED,
+        )
+        await dummy_task_adapter.save_task(other)
+        await schedule(scheduler, other, PAST)
+    match = Task(
+        id="01JQC31AJP7TSA9X8AEP64XFFF",
+        name="test_task",
+        version=1,
+        queue="default",
+        status=TaskStatus.SCHEDULED,
+    )
+    await dummy_task_adapter.save_task(match)
+    await schedule(scheduler, match, PAST)
+
+    results = await scheduler.get_by_filter(queue="default", task_name="test_task", limit=1)
+    assert len(results) == 1
+    assert results[0][0].id == match.id
+
+
 # ── get_by_filter: queue=None (all-queues path) ───────────────────────────────
 
 
