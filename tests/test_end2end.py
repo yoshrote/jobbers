@@ -17,6 +17,7 @@ from jobbers.adapters.redis import (
     RedisTaskSubmit,
 )
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
+from jobbers.models.dag import DagRunStatus
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import clear_registry
@@ -76,6 +77,17 @@ async def drain(sm: StateManager) -> int:
     return count
 
 
+async def pop_and_process_one(sm: StateManager, queue: str = "default") -> None:
+    """Pop and process exactly one task from *queue* (no draining loop)."""
+    ta = sm.task_state
+    results = await ta.data_store.zpopmin(ta.TASKS_BY_QUEUE(queue=queue), count=1)
+    assert results, f"expected a queued task in {queue!r}"
+    task_id_bytes, _ = results[0]
+    task = await ta.get_task(ULID.from_bytes(task_id_bytes))
+    assert task is not None
+    await TaskProcessor(sm).run(task)
+
+
 async def tick_scheduler(sm: StateManager) -> int:
     """Dispatch all currently-due scheduled tasks. Returns count dispatched."""
     entries = await sm.task_scheduler.next_due_bulk(100)
@@ -104,7 +116,7 @@ async def test_single_node_happy_path(sm: StateManager) -> None:
       A["echo_task@1(value=a)"]
     """
     roots = parse_mermaid_dag(diagram)
-    _, submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots, name="test-run")
     await run_until_done(sm)
 
     assert len(submitted) == 1
@@ -129,7 +141,7 @@ async def test_linear_chain(sm: StateManager) -> None:
       A["echo_task@1(value=a)"] --> B["echo_task@1(value=b)"] --> C["echo_task@1(value=c)"]
     """
     roots = parse_mermaid_dag(diagram)
-    await sm.submit_dag(*roots)
+    await sm.submit_dag(*roots, name="test-run")
     await run_until_done(sm)
 
     a_node = roots[0]
@@ -170,7 +182,7 @@ async def test_diamond_fan_out_fan_in(sm: StateManager) -> None:
       C["echo_task@1(value=c)"] --> D["echo_task@1(value=d)"]
     """
     roots = parse_mermaid_dag(diagram)
-    await sm.submit_dag(*roots)
+    await sm.submit_dag(*roots, name="test-run")
     await run_until_done(sm)
 
     a_node = roots[0]
@@ -215,7 +227,7 @@ async def test_error_callback_fires_on_failure(sm: StateManager) -> None:
       A -.-> C["echo_task@1(value=error_cb)"]
     """
     roots = parse_mermaid_dag(diagram)
-    await sm.submit_dag(*roots)
+    await sm.submit_dag(*roots, name="test-run")
     await run_until_done(sm)
 
     a_node = roots[0]
@@ -249,7 +261,7 @@ async def test_downstream_not_submitted_on_parent_failure(sm: StateManager) -> N
       A["always_fail_task@1"] --> B["echo_task@1(value=b)"]
     """
     roots = parse_mermaid_dag(diagram)
-    await sm.submit_dag(*roots)
+    await sm.submit_dag(*roots, name="test-run")
     await run_until_done(sm)
 
     a_node = roots[0]
@@ -275,7 +287,7 @@ async def test_multi_root_dag(sm: StateManager) -> None:
       B["echo_task@1(value=b)"]
     """
     roots = parse_mermaid_dag(diagram)
-    await sm.submit_dag(*roots)
+    await sm.submit_dag(*roots, name="test-run")
     await run_until_done(sm)
 
     # roots order is non-deterministic (set iteration); look up by parameter
@@ -304,7 +316,7 @@ async def test_retry_exhaustion_dlq(sm: StateManager) -> None:
       A["always_fail_task@1"]
     """
     roots = parse_mermaid_dag(diagram)
-    _, submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots, name="test-run")
     await run_until_done(sm)
 
     task = await sm.task_state.get_task(submitted[0].id)
@@ -328,7 +340,7 @@ async def test_scheduled_retry_path(sm: StateManager) -> None:
       A["scheduled_fail_task@1"]
     """
     roots = parse_mermaid_dag(diagram)
-    _, submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots, name="test-run")
     task_id = submitted[0].id
 
     await run_until_done(sm)
@@ -354,7 +366,7 @@ async def test_parameters_passed_and_results(sm: StateManager) -> None:
       A["echo_task@1(value=hello)"]
     """
     roots = parse_mermaid_dag(diagram)
-    _, submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots, name="test-run")
     await run_until_done(sm)
 
     task = await sm.task_state.get_task(submitted[0].id)
@@ -386,7 +398,7 @@ async def test_cancel_running_task(sm: StateManager) -> None:
       A["slow_task@1"]
     """
     roots = parse_mermaid_dag(diagram)
-    _, submitted = await sm.submit_dag(*roots)
+    _, submitted = await sm.submit_dag(*roots, name="test-run")
     task_id = submitted[0].id
 
     cancel_listener = asyncio.create_task(sm.run_cancel_listener())
@@ -414,7 +426,7 @@ async def test_cancel_dag_root_leaves_downstream_unsubmitted(sm: StateManager) -
       A["slow_task@1"] --> B["echo_task@1(value=b)"]
     """
     roots = parse_mermaid_dag(diagram)
-    await sm.submit_dag(*roots)
+    await sm.submit_dag(*roots, name="test-run")
 
     a_node = roots[0]
     b_node = a_node._successors[0][0]
@@ -437,3 +449,92 @@ async def test_cancel_dag_root_leaves_downstream_unsubmitted(sm: StateManager) -
     assert task_a is not None
     assert task_a.status == TaskStatus.CANCELLED
     assert task_b is None  # successor was never submitted
+
+
+# ── Scenario 11: DAG run aggregate status ──────────────────────────────────────
+#
+# These exercise the real RedisTaskState/RedisTaskSubmit adapters (via the `sm`
+# fixture, not DummyTaskAdapter) end-to-end through TaskProcessor.run(), since the
+# ordering/atomicity of the aggregate-status write path is exactly the kind of
+# interaction Dummy-backed orchestration tests can't prove is race-free.
+
+
+@pytest.mark.asyncio
+async def test_dag_run_reaches_complete_status_only_after_last_task(sm: StateManager) -> None:
+    """A 2-root DAG's aggregate status becomes 'complete' only once every task has completed."""
+    diagram = """
+    flowchart TD
+      A["echo_task@1(value=a)"]
+      B["echo_task@1(value=b)"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    dag_run_id, submitted = await sm.submit_dag(*roots, name="two-root-run")
+    assert len(submitted) == 2
+
+    await pop_and_process_one(sm)
+
+    run = await sm.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.name == "two-root-run"
+    assert run.status == DagRunStatus.RUNNING  # one task done, one still pending
+
+    await pop_and_process_one(sm)
+
+    run = await sm.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_dag_run_with_one_stuck_task_latches_to_partial_failure_and_never_completes(
+    sm: StateManager,
+) -> None:
+    """A run with a mix of a completed and a permanently-failed task reaches 'partial_failure' and stays there."""
+    diagram = """
+    flowchart TD
+      A["echo_task@1(value=a)"]
+      B["always_fail_task@1"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    dag_run_id, submitted = await sm.submit_dag(*roots, name="mixed-run")
+    assert len(submitted) == 2
+
+    await run_until_done(sm)
+
+    run = await sm.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status == DagRunStatus.PARTIAL_FAILURE
+
+    # The stuck (FAILED) task never lets the pending count reach zero, so the
+    # complete-detection path (close_dag_run_task_and_sweep) never fires for this
+    # run -- status must stay latched at partial_failure, never flip to complete.
+    b_task = await sm.task_state.get_task(
+        submitted[1].id if submitted[0].name == "echo_task" else submitted[0].id
+    )
+    assert b_task is not None
+    assert b_task.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_dag_run_concurrent_last_completers_both_reach_complete_idempotently(sm: StateManager) -> None:
+    """Two siblings finishing concurrently and both hitting the 'last completer' path is race-free."""
+    diagram = """
+    flowchart TD
+      A["echo_task@1(value=a)"]
+      B["echo_task@1(value=b)"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    dag_run_id, submitted = await sm.submit_dag(*roots, name="concurrent-run")
+    assert len(submitted) == 2
+
+    ta = sm.task_state
+    results = await ta.data_store.zpopmin(ta.TASKS_BY_QUEUE(queue="default"), count=2)
+    assert len(results) == 2
+    tasks = [await ta.get_task(ULID.from_bytes(task_id_bytes)) for task_id_bytes, _ in results]
+    assert all(t is not None for t in tasks)
+
+    await asyncio.gather(*(TaskProcessor(sm).run(t) for t in tasks))
+
+    run = await sm.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status == DagRunStatus.COMPLETE

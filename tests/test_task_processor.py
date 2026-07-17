@@ -2175,6 +2175,7 @@ async def test_maybe_cleanup_dag_task_delegates_to_state_manager():
 
     assert task.status == TaskStatus.COMPLETED
     state_manager.close_dag_run_task_and_sweep.assert_awaited_once_with(task)
+    state_manager.record_dag_run_task_terminal.assert_awaited_once_with(task)
     state_manager.delete_task.assert_not_awaited()
 
 
@@ -2220,6 +2221,7 @@ async def test_maybe_cleanup_skipped_for_non_terminal_status():
     # then queue_retry_task re-queues it as SUBMITTED — either way, not terminal.
     assert task.status == TaskStatus.SUBMITTED
     state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.record_dag_run_task_terminal.assert_not_awaited()
     state_manager.delete_task.assert_not_awaited()
 
 
@@ -2265,6 +2267,7 @@ async def test_maybe_cleanup_failed_dag_task_does_not_close_pending():
 
     assert task.status == TaskStatus.FAILED
     state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.record_dag_run_task_terminal.assert_awaited_once_with(task)
     state_manager.delete_task.assert_not_awaited()
 
 
@@ -2296,6 +2299,7 @@ async def test_maybe_cleanup_stuck_dag_task_does_not_close_pending(status):
     await processor._maybe_cleanup(task)
 
     state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.record_dag_run_task_terminal.assert_awaited_once_with(task)
 
 
 @pytest.mark.asyncio

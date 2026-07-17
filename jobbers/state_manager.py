@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
     from jobbers.models.cron_dag import CronDAGEntry
-    from jobbers.models.dag import DAGNode, DAGRunPagination
+    from jobbers.models.dag import DAGNode, DAGRunDetail, DagRunOutcome, DAGRunPagination, DAGRunSummary
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task_routing import RoutingConfig
     from jobbers.protocols import (
@@ -523,6 +523,7 @@ class StateManager:
                 dag_callbacks=fresh_spec.dag_callbacks,
                 cron_id=entry.id,
                 dag_run_id=dag_run_id,
+                dag_run_name=f"{entry.name} @ {run_at.isoformat()}",
             )
 
             is_rate_limited = bool(
@@ -938,36 +939,61 @@ class StateManager:
         await self.cron_dag_scheduler.remove(cron_id)
         logger.info("Cron DAG entry %s removed.", cron_id)
 
-    async def submit_dag(self, *roots: DAGNode) -> tuple[ULID, list[Task]]:
+    async def submit_dag(
+        self, *roots: DAGNode, name: str, dag_run_id: ULID | None = None
+    ) -> tuple[ULID, list[Task]]:
         """
         Initialise fan-in sets and submit all root tasks of a DAG.
 
         All fan-in Redis sets are populated *before* any task is enqueued so
         that a fast-completing predecessor cannot decrement a set that does not
         yet exist.
+
+        `name` is required here — callers must resolve any user-facing default
+        (e.g. `jobbers/task_routes.py`'s `submit_dag` route defaults an omitted
+        name to `str(dag_run_id)`) before calling this method. `dag_run_id` is an
+        optional override so a caller that needs to know the ID in advance (in
+        order to build that default) can supply it; every other caller lets this
+        method self-generate one exactly as before.
         """
         all_fan_ins: dict[str, set[ULID]] = {}
         for root in roots:
             for key, ids in root.fan_in_predecessors().items():
                 all_fan_ins.setdefault(key, set()).update(ids)
 
-        dag_run_id = ULID()
+        dag_run_id = dag_run_id or ULID()
         await asyncio.gather(*(self.init_fan_in(dag_run_id, k, ids) for k, ids in all_fan_ins.items()))
 
         submitted: list[Task] = []
         for root in roots:
-            task = root.to_task(dag_run_id=dag_run_id)
+            task = root.to_task(dag_run_id=dag_run_id, dag_run_name=name)
             await self.submit_task(task)
             submitted.append(task)
         return dag_run_id, submitted
 
-    async def list_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
+    async def list_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[DAGRunSummary], int]:
         """Return a paginated list of DAG runs ordered by submission time."""
         return await self.task_state.get_dag_runs(pagination)
 
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
-        """Return (submitted_at, task_ids) for a DAG run, or None if not found."""
+    async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None:
+        """Return details for a DAG run, or None if not found."""
         return await self.task_state.get_dag_run(dag_run_id)
+
+    async def record_dag_run_task_terminal(self, task: Task) -> None:
+        """
+        Record *task*'s terminal outcome against its run's aggregate status counters.
+
+        Wholly additive: does not read or write DAG_RUN_PENDING/CLOSED. Called once
+        per terminal DAG task for every terminal status (unlike close_dag_run_task_
+        and_sweep, which only fires for non-stuck statuses).
+        """
+        assert task.dag_run_id is not None  # noqa: S101
+        outcome: DagRunOutcome = "failed" if task.status in TaskStatus.stuck_statuses() else "completed"
+        await self.task_state.record_dag_run_task_terminal(task.dag_run_id, outcome)
+
+    async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
+        """Set the run's status to complete iff it has never recorded a failed task."""
+        await self.task_state.mark_dag_run_complete(dag_run_id)
 
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         """Mark task_id resolved in the DAG run's pending set; return the remaining count."""
@@ -998,8 +1024,7 @@ class StateManager:
                     await self.delete_task(fallback_task)
             return
 
-        _, task_ids = run
-        sibling_tasks = await self.task_state.get_tasks_bulk(task_ids)
+        sibling_tasks = await self.task_state.get_tasks_bulk(run.task_ids)
         to_delete: list[Task] = []
         for sibling in sibling_tasks:
             if sibling is None:
@@ -1015,9 +1040,13 @@ class StateManager:
         Close *task* out of its DAG run's pending set and sweep siblings if the run just went terminal.
 
         Only called for tasks reaching a non-stuck terminal status (see
-        ``TaskProcessor._maybe_cleanup``) — FAILED/STALLED tasks never close out of
-        ``DAG_RUN_PENDING`` at all, so a run containing one simply never reaches a
-        pending count of zero and this method is never invoked for it.
+        ``TaskProcessor._maybe_cleanup``) — FAILED/STALLED/CANCELLED/DROPPED tasks never
+        close out of ``DAG_RUN_PENDING`` at all, so a run containing one simply never
+        reaches a pending count of zero and this method is never invoked for it. Since
+        only ``COMPLETED`` tasks ever reach here, reaching a pending count of zero means
+        every task the run has ever registered completed successfully -- so this also
+        marks the run's aggregate status ``complete`` (via ``mark_dag_run_complete``,
+        itself gated on the run having never recorded a failed task, defensively).
         """
         assert task.dag_run_id is not None  # noqa: S101
         remaining = await self.close_dag_run_task(task.dag_run_id, task.id)
@@ -1026,6 +1055,7 @@ class StateManager:
             # -1: already closed (duplicate call) or the run's pending entry expired/was
             # swept — either way, do not re-trigger the sweep from here.
             return
+        await self.mark_dag_run_complete(task.dag_run_id)
         await self.sweep_dag_run(task.dag_run_id, fallback_task=task)
 
     async def delete_task(self, task: Task) -> None:
