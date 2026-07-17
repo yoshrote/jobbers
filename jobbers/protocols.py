@@ -20,6 +20,8 @@ Task storage / dead-letter queue (split-store protocols):
 - `AtomicTaskSchedulerProtocol` — extends TaskSchedulerProtocol with pipeline staging.
 - `AtomicDeadQueueProtocol` — extends DeadQueueProtocol with pipeline staging.
 - `AtomicCronDAGSchedulerProtocol` — extends CronDAGSchedulerProtocol with pipeline staging.
+- `AtomicDagRunProtocol` — optional additive capability: fold DAG-run-terminal
+  bookkeeping into the same pipeline as close_dag_run_task (Redis/RedisJSON only).
 - `DeadQueueProtocol` — interface all dead-letter queue implementations must implement.
 """
 
@@ -431,6 +433,44 @@ class AtomicDeadQueueProtocol(DeadQueueProtocol, Protocol):  # pragma: no cover
     def backend_key(self) -> str: ...
 
     def pipeline(self, transaction: bool = True) -> TransactionHandle: ...
+
+
+@runtime_checkable
+class AtomicDagRunProtocol(Protocol):  # pragma: no cover
+    """
+    Optional additive capability, checked independently of AtomicTaskStateProtocol.
+
+    Lets StateManager fold record_dag_run_task_terminal + close_dag_run_task into a
+    single pipelined round trip instead of two separate EVALSHA calls.
+
+    Not part of AtomicTaskStateProtocol itself -- an adapter can be atomic-pipeline-
+    eligible (stage_save, stage_requeue, etc.) without implementing this. SQL's
+    record_dag_run_task_terminal is already a single UPDATE with no separate round
+    trip to fold away, so SQLTaskState has no reason to implement it; only
+    RedisTaskState/RedisJSONTaskState do.
+    """
+
+    def pipeline(self, transaction: bool = True) -> TransactionHandle: ...
+
+    async def stage_record_dag_run_task_terminal(
+        self, pipe: TransactionHandle, dag_run_id: ULID, outcome: DagRunOutcome
+    ) -> None:
+        """
+        Stage the counter-increment + status recompute onto pipe.
+
+        Must be awaited even though it only queues a command onto pipe and performs
+        no I/O of its own: registered Lua scripts (redis-py's AsyncScript) are
+        coroutines regardless of whether `client` is the live connection or a
+        pipeline. The actual result is only available in the list returned by
+        `await pipe.execute()`.
+        """
+        ...
+
+    async def stage_close_dag_run_task(
+        self, pipe: TransactionHandle, dag_run_id: ULID, task_id: ULID
+    ) -> None:
+        """Stage close_dag_run_task's SREM/SADD/SCARD move onto pipe (see stage_record_dag_run_task_terminal)."""
+        ...
 
 
 class CronDAGSchedulerProtocol(Protocol):  # pragma: no cover

@@ -7,7 +7,7 @@ import random
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from croniter import croniter
 from opentelemetry import metrics
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from jobbers.models.task_routing import RoutingConfig
     from jobbers.protocols import (
         AtomicCronDAGSchedulerProtocol,
+        AtomicDagRunProtocol,
         AtomicDeadQueueProtocol,
         AtomicTaskSchedulerProtocol,
         AtomicTaskStateProtocol,
@@ -123,6 +124,7 @@ class StateManager:
         # when force_saga=True, it falls back to saga coordination.
         from jobbers.protocols import (  # local import avoids circular at module level
             AtomicCronDAGSchedulerProtocol,
+            AtomicDagRunProtocol,
             AtomicDeadQueueProtocol,
             AtomicTaskSchedulerProtocol,
             AtomicTaskStateProtocol,
@@ -153,6 +155,17 @@ class StateManager:
                 and self._atomic_state is not None
                 and cron_dag_scheduler.backend_key == self._atomic_state.backend_key
             )
+            else None
+        )
+        # DAG-run-terminal-specific: True when the task-state adapter can fold
+        # record_dag_run_task_terminal + close_dag_run_task into one pipelined round
+        # trip (Redis/RedisJSON). Checked independently of _atomic_mode -- a backend
+        # without this (e.g. SQL) still gets full atomic-mode pipelining for
+        # everything else, it just doesn't have a "same pipeline" concept for these
+        # two calls to fold into.
+        self._atomic_dag_run: AtomicDagRunProtocol | None = (
+            self._atomic_state
+            if (not force_saga and isinstance(self._atomic_state, AtomicDagRunProtocol))
             else None
         )
 
@@ -979,13 +992,72 @@ class StateManager:
         """Return details for a DAG run, or None if not found."""
         return await self.task_state.get_dag_run(dag_run_id)
 
+    async def finalize_dag_run_task(self, task: Task) -> None:
+        """
+        Record *task*'s terminal outcome, close it out of its run's pending set, and sweep.
+
+        This is the single entry point TaskProcessor calls per DAG-task completion
+        (any terminal status). It owns the ordering between the two steps so callers
+        don't have to reproduce it: record_dag_run_task_terminal's recompute
+        unconditionally rewrites status to running/partial_failure/failed (never
+        complete), so running it *after* mark_dag_run_complete on the run's last task
+        would immediately clobber that 'complete' write back to a non-terminal
+        status. Calling record first for every task, and only ever calling
+        mark_dag_run_complete afterwards, means the 'complete' write is always the
+        last one to happen for a given task — and since pending only reaches zero
+        once every sibling's own close has already run (each preceded by its own
+        record call, in-order within that sibling's coroutine), every sibling's
+        record call is guaranteed to have already posted by the time the run's
+        pending count reaches zero, regardless of how concurrent completions
+        interleave.
+
+        A DAG task in a stuck status (``TaskStatus.stuck_statuses()`` — FAILED,
+        STALLED, CANCELLED, or DROPPED) never closes out of the pending counter: such
+        a task never calls ``generate_callbacks()``, so its ``FanInCallback``/
+        ``DynamicFanOutCallback`` never fires and the DAG can't complete on its own.
+        Leaving the counter open preserves the run's fan-in tracking and sibling task
+        records (within their TTLs) instead of sweeping them away.
+
+        When the task-state adapter implements ``AtomicDagRunProtocol`` (Redis/
+        RedisJSON), the record + close steps for non-stuck tasks are folded into one
+        pipelined round trip instead of two sequential ones.
+        """
+        assert task.dag_run_id is not None  # noqa: S101
+        if task.status in TaskStatus.stuck_statuses():
+            await self.record_dag_run_task_terminal(task)
+            return
+        if self._atomic_dag_run is None:
+            await self.record_dag_run_task_terminal(task)
+            await self.close_dag_run_task_and_sweep(task)
+            return
+        remaining = await self._record_terminal_and_close_atomic(task)
+        await self._finish_dag_run_if_terminal(task, remaining)
+
+    async def _record_terminal_and_close_atomic(self, task: Task) -> int:
+        """
+        Fold record_dag_run_task_terminal + close_dag_run_task into one pipelined round trip.
+
+        Only called from finalize_dag_run_task for non-stuck tasks, so outcome is
+        always 'completed' here (stuck tasks return before reaching this path).
+        """
+        assert task.dag_run_id is not None  # noqa: S101
+        assert self._atomic_dag_run is not None  # noqa: S101
+        pipe = self._atomic_dag_run.pipeline(transaction=True)
+        await self._atomic_dag_run.stage_record_dag_run_task_terminal(pipe, task.dag_run_id, "completed")
+        await self._atomic_dag_run.stage_close_dag_run_task(pipe, task.dag_run_id, task.id)
+        results = await pipe.execute()
+        close_result = cast("list[int]", results[-1])
+        return int(close_result[1])
+
     async def record_dag_run_task_terminal(self, task: Task) -> None:
         """
         Record *task*'s terminal outcome against its run's aggregate status counters.
 
         Wholly additive: does not read or write DAG_RUN_PENDING/CLOSED. Called once
         per terminal DAG task for every terminal status (unlike close_dag_run_task_
-        and_sweep, which only fires for non-stuck statuses).
+        and_sweep, which only fires for non-stuck statuses). Prefer
+        ``finalize_dag_run_task`` at call sites — it owns the ordering between this
+        and ``close_dag_run_task_and_sweep``.
         """
         assert task.dag_run_id is not None  # noqa: S101
         outcome: DagRunOutcome = "failed" if task.status in TaskStatus.stuck_statuses() else "completed"
@@ -1013,8 +1085,9 @@ class StateManager:
         the run's index is orphaned, cannot — re-verify that on its own; passing
         *fallback_task* for a run that still has siblings in flight would delete a
         task those siblings may still depend on (e.g. via ``parent_results()``).
-        The only production caller, ``close_dag_run_task_and_sweep``, already
-        guarantees this.
+        The only production caller, ``_finish_dag_run_if_terminal`` (via either
+        ``close_dag_run_task_and_sweep`` or ``finalize_dag_run_task``'s pipelined
+        path), already guarantees this.
         """
         run = await self.get_dag_run(dag_run_id)
         if run is None:
@@ -1042,14 +1115,24 @@ class StateManager:
         Only called for tasks reaching a non-stuck terminal status (see
         ``TaskProcessor._maybe_cleanup``) — FAILED/STALLED/CANCELLED/DROPPED tasks never
         close out of ``DAG_RUN_PENDING`` at all, so a run containing one simply never
-        reaches a pending count of zero and this method is never invoked for it. Since
-        only ``COMPLETED`` tasks ever reach here, reaching a pending count of zero means
-        every task the run has ever registered completed successfully -- so this also
-        marks the run's aggregate status ``complete`` (via ``mark_dag_run_complete``,
-        itself gated on the run having never recorded a failed task, defensively).
+        reaches a pending count of zero and this method is never invoked for it.
         """
         assert task.dag_run_id is not None  # noqa: S101
         remaining = await self.close_dag_run_task(task.dag_run_id, task.id)
+        await self._finish_dag_run_if_terminal(task, remaining)
+
+    async def _finish_dag_run_if_terminal(self, task: Task, remaining: int) -> None:
+        """
+        Mark the run complete and sweep siblings once *remaining* hits 0.
+
+        *remaining* comes from close_dag_run_task, staged or not. Since only
+        ``COMPLETED`` tasks ever reach here, reaching a pending count of
+        zero means every task the run has ever registered completed successfully --
+        so this also marks the run's aggregate status ``complete`` (via
+        ``mark_dag_run_complete``, itself gated on the run having never recorded a
+        failed task, defensively).
+        """
+        assert task.dag_run_id is not None  # noqa: S101
         if remaining != 0:
             # >0: DAG still in flight, the last task to close will trigger the sweep.
             # -1: already closed (duplicate call) or the run's pending entry expired/was

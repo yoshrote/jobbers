@@ -267,45 +267,17 @@ class TaskProcessor:
         """
         Delete the task record if its final status is in cleanup_on.
 
-        For standalone tasks this is a direct check. For DAG tasks, an atomic
-        per-run pending counter (rather than re-fetching every sibling on each
-        completion) detects when the whole run has gone terminal; the full
-        sibling sweep then runs exactly once, when the counter reaches zero,
-        instead of being redone from scratch on every one of the run's completions.
-
-        A DAG task in a stuck status (``TaskStatus.stuck_statuses()`` — FAILED,
-        STALLED, CANCELLED, or DROPPED) never closes out of the pending counter at
-        all: such a task never calls ``generate_callbacks()``, so its
-        ``FanInCallback``/``DynamicFanOutCallback`` never fires and the DAG can't
-        complete on its own. Leaving the counter open preserves the run's fan-in
-        tracking and sibling task records (within their TTLs) instead of sweeping
-        them away — a foundation for a future DAG-resume mechanism.
-
-        Independent of all of the above, ``record_dag_run_task_terminal`` is called
-        for *every* terminal DAG task (stuck or not) to update the run's aggregate
-        completed/failed status counters — this is wholly additive and never gated
-        on ``cleanup_on``/pending state the way the sweep above is.
-
-        ``record_dag_run_task_terminal`` must run *before* ``close_dag_run_task_and_
-        sweep``, not after: its recompute step unconditionally rewrites the run's
-        status field (to 'running'/'partial_failure'/'failed', never 'complete'), so
-        if it ran after close_dag_run_task_and_sweep's mark_dag_run_complete on the
-        run's last task, it would immediately clobber the 'complete' write back to
-        'running'. Calling it first means mark_dag_run_complete's write is always the
-        last one for that task, and — because within one task's call here record
-        strictly precedes close, and pending only reaches zero once every task's own
-        close has run — every sibling's record call is guaranteed to have already
-        posted by the time the run's pending count reaches zero, regardless of how
-        concurrent completions interleave.
+        For standalone tasks this is a direct check. For DAG tasks, delegates
+        entirely to ``StateManager.finalize_dag_run_task``, which owns both the
+        aggregate-status bookkeeping and the pending-counter/sweep logic (and the
+        ordering constraint between them — see its docstring). TaskProcessor just
+        needs to call it exactly once per DAG-task completion, regardless of
+        whether the task's terminal status is stuck or not.
         """
         if task.dag_run_id is None:
             await self._maybe_delete_self(task)
             return
-        if task.status in TaskStatus.stuck_statuses():
-            await self.state_manager.record_dag_run_task_terminal(task)
-            return
-        await self.state_manager.record_dag_run_task_terminal(task)
-        await self.state_manager.close_dag_run_task_and_sweep(task)
+        await self.state_manager.finalize_dag_run_task(task)
 
     async def _maybe_delete_self(self, task: Task) -> None:
         """Delete a standalone (non-DAG) task's record if its status matches cleanup_on."""

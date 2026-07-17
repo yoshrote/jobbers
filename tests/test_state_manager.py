@@ -547,6 +547,127 @@ async def test_sweep_dag_run_orphaned_index_no_fallback_task_is_noop(state_manag
     await state_manager_real_ta.sweep_dag_run(dag_run_id)
 
 
+# ── finalize_dag_run_task ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_finalize_dag_run_task_uses_pipelined_path_when_atomic_dag_run_available(state_manager_real_ta):
+    """
+    Sanity check for the fixture used by the tests below.
+
+    state_manager_real_ta's RedisTaskState implements AtomicDagRunProtocol, so
+    finalize_dag_run_task takes the pipelined record+close round trip.
+    """
+    assert state_manager_real_ta._atomic_dag_run is not None
+
+
+@pytest.mark.asyncio
+async def test_finalize_dag_run_task_completes_run_only_after_last_task(state_manager_real_ta):
+    """Pipelined path: a 2-task run reaches 'complete' only once both tasks have finalized."""
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    task_b = Task(
+        id=ULID2,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task_a)
+    await state_manager_real_ta.task_submit.submit_task(task=task_b)
+
+    cleanup_config = TaskConfig(name="my_task", function=dummy_fn)
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.finalize_dag_run_task(task_a)
+        run = await state_manager_real_ta.get_dag_run(dag_run_id)
+        assert run is not None
+        assert run.status.value == "running"
+
+        await state_manager_real_ta.finalize_dag_run_task(task_b)
+        run = await state_manager_real_ta.get_dag_run(dag_run_id)
+        assert run is not None
+        assert run.status.value == "complete"
+
+
+@pytest.mark.asyncio
+async def test_finalize_dag_run_task_stuck_status_records_but_never_closes(state_manager_real_ta):
+    """A FAILED task's outcome is recorded, but it never closes out of the pending set."""
+    dag_run_id = ULID()
+    task = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.FAILED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task)
+
+    await state_manager_real_ta.finalize_dag_run_task(task)
+
+    run = await state_manager_real_ta.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status.value == "failed"
+    # Never closed out of DAG_RUN_PENDING: close_dag_run_task still finds it pending.
+    assert await state_manager_real_ta.close_dag_run_task(dag_run_id, ULID1) == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_dag_run_task_sequential_fallback_matches_pipelined_result(state_manager_real_ta):
+    """
+    Sequential fallback (no AtomicDagRunProtocol) reaches the same end state as the pipelined path.
+
+    With _atomic_dag_run forced off, finalize_dag_run_task falls back to two
+    sequential calls: record_dag_run_task_terminal then close_dag_run_task_and_sweep.
+    """
+    state_manager_real_ta._atomic_dag_run = None
+
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    task_b = Task(
+        id=ULID2,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task_a)
+    await state_manager_real_ta.task_submit.submit_task(task=task_b)
+
+    cleanup_config = TaskConfig(name="my_task", function=dummy_fn)
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.finalize_dag_run_task(task_a)
+        run = await state_manager_real_ta.get_dag_run(dag_run_id)
+        assert run is not None
+        assert run.status.value == "running"
+
+        await state_manager_real_ta.finalize_dag_run_task(task_b)
+        run = await state_manager_real_ta.get_dag_run(dag_run_id)
+        assert run is not None
+        assert run.status.value == "complete"
+
+
 # ── fail_task ─────────────────────────────────────────────────────────────────
 
 

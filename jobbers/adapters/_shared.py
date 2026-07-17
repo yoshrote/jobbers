@@ -512,6 +512,24 @@ class SharedTaskAdapterMixin(ABC):
         )
         return int(results[1])
 
+    async def stage_close_dag_run_task(
+        self, pipe: TransactionHandle, dag_run_id: ULID, task_id: ULID
+    ) -> None:
+        """
+        Stage close_dag_run_task's SREM/SADD/SCARD move onto pipe (part of AtomicDagRunProtocol).
+
+        Must be awaited: registered Lua scripts are coroutines under redis-py's async
+        client even when `client` is a pipeline -- awaiting only queues the EVALSHA
+        command here, it does not execute it. The real [removed, remaining] result is
+        only available in the list returned by the eventual `await pipe.execute()`.
+        """
+        p: Any = pipe
+        await self._close_dag_run_task_script(
+            keys=[self.DAG_RUN_PENDING(dag_run_id=dag_run_id), self.DAG_RUN_CLOSED(dag_run_id=dag_run_id)],
+            args=[bytes(task_id)],
+            client=p,
+        )
+
     async def task_exists(self, task_id: ULID) -> bool:
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
         return does_exists == 1

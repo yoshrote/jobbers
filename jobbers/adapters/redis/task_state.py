@@ -239,6 +239,22 @@ class RedisTaskState(SharedTaskAdapterMixin):
             keys=[self.DAG_RUN_META(dag_run_id=dag_run_id)], args=[outcome]
         )
 
+    async def stage_record_dag_run_task_terminal(
+        self, pipe: TransactionHandle, dag_run_id: ULID, outcome: DagRunOutcome
+    ) -> None:
+        """
+        Stage record_dag_run_task_terminal onto pipe (part of AtomicDagRunProtocol).
+
+        Must be awaited: this only queues the EVALSHA command onto pipe, it does not
+        execute it (registered Lua scripts are coroutines under redis-py's async
+        client regardless of the target). The real result is only available in the
+        list returned by the eventual `await pipe.execute()`.
+        """
+        p: Any = pipe
+        await self._record_dag_run_terminal_script(
+            keys=[self.DAG_RUN_META(dag_run_id=dag_run_id)], args=[outcome], client=p
+        )
+
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
         """Set status='complete' iff failed_count == 0. No-op if the run's record is missing."""
         await self._mark_dag_run_complete_script(keys=[self.DAG_RUN_META(dag_run_id=dag_run_id)], args=[])

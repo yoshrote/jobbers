@@ -14,7 +14,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import case, delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
@@ -78,15 +78,6 @@ def _ensure_utc(d: dt.datetime | None) -> dt.datetime | None:
 def _ensure_utc_nn(d: dt.datetime) -> dt.datetime:
     """Non-nullable variant of _ensure_utc."""
     return d if d.tzinfo is not None else d.replace(tzinfo=dt.UTC)
-
-
-def _derive_dag_run_status(completed_count: int, failed_count: int) -> DagRunStatus:
-    """Derive aggregate status from a run's completed/failed counters (never returns COMPLETE)."""
-    if failed_count == 0:
-        return DagRunStatus.RUNNING
-    if completed_count > 0:
-        return DagRunStatus.PARTIAL_FAILURE
-    return DagRunStatus.FAILED
 
 
 def _row_to_task(row: Any) -> Task:
@@ -624,46 +615,47 @@ class SQLTaskState:
                 return count_result.scalar() or 0
 
     async def record_dag_run_task_terminal(self, dag_run_id: ULID, outcome: DagRunOutcome) -> None:
-        """Atomically increment the run's completed/failed counters and recompute+persist status."""
+        """
+        Atomically increment the run's completed/failed counters and recompute+persist status.
+
+        A single UPDATE does the increment, status recompute, and write together.
+        SET-clause column references (``dag_runs.c.completed_count`` etc.) are
+        evaluated against the row's pre-statement values under standard SQL UPDATE
+        semantics, and Postgres takes an implicit row lock for the statement's
+        duration -- concurrent calls for the same run serialize on that lock and
+        each sees the other's committed increment, the same guarantee the previous
+        explicit ``SELECT ... FOR UPDATE`` provided, without a separate round trip
+        for it. No-op (matches 0 rows) if the run's record is missing.
+        """
         dag_run_id_str = str(dag_run_id)
+        new_completed = dag_runs.c.completed_count + (1 if outcome == "completed" else 0)
+        new_failed = dag_runs.c.failed_count + (1 if outcome == "failed" else 0)
         async with self._sf() as session:
             async with session.begin():
-                lock_stmt = select(dag_runs.c.dag_run_id).where(dag_runs.c.dag_run_id == dag_run_id_str)
-                if self._use_for_update:
-                    lock_stmt = lock_stmt.with_for_update()
-                if (await session.execute(lock_stmt)).first() is None:
-                    return  # run record missing (already cleaned up) -- no-op
-                col = dag_runs.c.failed_count if outcome == "failed" else dag_runs.c.completed_count
                 await session.execute(
                     update(dag_runs)
                     .where(dag_runs.c.dag_run_id == dag_run_id_str)
-                    .values({col.name: col + 1})
-                )
-                counts = (
-                    await session.execute(
-                        select(dag_runs.c.completed_count, dag_runs.c.failed_count).where(
-                            dag_runs.c.dag_run_id == dag_run_id_str
-                        )
+                    .values(
+                        completed_count=new_completed,
+                        failed_count=new_failed,
+                        status=case(
+                            (new_failed == 0, DagRunStatus.RUNNING.value),
+                            (new_completed > 0, DagRunStatus.PARTIAL_FAILURE.value),
+                            else_=DagRunStatus.FAILED.value,
+                        ),
                     )
-                ).first()
-                assert counts is not None  # noqa: S101
-                new_status = _derive_dag_run_status(counts.completed_count, counts.failed_count)
-                await session.execute(
-                    update(dag_runs)
-                    .where(dag_runs.c.dag_run_id == dag_run_id_str)
-                    .values(status=new_status.value)
                 )
 
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
-        """Set status='complete' iff failed_count == 0. No-op if the run's record is missing."""
+        """
+        Set status='complete' iff failed_count == 0. No-op if the run's record is missing.
+
+        A single conditional UPDATE (see record_dag_run_task_terminal's docstring for
+        why the row lock from a bare UPDATE is sufficient here too).
+        """
         dag_run_id_str = str(dag_run_id)
         async with self._sf() as session:
             async with session.begin():
-                lock_stmt = select(dag_runs.c.dag_run_id).where(dag_runs.c.dag_run_id == dag_run_id_str)
-                if self._use_for_update:
-                    lock_stmt = lock_stmt.with_for_update()
-                if (await session.execute(lock_stmt)).first() is None:
-                    return
                 await session.execute(
                     update(dag_runs)
                     .where(dag_runs.c.dag_run_id == dag_run_id_str, dag_runs.c.failed_count == 0)
