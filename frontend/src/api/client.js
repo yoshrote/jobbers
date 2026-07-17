@@ -189,9 +189,10 @@ export const deleteRole = (name) => del(`/roles/${name}`)
 /**
  * POST /submit-dag
  * @param {string} diagram  Mermaid flowchart TD text
- * @returns {{ root_task_ids: string[] }}
+ * @param {string} [name]  Human-readable name for this DAG run. Defaults to the generated dag_run_id if omitted.
+ * @returns {{ dag_run_id: string, root_task_ids: string[] }}
  */
-export const submitDag = (diagram) => post('/submit-dag', { diagram })
+export const submitDag = (diagram, name) => post('/submit-dag', { diagram, name: name || null })
 
 // ── Cron DAGs ──────────────────────────────────────────────────────────────────
 
@@ -245,13 +246,13 @@ export const deleteCronDag = (cronId) => del(`/cron-dags/${cronId}`)
 /**
  * GET /dags
  * @param {{ limit?: number, offset?: number }} [params]
- * @returns {{ total: number, dags: { dag_run_id: string, submitted_at: string }[] }}
+ * @returns {{ total: number, dags: { dag_run_id: string, name: string, status: string, submitted_at: string }[] }}
  */
 export const listDags = (params) => get('/dags', params)
 
 /**
  * GET /dags/{dag_run_id}
  * @param {string} dagRunId
- * @returns {{ dag_run_id: string, submitted_at: string, task_ids: string[] }}
+ * @returns {{ dag_run_id: string, name: string, status: string, submitted_at: string, task_ids: string[] }}
  */
 export const getDag = (dagRunId) => get(`/dags/${dagRunId}`)

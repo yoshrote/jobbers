@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { listDags } from '../api/client'
+import DagStatusBadge from '../components/DagStatusBadge'
 
 const PAGE_SIZE = 25
 
@@ -48,6 +49,8 @@ export default function DagList() {
             <thead>
               <tr>
                 <th>DAG Run ID</th>
+                <th>Name</th>
+                <th>Status</th>
                 <th>Submitted at</th>
               </tr>
             </thead>
@@ -59,6 +62,8 @@ export default function DagList() {
                       {dag.dag_run_id}
                     </Link>
                   </td>
+                  <td>{dag.name ?? '—'}</td>
+                  <td><DagStatusBadge status={dag.status} /></td>
                   <td>{dag.submitted_at ? new Date(dag.submitted_at).toLocaleString() : '—'}</td>
                 </tr>
               ))}

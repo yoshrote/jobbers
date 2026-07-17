@@ -2,6 +2,7 @@ import mermaid from 'mermaid'
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { getDag, getTaskStatus } from '../api/client'
+import DagStatusBadge from '../components/DagStatusBadge'
 import StatusBadge from '../components/StatusBadge'
 
 mermaid.initialize({ startOnLoad: false, theme: 'default' })
@@ -110,6 +111,8 @@ export default function DagDetail() {
         <table style={{ width: 'auto' }}>
           <tbody>
             <tr><th>DAG Run ID</th><td className="monospace" style={{ fontSize: '0.85rem' }}>{run.dag_run_id}</td></tr>
+            <tr><th>Name</th><td>{run.name ?? '—'}</td></tr>
+            <tr><th>Status</th><td><DagStatusBadge status={run.status} /></td></tr>
             <tr><th>Submitted at</th><td>{formatTs(run.submitted_at)}</td></tr>
             <tr><th>Tasks</th><td>{run.task_ids?.length ?? 0}</td></tr>
           </tbody>
