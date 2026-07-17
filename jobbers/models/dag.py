@@ -57,7 +57,9 @@ own `then()` chain if further steps are needed on failure.
 
 from __future__ import annotations
 
+import datetime as dt  # noqa: TC003 -- resolved at runtime by Pydantic (DAGRunSummary.submitted_at)
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_serializer
@@ -417,7 +419,13 @@ class DAGNode:
         callbacks.extend(self._fanout_callbacks)
         return callbacks
 
-    def to_task(self, *, parent_id: ULID | None = None, dag_run_id: ULID | None = None) -> Task:
+    def to_task(
+        self,
+        *,
+        parent_id: ULID | None = None,
+        dag_run_id: ULID | None = None,
+        dag_run_name: str | None = None,
+    ) -> Task:
         """Return a `Task` for this node ready for submission."""
         from jobbers.models.task import Task
 
@@ -430,6 +438,7 @@ class DAGNode:
             dag_callbacks=self._callbacks_recursive(),
             parent_ids=[parent_id] if parent_id is not None else [],
             dag_run_id=dag_run_id,
+            dag_run_name=dag_run_name,
         )
 
     def fan_in_predecessors(self) -> dict[str, set[ULID]]:
@@ -540,6 +549,44 @@ class DAGRunPagination(BaseModel):
 
     limit: int = Field(default=50, gt=0, le=100)
     offset: int = Field(default=0, ge=0)
+
+
+class DagRunStatus(StrEnum):
+    """Aggregate status of a DAG run, derived from its tasks' terminal outcomes."""
+
+    RUNNING = "running"
+    COMPLETE = "complete"
+    PARTIAL_FAILURE = "partial_failure"
+    FAILED = "failed"
+
+
+# Outcome recorded against a run's aggregate counters when one of its tasks reaches a
+# terminal status -- "completed" for TaskStatus.COMPLETED, "failed" for any status in
+# TaskStatus.stuck_statuses() (FAILED/STALLED/CANCELLED/DROPPED).
+DagRunOutcome = Literal["completed", "failed"]
+
+
+class DAGRunSummary(BaseModel):
+    """One row of a DAG run listing: identity, name, status, submission time."""
+
+    dag_run_id: ULID
+    name: str
+    status: DagRunStatus
+    submitted_at: dt.datetime
+
+    @field_serializer("dag_run_id", when_used="json")
+    def serialize_dag_run_id(self, value: ULID) -> str:
+        return str(value)
+
+
+class DAGRunDetail(DAGRunSummary):
+    """DAGRunSummary plus the full list of task IDs belonging to the run."""
+
+    task_ids: list[ULID]
+
+    @field_serializer("task_ids", when_used="json")
+    def serialize_task_ids(self, value: list[ULID]) -> list[str]:
+        return [str(v) for v in value]
 
 
 # Avoid circular import at module level – Task is only referenced inside methods.

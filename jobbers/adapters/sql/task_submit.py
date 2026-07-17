@@ -21,6 +21,7 @@ from jobbers.migrations.schema import (
     task_queue,
     tasks,
 )
+from jobbers.models.dag import DagRunStatus
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -44,7 +45,14 @@ async def _register_dag_run(session: AsyncSession, task: Task) -> None:
     existing = await session.execute(select(dag_runs).where(dag_runs.c.dag_run_id == dag_run_id_str))
     if existing.first() is None:
         await session.execute(
-            insert(dag_runs).values(dag_run_id=dag_run_id_str, submitted_at=task.submitted_at)
+            insert(dag_runs).values(
+                dag_run_id=dag_run_id_str,
+                submitted_at=task.submitted_at,
+                name=task.dag_run_name or "",
+                status=DagRunStatus.RUNNING.value,
+                completed_count=0,
+                failed_count=0,
+            )
         )
     async with session.begin_nested() as sp:
         try:

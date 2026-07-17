@@ -26,6 +26,7 @@ from jobbers.migrations.schema import (
     task_queue,
     tasks,
 )
+from jobbers.models.dag import DAGRunDetail, DagRunStatus, DAGRunSummary
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 from jobbers.utils.sql_transaction import SQLTransactionBatch
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from jobbers.models.dag import DAGRunPagination
+    from jobbers.models.dag import DagRunOutcome, DAGRunPagination
     from jobbers.protocols import TransactionHandle
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,15 @@ def _ensure_utc(d: dt.datetime | None) -> dt.datetime | None:
 def _ensure_utc_nn(d: dt.datetime) -> dt.datetime:
     """Non-nullable variant of _ensure_utc."""
     return d if d.tzinfo is not None else d.replace(tzinfo=dt.UTC)
+
+
+def _derive_dag_run_status(completed_count: int, failed_count: int) -> DagRunStatus:
+    """Derive aggregate status from a run's completed/failed counters (never returns COMPLETE)."""
+    if failed_count == 0:
+        return DagRunStatus.RUNNING
+    if completed_count > 0:
+        return DagRunStatus.PARTIAL_FAILURE
+    return DagRunStatus.FAILED
 
 
 def _row_to_task(row: Any) -> Task:
@@ -188,12 +198,20 @@ class SQLTaskState:
             dag_run_id_str = str(task.dag_run_id)
             submitted_at = task.submitted_at
             task_id_str = str(task.id)
+            dag_run_name = task.dag_run_name or ""
 
             async def _register_dag_run(s: AsyncSession) -> None:
                 existing = await s.execute(select(dag_runs).where(dag_runs.c.dag_run_id == dag_run_id_str))
                 if existing.first() is None:
                     await s.execute(
-                        insert(dag_runs).values(dag_run_id=dag_run_id_str, submitted_at=submitted_at)
+                        insert(dag_runs).values(
+                            dag_run_id=dag_run_id_str,
+                            submitted_at=submitted_at,
+                            name=dag_run_name,
+                            status=DagRunStatus.RUNNING.value,
+                            completed_count=0,
+                            failed_count=0,
+                        )
                     )
                 async with s.begin_nested() as sp:
                     try:
@@ -499,7 +517,7 @@ class SQLTaskState:
 
     # ── DAG run index ───────────────────────────────────────────────────────
 
-    async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
+    async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[DAGRunSummary], int]:
         """Return a paginated list of DAG runs ordered by submission time."""
         async with self._sf() as session:
             total_result = await session.execute(select(func.count()).select_from(dag_runs))
@@ -511,12 +529,18 @@ class SQLTaskState:
                 .offset(pagination.offset)
             )
             entries = [
-                (ULID.from_str(row.dag_run_id), _ensure_utc_nn(row.submitted_at)) for row in result.all()
+                DAGRunSummary(
+                    dag_run_id=ULID.from_str(row.dag_run_id),
+                    name=row.name,
+                    status=DagRunStatus(row.status),
+                    submitted_at=_ensure_utc_nn(row.submitted_at),
+                )
+                for row in result.all()
             ]
         return entries, total
 
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
-        """Return (submitted_at, task_ids) for a DAG run, or None."""
+    async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None:
+        """Return DAGRunDetail for a DAG run, or None."""
         dag_run_id_str = str(dag_run_id)
         async with self._sf() as session:
             run_result = await session.execute(
@@ -531,7 +555,13 @@ class SQLTaskState:
             # ULIDs sort lexicographically by creation time; sort here so task_ids
             # is chronologically ordered regardless of the row order SQL returns.
             task_ids = sorted(ULID.from_str(row.id) for row in task_result.all())
-        return _ensure_utc_nn(run_row.submitted_at), task_ids
+        return DAGRunDetail(
+            dag_run_id=dag_run_id,
+            name=run_row.name,
+            status=DagRunStatus(run_row.status),
+            submitted_at=_ensure_utc_nn(run_row.submitted_at),
+            task_ids=task_ids,
+        )
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete DAG run entries (and their pending rows) older than ``max_age``."""
@@ -592,6 +622,53 @@ class SQLTaskState:
                     )
                 )
                 return count_result.scalar() or 0
+
+    async def record_dag_run_task_terminal(self, dag_run_id: ULID, outcome: DagRunOutcome) -> None:
+        """Atomically increment the run's completed/failed counters and recompute+persist status."""
+        dag_run_id_str = str(dag_run_id)
+        async with self._sf() as session:
+            async with session.begin():
+                lock_stmt = select(dag_runs.c.dag_run_id).where(dag_runs.c.dag_run_id == dag_run_id_str)
+                if self._use_for_update:
+                    lock_stmt = lock_stmt.with_for_update()
+                if (await session.execute(lock_stmt)).first() is None:
+                    return  # run record missing (already cleaned up) -- no-op
+                col = dag_runs.c.failed_count if outcome == "failed" else dag_runs.c.completed_count
+                await session.execute(
+                    update(dag_runs)
+                    .where(dag_runs.c.dag_run_id == dag_run_id_str)
+                    .values({col.name: col + 1})
+                )
+                counts = (
+                    await session.execute(
+                        select(dag_runs.c.completed_count, dag_runs.c.failed_count).where(
+                            dag_runs.c.dag_run_id == dag_run_id_str
+                        )
+                    )
+                ).first()
+                assert counts is not None  # noqa: S101
+                new_status = _derive_dag_run_status(counts.completed_count, counts.failed_count)
+                await session.execute(
+                    update(dag_runs)
+                    .where(dag_runs.c.dag_run_id == dag_run_id_str)
+                    .values(status=new_status.value)
+                )
+
+    async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
+        """Set status='complete' iff failed_count == 0. No-op if the run's record is missing."""
+        dag_run_id_str = str(dag_run_id)
+        async with self._sf() as session:
+            async with session.begin():
+                lock_stmt = select(dag_runs.c.dag_run_id).where(dag_runs.c.dag_run_id == dag_run_id_str)
+                if self._use_for_update:
+                    lock_stmt = lock_stmt.with_for_update()
+                if (await session.execute(lock_stmt)).first() is None:
+                    return
+                await session.execute(
+                    update(dag_runs)
+                    .where(dag_runs.c.dag_run_id == dag_run_id_str, dag_runs.c.failed_count == 0)
+                    .values(status=DagRunStatus.COMPLETE.value)
+                )
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 

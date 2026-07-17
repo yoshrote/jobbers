@@ -507,12 +507,18 @@ async def test_stage_register_dag_run_adds_to_dag_runs_set(redis_task_adapter):
     dag_run_id = ULID()
     task = make_task()
     task.dag_run_id = dag_run_id
+    task.dag_run_name = "my-run"
     pipe = state.data_store.pipeline(transaction=True)
     state.stage_submit_task(pipe, task)
     await pipe.execute()
     score = await state.data_store.zscore(state.DAG_RUNS, bytes(dag_run_id))
     assert score is not None
     assert score == pytest.approx(FROZEN_TIME.timestamp())
+
+    detail = await state.get_dag_run(dag_run_id)
+    assert detail is not None
+    assert detail.name == "my-run"
+    assert detail.status.value == "running"
 
 
 @pytest.mark.asyncio

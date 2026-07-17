@@ -83,6 +83,13 @@ class Task(BaseModel):
     # Generated once at submission time (submit_dag / dispatch_cron_dag) and propagated to all
     # descendants via generate_callbacks, generate_error_callbacks, and _handle_dynamic_fanout.
     dag_run_id: OptionalULIDField = Field(default=None)
+    # Human-readable name of the DAG run, set once alongside dag_run_id by whichever call
+    # site mints it (StateManager.submit_dag, StateManager._dispatch_cron_dag_locked,
+    # TaskProcessor._handle_dynamic_fanout's self-started-run case) and propagated unchanged
+    # to every descendant the same way dag_run_id is. Always resolved to a concrete
+    # non-empty string by that call site — never left as a bare None. Non-None whenever
+    # dag_run_id is non-None.
+    dag_run_name: str | None = Field(default=None)
 
     @field_serializer("id", when_used="json")
     def serialize_id(self, value: ULID) -> str:
@@ -206,6 +213,7 @@ class Task(BaseModel):
             parent_ids=parent_ids,
             inject_parent_results=inject_parent_results,
             dag_run_id=self.dag_run_id,
+            dag_run_name=self.dag_run_name,
         )
 
     def generate_error_callbacks(self) -> list[Self]:

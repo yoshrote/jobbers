@@ -139,6 +139,12 @@ class DummyTaskState:
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         raise NotImplementedError("DummyTaskState.close_dag_run_task")
 
+    async def record_dag_run_task_terminal(self, dag_run_id: ULID, outcome: object) -> None:
+        raise NotImplementedError("DummyTaskState.record_dag_run_task_terminal")
+
+    async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
+        raise NotImplementedError("DummyTaskState.mark_dag_run_complete")
+
     async def ensure_index(self) -> None:
         raise NotImplementedError("DummyTaskState.ensure_index")
 

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from jobbers.adapters._shared import _SharedRedisTaskSubmitBase
 
 if TYPE_CHECKING:
-    from redis.asyncio.client import Redis
+    from redis.asyncio.client import Pipeline, Redis
 
     from jobbers.adapters.redis.task_state import RedisTaskState
     from jobbers.models.task import Task
@@ -31,6 +31,10 @@ _MSGPACK_SUBMIT_SCRIPT = """
     if ARGV[5] ~= '' then
         redis.call('ZADD', KEYS[4], 'NX', ARGV[1], ARGV[5])
         redis.call('SADD', KEYS[5], ARGV[2])
+        redis.call('HSETNX', KEYS[6], 'name', ARGV[6])
+        redis.call('HSETNX', KEYS[6], 'status', 'running')
+        redis.call('HSETNX', KEYS[6], 'completed', 0)
+        redis.call('HSETNX', KEYS[6], 'failed', 0)
     end
     return 1
 """
@@ -65,6 +69,10 @@ _MSGPACK_SUBMIT_RATE_LIMITED_SCRIPT = """
     if enqueued == 1 and ARGV[7] ~= '' then
         redis.call('ZADD', KEYS[5], 'NX', ARGV[3], ARGV[7])
         redis.call('SADD', KEYS[6], ARGV[4])
+        redis.call('HSETNX', KEYS[7], 'name', ARGV[8])
+        redis.call('HSETNX', KEYS[7], 'status', 'running')
+        redis.call('HSETNX', KEYS[7], 'completed', 0)
+        redis.call('HSETNX', KEYS[7], 'failed', 0)
     end
     return enqueued
 """
@@ -84,11 +92,13 @@ class RedisTaskSubmit(_SharedRedisTaskSubmitBase):
     # KEYS[3] = task-type-idx:{name}
     # KEYS[4] = dag-runs
     # KEYS[5] = dag-run:{dag_run_id}:pending (placeholder key when task has no DAG run)
+    # KEYS[6] = dag-run:{dag_run_id}:meta (placeholder key when task has no DAG run)
     # ARGV[1] = submitted_at timestamp
     # ARGV[2] = task_id bytes
     # ARGV[3] = '1'/'0' for type index
     # ARGV[4] = msgpack-encoded task blob
     # ARGV[5] = dag_run_id bytes (empty string if task is not part of a DAG run)
+    # ARGV[6] = dag_run_name (empty string if task is not part of a DAG run)
     SUBMIT_SCRIPT = _MSGPACK_SUBMIT_SCRIPT
 
     # Atomically check rate limit and enqueue.
@@ -98,6 +108,7 @@ class RedisTaskSubmit(_SharedRedisTaskSubmitBase):
     # KEYS[4] = task-type-idx:{name}
     # KEYS[5] = dag-runs
     # KEYS[6] = dag-run:{dag_run_id}:pending (placeholder key when task has no DAG run)
+    # KEYS[7] = dag-run:{dag_run_id}:meta (placeholder key when task has no DAG run)
     # ARGV[1] = earliest_time
     # ARGV[2] = rate_numerator
     # ARGV[3] = submitted_at timestamp
@@ -105,6 +116,7 @@ class RedisTaskSubmit(_SharedRedisTaskSubmitBase):
     # ARGV[5] = '1'/'0' for type index
     # ARGV[6] = msgpack-encoded task blob
     # ARGV[7] = dag_run_id bytes (empty string if task is not part of a DAG run)
+    # ARGV[8] = dag_run_name (empty string if task is not part of a DAG run)
     # Returns: 1 if enqueued, 0 if rate-limited
     SUBMIT_RATE_LIMITED_SCRIPT = _MSGPACK_SUBMIT_RATE_LIMITED_SCRIPT
 
@@ -113,8 +125,16 @@ class RedisTaskSubmit(_SharedRedisTaskSubmitBase):
 
     def _extra_submit_keys(self, task: Task) -> list[str]:
         dag_run_id = task.dag_run_id if task.dag_run_id is not None else ""
-        return [self.DAG_RUN_PENDING(dag_run_id=dag_run_id)]
+        return [self.DAG_RUN_PENDING(dag_run_id=dag_run_id), self.DAG_RUN_META(dag_run_id=dag_run_id)]
 
     def _extra_rate_limited_keys(self, task: Task) -> list[str]:
         dag_run_id = task.dag_run_id if task.dag_run_id is not None else ""
-        return [self.DAG_RUN_PENDING(dag_run_id=dag_run_id)]
+        return [self.DAG_RUN_PENDING(dag_run_id=dag_run_id), self.DAG_RUN_META(dag_run_id=dag_run_id)]
+
+    def _stage_dag_run_meta_seed(self, pipe: Pipeline, task: Task) -> None:
+        assert task.dag_run_id is not None  # noqa: S101
+        meta_key = self.DAG_RUN_META(dag_run_id=task.dag_run_id)
+        pipe.hsetnx(meta_key, "name", task.dag_run_name or "")
+        pipe.hsetnx(meta_key, "status", "running")
+        pipe.hsetnx(meta_key, "completed", 0)
+        pipe.hsetnx(meta_key, "failed", 0)

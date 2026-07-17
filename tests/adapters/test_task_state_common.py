@@ -17,7 +17,7 @@ from ulid import ULID
 
 from jobbers.adapters.redis import RedisTaskState
 from jobbers.adapters.redis_json import RedisJSONTaskState
-from jobbers.models.dag import DAGRunPagination
+from jobbers.models.dag import DAGRunPagination, DagRunStatus
 from jobbers.models.task import PaginationOrder, Task, TaskPagination
 from jobbers.models.task_status import TaskStatus
 
@@ -790,9 +790,9 @@ async def test_get_dag_runs_returns_submitted_dag_runs(task_adapter):
     await submit.submit_task(task)
     runs, total = await state.get_dag_runs(DAGRunPagination())
     assert total == 1
-    run_id, submitted_at = runs[0]
-    assert run_id == ULID1
-    assert submitted_at == pytest.approx(FROZEN_TIME, abs=dt.timedelta(seconds=1))
+    run = runs[0]
+    assert run.dag_run_id == ULID1
+    assert run.submitted_at == pytest.approx(FROZEN_TIME, abs=dt.timedelta(seconds=1))
 
 
 @pytest.mark.asyncio
@@ -815,9 +815,8 @@ async def test_get_dag_run_returns_submitted_at_and_task_ids(task_adapter):
     await submit.submit_task(task_b)
     result = await state.get_dag_run(dag_run_id)
     assert result is not None
-    submitted_at, task_ids = result
-    assert submitted_at == pytest.approx(FROZEN_TIME, abs=dt.timedelta(seconds=1))
-    assert set(task_ids) == {ULID2, ULID3}
+    assert result.submitted_at == pytest.approx(FROZEN_TIME, abs=dt.timedelta(seconds=1))
+    assert set(result.task_ids) == {ULID2, ULID3}
 
 
 @pytest.mark.asyncio
@@ -847,8 +846,7 @@ async def test_get_dag_run_task_ids_are_chronologically_ordered(task_adapter):
 
     result = await state.get_dag_run(dag_run_id)
     assert result is not None
-    _, task_ids = result
-    assert task_ids == [earliest, middle, latest]
+    assert result.task_ids == [earliest, middle, latest]
 
 
 # ── clean_dag_runs ────────────────────────────────────────────────────────────
@@ -877,7 +875,7 @@ async def test_clean_dag_runs_keeps_recent_entries(task_adapter):
     await state.clean_dag_runs(FROZEN_TIME, dt.timedelta(days=7))
     runs, total = await state.get_dag_runs(DAGRunPagination())
     assert total == 1
-    assert runs[0][0] == ULID1
+    assert runs[0].dag_run_id == ULID1
 
 
 # ── close_dag_run_task ────────────────────────────────────────────────────────
@@ -922,6 +920,91 @@ async def test_close_dag_run_task_returns_minus_one_for_unregistered_task(task_a
     await submit.submit_task(task)
 
     assert await state.close_dag_run_task(dag_run_id, ULID3) == -1
+
+
+# ── DAG run aggregate status ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_dag_runs_includes_name_and_default_running_status(task_adapter):
+    """A freshly registered run appears with its name and status='running'."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    task.dag_run_name = "my-run"
+    await submit.submit_task(task)
+
+    runs, _ = await state.get_dag_runs(DAGRunPagination())
+    assert runs[0].name == "my-run"
+    assert runs[0].status == DagRunStatus.RUNNING
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.name == "my-run"
+    assert detail.status == DagRunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_record_dag_run_task_terminal_failed_only_yields_failed(task_adapter):
+    """A run with only failed outcomes (zero completions) has status='failed'."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_record_dag_run_task_terminal_failed_then_completed_yields_partial_failure(task_adapter):
+    """A run with a mix of failed and completed outcomes has status='partial_failure'."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.PARTIAL_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_mark_dag_run_complete_sets_complete_when_failed_count_zero(task_adapter):
+    """mark_dag_run_complete sets status='complete' when the run has never recorded a failure."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_mark_dag_run_complete_noop_when_failed_count_nonzero(task_adapter):
+    """mark_dag_run_complete does not overwrite a failed/partial_failure status."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.FAILED
 
 
 # ── fan-in ────────────────────────────────────────────────────────────────────
