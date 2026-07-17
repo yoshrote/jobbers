@@ -20,6 +20,8 @@ Task storage / dead-letter queue (split-store protocols):
 - `AtomicTaskSchedulerProtocol` — extends TaskSchedulerProtocol with pipeline staging.
 - `AtomicDeadQueueProtocol` — extends DeadQueueProtocol with pipeline staging.
 - `AtomicCronDAGSchedulerProtocol` — extends CronDAGSchedulerProtocol with pipeline staging.
+- `AtomicDagRunProtocol` — optional additive capability: fold DAG-run-terminal
+  bookkeeping into the same pipeline as close_dag_run_task (Redis/RedisJSON only).
 - `DeadQueueProtocol` — interface all dead-letter queue implementations must implement.
 """
 
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
     from ulid import ULID
 
     from jobbers.models.cron_dag import CronDAGEntry
-    from jobbers.models.dag import DAGRunPagination
+    from jobbers.models.dag import DAGRunDetail, DagRunOutcome, DAGRunPagination, DAGRunSummary
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
     from jobbers.models.task_routing import RoutingConfig
@@ -271,10 +273,8 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
         ...
 
     # DAG run index
-    async def get_dag_runs(
-        self, pagination: DAGRunPagination
-    ) -> tuple[list[tuple[ULID, dt.datetime]], int]: ...
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None: ...
+    async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[DAGRunSummary], int]: ...
+    async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None: ...
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         """
@@ -284,6 +284,16 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
         key/rows expired) — callers must treat -1 as "do not trigger the sweep",
         exactly like fan_in_complete's -1 sentinel.
         """
+        ...
+
+    # DAG run aggregate status — wholly additive to the pending/closed mechanism above;
+    # neither of these reads or writes DAG_RUN_PENDING/DAG_RUN_CLOSED state.
+    async def record_dag_run_task_terminal(self, dag_run_id: ULID, outcome: DagRunOutcome) -> None:
+        """Atomically increment the run's completed/failed counters and recompute+persist status."""
+        ...
+
+    async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
+        """Set status='complete' iff failed_count == 0. No-op if the run's record is missing."""
         ...
 
     # Lifecycle
@@ -423,6 +433,44 @@ class AtomicDeadQueueProtocol(DeadQueueProtocol, Protocol):  # pragma: no cover
     def backend_key(self) -> str: ...
 
     def pipeline(self, transaction: bool = True) -> TransactionHandle: ...
+
+
+@runtime_checkable
+class AtomicDagRunProtocol(Protocol):  # pragma: no cover
+    """
+    Optional additive capability, checked independently of AtomicTaskStateProtocol.
+
+    Lets StateManager fold record_dag_run_task_terminal + close_dag_run_task into a
+    single pipelined round trip instead of two separate EVALSHA calls.
+
+    Not part of AtomicTaskStateProtocol itself -- an adapter can be atomic-pipeline-
+    eligible (stage_save, stage_requeue, etc.) without implementing this. SQL's
+    record_dag_run_task_terminal is already a single UPDATE with no separate round
+    trip to fold away, so SQLTaskState has no reason to implement it; only
+    RedisTaskState/RedisJSONTaskState do.
+    """
+
+    def pipeline(self, transaction: bool = True) -> TransactionHandle: ...
+
+    async def stage_record_dag_run_task_terminal(
+        self, pipe: TransactionHandle, dag_run_id: ULID, outcome: DagRunOutcome
+    ) -> None:
+        """
+        Stage the counter-increment + status recompute onto pipe.
+
+        Must be awaited even though it only queues a command onto pipe and performs
+        no I/O of its own: registered Lua scripts (redis-py's AsyncScript) are
+        coroutines regardless of whether `client` is the live connection or a
+        pipeline. The actual result is only available in the list returned by
+        `await pipe.execute()`.
+        """
+        ...
+
+    async def stage_close_dag_run_task(
+        self, pipe: TransactionHandle, dag_run_id: ULID, task_id: ULID
+    ) -> None:
+        """Stage close_dag_run_task's SREM/SADD/SCARD move onto pipe (see stage_record_dag_run_task_terminal)."""
+        ...
 
 
 class CronDAGSchedulerProtocol(Protocol):  # pragma: no cover

@@ -19,6 +19,7 @@ const PLACEHOLDER = `flowchart TD
     B -.-> err`
 
 export default function SubmitDAG() {
+  const [name, setName]           = useState('')
   const [diagram, setDiagram]     = useState(PLACEHOLDER)
   const [svgHtml, setSvgHtml]     = useState('')
   const [parseError, setParseError] = useState(null)
@@ -50,7 +51,7 @@ export default function SubmitDAG() {
     setSubmitError(null)
     setResult(null)
     try {
-      const res = await submitDag(diagram)
+      const res = await submitDag(diagram, name)
       setResult(res)
     } catch (e) {
       setSubmitError(e.message)
@@ -71,6 +72,14 @@ export default function SubmitDAG() {
         <div className="card" style={{ margin: 0 }}>
           <h2 style={{ marginTop: 0 }}>Diagram</h2>
           <form onSubmit={handleSubmit}>
+            <div className="form-row">
+              <label>Name</label>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Defaults to the generated run ID if left blank"
+              />
+            </div>
             <textarea
               value={diagram}
               onChange={(e) => setDiagram(e.target.value)}

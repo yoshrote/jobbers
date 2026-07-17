@@ -530,6 +530,10 @@ class SubmitDAGRequest(BaseModel):
     """Request body for ad-hoc DAG submission from a mermaid diagram."""
 
     diagram: str = Field(description="Mermaid flowchart text describing the DAG.")
+    name: str | None = Field(
+        default=None,
+        description="Human-readable name for this DAG run. Defaults to the generated dag_run_id if omitted.",
+    )
 
 
 @app.post("/submit-dag")
@@ -548,9 +552,14 @@ async def submit_dag(request: SubmitDAGRequest) -> dict[str, Any]:
 
     _validate_dag_against_registry(roots)
 
+    # Generated here (rather than left to StateManager.submit_dag's internal default)
+    # so an omitted name can default to this exact ID.
+    dag_run_id = ULID()
+    name = request.name or str(dag_run_id)
+
     sm = db.get_state_manager()
     try:
-        dag_run_id, submitted = await sm.submit_dag(*roots)
+        dag_run_id, submitted = await sm.submit_dag(*roots, name=name, dag_run_id=dag_run_id)
     except TaskRateLimitedError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     return {"dag_run_id": str(dag_run_id), "root_task_ids": [str(t.id) for t in submitted]}
@@ -695,7 +704,15 @@ async def list_dags(pagination: Annotated[DAGRunPagination, Query()]) -> dict[st
     dag_runs, total = await sm.list_dag_runs(pagination)
     return {
         "total": total,
-        "dags": [{"dag_run_id": str(rid), "submitted_at": ts.isoformat()} for rid, ts in dag_runs],
+        "dags": [
+            {
+                "dag_run_id": str(run.dag_run_id),
+                "name": run.name,
+                "status": run.status.value,
+                "submitted_at": run.submitted_at.isoformat(),
+            }
+            for run in dag_runs
+        ],
     }
 
 
@@ -707,9 +724,10 @@ async def get_dag(dag_run_id: str) -> dict[str, Any]:
     result = await sm.get_dag_run(uid)
     if result is None:
         raise HTTPException(status_code=404, detail=f"DAG run '{dag_run_id}' not found.")
-    submitted_at, task_ids = result
     return {
-        "dag_run_id": dag_run_id,
-        "submitted_at": submitted_at.isoformat(),
-        "task_ids": [str(t) for t in task_ids],
+        "dag_run_id": str(result.dag_run_id),
+        "name": result.name,
+        "status": result.status.value,
+        "submitted_at": result.submitted_at.isoformat(),
+        "task_ids": [str(t) for t in result.task_ids],
     }

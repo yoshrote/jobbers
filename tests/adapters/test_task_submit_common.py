@@ -128,8 +128,7 @@ async def test_enqueue_registers_dag_run(task_adapter):
 
     run = await state.get_dag_run(dag_run_id)
     assert run is not None
-    _, task_ids = run
-    assert ULID1 in task_ids
+    assert ULID1 in run.task_ids
 
 
 # ── get_next_task ─────────────────────────────────────────────────────────────

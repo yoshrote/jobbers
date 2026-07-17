@@ -279,11 +279,11 @@
                   "type": "string",
                   "minLength": 26,
                   "maxLength": 26,
-                  "pattern": "[A-Z0-9]{26}"
+                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
                 },
                 {
                   "type": "string",
-                  "format": "binary",
+                  "contentMediaType": "application/octet-stream",
                   "minLength": 16,
                   "maxLength": 16
                 },
@@ -988,11 +988,11 @@
                   "type": "string",
                   "minLength": 26,
                   "maxLength": 26,
-                  "pattern": "[A-Z0-9]{26}"
+                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
                 },
                 {
                   "type": "string",
-                  "format": "binary",
+                  "contentMediaType": "application/octet-stream",
                   "minLength": 16,
                   "maxLength": 16
                 },
@@ -1266,6 +1266,48 @@
                   "type": "object",
                   "additionalProperties": true,
                   "title": "Response Delete Role Roles  Role Name  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role_name}/refresh": {
+      "post": {
+        "summary": "Refresh Role",
+        "description": "Bump the refresh tag for a role, causing workers to reload their queue list on the next poll.",
+        "operationId": "refresh_role_roles__role_name__refresh_post",
+        "parameters": [
+          {
+            "name": "role_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Role Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Refresh Role Roles  Role Name  Refresh Post"
                 }
               }
             }
@@ -1892,13 +1934,13 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[A-Z0-9]{26}"
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
               },
               {
                 "type": "string",
                 "maxLength": 16,
                 "minLength": 16,
-                "format": "binary"
+                "contentMediaType": "application/octet-stream"
               }
             ],
             "title": "Id"
@@ -1931,11 +1973,15 @@
                 },
                 {
                   "$ref": "#/components/schemas/FanInCallback"
+                },
+                {
+                  "$ref": "#/components/schemas/DynamicFanOutCallback"
                 }
               ],
               "discriminator": {
                 "propertyName": "type",
                 "mapping": {
+                  "dynamic_fanout": "#/components/schemas/DynamicFanOutCallback",
                   "fan_in": "#/components/schemas/FanInCallback",
                   "simple": "#/components/schemas/SimpleCallback"
                 }
@@ -2052,6 +2098,54 @@
         "title": "DeadLetterPolicy",
         "description": "Dead letter policy to use when a task fails."
       },
+      "DynamicFanOutCallback": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "dynamic_fanout",
+            "title": "Type",
+            "default": "dynamic_fanout"
+          },
+          "arm_root": {
+            "$ref": "#/components/schemas/DAGTaskSpec"
+          },
+          "collector": {
+            "$ref": "#/components/schemas/DAGTaskSpec"
+          },
+          "items_key": {
+            "type": "string",
+            "title": "Items Key",
+            "default": "items"
+          },
+          "fan_in_ttl": {
+            "type": "integer",
+            "title": "Fan In Ttl",
+            "default": 86400
+          },
+          "propagate_fan_in": {
+            "type": "boolean",
+            "title": "Propagate Fan In",
+            "default": true
+          },
+          "error_callback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DAGTaskSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "arm_root",
+          "collector"
+        ],
+        "title": "DynamicFanOutCallback",
+        "description": "Declarative dynamic fan-out driven by the dispatcher task's result data.\n\nThe processor reads arm parameters from the dispatcher task's results and\nspawns one arm instance per entry.\n\n``arm_root`` is a template ``DAGTaskSpec`` for the root of each arm chain.\nEach entry in ``dispatcher.results[items_key]`` (a list of dicts) is\nshallow-merged into the arm root's parameters (entry values take precedence\nover the template's static parameters).\n\n``collector`` is submitted once all arm terminals have completed (fan-in).\n\n``propagate_fan_in`` mirrors the same field on ``DynamicFanOut``: when\n``True`` (the default), if this dispatcher is itself an arm of an outer\nfan-in, the outer fan-in responsibility is transferred to ``collector``\nso the outer fan-in waits for the collector rather than the dispatcher.\n\nThis callback type is produced by the mermaid parser when it encounters a\n``-->>`` fan-out edge.  Task functions that need runtime control over arm\nstructure should continue to use ``DynamicFanOut`` / ``TaskResult`` instead."
+      },
       "FanInCallback": {
         "properties": {
           "type": {
@@ -2089,7 +2183,7 @@
           "fan_in_key"
         ],
         "title": "FanInCallback",
-        "description": "Submit `task` only once all fan-in predecessors have completed.\n\n`fan_in_key` is a Redis key for a set of pending predecessor task IDs.\nEach predecessor removes its own ID via `TaskAdapterProtocol.fan_in_complete`;\nwhen the set becomes empty the collector task is submitted."
+        "description": "Submit `task` only once all fan-in predecessors have completed.\n\n`fan_in_key` is a Redis key for a set of pending predecessor task IDs.\nEach predecessor removes its own ID via `TaskStateProtocol.fan_in_complete`;\nwhen the set becomes empty the collector task is submitted."
       },
       "HTTPValidationError": {
         "properties": {
@@ -2122,7 +2216,8 @@
           "max_concurrent": {
             "anyOf": [
               {
-                "type": "integer"
+                "type": "integer",
+                "minimum": 0.0
               },
               {
                 "type": "null"
@@ -2354,6 +2449,18 @@
             "type": "string",
             "title": "Diagram",
             "description": "Mermaid flowchart text describing the DAG."
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name",
+            "description": "Human-readable name for this DAG run. Defaults to the generated dag_run_id if omitted."
           }
         },
         "type": "object",
@@ -2371,13 +2478,13 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[A-Z0-9]{26}"
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
               },
               {
                 "type": "string",
                 "maxLength": 16,
                 "minLength": 16,
-                "format": "binary"
+                "contentMediaType": "application/octet-stream"
               }
             ],
             "title": "Id"
@@ -2503,11 +2610,15 @@
                 },
                 {
                   "$ref": "#/components/schemas/FanInCallback"
+                },
+                {
+                  "$ref": "#/components/schemas/DynamicFanOutCallback"
                 }
               ],
               "discriminator": {
                 "propertyName": "type",
                 "mapping": {
+                  "dynamic_fanout": "#/components/schemas/DynamicFanOutCallback",
                   "fan_in": "#/components/schemas/FanInCallback",
                   "simple": "#/components/schemas/SimpleCallback"
                 }
@@ -2523,13 +2634,13 @@
                   "type": "string",
                   "maxLength": 26,
                   "minLength": 26,
-                  "pattern": "[A-Z0-9]{26}"
+                  "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
                 },
                 {
                   "type": "string",
                   "maxLength": 16,
                   "minLength": 16,
-                  "format": "binary"
+                  "contentMediaType": "application/octet-stream"
                 }
               ]
             },
@@ -2547,13 +2658,13 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[A-Z0-9]{26}"
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
               },
               {
                 "type": "string",
                 "maxLength": 16,
                 "minLength": 16,
-                "format": "binary"
+                "contentMediaType": "application/octet-stream"
               },
               {
                 "type": "null"
@@ -2567,19 +2678,30 @@
                 "type": "string",
                 "maxLength": 26,
                 "minLength": 26,
-                "pattern": "[A-Z0-9]{26}"
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
               },
               {
                 "type": "string",
                 "maxLength": 16,
                 "minLength": 16,
-                "format": "binary"
+                "contentMediaType": "application/octet-stream"
               },
               {
                 "type": "null"
               }
             ],
             "title": "Dag Run Id"
+          },
+          "dag_run_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dag Run Name"
           }
         },
         "type": "object",
@@ -2657,6 +2779,21 @@
             "$ref": "#/components/schemas/DeadLetterPolicy",
             "default": "none"
           },
+          "cleanup_on": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/TaskStatus"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cleanup On"
+          },
           "max_heartbeat_interval": {
             "anyOf": [
               {
@@ -2677,18 +2814,19 @@
           "expected_exceptions": {
             "anyOf": [
               {
-                "prefixItems": [
-                  {}
-                ],
-                "type": "array",
-                "maxItems": 1,
-                "minItems": 1
+                "items": {},
+                "type": "array"
               },
               {
                 "type": "null"
               }
             ],
             "title": "Expected Exceptions"
+          },
+          "dependency_graph": {
+            "type": "array",
+            "title": "Dependency Graph",
+            "readOnly": true
           }
         },
         "type": "object",
@@ -2748,6 +2886,13 @@
           "type": {
             "type": "string",
             "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
           }
         },
         "type": "object",

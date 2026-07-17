@@ -2140,11 +2140,13 @@ async def test_maybe_cleanup_standalone_no_cleanup_on():
 @pytest.mark.asyncio
 async def test_maybe_cleanup_dag_task_delegates_to_state_manager():
     """
-    DAG tasks delegate to StateManager.close_dag_run_task_and_sweep.
+    DAG tasks delegate to StateManager.finalize_dag_run_task.
 
-    The counter-close-and-sweep logic itself now lives on StateManager (so the
-    Cleaner's stale-heartbeat path can trigger it too, see test_state_manager.py) —
-    TaskProcessor just needs to call it exactly once per DAG-task completion.
+    All the DAG-run bookkeeping (aggregate-status recording, pending-counter close,
+    sibling sweep, and the ordering between them) now lives on StateManager behind
+    this single method — TaskProcessor just needs to call it exactly once per
+    DAG-task completion. See test_state_manager.py for coverage of what
+    finalize_dag_run_task itself does.
     """
     dag_run_id = ULID()
     task_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG08")
@@ -2159,7 +2161,6 @@ async def test_maybe_cleanup_dag_task_delegates_to_state_manager():
     )
 
     state_manager = _make_state_manager()
-    state_manager.close_dag_run_task_and_sweep = AsyncMock()
 
     task_function = AsyncMock(return_value=None)
     task_config = TaskConfig(
@@ -2174,7 +2175,7 @@ async def test_maybe_cleanup_dag_task_delegates_to_state_manager():
         await processor.process(task)
 
     assert task.status == TaskStatus.COMPLETED
-    state_manager.close_dag_run_task_and_sweep.assert_awaited_once_with(task)
+    state_manager.finalize_dag_run_task.assert_awaited_once_with(task)
     state_manager.delete_task.assert_not_awaited()
 
 
@@ -2210,7 +2211,6 @@ async def test_maybe_cleanup_skipped_for_non_terminal_status():
     )
 
     state_manager = _make_state_manager()
-    state_manager.close_dag_run_task_and_sweep = AsyncMock()
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
@@ -2219,7 +2219,7 @@ async def test_maybe_cleanup_skipped_for_non_terminal_status():
     # No retry_delay configured means immediate retry: _handle_retry sets UNSUBMITTED,
     # then queue_retry_task re-queues it as SUBMITTED — either way, not terminal.
     assert task.status == TaskStatus.SUBMITTED
-    state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.finalize_dag_run_task.assert_not_awaited()
     state_manager.delete_task.assert_not_awaited()
 
 
@@ -2257,14 +2257,13 @@ async def test_maybe_cleanup_failed_dag_task_does_not_close_pending():
     )
 
     state_manager = _make_state_manager()
-    state_manager.close_dag_run_task_and_sweep = AsyncMock()
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
         await processor.process(task)
 
     assert task.status == TaskStatus.FAILED
-    state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.finalize_dag_run_task.assert_awaited_once_with(task)
     state_manager.delete_task.assert_not_awaited()
 
 
@@ -2290,12 +2289,11 @@ async def test_maybe_cleanup_stuck_dag_task_does_not_close_pending(status):
         dag_run_id=dag_run_id,
     )
     state_manager = _make_state_manager()
-    state_manager.close_dag_run_task_and_sweep = AsyncMock()
 
     processor = TaskProcessor(state_manager)
     await processor._maybe_cleanup(task)
 
-    state_manager.close_dag_run_task_and_sweep.assert_not_awaited()
+    state_manager.finalize_dag_run_task.assert_awaited_once_with(task)
 
 
 @pytest.mark.asyncio
@@ -2335,7 +2333,6 @@ async def test_maybe_cleanup_runs_after_dynamic_fanout_registers_arms():
 
     state_manager = _make_state_manager()
     state_manager.get_queue_config = AsyncMock(return_value=None)
-    state_manager.close_dag_run_task_and_sweep = AsyncMock()
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
         processor = TaskProcessor(state_manager)
@@ -2344,5 +2341,5 @@ async def test_maybe_cleanup_runs_after_dynamic_fanout_registers_arms():
     assert task.status == TaskStatus.COMPLETED
     call_names = [c[0] for c in state_manager.mock_calls]
     submit_index = call_names.index("submit_tasks_batch")
-    close_index = call_names.index("close_dag_run_task_and_sweep")
+    close_index = call_names.index("finalize_dag_run_task")
     assert submit_index < close_index, "arms must be registered before the dispatcher closes out of the run"

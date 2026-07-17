@@ -267,26 +267,17 @@ class TaskProcessor:
         """
         Delete the task record if its final status is in cleanup_on.
 
-        For standalone tasks this is a direct check. For DAG tasks, an atomic
-        per-run pending counter (rather than re-fetching every sibling on each
-        completion) detects when the whole run has gone terminal; the full
-        sibling sweep then runs exactly once, when the counter reaches zero,
-        instead of being redone from scratch on every one of the run's completions.
-
-        A DAG task in a stuck status (``TaskStatus.stuck_statuses()`` — FAILED or
-        STALLED) never closes out of the pending counter at all: such a task never
-        calls ``generate_callbacks()``, so its ``FanInCallback``/
-        ``DynamicFanOutCallback`` never fires and the DAG can't complete on its
-        own. Leaving the counter open preserves the run's fan-in tracking and
-        sibling task records (within their TTLs) instead of sweeping them away —
-        a foundation for a future DAG-resume mechanism.
+        For standalone tasks this is a direct check. For DAG tasks, delegates
+        entirely to ``StateManager.finalize_dag_run_task``, which owns both the
+        aggregate-status bookkeeping and the pending-counter/sweep logic (and the
+        ordering constraint between them — see its docstring). TaskProcessor just
+        needs to call it exactly once per DAG-task completion, regardless of
+        whether the task's terminal status is stuck or not.
         """
         if task.dag_run_id is None:
             await self._maybe_delete_self(task)
             return
-        if task.status in TaskStatus.stuck_statuses():
-            return
-        await self.state_manager.close_dag_run_task_and_sweep(task)
+        await self.state_manager.finalize_dag_run_task(task)
 
     async def _maybe_delete_self(self, task: Task) -> None:
         """Delete a standalone (non-DAG) task's record if its status matches cleanup_on."""
@@ -468,14 +459,17 @@ class TaskProcessor:
         Rate limits on arm queues are bypassed with a warning logged.
         """
         # Fan-in tracking is scoped per DAG run. A task fanning out without already
-        # being part of one starts a fresh run for the fanned-out sub-graph.
+        # being part of one starts a fresh run for the fanned-out sub-graph, with no
+        # user-supplied name available to inherit -- default to a name derived from
+        # the dispatching task.
         dag_run_id = parent.dag_run_id or ULID()
+        dag_run_name = parent.dag_run_name or f"{parent.name} (fan-out)"
 
         if not fanout.arms:
             # Degenerate case: no arms — submit the collector immediately. Outer fan-in
             # callbacks still need to be delegated to it, exactly as in the normal path
             # below, otherwise an outer fan-in waiting on *parent* never gets closed.
-            solo = fanout.collector.to_task(dag_run_id=dag_run_id)
+            solo = fanout.collector.to_task(dag_run_id=dag_run_id, dag_run_name=dag_run_name)
             await self._delegate_outer_fan_in(
                 solo, dag_run_id, parent.id, fanout.collector.id, outer_fan_in_cbs
             )
@@ -510,8 +504,11 @@ class TaskProcessor:
         all_fan_ins[fan_in_key] = terminal_ids
 
         # 4. Build tasks: submit arm roots, collector waits for terminal IDs.
-        arm_tasks = [arm.to_task(parent_id=parent.id, dag_run_id=dag_run_id) for arm in fanout.arms]
-        collector_task = fanout.collector.to_task(dag_run_id=dag_run_id)
+        arm_tasks = [
+            arm.to_task(parent_id=parent.id, dag_run_id=dag_run_id, dag_run_name=dag_run_name)
+            for arm in fanout.arms
+        ]
+        collector_task = fanout.collector.to_task(dag_run_id=dag_run_id, dag_run_name=dag_run_name)
         collector_task.parent_ids = list(terminal_ids)
 
         # 5. Delegation: transfer outer fan-in callbacks to the collector and

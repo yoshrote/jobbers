@@ -135,6 +135,10 @@ dag_runs = Table(
     metadata,
     Column("dag_run_id", String(26), primary_key=True),
     Column("submitted_at", DateTime(timezone=True), nullable=False),
+    Column("name", String, nullable=False, server_default=""),
+    Column("status", String, nullable=False, server_default="running"),
+    Column("completed_count", Integer, nullable=False, server_default="0"),
+    Column("failed_count", Integer, nullable=False, server_default="0"),
 )
 
 Index("idx_dag_runs_submitted", dag_runs.c.submitted_at)

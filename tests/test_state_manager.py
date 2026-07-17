@@ -547,6 +547,127 @@ async def test_sweep_dag_run_orphaned_index_no_fallback_task_is_noop(state_manag
     await state_manager_real_ta.sweep_dag_run(dag_run_id)
 
 
+# ── finalize_dag_run_task ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_finalize_dag_run_task_uses_pipelined_path_when_atomic_dag_run_available(state_manager_real_ta):
+    """
+    Sanity check for the fixture used by the tests below.
+
+    state_manager_real_ta's RedisTaskState implements AtomicDagRunProtocol, so
+    finalize_dag_run_task takes the pipelined record+close round trip.
+    """
+    assert state_manager_real_ta._atomic_dag_run is not None
+
+
+@pytest.mark.asyncio
+async def test_finalize_dag_run_task_completes_run_only_after_last_task(state_manager_real_ta):
+    """Pipelined path: a 2-task run reaches 'complete' only once both tasks have finalized."""
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    task_b = Task(
+        id=ULID2,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task_a)
+    await state_manager_real_ta.task_submit.submit_task(task=task_b)
+
+    cleanup_config = TaskConfig(name="my_task", function=dummy_fn)
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.finalize_dag_run_task(task_a)
+        run = await state_manager_real_ta.get_dag_run(dag_run_id)
+        assert run is not None
+        assert run.status.value == "running"
+
+        await state_manager_real_ta.finalize_dag_run_task(task_b)
+        run = await state_manager_real_ta.get_dag_run(dag_run_id)
+        assert run is not None
+        assert run.status.value == "complete"
+
+
+@pytest.mark.asyncio
+async def test_finalize_dag_run_task_stuck_status_records_but_never_closes(state_manager_real_ta):
+    """A FAILED task's outcome is recorded, but it never closes out of the pending set."""
+    dag_run_id = ULID()
+    task = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.FAILED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task)
+
+    await state_manager_real_ta.finalize_dag_run_task(task)
+
+    run = await state_manager_real_ta.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status.value == "failed"
+    # Never closed out of DAG_RUN_PENDING: close_dag_run_task still finds it pending.
+    assert await state_manager_real_ta.close_dag_run_task(dag_run_id, ULID1) == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_dag_run_task_sequential_fallback_matches_pipelined_result(state_manager_real_ta):
+    """
+    Sequential fallback (no AtomicDagRunProtocol) reaches the same end state as the pipelined path.
+
+    With _atomic_dag_run forced off, finalize_dag_run_task falls back to two
+    sequential calls: record_dag_run_task_terminal then close_dag_run_task_and_sweep.
+    """
+    state_manager_real_ta._atomic_dag_run = None
+
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    task_b = Task(
+        id=ULID2,
+        name="my_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        submitted_at=FROZEN_TIME,
+    )
+    await state_manager_real_ta.task_submit.submit_task(task=task_a)
+    await state_manager_real_ta.task_submit.submit_task(task=task_b)
+
+    cleanup_config = TaskConfig(name="my_task", function=dummy_fn)
+    with patch.object(registry, "get_task_config", return_value=cleanup_config):
+        await state_manager_real_ta.finalize_dag_run_task(task_a)
+        run = await state_manager_real_ta.get_dag_run(dag_run_id)
+        assert run is not None
+        assert run.status.value == "running"
+
+        await state_manager_real_ta.finalize_dag_run_task(task_b)
+        run = await state_manager_real_ta.get_dag_run(dag_run_id)
+        assert run is not None
+        assert run.status.value == "complete"
+
+
 # ── fail_task ─────────────────────────────────────────────────────────────────
 
 
@@ -1105,13 +1226,36 @@ async def test_submit_dag_simple_chain(state_manager):
     child = DAGNode("process_data")
     root.then(child)
 
-    dag_run_id, submitted = await state_manager.submit_dag(root)
+    dag_run_id, submitted = await state_manager.submit_dag(root, name="my-run")
 
     assert dag_run_id is not None
     assert len(submitted) == 1
     assert submitted[0].id == root.id
     assert submitted[0].status == TaskStatus.SUBMITTED
     assert submitted[0].dag_run_id is not None
+    assert submitted[0].dag_run_name == "my-run"
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_defaults_dag_run_id_when_no_name_and_no_override(state_manager):
+    """submit_dag self-generates a dag_run_id when neither name nor dag_run_id is supplied."""
+    root = DAGNode("fetch_data")
+
+    dag_run_id, submitted = await state_manager.submit_dag(root, name="unnamed")
+
+    assert submitted[0].dag_run_id == dag_run_id
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_honors_explicit_dag_run_id_override(state_manager):
+    """submit_dag uses a caller-supplied dag_run_id instead of self-generating one."""
+    root = DAGNode("fetch_data")
+    forced_id = ULID()
+
+    dag_run_id, submitted = await state_manager.submit_dag(root, name="forced", dag_run_id=forced_id)
+
+    assert dag_run_id == forced_id
+    assert submitted[0].dag_run_id == forced_id
 
 
 @pytest.mark.asyncio
@@ -1124,13 +1268,15 @@ async def test_submit_dag_multi_root_shares_dag_run_id(state_manager):
 
     state_manager.init_fan_in = AsyncMock()
 
-    dag_run_id, submitted = await state_manager.submit_dag(branch_a, branch_b)
+    dag_run_id, submitted = await state_manager.submit_dag(branch_a, branch_b, name="multi-root-run")
 
     assert dag_run_id is not None
     assert len(submitted) == 2
     assert submitted[0].dag_run_id is not None
     assert submitted[0].dag_run_id == submitted[1].dag_run_id
     assert submitted[0].dag_run_id == dag_run_id
+    assert submitted[0].dag_run_name == "multi-root-run"
+    assert submitted[1].dag_run_name == "multi-root-run"
 
 
 @pytest.mark.asyncio
@@ -1143,7 +1289,7 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 
     state_manager.init_fan_in = AsyncMock()
 
-    dag_run_id, submitted = await state_manager.submit_dag(branch_a, branch_b)
+    dag_run_id, submitted = await state_manager.submit_dag(branch_a, branch_b, name="fan-in-run")
 
     # init_fan_in must be called with the run's dag_run_id and the collector's fan-in key
     fan_in_key = f"dag:fan-in:{collector.id}"

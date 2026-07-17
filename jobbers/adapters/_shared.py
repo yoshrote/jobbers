@@ -1,9 +1,16 @@
 """
 Shared base classes for Redis-backed task adapters.
 
-``SharedTaskAdapterMixin`` is an internal ABC that implements all ``TaskStateProtocol``
+``SharedTaskAdapterMixin`` is an internal ABC that implements the ``TaskStateProtocol``
 and ``AtomicTaskStateProtocol`` logic identical across the plain-Redis and RedisJSON
-backends.  It is not part of the public adapter API.
+backends. It is not part of the public adapter API.
+
+DAG-run-index methods (``stage_register_dag_run``, ``get_dag_runs``, ``get_dag_run``,
+``clean_dag_runs``) are *not* here — they live per-backend in ``redis/task_state.py``
+and ``redis_json/task_state.py``, since the two backends store DAG-run name/status
+metadata in genuinely different native shapes. Fan-in tracking and the pending/closed
+completion counter (``close_dag_run_task`` and friends) are unaffected by that and
+remain shared here.
 
 ``_SharedRedisTaskSubmitBase`` is an internal base that implements ``TaskSubmitProtocol``
 (submit_task, submit_rate_limited_task, get_next_task) shared across both Redis backends.
@@ -41,7 +48,7 @@ if TYPE_CHECKING:
 
     from redis.asyncio.client import Pipeline, Redis
 
-    from jobbers.models.dag import DAGRunPagination
+    from jobbers.models.dag import DAGRunDetail, DagRunOutcome, DAGRunPagination, DAGRunSummary
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
     from jobbers.protocols import TransactionHandle
@@ -60,7 +67,6 @@ class SharedTaskAdapterMixin(ABC):
     TASK_BY_TYPE_IDX = "task-type-idx:{name}".format
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     DLQ_MISSING_DATA = "dlq-missing-data"
-    DAG_RUNS = "dag-runs"
     # Per-DAG-run structures — flat key count regardless of task count or fan-out nesting depth.
     DAG_RUN_PENDING = "dag-run:{dag_run_id}:pending".format  # Set: task IDs submitted, not yet closed.
     DAG_RUN_CLOSED = "dag-run:{dag_run_id}:closed".format  # Set: task IDs that have closed.
@@ -173,6 +179,33 @@ class SharedTaskAdapterMixin(ABC):
     @abstractmethod
     async def get_all_tasks(self, pagination: TaskPagination) -> list[Task]:
         """Return a page of tasks matching the pagination filters."""
+
+    # DAG-run-index primitives — backend-specific because RedisTaskState and
+    # RedisJSONTaskState store run name/status/counters in different native shapes
+    # (a flat-field Hash vs. a JSON document per run).
+    @abstractmethod
+    def stage_register_dag_run(self, pipe: TransactionHandle, task: Task) -> None:
+        """Stage DAG run index + metadata registration onto pipe if task belongs to a DAG run."""
+
+    @abstractmethod
+    async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[DAGRunSummary], int]:
+        """Return a paginated list of DAG runs ordered by submission time (oldest first)."""
+
+    @abstractmethod
+    async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None:
+        """Return details for a DAG run, or None if not registered."""
+
+    @abstractmethod
+    async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
+        """Remove DAG run index entries and all their per-run structures older than ``max_age``."""
+
+    @abstractmethod
+    async def record_dag_run_task_terminal(self, dag_run_id: ULID, outcome: DagRunOutcome) -> None:
+        """Atomically increment the run's completed/failed counters and recompute+persist status."""
+
+    @abstractmethod
+    async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
+        """Set status='complete' iff failed_count == 0. No-op if the run's record is missing."""
 
     # ---------------------------------------------------------------------------
     # Shared implementations (identical across all backends)
@@ -323,66 +356,6 @@ class SharedTaskAdapterMixin(ABC):
         p.zadd(self.TASKS_BY_QUEUE(queue=task.queue), {bytes(task.id): task.submitted_at.timestamp()})
         self.stage_save(pipe, task)
         self.stage_register_dag_run(pipe, task)
-
-    def stage_register_dag_run(self, pipe: TransactionHandle, task: Task) -> None:
-        """Stage DAG run index updates onto pipe if the task belongs to a DAG run."""
-        if task.dag_run_id is None or task.submitted_at is None:
-            return
-        score = task.submitted_at.timestamp()
-        p: Any = pipe
-        p.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): score}, nx=True)
-        p.sadd(self.DAG_RUN_PENDING(dag_run_id=task.dag_run_id), bytes(task.id))
-
-    async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[tuple[ULID, dt.datetime]], int]:
-        """Return a paginated list of DAG runs ordered by submission time (oldest first)."""
-        total: int = await self.data_store.zcard(self.DAG_RUNS)
-        raw = cast(
-            "list[tuple[bytes, float]]",
-            await self.data_store.zrange(
-                self.DAG_RUNS, pagination.offset, pagination.offset + pagination.limit - 1, withscores=True
-            ),
-        )
-        return [
-            (ULID.from_bytes(dag_id_bytes), dt.datetime.fromtimestamp(score, dt.UTC))
-            for dag_id_bytes, score in raw
-        ], total
-
-    async def get_dag_run(self, dag_run_id: ULID) -> tuple[dt.datetime, list[ULID]] | None:
-        """Return (submitted_at, task_ids) for a DAG run via SUNION(pending, closed)."""
-        score: float | None = await self.data_store.zscore(self.DAG_RUNS, bytes(dag_run_id))
-        if score is None:
-            return None
-        submitted_at = dt.datetime.fromtimestamp(score, dt.UTC)
-        raw_ids = cast(
-            "set[bytes]",
-            await self.data_store.sunion(
-                [self.DAG_RUN_PENDING(dag_run_id=dag_run_id), self.DAG_RUN_CLOSED(dag_run_id=dag_run_id)]
-            ),
-        )
-        # SUNION has no ordering guarantee; ULIDs sort lexicographically by creation
-        # time, so sorting restores the submission-order guarantee callers rely on
-        # (e.g. the /dags/{dag_run_id} response) at no extra I/O cost.
-        task_ids = sorted(ULID.from_bytes(b) for b in raw_ids)
-        return submitted_at, task_ids
-
-    async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
-        """Remove DAG run index entries and all their per-run structures older than ``max_age``."""
-        cutoff = (now - max_age).timestamp()
-        stale = cast("list[bytes]", await self.data_store.zrange(self.DAG_RUNS, "-inf", cutoff, byscore=True))
-        if not stale:
-            return
-        pipe = self.data_store.pipeline(transaction=False)
-        pipe.zrem(self.DAG_RUNS, *stale)
-        for dag_id_bytes in stale:
-            try:
-                dag_run_id = ULID.from_bytes(dag_id_bytes)
-            except ValueError:
-                continue
-            pipe.delete(self.DAG_RUN_PENDING(dag_run_id=dag_run_id))
-            pipe.delete(self.DAG_RUN_CLOSED(dag_run_id=dag_run_id))
-            pipe.delete(self.DAG_RUN_FANIN(dag_run_id=dag_run_id))
-            pipe.delete(self.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id))
-        await pipe.execute()
 
     async def save_task(self, task: Task) -> None:
         """Save task state to the Redis data store."""
@@ -539,6 +512,24 @@ class SharedTaskAdapterMixin(ABC):
         )
         return int(results[1])
 
+    async def stage_close_dag_run_task(
+        self, pipe: TransactionHandle, dag_run_id: ULID, task_id: ULID
+    ) -> None:
+        """
+        Stage close_dag_run_task's SREM/SADD/SCARD move onto pipe (part of AtomicDagRunProtocol).
+
+        Must be awaited: registered Lua scripts are coroutines under redis-py's async
+        client even when `client` is a pipeline -- awaiting only queues the EVALSHA
+        command here, it does not execute it. The real [removed, remaining] result is
+        only available in the list returned by the eventual `await pipe.execute()`.
+        """
+        p: Any = pipe
+        await self._close_dag_run_task_script(
+            keys=[self.DAG_RUN_PENDING(dag_run_id=dag_run_id), self.DAG_RUN_CLOSED(dag_run_id=dag_run_id)],
+            args=[bytes(task_id)],
+            client=p,
+        )
+
     async def task_exists(self, task_id: ULID) -> bool:
         does_exists: int = await self.data_store.exists(self.TASK_DETAILS(task_id=task_id))
         return does_exists == 1
@@ -601,6 +592,8 @@ class _SharedRedisTaskSubmitBase:
     QUEUE_RATE_LIMITER = "rate-limiter:{queue}".format
     DAG_RUNS = "dag-runs"
     DAG_RUN_PENDING = "dag-run:{dag_run_id}:pending".format
+    # Identical key pattern on both Redis backends (flat Hash vs. JSON doc, same name).
+    DAG_RUN_META = "dag-run:{dag_run_id}:meta".format
     DLQ_MISSING_DATA = "dlq-missing-data"
 
     def __init__(
@@ -638,7 +631,11 @@ class _SharedRedisTaskSubmitBase:
         if task.dag_run_id is not None:
             pipe.zadd(self.DAG_RUNS, {bytes(task.dag_run_id): task.submitted_at.timestamp()}, nx=True)
             pipe.sadd(self.DAG_RUN_PENDING(dag_run_id=task.dag_run_id), bytes(task.id))
+            self._stage_dag_run_meta_seed(pipe, task)
         await pipe.execute()
+
+    def _stage_dag_run_meta_seed(self, pipe: Pipeline, task: Task) -> None:
+        """Backend-specific DAG-run meta seeding; no-op by default (overridden per backend)."""
 
     async def submit_task(self, task: Task) -> bool:
         """Atomically enqueue a new task with no rate limiting. Status must already be SUBMITTED."""
@@ -661,6 +658,7 @@ class _SharedRedisTaskSubmitBase:
                 is_active,
                 self._pack_fn(task),
                 dag_run_id_bytes,
+                task.dag_run_name or "",
             ),
         )
         return result == 1
@@ -691,6 +689,7 @@ class _SharedRedisTaskSubmitBase:
                 is_active,
                 self._pack_fn(task),
                 dag_run_id_bytes,
+                task.dag_run_name or "",
             ),
         )
         return result == 1

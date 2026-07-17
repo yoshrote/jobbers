@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
 from jobbers.adapters.sql import SQLQueueConfigAdapter
-from jobbers.models.dag import DAGRunPagination
+from jobbers.models.dag import DAGRunDetail, DAGRunPagination, DagRunStatus, DAGRunSummary
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
@@ -1119,8 +1119,11 @@ async def test_list_dags_empty(state_manager):
 
 @pytest.mark.asyncio
 async def test_list_dags_returns_runs(state_manager):
-    """GET /dags returns DAG runs with dag_run_id and submitted_at."""
-    state_manager.list_dag_runs = AsyncMock(return_value=([(DAG_RUN_ID, SUBMITTED_AT)], 1))
+    """GET /dags returns DAG runs with dag_run_id, name, status, and submitted_at."""
+    run = DAGRunSummary(
+        dag_run_id=DAG_RUN_ID, name="my-run", status=DagRunStatus.RUNNING, submitted_at=SUBMITTED_AT
+    )
+    state_manager.list_dag_runs = AsyncMock(return_value=([run], 1))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/dags")
@@ -1130,6 +1133,8 @@ async def test_list_dags_returns_runs(state_manager):
     assert data["total"] == 1
     assert len(data["dags"]) == 1
     assert data["dags"][0]["dag_run_id"] == str(DAG_RUN_ID)
+    assert data["dags"][0]["name"] == "my-run"
+    assert data["dags"][0]["status"] == "running"
     assert data["dags"][0]["submitted_at"] == SUBMITTED_AT.isoformat()
 
 
@@ -1147,8 +1152,15 @@ async def test_list_dags_passes_pagination(state_manager):
 
 @pytest.mark.asyncio
 async def test_get_dag_found(state_manager):
-    """GET /dags/{dag_run_id} returns run details and task IDs."""
-    state_manager.get_dag_run = AsyncMock(return_value=(SUBMITTED_AT, [ULID1, ULID2]))
+    """GET /dags/{dag_run_id} returns run details, name, status, and task IDs."""
+    detail = DAGRunDetail(
+        dag_run_id=DAG_RUN_ID,
+        name="my-run",
+        status=DagRunStatus.PARTIAL_FAILURE,
+        submitted_at=SUBMITTED_AT,
+        task_ids=[ULID1, ULID2],
+    )
+    state_manager.get_dag_run = AsyncMock(return_value=detail)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get(f"/dags/{DAG_RUN_ID}")
@@ -1156,6 +1168,8 @@ async def test_get_dag_found(state_manager):
     assert response.status_code == 200
     data = response.json()
     assert data["dag_run_id"] == str(DAG_RUN_ID)
+    assert data["name"] == "my-run"
+    assert data["status"] == "partial_failure"
     assert data["submitted_at"] == SUBMITTED_AT.isoformat()
     assert data["task_ids"] == [str(ULID1), str(ULID2)]
 
@@ -1444,6 +1458,36 @@ async def test_submit_dag_raises_429_on_rate_limited_error():
 
     assert response.status_code == 429
     assert "queue is full" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_defaults_name_to_dag_run_id():
+    """POST /submit-dag with no name field succeeds; the run's name defaults to its dag_run_id."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    async def task_function(**kwargs: object) -> None: ...
+
+    test_task_config = TaskConfig(name="my_task", version=1, function=task_function)
+    captured: dict[str, object] = {}
+
+    async def fake_submit_dag(*roots: object, name: str, dag_run_id: ULID | None = None) -> tuple[ULID, list]:
+        captured["name"] = name
+        captured["dag_run_id"] = dag_run_id
+        return dag_run_id, []
+
+    mock_sm = MagicMock()
+    mock_sm.submit_dag = AsyncMock(side_effect=fake_submit_dag)
+
+    with (
+        patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm),
+        patch("jobbers.registry.get_task_config", return_value=test_task_config),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/submit-dag", json={"diagram": diagram})
+
+    assert response.status_code == 200
+    assert response.json()["dag_run_id"] == str(captured["dag_run_id"])
+    assert captured["name"] == str(captured["dag_run_id"])
 
 
 # ── PUT /cron-dags/{id} branches ─────────────────────────────────────────────
