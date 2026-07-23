@@ -104,6 +104,8 @@ graph TD
 
 `merge_results` is submitted only after **all** predecessors have completed. Under the hood, `submit_dag` pre-populates a Redis set with both predecessor IDs; each predecessor atomically removes itself from the set on completion, and the last one out triggers the collector.
 
+Because `merge()` always supplies 2+ parents, `merge_results` must use `FromParent(key, many=True)` for anything it reads from its parents (see "Options" above) — a singular (`many=False`) `FromParent` param on `merge_results` raises `FanInCardinalityError` as soon as `DAGNode.merge(a, b, into=collector)` is called, not later at task-execution time.
+
 ---
 
 ### Diamond (Fan-Out + Fan-In)
@@ -166,26 +168,71 @@ graph TD
 
 ## Options
 
-### `inject_parent_results`
+### `FromParent`
 
-Pass `inject_parent_results=True` to `then()` or `merge()` to have the worker automatically fetch the parent task's results and inject them as a `parent_results` keyword argument into the successor's function:
+Annotate a task function's parameter with `FromParent(key)` to have the worker pull a specific field out of the parent's results and inject it directly — no edge-level flag needed, and no need to destructure a raw results dict inside the function body:
 
 ```python
 fetch = DAGNode("fetch_records")
 process = DAGNode("process_records")
-fetch.then(process, inject_parent_results=True)
+fetch.then(process)
 ```
 
 ```python
+from typing import Annotated
+from jobbers.models.dag import FromParent
+
 @register_task(name="process_records")
-async def process_records(parent_results, **kwargs):
-    # parent_results is a dict for a single parent,
-    # or a dict[ULID, dict] for fan-in collectors (keyed by predecessor task ID).
-    rows = parent_results["rows"]
+async def process_records(rows: Annotated[int, FromParent("rows")], **kwargs):
     ...
 ```
 
-For fan-in collectors, `parent_results` is a `dict[ULID, dict]` keyed by predecessor task ID — iterate over `.values()` to process results without assuming any order.
+`FromParent(key)` (`many=False`, the default) requires the task to have **exactly one parent** — a structural (DAG-shape) contract, not a data one: it's about chain position, not about whether the data happens to look right. If the key is absent from that one parent's results, the parameter is simply left unset, so the function's own Python default applies (or a standard `TypeError` if it has none) — there is no separate `default=` on `FromParent` itself:
+
+```python
+async def process_records(rows: Annotated[int, FromParent("rows")] = 0, **kwargs):
+    ...  # rows falls back to 0 if the parent didn't produce "rows"
+```
+
+`FromParent()` with no key argument resolves using the parameter's own name — `Annotated[int, FromParent()]` on a parameter named `rows` reads `results["rows"]`.
+
+For fan-in collectors, use `FromParent(key, many=True)` — this always resolves to a `list[T]` (0, 1, or N entries — every parent that produced the key), never a bare scalar, and never raises for "too many" or "too few":
+
+```python
+@register_task(name="merge_results")
+async def merge_results(rows: Annotated[list[int], FromParent("rows", many=True)], **kwargs):
+    total = sum(rows)
+    ...
+```
+
+Because a singular (`many=False`) `FromParent` param can never be satisfied by a fan-in edge (`merge()` always supplies 2+ parents), `DAGNode.merge()` raises `FanInCardinalityError` immediately, at graph-construction time, if `into`'s registered task declares one — see "Fan-In (Merge)" below.
+
+There's no ordering guarantee for `many=True` results, matching `parent_results()` — iterate/reduce without assuming order, or key results by a field inside each entry if you need to identify them.
+
+**Don't stack multiple `many=True` params expecting their lists to line up positionally.** Each one is resolved independently, filtered by its own key's presence across parents:
+
+```python
+async def combine(
+    count: Annotated[list[int], FromParent("count", many=True)],
+    name: Annotated[list[str], FromParent("name", many=True)],
+    **kwargs,
+):
+    # DANGEROUS: count[i] and name[i] only match up if every parent that
+    # contributes to one list also contributes to the other.
+    for c, n in zip(count, name):
+        ...
+```
+
+If parent A produced `"count"` but not `"name"`, and parent B the reverse, the two lists differ in length and `zip()` silently truncates and mispairs — no error, no warning. When several fields need to come from the *same* parent, fetch the raw per-parent dicts instead and destructure each one directly:
+
+```python
+async def combine(**kwargs):
+    task = get_current_task()
+    parents = await task.parent_results()
+    for r in parents.values():
+        c, n = r["count"], r["name"]  # same dict `r` -- guaranteed same parent
+        ...
+```
 
 ### Error Callbacks
 
@@ -343,14 +390,15 @@ Each cron fire generates fresh ULIDs for every node so runs never share Redis ke
 
 ## Fetching Parent Results Manually
 
-Inside a task function, call `await task.parent_results()` to fetch parent task blobs without using `inject_parent_results`:
+`FromParent` covers the common cases, but for anything it can't express — needing a producer's task ID rather than just its results, or deciding at runtime which keys to read — call `await task.parent_results()` directly inside the task function:
 
 ```python
 @register_task(name="merge_results")
 async def merge_results(**kwargs):
     task = get_current_task()
     parents = await task.parent_results()
-    # Single parent → dict; multiple parents → dict[ULID, dict]
+    # dict[ULID, dict] keyed by predecessor task ID -- one entry for a chain-position
+    # task, many for a fan-in collector.
     ...
 ```
 
@@ -384,7 +432,7 @@ For non-dynamic DAGs, the graph shape (which tasks exist and how they connect) i
 
 ### Fan-In Result Access
 
-For fan-in collectors (static or dynamic), `parent_results()` returns a `dict[ULID, dict]` keyed by predecessor task ID. There is no ordering guarantee — iterate over `.values()` and key results by a field inside each result dict if you need to identify them.
+For fan-in collectors (static or dynamic), `parent_results()` returns a `dict[ULID, dict]` keyed by predecessor task ID. There is no ordering guarantee — iterate over `.values()` and key results by a field inside each result dict if you need to identify them. `FromParent(key, many=True)` (see "Options" above) covers the common case of pulling one field out of every predecessor without touching `parent_results()` directly, and inherits the same lack of ordering guarantee.
 
 ### SQL Task State and Optimistic Dispatch
 

@@ -231,7 +231,7 @@ async def test_error_callback_fires_on_failure(sm: StateManager) -> None:
     await run_until_done(sm)
 
     a_node = roots[0]
-    # _successors entry: (successor, fan_in_key, error_node, inject_parent_results)
+    # _successors entry: (successor, fan_in_key, error_node)
     c_node = a_node._successors[0][2]
 
     task_a = await sm.task_state.get_task(a_node.id)

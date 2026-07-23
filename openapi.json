@@ -2170,11 +2170,6 @@
                 "type": "null"
               }
             ]
-          },
-          "inject_parent_results": {
-            "type": "boolean",
-            "title": "Inject Parent Results",
-            "default": false
           }
         },
         "type": "object",
@@ -2429,11 +2424,6 @@
                 "type": "null"
               }
             ]
-          },
-          "inject_parent_results": {
-            "type": "boolean",
-            "title": "Inject Parent Results",
-            "default": false
           }
         },
         "type": "object",
@@ -2646,11 +2636,6 @@
             },
             "type": "array",
             "title": "Parent Ids"
-          },
-          "inject_parent_results": {
-            "type": "boolean",
-            "title": "Inject Parent Results",
-            "default": false
           },
           "cron_id": {
             "anyOf": [

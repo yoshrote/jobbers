@@ -74,9 +74,6 @@ class Task(BaseModel):
     # Immediate parent task IDs — empty for root tasks, one entry for simple-chain
     # and dynamic fan-out children, many entries for fan-in collectors.
     parent_ids: list[ULIDField] = Field(default_factory=list)
-    # When True, the worker fetches parent results via parent_ids and injects them
-    # as a `parent_results` kwarg before calling the task function.
-    inject_parent_results: bool = False
     # Set on cron-dispatched root tasks so the worker can clear the active-run key on completion.
     cron_id: OptionalULIDField = Field(default=None)
     # Shared across every task in a DAG run; None for standalone tasks.
@@ -201,7 +198,6 @@ class Task(BaseModel):
         self,
         spec: "DAGTaskSpec",
         parent_ids: list[ULID],
-        inject_parent_results: bool = False,
     ) -> "Self":
         return self.__class__(
             id=spec.id,
@@ -211,7 +207,6 @@ class Task(BaseModel):
             parameters=spec.parameters,
             dag_callbacks=spec.dag_callbacks,
             parent_ids=parent_ids,
-            inject_parent_results=inject_parent_results,
             dag_run_id=self.dag_run_id,
             dag_run_name=self.dag_run_name,
         )
@@ -258,7 +253,7 @@ class Task(BaseModel):
                     # Handled separately by TaskProcessor.post_process; skip here.
                     continue
                 case SimpleCallback():
-                    results.append(self._build_callback_task(cb.task, [self.id], cb.inject_parent_results))
+                    results.append(self._build_callback_task(cb.task, [self.id]))
                 case FanInCallback():
                     if cb.fan_in_key in skip_fan_in_keys:
                         continue
@@ -271,9 +266,7 @@ class Task(BaseModel):
                     remaining = await ta.fan_in_complete(self.dag_run_id, cb.fan_in_key, self.id)
                     if remaining == 0:
                         member_ids = await ta.get_fan_in_members(self.dag_run_id, cb.fan_in_key)
-                        results.append(
-                            self._build_callback_task(cb.task, member_ids, cb.inject_parent_results)
-                        )
+                        results.append(self._build_callback_task(cb.task, member_ids))
                     elif remaining == -1:
                         logger.warning(
                             "fan_in_complete returned -1 for key %s task %s — "

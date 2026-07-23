@@ -21,7 +21,7 @@ For pre-nesting DAG runs (a handful of tasks), this was invisible. Nested fan-ou
 
 ### The ordering hazard (a real, previously-untested correctness gap)
 
-`_maybe_cleanup` used to run *before* `post_process`/`_handle_dynamic_fanout`, which is what actually creates and registers a dispatcher's arm/collector tasks into the DAG run. If a dispatcher task was the last currently-known active sibling when it completed, `_maybe_cleanup` could conclude "all siblings terminal" and start deleting tasks — including possibly the dispatcher itself, if its `cleanup_on` matched — **before its arms existed**. Those arms were about to be created with `parent_id=dispatcher.id`; if the dispatcher record was gone first, a descendant relying on `inject_parent_results`/`parent_results()` would silently lose data.
+`_maybe_cleanup` used to run *before* `post_process`/`_handle_dynamic_fanout`, which is what actually creates and registers a dispatcher's arm/collector tasks into the DAG run. If a dispatcher task was the last currently-known active sibling when it completed, `_maybe_cleanup` could conclude "all siblings terminal" and start deleting tasks — including possibly the dispatcher itself, if its `cleanup_on` matched — **before its arms existed**. Those arms were about to be created with `parent_id=dispatcher.id`; if the dispatcher record was gone first, a descendant relying on `FromParent`/`parent_results()` would silently lose data.
 
 This bug wasn't caused by nesting — it applied to single-level fan-out too — but nesting made the failure window far more common, since large nested runs spend more of their lifetime with exactly one active "frontier" task that looks like the last one standing.
 

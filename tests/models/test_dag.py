@@ -1,5 +1,8 @@
 """Tests for DAGTaskSpec.fresh_copy, collect_fan_in_keys, DAGNode, and TaskResult."""
 
+from typing import Annotated
+
+import pytest
 from ulid import ULID
 
 from jobbers.models.dag import (
@@ -8,10 +11,13 @@ from jobbers.models.dag import (
     DynamicFanOut,
     DynamicFanOutCallback,
     FanInCallback,
+    FanInCardinalityError,
+    FromParent,
     SimpleCallback,
     TaskResult,
     collect_fan_in_keys,
 )
+from jobbers.registry import clear_registry, register_task
 
 
 def make_spec(name: str = "task", **kwargs) -> DAGTaskSpec:
@@ -579,3 +585,103 @@ def test_fresh_copy_none_error_callback_stays_none():
 
     cb = fresh.dag_callbacks[0]
     assert cb.error_callback is None
+
+
+# ── FromParent ────────────────────────────────────────────────────────────────
+
+
+def test_from_parent_defaults():
+    """FromParent() with no args defaults key to None and many to False."""
+    fp = FromParent()
+    assert fp.key is None
+    assert fp.many is False
+
+
+def test_from_parent_stores_key_and_many():
+    fp = FromParent("rows", many=True)
+    assert fp.key == "rows"
+    assert fp.many is True
+
+
+# ── DAGNode.merge: FanInCardinalityError ─────────────────────────────────────
+
+
+@pytest.fixture
+def register_collector():
+    """Register a "collector" task and clean it up afterward."""
+
+    def _register(fn):
+        register_task(name="collector", version=0)(fn)
+        return fn
+
+    yield _register
+    clear_registry()
+
+
+def test_merge_raises_for_singular_from_parent_on_collector(register_collector):
+    """merge() always supplies 2+ parents, so a singular FromParent param on `into` always errors."""
+
+    async def collector_fn(rows: Annotated[int, FromParent("rows")], **kwargs): ...
+
+    register_collector(collector_fn)
+
+    b1 = DAGNode("branch1")
+    b2 = DAGNode("branch2")
+    collector = DAGNode("collector")
+
+    with pytest.raises(FanInCardinalityError, match="singular FromParent"):
+        DAGNode.merge(b1, b2, into=collector)
+
+
+def test_merge_raises_regardless_of_predecessor_task_types(register_collector):
+    """The check doesn't care whether predecessors are the same or different task types."""
+
+    async def collector_fn(rows: Annotated[int, FromParent("rows")], **kwargs): ...
+
+    register_collector(collector_fn)
+
+    b1 = DAGNode("fetch_a")
+    b2 = DAGNode("fetch_b")  # distinct task name from b1 -- still always invalid
+    collector = DAGNode("collector")
+
+    with pytest.raises(FanInCardinalityError):
+        DAGNode.merge(b1, b2, into=collector)
+
+
+def test_merge_allows_many_true_from_parent(register_collector):
+    """A many=True FromParent param on the collector is exactly what merge() expects."""
+
+    async def collector_fn(rows: Annotated[list[int], FromParent("rows", many=True)], **kwargs): ...
+
+    register_collector(collector_fn)
+
+    b1 = DAGNode("branch1")
+    b2 = DAGNode("branch2")
+    collector = DAGNode("collector")
+
+    merged = DAGNode.merge(b1, b2, into=collector)
+    assert merged is collector
+
+
+def test_merge_skips_validation_for_unregistered_task():
+    """merge() doesn't raise when `into`'s task isn't registered -- can't validate, so it's skipped."""
+    b1 = DAGNode("branch1")
+    b2 = DAGNode("branch2")
+    collector = DAGNode("never_registered_collector")
+
+    merged = DAGNode.merge(b1, b2, into=collector)
+    assert merged is collector
+
+
+def test_merge_single_predecessor_never_raises(register_collector):
+    """A single-predecessor merge() call can never violate the singular FromParent contract."""
+
+    async def collector_fn(rows: Annotated[int, FromParent("rows")], **kwargs): ...
+
+    register_collector(collector_fn)
+
+    branch = DAGNode("branch1")
+    collector = DAGNode("collector")
+
+    merged = DAGNode.merge(branch, into=collector)
+    assert merged is collector

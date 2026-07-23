@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import logging
+from typing import Annotated
 from unittest.mock import ANY, AsyncMock, call, patch
 
 import pytest
@@ -14,6 +15,7 @@ from jobbers.models.dag import (
     DynamicFanOut,
     DynamicFanOutCallback,
     FanInCallback,
+    FromParent,
     SimpleCallback,
     TaskResult,
 )
@@ -2003,61 +2005,195 @@ async def test_retried_task_does_not_trigger_error_callback():
     state_manager.submit_task.assert_not_awaited()
 
 
-# ── inject_parent_results ────────────────────────────────────────────────────
+# ── FromParent ────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_inject_parent_results_passes_results_as_kwarg():
-    """When inject_parent_results=True and parent_ids is set, the task function receives parent_results."""
-    parent_id = ULID()
-    task = Task(
+def _make_from_parent_task(parent_ids: list[ULID]) -> Task:
+    return Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
         version=1,
         status=TaskStatus.SUBMITTED,
         queue="default",
-        parent_ids=[parent_id],
-        inject_parent_results=True,
+        parent_ids=parent_ids,
     )
+
+
+@pytest.mark.asyncio
+async def test_from_parent_single_parent_key_present_injects_scalar():
+    """A single parent producing the key resolves to a plain scalar value."""
+    parent_id = ULID()
+    task = _make_from_parent_task([parent_id])
     state_manager = _make_state_manager()
-    task_function = AsyncMock(return_value=TaskResult(results={}))
-    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+    calls: list[int] = []
+
+    async def fn(rows: Annotated[int, FromParent("rows")], **kwargs):
+        calls.append(rows)
+        return {"seen": rows}
+
+    # task_config.function must be the real function, not a Mock wrapper: FromParent
+    # resolution relies on get_type_hints(), which can't see through a Mock's annotations.
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
-        with patch.object(task.__class__, "parent_results", new_callable=AsyncMock, return_value={"val": 99}):
+        with patch.object(
+            task.__class__, "parent_results", new_callable=AsyncMock, return_value={parent_id: {"rows": 42}}
+        ):
             processor = TaskProcessor(state_manager)
             result = await processor.process(task)
 
     assert result.status == TaskStatus.COMPLETED
-    task_function.assert_awaited_once()
-    _, call_kwargs = task_function.call_args
-    assert call_kwargs.get("parent_results") == {"val": 99}
+    assert calls == [42]
 
 
 @pytest.mark.asyncio
-async def test_no_injection_when_flag_is_false():
-    """When inject_parent_results=False, the task function is called with only task.parameters."""
+async def test_from_parent_single_parent_key_absent_no_default_raises_type_error():
+    """Key absent + no Python default -- the kwarg is omitted and the call itself raises."""
     parent_id = ULID()
-    task = Task(
-        id="01JQC31AJP7TSA9X8AEP64XG08",
-        name="test_task",
-        version=1,
-        status=TaskStatus.SUBMITTED,
-        queue="default",
-        parameters={"x": 1},
-        parent_ids=[parent_id],
-        inject_parent_results=False,
-    )
+    task = _make_from_parent_task([parent_id])
     state_manager = _make_state_manager()
-    task_function = AsyncMock(return_value=TaskResult(results={}))
-    task_config = TaskConfig(name="test_task", version=1, function=task_function, timeout=10)
+
+    async def fn(rows: Annotated[int, FromParent("rows")], **kwargs):
+        return {"seen": rows}  # pragma: no cover -- never reached, call itself raises first
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
 
     with patch("jobbers.task_processor.get_task_config", return_value=task_config):
-        processor = TaskProcessor(state_manager)
-        result = await processor.process(task)
+        with patch.object(
+            task.__class__, "parent_results", new_callable=AsyncMock, return_value={parent_id: {}}
+        ):
+            processor = TaskProcessor(state_manager)
+            with pytest.raises(TypeError):
+                await processor.process(task)
+
+
+@pytest.mark.asyncio
+async def test_from_parent_single_parent_key_absent_with_python_default_uses_it():
+    """Key absent + the function's own Python default -- FromParent never sets the kwarg, so the default applies."""
+    parent_id = ULID()
+    task = _make_from_parent_task([parent_id])
+    state_manager = _make_state_manager()
+    calls: list[int] = []
+
+    async def fn(rows: Annotated[int, FromParent("rows")] = 0, **kwargs):
+        calls.append(rows)
+        return {"seen": rows}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        with patch.object(
+            task.__class__, "parent_results", new_callable=AsyncMock, return_value={parent_id: {}}
+        ):
+            processor = TaskProcessor(state_manager)
+            result = await processor.process(task)
 
     assert result.status == TaskStatus.COMPLETED
-    task_function.assert_awaited_once_with(x=1)
+    assert calls == [0]
+
+
+@pytest.mark.asyncio
+async def test_from_parent_wrong_parent_count_always_raises():
+    """many=False requires exactly one parent -- always raises, regardless of what the parents' data contains."""
+    p1, p2 = ULID(), ULID()
+    task = _make_from_parent_task([p1, p2])
+    state_manager = _make_state_manager()
+    calls: list[int] = []
+
+    async def fn(rows: Annotated[int, FromParent("rows")], **kwargs):
+        calls.append(rows)  # pragma: no cover -- never reached, resolution raises first
+        return {"seen": rows}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    # Neither, one, nor both parents having the key changes the outcome -- it's a shape mismatch.
+    for parent_results in ({p1: {}, p2: {}}, {p1: {"rows": 1}, p2: {}}, {p1: {"rows": 1}, p2: {"rows": 2}}):
+        with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+            with patch.object(
+                task.__class__, "parent_results", new_callable=AsyncMock, return_value=parent_results
+            ):
+                processor = TaskProcessor(state_manager)
+                with pytest.raises(ValueError, match="requires exactly one parent"):
+                    await processor.process(task)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_from_parent_many_collects_list_across_parents():
+    """many=True always returns a list -- collected from every parent that produced the key."""
+    p1, p2 = ULID(), ULID()
+    task = _make_from_parent_task([p1, p2])
+    state_manager = _make_state_manager()
+    calls: list[list[int]] = []
+
+    async def fn(rows: Annotated[list[int], FromParent("rows", many=True)], **kwargs):
+        calls.append(rows)
+        return {"total": sum(rows)}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        with patch.object(
+            task.__class__,
+            "parent_results",
+            new_callable=AsyncMock,
+            return_value={p1: {"rows": 1}, p2: {"rows": 2}},
+        ):
+            processor = TaskProcessor(state_manager)
+            result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert sorted(calls[0]) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_from_parent_many_empty_when_none_match():
+    """many=True resolves to an empty list, not an error, when no parent produced the key."""
+    p1, p2 = ULID(), ULID()
+    task = _make_from_parent_task([p1, p2])
+    state_manager = _make_state_manager()
+    calls: list[list[int]] = []
+
+    async def fn(rows: Annotated[list[int], FromParent("rows", many=True)], **kwargs):
+        calls.append(rows)
+        return {"total": sum(rows)}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        with patch.object(
+            task.__class__, "parent_results", new_callable=AsyncMock, return_value={p1: {}, p2: {}}
+        ):
+            processor = TaskProcessor(state_manager)
+            result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert calls == [[]]
+
+
+@pytest.mark.asyncio
+async def test_from_parent_key_defaults_to_param_name():
+    """FromParent() with no key argument resolves using the annotated parameter's own name."""
+    parent_id = ULID()
+    task = _make_from_parent_task([parent_id])
+    state_manager = _make_state_manager()
+    calls: list[int] = []
+
+    async def fn(rows: Annotated[int, FromParent()], **kwargs):
+        calls.append(rows)
+        return {"seen": rows}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        with patch.object(
+            task.__class__, "parent_results", new_callable=AsyncMock, return_value={parent_id: {"rows": 7}}
+        ):
+            processor = TaskProcessor(state_manager)
+            result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert calls == [7]
 
 
 # ── _maybe_cleanup ────────────────────────────────────────────────────────────

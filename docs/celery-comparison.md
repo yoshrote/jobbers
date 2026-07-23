@@ -304,13 +304,13 @@ Error callbacks fire only when a task reaches `FAILED` status (retries exhausted
 | --- | --- | --- |
 | Graph shape | Single composable expression (define + submit inline) | `DAGNode` graph or Mermaid text submitted separately; `.node()` wrappers allow call-site construction |
 | Graph format | Python API only | Mermaid text (portable, renderable, API-submittable) |
-| Result passing | Automatic argument injection (`self.s()`) | Manual `await get_current_task().parent_results()` **or** automatic injection via `inject_parent_results=True` on `then()`/`merge()` |
+| Result passing | Automatic argument injection (`self.s()`) | Manual `await get_current_task().parent_results()` **or** automatic per-field injection via `Annotated[T, FromParent("key")]` |
 | Fan-in (chord) | `chord(group)(callback)` | `DAGNode.merge(..., into=collector)` or `DynamicFanOut` |
 | Runtime fan-out | `group(task.s(x) for x in items)` | `TaskResult(fanout=DynamicFanOut(...))` return value |
 | Error routing | `link_error` on any signature | `on_error=` on `then()` / `merge()` |
 | DAG introspection | No standard visual format | `dag_diagram` field in task status: render anywhere Mermaid is supported |
 
-**Verdict:** Jobbers edges ahead for DAG-heavy workloads. The Mermaid format makes DAG authoring, sharing, and debugging significantly more ergonomic — a graph can be pasted into a GitHub comment or a wiki page and rendered immediately. Both frameworks support call-site node construction (Celery via `.s()`, Jobbers via `.node()`); the real difference is that Celery's canvas is a single composable expression that defines and submits in one call, while Jobbers separates graph construction from `submit_dag`. Jobbers supports both explicit result fetching (`await get_current_task().parent_results()`) and automatic injection (`inject_parent_results=True` on `then()`/`merge()`), so the data-flow style is a matter of preference.
+**Verdict:** Jobbers edges ahead for DAG-heavy workloads. The Mermaid format makes DAG authoring, sharing, and debugging significantly more ergonomic — a graph can be pasted into a GitHub comment or a wiki page and rendered immediately. Both frameworks support call-site node construction (Celery via `.s()`, Jobbers via `.node()`); the real difference is that Celery's canvas is a single composable expression that defines and submits in one call, while Jobbers separates graph construction from `submit_dag`. Jobbers supports both explicit result fetching (`await get_current_task().parent_results()`) and automatic per-field injection (`Annotated[T, FromParent("key")]` on the task function), so the data-flow style is a matter of preference.
 
 ---
 
