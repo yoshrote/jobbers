@@ -485,14 +485,26 @@ class FromParent:
     ```
 
     ``many=False`` (the default) requires the task to have exactly one parent
-    — a structural (DAG-shape) contract, not a data one. If the key is absent
-    from that one parent's results, the parameter is simply left unset so the
-    function's own Python default (if any) applies; there is no separate
-    ``default=`` here; see ``docs/task-definition-reference.md``.
+    when it has *any* — a structural (DAG-shape) contract, not a data one. If
+    the key is absent from that one parent's results, the parameter is simply
+    left unset so the function's own Python default (if any) applies; see
+    ``docs/task-definition-reference.md``.
 
-    ``many=True`` always resolves to a list — every parent that produced the
-    key, in no particular order — even when there is only one parent or none
-    at all (``[]``).
+    ``many=True`` resolves to a list — every parent that produced the key, in
+    no particular order — including ``[]`` when the task has one or more
+    parents but none of them produced the key.
+
+    **Root nodes (zero parents) are not a shape violation for either mode.**
+    There is nothing to pull from, so ``FromParent`` leaves the parameter
+    unset entirely — the same as a missing key — rather than raising (singular
+    mode) or forcing an empty list (``many=True``). This is what makes a
+    ``FromParent``-annotated task usable as a root node, or called/submitted
+    directly in a test without fabricating a parent: submit it with the value
+    as an ordinary parameter (``DAGNode(name, parameters={"rows": 5})`` or
+    ``my_task.submit(rows=5)``), or give the function its own Python default.
+    Only a *wrong* parent count — 2+ parents on a singular slot — is a real
+    structural bug and still raises unconditionally, regardless of what the
+    parents' results contain.
 
     **Fragility warning:** don't stack multiple ``many=True`` params on one
     task expecting their lists to line up positionally (e.g. ``zip(count,

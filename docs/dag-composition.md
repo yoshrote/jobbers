@@ -187,7 +187,7 @@ async def process_records(rows: Annotated[int, FromParent("rows")], **kwargs):
     ...
 ```
 
-`FromParent(key)` (`many=False`, the default) requires the task to have **exactly one parent** — a structural (DAG-shape) contract, not a data one: it's about chain position, not about whether the data happens to look right. If the key is absent from that one parent's results, the parameter is simply left unset, so the function's own Python default applies (or a standard `TypeError` if it has none) — there is no separate `default=` on `FromParent` itself:
+`FromParent(key)` (`many=False`, the default) requires the task to have **exactly one parent when it has any** — a structural (DAG-shape) contract, not a data one: it's about chain position, not about whether the data happens to look right. If the key is absent from that one parent's results, the parameter is simply left unset, so the function's own Python default applies (or a standard `TypeError` if it has none):
 
 ```python
 async def process_records(rows: Annotated[int, FromParent("rows")] = 0, **kwargs):
@@ -196,7 +196,9 @@ async def process_records(rows: Annotated[int, FromParent("rows")] = 0, **kwargs
 
 `FromParent()` with no key argument resolves using the parameter's own name — `Annotated[int, FromParent()]` on a parameter named `rows` reads `results["rows"]`.
 
-For fan-in collectors, use `FromParent(key, many=True)` — this always resolves to a `list[T]` (0, 1, or N entries — every parent that produced the key), never a bare scalar, and never raises for "too many" or "too few":
+**Root nodes are not a shape violation.** A task with **zero** parents leaves a `FromParent`-annotated parameter unset entirely, the same as a missing key — it does not raise (singular mode) or force an empty list (`many=True`). This is what makes a `FromParent`-annotated task usable as a root node, or callable/submittable directly in a test without fabricating a parent: submit the value as an ordinary parameter (`DAGNode(name, parameters={"rows": 5})` or `my_task.submit(rows=5)`), or give the function its own Python default. Only a genuinely wrong parent count — 2+ parents on a singular slot — still raises unconditionally.
+
+For fan-in collectors, use `FromParent(key, many=True)` — with one or more parents this always resolves to a `list[T]` (0, 1, or N entries — every parent that produced the key), never a bare scalar, and never raises for "too many" or "too few":
 
 ```python
 @register_task(name="merge_results")
@@ -249,16 +251,18 @@ graph TD
     A -->|FAILED| E[notify_failure]
 ```
 
-The error task receives `parent_ids=[failing_task.id]` so it can inspect the failure:
+The error task receives `parent_ids=[failing_task.id]` so it can inspect the failure. Use `parent_errors()`, not `parent_results()`, to see *why* it failed — a permanently-failed task's `results` stays `{}` (the function raised before returning anything); the error text lives in `errors`:
 
 ```python
 @register_task(name="notify_failure")
 async def notify_failure(**kwargs):
     task = get_current_task()
-    parent = next(iter((await task.parent_results()).values()))
-    # parent contains the failed task's stored result/error info
+    errors = next(iter((await task.parent_errors()).values()), [])
+    last_error = errors[-1] if errors else "unknown error"
     ...
 ```
+
+`parent_results()` is still the right call if the failing task saved partial results via `task.make_result(...)` before raising — the two accessors are independent and can be combined.
 
 Error callbacks only fire on **permanent** failure — tasks still in their retry window do not trigger them.
 

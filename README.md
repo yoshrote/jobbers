@@ -70,7 +70,7 @@ Task functions declare shared resources — database sessions, HTTP clients, con
 
 ```python
 from typing import Annotated
-from jobbers.di import Depends
+from jobbers.utils.di import Depends
 from jobbers.registry import register_task
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

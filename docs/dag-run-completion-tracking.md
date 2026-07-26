@@ -208,7 +208,7 @@ This works because `DAG_RUN_PENDING ∪ DAG_RUN_CLOSED` is always exactly "every
 
 ### Debug/enumeration comes for free
 
-A nice-to-have from the original proposal — being able to inspect a run's fan-in topology, since nesting makes it non-obvious from Redis alone — doesn't need a dedicated method. `HKEYS dag-run:{id}:fanin-members` already returns every `fan_in_key` used anywhere in a run, at any nesting depth, since each one is just a field name in that Hash. There is no `get_fan_in_keys_for_run` method, and none is needed — a registry never had to exist for this to work.
+Inspecting a run's fan-in topology — useful since nesting makes it non-obvious from Redis alone — needs no dedicated method: `HKEYS dag-run:{id}:fanin-members` already returns every `fan_in_key` used anywhere in a run, at any nesting depth, since each one is just a field name in that Hash.
 
 ---
 
