@@ -114,19 +114,28 @@ def _resolve_from_parent(
     """
     Resolve a single ``FromParent``-annotated parameter for *task*.
 
-    ``many=True`` always returns a list (possibly empty). ``many=False`` requires
-    exactly one parent -- a DAG-shape contract, not a data one -- and raises
-    unconditionally if that isn't the case, regardless of what the parent(s)'
-    results contain. When the one parent's results lack the key, returns
-    ``_OMIT`` so the caller leaves the kwarg unset and the function's own
-    Python default (if any) applies.
+    Zero parents (a root node) is not a shape violation for either mode -- there is
+    nothing to pull from, so this returns ``_OMIT`` so the caller leaves the kwarg
+    unset. That lets a submitted ``task.parameters`` value or the function's own
+    Python default apply, which is what makes a ``FromParent``-annotated task usable
+    as a root node (or called directly in a test) without fabricating a parent.
+
+    ``many=True`` with 1+ parents always returns a list (possibly empty -- when none
+    of the parents produced the key). ``many=False`` with 2+ parents is a genuine
+    shape violation -- a fan-in wired to a singular slot -- and raises unconditionally,
+    regardless of what the parents' results contain, since no data could ever make
+    that wiring correct. With exactly one parent, a missing key returns ``_OMIT`` so
+    the function's own Python default (if any) applies.
     """
     key = spec.key or param_name
+
+    if not task.parent_ids:
+        return _OMIT
 
     if spec.many:
         return [r[key] for r in parent_results_map.values() if key in r]
 
-    if len(task.parent_ids) != 1:
+    if len(task.parent_ids) > 1:
         raise ValueError(
             f"FromParent({key!r}) on task {task.name!r} (param {param_name!r}, id={task.id}) requires "
             f"exactly one parent (chain position); this task has {len(task.parent_ids)}. Use "

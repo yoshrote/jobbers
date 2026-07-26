@@ -574,6 +574,50 @@ async def test_parent_results_no_parent_info_returns_empty():
     assert result == {}
 
 
+# ── parent_errors ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_parent_errors_returns_failed_parent_error_history():
+    """parent_errors() surfaces a failed parent's error messages, unlike parent_results() which is {}."""
+    parent_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+    parent_task = Task(
+        id=parent_id,
+        name="parent",
+        version=1,
+        queue="default",
+        status=TaskStatus.FAILED,
+        results={},
+        errors=["boom"],
+    )
+    task = Task(
+        id=ULID1,
+        name="notify_failure",
+        version=1,
+        queue="default",
+        status=TaskStatus.STARTED,
+        parent_ids=[parent_id],
+    )
+    mock_adapter = AsyncMock()
+    mock_adapter.get_tasks_bulk.return_value = [parent_task]
+    task._adapter = mock_adapter
+    result = await task.parent_errors()
+
+    assert result == {parent_id: ["boom"]}
+
+
+@pytest.mark.asyncio
+async def test_parent_errors_no_parents_returns_empty():
+    """parent_errors() returns {} for a root task, without touching the adapter."""
+    task = Task(id=ULID1, name="root", version=1, queue="default", status=TaskStatus.STARTED)
+    mock_adapter = AsyncMock()
+    task._adapter = mock_adapter
+    result = await task.parent_errors()
+
+    assert result == {}
+    mock_adapter.get_tasks_bulk.assert_not_called()
+
+
 # ── make_result ───────────────────────────────────────────────────────────────
 
 

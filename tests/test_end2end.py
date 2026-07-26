@@ -538,3 +538,86 @@ async def test_dag_run_concurrent_last_completers_both_reach_complete_idempotent
     run = await sm.get_dag_run(dag_run_id)
     assert run is not None
     assert run.status == DagRunStatus.COMPLETE
+
+
+# ── Scenario 12: FromParent resolution through real dispatch ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_from_parent_chain_resolution(sm: StateManager) -> None:
+    """A downstream FromParent param is resolved from the real parent's stored results through actual dispatch."""
+    diagram = """
+    flowchart TD
+      A["echo_task@1(value=hello)"] --> B["from_parent_task@1"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    await sm.submit_dag(*roots, name="test-run")
+    await run_until_done(sm)
+
+    a_node = roots[0]
+    b_node = a_node._successors[0][0]
+    task_b = await sm.task_state.get_task(b_node.id)
+
+    assert task_b is not None
+    assert task_b.status == TaskStatus.COMPLETED
+    assert task_b.results == {"seen": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_from_parent_many_fan_in_resolution(sm: StateManager) -> None:
+    """A many=True FromParent collector resolves a real list across real fan-in predecessors."""
+    diagram = """
+    flowchart TD
+      A["echo_task@1(value=a)"] --> C["from_parent_many_task@1"]
+      B["echo_task@1(value=b)"] --> C["from_parent_many_task@1"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    await sm.submit_dag(*roots, name="test-run")
+    await run_until_done(sm)
+
+    a_node = next(r for r in roots if r._name == "echo_task")
+    c_node = a_node._successors[0][0]
+    task_c = await sm.task_state.get_task(c_node.id)
+
+    assert task_c is not None
+    assert task_c.status == TaskStatus.COMPLETED
+    assert sorted(task_c.results["seen"]) == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_from_parent_task_used_as_root_with_direct_override(sm: StateManager) -> None:
+    """
+    A FromParent-annotated task can be submitted as a root node; the submitted parameter is used directly.
+
+    Before the root-node fix, FromParent(many=False) raised unconditionally whenever
+    parent_ids != 1 -- including 0 -- so this would have failed rather than complete.
+    """
+    diagram = """
+    flowchart TD
+      A["from_parent_task@1(value=direct)"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    await sm.submit_dag(*roots, name="test-run")
+    await run_until_done(sm)
+
+    task = await sm.task_state.get_task(roots[0].id)
+    assert task is not None
+    assert task.status == TaskStatus.COMPLETED
+    assert task.results == {"seen": "direct"}
+
+
+@pytest.mark.asyncio
+async def test_from_parent_task_used_as_root_falls_back_to_default(sm: StateManager) -> None:
+    """A FromParent-annotated task used as a root node with no submitted value uses its Python default."""
+    diagram = """
+    flowchart TD
+      A["from_parent_task@1"]
+    """
+    roots = parse_mermaid_dag(diagram)
+    await sm.submit_dag(*roots, name="test-run")
+    await run_until_done(sm)
+
+    task = await sm.task_state.get_task(roots[0].id)
+    assert task is not None
+    assert task.status == TaskStatus.COMPLETED
+    assert task.results == {"seen": "no-parent-value"}

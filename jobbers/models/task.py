@@ -316,6 +316,9 @@ class Task(BaseModel):
 
         Returns a dict of ULID to dicts when
         there are multiple (fan-in collector), or `{}` for root tasks.
+
+        A permanently-failed parent's `results` is `{}` -- the task function raised
+        before returning anything. Use `parent_errors()` to see why a parent failed.
         """
         if not self.parent_ids:
             return {}
@@ -324,6 +327,22 @@ class Task(BaseModel):
         tasks = await self._adapter.get_tasks_bulk(self.parent_ids)
         results_map = {t.id: t.results for t in tasks if t is not None}
         return results_map
+
+    async def parent_errors(self) -> dict[ULID, list[str]]:
+        """
+        Fetch the error history of this task's parent(s) using `parent_ids`.
+
+        For an `on_error` callback task, this is how to see *why* the failing
+        predecessor(s) failed -- `parent_results()` only ever returns `results`,
+        which stays `{}` on a permanent failure since the task function raised
+        instead of returning.
+        """
+        if not self.parent_ids:
+            return {}
+        if self._adapter is None:
+            raise RuntimeError("Task adapter not injected — set task._adapter before running")
+        tasks = await self._adapter.get_tasks_bulk(self.parent_ids)
+        return {t.id: t.errors for t in tasks if t is not None}
 
     def set_status(self, status: TaskStatus) -> None:
         match status:

@@ -1,6 +1,7 @@
 import asyncio
-from typing import Any
+from typing import Annotated, Any
 
+from jobbers.models.dag import FromParent
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy
 from jobbers.registry import register_task
 
@@ -57,3 +58,25 @@ async def scheduled_fail_task() -> dict[Any, Any]:
 async def slow_task() -> dict[Any, Any]:
     await asyncio.sleep(30)
     return {}
+
+
+@register_task(
+    name="from_parent_task",
+    version=1,
+    max_concurrent=None,
+    max_retries=0,
+)
+async def from_parent_task(value: Annotated[str, FromParent("value")] = "no-parent-value") -> dict[str, str]:
+    return {"seen": value}
+
+
+@register_task(
+    name="from_parent_many_task",
+    version=1,
+    max_concurrent=None,
+    max_retries=0,
+)
+async def from_parent_many_task(
+    values: Annotated[list[str], FromParent("value", many=True)] = (),  # type: ignore[assignment]
+) -> dict[str, list[str]]:
+    return {"seen": list(values)}

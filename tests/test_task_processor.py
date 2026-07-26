@@ -2008,7 +2008,7 @@ async def test_retried_task_does_not_trigger_error_callback():
 # ── FromParent ────────────────────────────────────────────────────────────────
 
 
-def _make_from_parent_task(parent_ids: list[ULID]) -> Task:
+def _make_from_parent_task(parent_ids: list[ULID], parameters: dict[str, object] | None = None) -> Task:
     return Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -2016,6 +2016,7 @@ def _make_from_parent_task(parent_ids: list[ULID]) -> Task:
         status=TaskStatus.SUBMITTED,
         queue="default",
         parent_ids=parent_ids,
+        parameters=parameters or {},
     )
 
 
@@ -2194,6 +2195,90 @@ async def test_from_parent_key_defaults_to_param_name():
 
     assert result.status == TaskStatus.COMPLETED
     assert calls == [7]
+
+
+@pytest.mark.asyncio
+async def test_from_parent_root_node_singular_falls_back_to_python_default():
+    """Zero parents is not a shape violation -- a root node uses the function's own default instead of raising."""
+    task = _make_from_parent_task([])
+    state_manager = _make_state_manager()
+    calls: list[int] = []
+
+    async def fn(rows: Annotated[int, FromParent("rows")] = 9, **kwargs):
+        calls.append(rows)
+        return {"seen": rows}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert calls == [9]
+
+
+@pytest.mark.asyncio
+async def test_from_parent_root_node_singular_uses_submitted_parameter():
+    """A root node can override FromParent with a directly-submitted parameter of the same name."""
+    task = _make_from_parent_task([], parameters={"rows": 5})
+    state_manager = _make_state_manager()
+    calls: list[int] = []
+
+    async def fn(rows: Annotated[int, FromParent("rows")], **kwargs):
+        calls.append(rows)
+        return {"seen": rows}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert calls == [5]
+
+
+@pytest.mark.asyncio
+async def test_from_parent_root_node_many_uses_submitted_parameter_not_empty_list():
+    """A root node with many=True does not clobber a submitted list with []."""
+    task = _make_from_parent_task([], parameters={"rows": [1, 2, 3]})
+    state_manager = _make_state_manager()
+    calls: list[list[int]] = []
+
+    async def fn(rows: Annotated[list[int], FromParent("rows", many=True)], **kwargs):
+        calls.append(rows)
+        return {"seen": rows}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert calls == [[1, 2, 3]]
+
+
+@pytest.mark.asyncio
+async def test_from_parent_root_node_many_falls_back_to_python_default():
+    """Root node, many=True, no submitted parameter -- the function's own default applies, not []."""
+    task = _make_from_parent_task([])
+    state_manager = _make_state_manager()
+    calls: list[list[int]] = []
+
+    async def fn(rows: Annotated[list[int], FromParent("rows", many=True)] = (), **kwargs):  # type: ignore[assignment]
+        calls.append(list(rows))
+        return {"seen": list(rows)}
+
+    task_config = TaskConfig(name="test_task", version=1, function=fn, timeout=10)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.COMPLETED
+    assert calls == [[]]
 
 
 # ── _maybe_cleanup ────────────────────────────────────────────────────────────

@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import Annotated
 
 import pytest
 from ulid import ULID
 
-from jobbers.models.dag import DAGTaskSpec, DynamicFanOutCallback, FanInCallback, SimpleCallback
+from jobbers.models.dag import (
+    DAGTaskSpec,
+    DynamicFanOutCallback,
+    FanInCallback,
+    FanInCardinalityError,
+    FromParent,
+    SimpleCallback,
+)
 from jobbers.models.task_status import TaskStatus
+from jobbers.registry import clear_registry, register_task
 from jobbers.utils.mermaid_dag import (
     MermaidParseError,
     _parse_label,
@@ -18,6 +27,19 @@ from jobbers.utils.mermaid_dag import (
     dag_spec_to_mermaid,
     parse_mermaid_dag,
 )
+
+
+@pytest.fixture
+def register_collector():
+    """Register a "collector" task and clean it up afterward."""
+
+    def _register(fn):
+        register_task(name="collector", version=0)(fn)
+        return fn
+
+    yield _register
+    clear_registry()
+
 
 # ── _parse_param_value ────────────────────────────────────────────────────────
 
@@ -260,6 +282,34 @@ def test_parse_diamond_fan_in_predecessors() -> None:
     key, preds = next(iter(fan_in_map.items()))
     assert "dag:fan-in:" in key
     assert len(preds) == 2
+
+
+def test_parse_diamond_raises_for_singular_from_parent_on_collector(register_collector) -> None:
+    """
+    A mermaid-parsed fan-in validates cardinality just like DAGNode.merge() does directly.
+
+    Regression test: DAGNode.merge() was previously called once per incoming edge here,
+    so validate_fan_in_cardinality() only ever saw one predecessor at a time and never
+    fired for mermaid-authored diagrams.
+    """
+
+    async def collector_fn(rows: Annotated[int, FromParent("rows")], **kwargs): ...
+
+    register_collector(collector_fn)
+
+    text = """
+    flowchart TD
+        A["root"]
+        B["branch_a"]
+        C["branch_b"]
+        D["collector"]
+        A --> B
+        A --> C
+        B --> D
+        C --> D
+    """
+    with pytest.raises(FanInCardinalityError, match="singular FromParent"):
+        parse_mermaid_dag(text)
 
 
 # ── parse_mermaid_dag — error callbacks ──────────────────────────────────────
