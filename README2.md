@@ -109,7 +109,7 @@ Chains, fan-out, fan-in, and diamond (fan-out followed by fan-in) are all expres
 
 > TODO: Design syntax to support dynamic fan-out
 
-Downstream tasks receive upstream results via `parent_results()` inside the function body, or via an injected `parent_results` parameter when `inject_parent_results=True` is set on the edge. A single-parent node receives a `dict`; a fan-in collector receives a `list[dict]`.
+Downstream tasks receive upstream results either by calling `parent_results()` inside the function body, or by annotating a parameter `Annotated[T, FromParent("key")]`, which the worker resolves before calling the function. A chain-position task (exactly one parent) resolves a plain scalar; a fan-in collector needs `FromParent(..., many=True)`, which always resolves to a list.
 
 ### Cron DAGs
 

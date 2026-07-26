@@ -57,7 +57,7 @@ Task functions can declare shared resources — database sessions, HTTP clients,
 ```python
 from typing import Annotated, AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
-from jobbers.di import Depends
+from jobbers.utils.di import Depends
 from jobbers.registry import register_task
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

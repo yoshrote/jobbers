@@ -128,7 +128,14 @@ from typing import Any, NamedTuple
 
 from ulid import ULID
 
-from jobbers.models.dag import DAGNode, DAGTaskSpec, DynamicFanOutCallback, FanInCallback, SimpleCallback
+from jobbers.models.dag import (
+    DAGNode,
+    DAGTaskSpec,
+    DynamicFanOutCallback,
+    FanInCallback,
+    SimpleCallback,
+    validate_fan_in_cardinality,
+)
 from jobbers.models.task_status import TaskStatus
 
 
@@ -550,6 +557,13 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
     # Fan-in collectors: destinations with ≥ 2 incoming non-arm success edges.
     fan_in_collectors: set[str] = {dst for dst, srcs in predecessors.items() if len(srcs) >= 2}
 
+    # DAGNode.merge() is called once per predecessor below (to allow each predecessor
+    # its own on_error node), so it never sees the full group and can't run its own
+    # cardinality check -- validate the full group here instead (mirrors
+    # task_processor.py's _spec_to_dag_node, which has the same per-predecessor loop).
+    for dst in fan_in_collectors:
+        validate_fan_in_cardinality(tuple(dag_nodes[src] for src in predecessors[dst]), dag_nodes[dst])
+
     # Wire non-arm success edges.
     for edge in success_edges:
         if edge.src in arm_node_ids or edge.dst in arm_node_ids:
@@ -568,6 +582,8 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
             arm_predecessors[edge.dst].append(edge.src)
 
     arm_fan_in_collectors: set[str] = {dst for dst, srcs in arm_predecessors.items() if len(srcs) >= 2}
+    for dst in arm_fan_in_collectors:
+        validate_fan_in_cardinality(tuple(dag_nodes[src] for src in arm_predecessors[dst]), dag_nodes[dst])
     for edge in success_edges:
         if edge.src not in arm_node_ids or edge.dst not in arm_node_ids:
             continue

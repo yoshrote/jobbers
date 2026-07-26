@@ -60,7 +60,7 @@ from __future__ import annotations
 import datetime as dt  # noqa: TC003 -- resolved at runtime by Pydantic (DAGRunSummary.submitted_at)
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel, Field, field_serializer
 from ulid import ULID
@@ -112,7 +112,6 @@ class DAGTaskSpec(BaseModel):
                     SimpleCallback(
                         task=cb.task._remap(id_map),
                         error_callback=new_err,
-                        inject_parent_results=cb.inject_parent_results,
                     )
                 )
             elif isinstance(cb, FanInCallback):
@@ -125,7 +124,6 @@ class DAGTaskSpec(BaseModel):
                         task=new_child,
                         fan_in_key=new_fan_in_key,
                         error_callback=new_err,
-                        inject_parent_results=cb.inject_parent_results,
                     )
                 )
             else:
@@ -157,7 +155,6 @@ class SimpleCallback(BaseModel):
     type: Literal["simple"] = "simple"
     task: DAGTaskSpec
     error_callback: DAGTaskSpec | None = None  # Submit when the parent task fails permanently
-    inject_parent_results: bool = False  # Inject parent results as `parent_results` kwarg
 
 
 class FanInCallback(BaseModel):
@@ -173,7 +170,6 @@ class FanInCallback(BaseModel):
     task: DAGTaskSpec
     fan_in_key: str  # Redis SSET key tracking remaining predecessors
     error_callback: DAGTaskSpec | None = None  # Submit when this predecessor fails permanently
-    inject_parent_results: bool = False  # Inject all predecessor results as `parent_results` kwarg
 
 
 class DynamicFanOutCallback(BaseModel):
@@ -276,8 +272,8 @@ class DAGNode:
         self._queue = queue
         self._version = version
         self._parameters: dict[str, Any] = parameters or {}
-        # (successor_node, fan_in_key or None, error_node or None, inject_parent_results)
-        self._successors: list[tuple[DAGNode, str | None, DAGNode | None, bool]] = []
+        # (successor_node, fan_in_key or None, error_node or None)
+        self._successors: list[tuple[DAGNode, str | None, DAGNode | None]] = []
         # DynamicFanOutCallback entries declared via the mermaid parser (-->> / --o edges).
         self._fanout_callbacks: list[DynamicFanOutCallback] = []
 
@@ -294,14 +290,15 @@ class DAGNode:
         self,
         *nodes: DAGNode,
         on_error: DAGNode | None = None,
-        inject_parent_results: bool = False,
     ) -> DAGNode:
         """
         Chain: each of *nodes* runs immediately after *this* node completes.
 
         Pass `on_error` to also submit an error task when *this* node fails permanently.
-        Pass `inject_parent_results=True` to have the worker fetch this node's results
-        and inject them as a ``parent_results`` kwarg into each successor's task function.
+
+        Each successor is a chain-position task with exactly one parent (this
+        node); annotate its function's parameters with ``FromParent(key)`` to
+        pull specific values out of this node's results.
 
         Returns *self* for fluent chaining:
 
@@ -310,7 +307,7 @@ class DAGNode:
         ```
         """
         for node in nodes:
-            self._successors.append((node, None, on_error, inject_parent_results))
+            self._successors.append((node, None, on_error))
         return self
 
     @classmethod
@@ -339,7 +336,7 @@ class DAGNode:
             if not node._successors:
                 terminals.append(node)
             else:
-                for successor, _, _, _ in node._successors:
+                for successor, _, _ in node._successors:
                     _walk(successor)
 
         for root in roots:
@@ -352,14 +349,18 @@ class DAGNode:
         *predecessors: DAGNode,
         into: DAGNode,
         on_error: DAGNode | None = None,
-        inject_parent_results: bool = False,
     ) -> DAGNode:
         """
         Fan-in: `into` runs only after *all* `predecessors` have completed.
 
         Pass `on_error` to submit an error task when any predecessor fails permanently.
-        Pass `inject_parent_results=True` to have the worker fetch all predecessors'
-        results and inject them as a ``parent_results`` list kwarg into `into`'s function.
+
+        `into` always receives 2+ parents (one per predecessor), so any of its
+        function's parameters annotated ``FromParent(key)`` must use
+        ``many=True`` to collect values across all of them — see
+        ``validate_fan_in_cardinality``, which raises ``FanInCardinalityError``
+        at this call site if `into` declares a singular (``many=False``)
+        ``FromParent`` param, since that annotation can never be satisfied here.
 
         A shared Redis set key derived from `into`'s task ID is stored on
         each predecessor's callback so the worker knows which set to decrement.
@@ -369,9 +370,10 @@ class DAGNode:
         DAGNode.merge(branch_a, branch_b, into=collector).then(next_step)
         ```
         """
+        validate_fan_in_cardinality(predecessors, into)
         fan_in_key = f"dag:fan-in:{into._id}"
         for pred in predecessors:
-            pred._successors.append((into, fan_in_key, on_error, inject_parent_results))
+            pred._successors.append((into, fan_in_key, on_error))
         return into
 
     # ------------------------------------------------------------------
@@ -396,7 +398,7 @@ class DAGNode:
     def _callbacks_recursive(self) -> list[DAGCallback]:
         """Return the list of `DAGCallback` objects for this node's successors."""
         callbacks: list[DAGCallback] = []
-        for successor, fan_in_key, error_node, inject_parent_results in self._successors:
+        for successor, fan_in_key, error_node in self._successors:
             spec = successor.to_spec()
             error_spec = error_node.to_spec() if error_node is not None else None
             if fan_in_key is None:
@@ -404,7 +406,6 @@ class DAGNode:
                     SimpleCallback(
                         task=spec,
                         error_callback=error_spec,
-                        inject_parent_results=inject_parent_results,
                     )
                 )
             else:
@@ -413,7 +414,6 @@ class DAGNode:
                         task=spec,
                         fan_in_key=fan_in_key,
                         error_callback=error_spec,
-                        inject_parent_results=inject_parent_results,
                     )
                 )
         callbacks.extend(self._fanout_callbacks)
@@ -454,7 +454,7 @@ class DAGNode:
             if id(node) in visited:
                 return
             visited.add(id(node))
-            for successor, fan_in_key, _error_node, _ipr in node._successors:
+            for successor, fan_in_key, _error_node in node._successors:
                 if fan_in_key is not None:
                     result.setdefault(fan_in_key, set()).add(node._id)
                 _walk(successor)
@@ -467,6 +467,111 @@ class DAGNode:
 
         _walk(self)
         return result
+
+
+class FanInCardinalityError(ValueError):
+    """Raised when a DAG wires a singular ``FromParent`` param to a fan-in edge."""
+
+
+class FromParent:
+    """
+    Marker for pulling a value out of parent task results.
+
+    ```python
+    Annotated[int, FromParent("rows")]  # exactly one parent — scalar, or error
+    Annotated[int, FromParent("rows")] = 0  # ...falling back to 0 if the key is absent
+    Annotated[list[int], FromParent("rows", many=True)]  # every parent that produced "rows" — a list, always
+    Annotated[int, FromParent()]  # key defaults to the param name
+    ```
+
+    ``many=False`` (the default) requires the task to have exactly one parent
+    when it has *any* — a structural (DAG-shape) contract, not a data one. If
+    the key is absent from that one parent's results, the parameter is simply
+    left unset so the function's own Python default (if any) applies; see
+    ``docs/task-definition-reference.md``.
+
+    ``many=True`` resolves to a list — every parent that produced the key, in
+    no particular order — including ``[]`` when the task has one or more
+    parents but none of them produced the key.
+
+    **Root nodes (zero parents) are not a shape violation for either mode.**
+    There is nothing to pull from, so ``FromParent`` leaves the parameter
+    unset entirely — the same as a missing key — rather than raising (singular
+    mode) or forcing an empty list (``many=True``). This is what makes a
+    ``FromParent``-annotated task usable as a root node, or called/submitted
+    directly in a test without fabricating a parent: submit it with the value
+    as an ordinary parameter (``DAGNode(name, parameters={"rows": 5})`` or
+    ``my_task.submit(rows=5)``), or give the function its own Python default.
+    Only a *wrong* parent count — 2+ parents on a singular slot — is a real
+    structural bug and still raises unconditionally, regardless of what the
+    parents' results contain.
+
+    **Fragility warning:** don't stack multiple ``many=True`` params on one
+    task expecting their lists to line up positionally (e.g. ``zip(count,
+    name)``). Each param is filtered independently by its own key's presence,
+    so the lists only correspond entry-for-entry when every parent
+    contributing to one also contributes to the other — and nothing detects
+    or errors when that assumption breaks; a partial mismatch just silently
+    truncates via ``zip()`` and pairs the wrong parents' data. When you need
+    several fields from the *same* parent kept together, fetch the raw dicts
+    with ``await task.parent_results()`` instead and destructure each entry
+    directly — correctness then follows from reading multiple keys off one
+    dict, not from independently-resolved lists happening to stay aligned.
+    """
+
+    __slots__ = ("key", "many")
+
+    def __init__(self, key: str | None = None, *, many: bool = False) -> None:
+        self.key = key
+        self.many = many
+
+    def __repr__(self) -> str:
+        return f"FromParent({self.key!r}, many={self.many!r})"
+
+
+def _extract_from_parent(hint: Any) -> FromParent | None:
+    """Return the FromParent marker from an Annotated hint, or None."""
+    if get_origin(hint) is not Annotated:
+        return None
+    for meta in get_args(hint)[1:]:
+        if isinstance(meta, FromParent):
+            return meta
+    return None
+
+
+def validate_fan_in_cardinality(predecessors: tuple[DAGNode, ...], into: DAGNode) -> None:
+    """
+    Raise ``FanInCardinalityError`` if `into` declares a singular FromParent param.
+
+    ``DAGNode.merge()`` always supplies 2+ parents to `into` by construction,
+    so a ``FromParent(..., many=False)`` param on `into`'s function can never
+    be satisfied — it always raises at execution time. Catch it here instead,
+    at graph-construction time, when the task is already registered.
+    """
+    if len(predecessors) < 2:
+        return
+
+    from jobbers.registry import get_task_config  # deferred: registry imports this module
+
+    task_config = get_task_config(into._name, into._version)
+    if task_config is None:
+        return  # not registered yet (graph built before task modules imported) — can't validate
+
+    try:
+        hints = get_type_hints(task_config.function, include_extras=True)
+    except Exception:
+        return
+
+    for param_name, hint in hints.items():
+        if param_name == "return":
+            continue
+        fp = _extract_from_parent(hint)
+        if fp is not None and not fp.many:
+            raise FanInCardinalityError(
+                f"DAGNode.merge(): {into._name!r} has a singular FromParent param "
+                f"({param_name!r}) but merge() always supplies {len(predecessors)} parents. "
+                "Use FromParent(..., many=True)."
+            )
 
 
 @dataclass

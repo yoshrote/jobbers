@@ -79,7 +79,6 @@ tasks = Table(
     Column("heartbeat_at", DateTime(timezone=True), nullable=True),
     Column("completed_at", DateTime(timezone=True), nullable=True),
     Column("parent_ids", Text, nullable=False, default="[]"),
-    Column("inject_parent_results", Boolean, nullable=False, default=False),
     Column("cron_id", String(26), nullable=True),
     Column("dag_run_id", String(26), nullable=True),
     Column("dag_callbacks", Text, nullable=False, default="[]"),

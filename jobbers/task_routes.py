@@ -15,7 +15,7 @@ from ulid import ULID
 
 from jobbers import db, registry
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.dag import DAGRunPagination, DAGTaskSpec
+from jobbers.models.dag import DAGRunPagination, DAGTaskSpec, FanInCardinalityError
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
@@ -547,7 +547,7 @@ async def submit_dag(request: SubmitDAGRequest) -> dict[str, Any]:
     """
     try:
         roots = parse_mermaid_dag(request.diagram)
-    except MermaidParseError as exc:
+    except (MermaidParseError, FanInCardinalityError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     _validate_dag_against_registry(roots)
@@ -601,7 +601,7 @@ async def create_cron_dag(request: CronDAGRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Invalid cron expression: {request.cron_expr!r}")
     try:
         roots = parse_mermaid_dag(request.diagram)
-    except MermaidParseError as exc:
+    except (MermaidParseError, FanInCardinalityError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if len(roots) != 1:
         raise HTTPException(status_code=400, detail="Cron DAGs must have exactly one root node.")
@@ -661,7 +661,7 @@ async def update_cron_dag(cron_id: str, request: CronDAGRequest) -> dict[str, An
         raise HTTPException(status_code=400, detail=f"Invalid cron expression: {request.cron_expr!r}")
     try:
         roots = parse_mermaid_dag(request.diagram)
-    except MermaidParseError as exc:
+    except (MermaidParseError, FanInCardinalityError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if len(roots) != 1:
         raise HTTPException(status_code=400, detail="Cron DAGs must have exactly one root node.")

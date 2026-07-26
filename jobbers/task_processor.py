@@ -12,8 +12,10 @@ from jobbers.models.dag import (
     DynamicFanOut,
     DynamicFanOutCallback,
     FanInCallback,
+    FromParent,
     SimpleCallback,
     TaskResult,
+    validate_fan_in_cardinality,
 )
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
@@ -33,7 +35,6 @@ logger = logging.getLogger(__name__)
 class _FanInPred(NamedTuple):
     node: DAGNode
     err_node: DAGNode | None
-    inject_parent_results: bool
 
 
 def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
@@ -74,23 +75,24 @@ def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
             if isinstance(cb, SimpleCallback):
                 successor = all_nodes[cb.task.id]
                 err_node = all_nodes.get(cb.error_callback.id) if cb.error_callback else None
-                node.then(successor, on_error=err_node, inject_parent_results=cb.inject_parent_results)
+                node.then(successor, on_error=err_node)
             elif isinstance(cb, FanInCallback):
                 err_node = all_nodes.get(cb.error_callback.id) if cb.error_callback else None
-                fan_in_preds.setdefault(cb.task.id, []).append(
-                    _FanInPred(node, err_node, cb.inject_parent_results)
-                )
+                fan_in_preds.setdefault(cb.task.id, []).append(_FanInPred(node, err_node))
             elif isinstance(cb, DynamicFanOutCallback):
                 node.add_fanout_callback(cb)
 
     for collector_id, preds in fan_in_preds.items():
         collector_node = all_nodes[collector_id]
+        # DAGNode.merge() is called once per predecessor below (to allow each
+        # predecessor its own on_error node), so it never sees the full group and
+        # can't run its own cardinality check — validate the full group here instead.
+        validate_fan_in_cardinality(tuple(pred.node for pred in preds), collector_node)
         for pred in preds:
             DAGNode.merge(
                 pred.node,
                 into=collector_node,
                 on_error=pred.err_node,
-                inject_parent_results=pred.inject_parent_results,
             )
 
     return all_nodes[root.id]
@@ -102,6 +104,45 @@ tasks_retried = meter.create_counter("tasks_retried", unit="1")
 execution_time = meter.create_histogram("task_execution_time", unit="ms")
 end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms")
 post_process_failures = meter.create_counter("post_process_failures", unit="1")
+
+_OMIT = object()  # sentinel: key legitimately absent — let the function's own Python default apply
+
+
+def _resolve_from_parent(
+    task: Task, param_name: str, spec: FromParent, parent_results_map: dict[ULID, dict[Any, Any]]
+) -> Any:
+    """
+    Resolve a single ``FromParent``-annotated parameter for *task*.
+
+    Zero parents (a root node) is not a shape violation for either mode -- there is
+    nothing to pull from, so this returns ``_OMIT`` so the caller leaves the kwarg
+    unset. That lets a submitted ``task.parameters`` value or the function's own
+    Python default apply, which is what makes a ``FromParent``-annotated task usable
+    as a root node (or called directly in a test) without fabricating a parent.
+
+    ``many=True`` with 1+ parents always returns a list (possibly empty -- when none
+    of the parents produced the key). ``many=False`` with 2+ parents is a genuine
+    shape violation -- a fan-in wired to a singular slot -- and raises unconditionally,
+    regardless of what the parents' results contain, since no data could ever make
+    that wiring correct. With exactly one parent, a missing key returns ``_OMIT`` so
+    the function's own Python default (if any) applies.
+    """
+    key = spec.key or param_name
+
+    if not task.parent_ids:
+        return _OMIT
+
+    if spec.many:
+        return [r[key] for r in parent_results_map.values() if key in r]
+
+    if len(task.parent_ids) > 1:
+        raise ValueError(
+            f"FromParent({key!r}) on task {task.name!r} (param {param_name!r}, id={task.id}) requires "
+            f"exactly one parent (chain position); this task has {len(task.parent_ids)}. Use "
+            "FromParent(..., many=True) for fan-in."
+        )
+    result = next(iter(parent_results_map.values()), {})
+    return result[key] if key in result else _OMIT
 
 
 class TaskProcessor:
@@ -143,18 +184,36 @@ class TaskProcessor:
                 await self.state_manager.update_task_heartbeat(task)
                 task._adapter = self.state_manager.task_state
                 _token = _current_task_cv.set(task)
+
+                try:
+                    hints = get_type_hints(task.task_config.function, include_extras=True)
+                except Exception:
+                    hints = {}
+
                 kwargs = dict(task.parameters)
-                if task.inject_parent_results and task.parent_ids:
-                    kwargs["parent_results"] = await task.parent_results()
+
+                from_parent_specs: dict[str, FromParent] = {}
+                for param_name, hint in hints.items():
+                    if param_name == "return" or get_origin(hint) is not Annotated:
+                        continue
+                    for meta in get_args(hint)[1:]:
+                        if isinstance(meta, FromParent):
+                            from_parent_specs[param_name] = meta
+                            break
+
+                parent_results_map: dict[ULID, dict[Any, Any]] = {}
+                if task.parent_ids and from_parent_specs:
+                    parent_results_map = await task.parent_results()
+
+                for param_name, spec in from_parent_specs.items():
+                    value = _resolve_from_parent(task, param_name, spec, parent_results_map)
+                    if value is not _OMIT:
+                        kwargs[param_name] = value
 
                 resolver = DependencyResolver(task.task_config.dependency_graph)
                 async with resolver:
                     # Resolve DI deps and map them to their kwarg names
                     dep_cache = await resolver.resolve_all()
-                    try:
-                        hints = get_type_hints(task.task_config.function, include_extras=True)
-                    except Exception:
-                        hints = {}
                     for param_name, hint in hints.items():
                         if param_name == "return":
                             continue

@@ -1,5 +1,5 @@
 import datetime as dt
-from typing import Any
+from typing import Annotated, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from ulid import ULID
 
 from jobbers.adapters.sql import SQLQueueConfigAdapter
-from jobbers.models.dag import DAGRunDetail, DAGRunPagination, DagRunStatus, DAGRunSummary
+from jobbers.models.dag import DAGRunDetail, DAGRunPagination, DagRunStatus, DAGRunSummary, FromParent
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
@@ -1436,6 +1436,28 @@ async def test_submit_dag_with_unregistered_task_returns_400():
 
     assert response.status_code == 400
     assert "totally_unregistered_xyz" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_submit_dag_with_singular_from_parent_fan_in_returns_400():
+    """
+    A mermaid fan-in wired to a singular FromParent param is a clean 400, not an unhandled 500.
+
+    FanInCardinalityError is a ValueError, not a MermaidParseError -- the route must catch
+    both, or this diverges from every other diagram validation error (which returns 400).
+    """
+    diagram = 'flowchart TD\n  A["branch_a"]\n  B["branch_b"]\n  C["collector"]\n  A --> C\n  B --> C'
+
+    async def collector_fn(rows: Annotated[int, FromParent("rows")], **kwargs: object) -> None: ...
+
+    test_task_config = TaskConfig(name="collector", version=0, function=collector_fn)
+
+    with patch("jobbers.registry.get_task_config", return_value=test_task_config):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/submit-dag", json={"diagram": diagram})
+
+    assert response.status_code == 400
+    assert "singular FromParent" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

@@ -248,7 +248,7 @@ Task functions can declare shared resources as parameters annotated with `Depend
 ```python
 from typing import Annotated, AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
-from jobbers.di import Depends
+from jobbers.utils.di import Depends
 from jobbers.registry import register_task
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -343,7 +343,7 @@ The dependency graph is validated at `@register_task` decoration time (i.e. at i
 Use `dependency_overrides` to replace a provider for the duration of a test. The original is restored automatically when the context exits, even if the test raises.
 
 ```python
-from jobbers.di import dependency_overrides
+from jobbers.utils.di import dependency_overrides
 
 async def fake_db() -> AsyncGenerator[AsyncSession, None]:
     yield FakeSession()
@@ -352,3 +352,95 @@ async def test_process_record():
     with dependency_overrides({get_db: fake_db}):
         await process_record.submit(queue="default", record_id=1)
 ```
+
+---
+
+## Parent Result Injection
+
+Task functions in a DAG can declare a parameter annotated with `FromParent(key)` to have the worker pull a specific field out of the parent task's results and inject it directly, instead of destructuring a raw results dict inside the function body.
+
+```python
+from typing import Annotated
+from jobbers.models.dag import FromParent
+from jobbers.registry import register_task
+
+@register_task(name="process_records", version=1)
+async def process_records(rows: Annotated[int, FromParent("rows")], **kwargs) -> dict:
+    return {"processed": rows}
+```
+
+`rows` is never part of the submitted payload — the worker fetches it from the parent's results before calling the function, the same way `Depends()` params are never part of the payload.
+
+### Two modes
+
+| Mode | Annotation | Resolves to | Requires |
+| --- | --- | --- | --- |
+| Singular (default) | `FromParent(key)` or `FromParent(key, many=False)` | A plain scalar value, or unset at zero parents | Exactly one parent whenever the task has any (root nodes are exempt — see below) |
+| Collect-all | `FromParent(key, many=True)` | A `list[T]` — one entry per parent that produced the key, 0..N — or unset at zero parents | Any number of parents |
+
+The key defaults to the parameter's own name: `Annotated[int, FromParent()]` on a parameter named `rows` reads `results["rows"]`.
+
+### Don't stack multiple `many=True` params expecting aligned lists
+
+Each `FromParent(key, many=True)` param is resolved independently — it filters `parent_results_map` down to whichever parents produced *its own* key. If a task declares two of these:
+
+```python
+async def combine(
+    count: Annotated[list[int], FromParent("count", many=True)],
+    name: Annotated[list[str], FromParent("name", many=True)],
+    **kwargs,
+) -> dict:
+    # DANGEROUS: count[i] and name[i] are only the same parent's data if every
+    # contributing parent produced BOTH "count" and "name". Nothing checks this.
+    return {"pairs": list(zip(count, name))}
+```
+
+`count[i]` and `name[i]` only correspond to the same parent when every parent that contributes to one list also contributes to the other — i.e. the two keys always co-occur across parents. As soon as that's not true (parent A has `"count"` but not `"name"`, parent B has the reverse), the lists differ in length and/or membership, and `zip()` doesn't raise — it silently truncates to the shorter list and pairs whatever lands at the same index, which is no longer guaranteed to be the same parent. There is no error and no warning; you just get wrong data.
+
+**When you need several fields from the same parent kept together, don't stack `FromParent(many=True)` params — fetch the raw per-parent dicts instead:**
+
+```python
+from jobbers.context import get_current_task
+
+async def combine(**kwargs) -> dict:
+    task = get_current_task()
+    parents = await task.parent_results()
+    pairs = [(r["count"], r["name"]) for r in parents.values()]
+    # r["count"] and r["name"] are read from the same dict `r` -- correctness
+    # follows from that, not from two independently-filtered lists staying aligned.
+    return {"pairs": pairs}
+```
+
+### Singular mode is a DAG-shape contract, not a data one
+
+`FromParent(key)` (`many=False`) checks the task's parent *count* before ever looking at the data: whenever the task has any parents at all, it requires exactly one, unconditionally. Wiring a singular `FromParent` param to a task that receives more than one parent (a fan-in collector) always raises `ValueError` at execution time, regardless of what the parents' results actually contain — and `DAGNode.merge()` raises `FanInCardinalityError` even earlier, at graph-construction time, if it detects this (see [dag-composition.md](dag-composition.md)). This means a given `FromParent`-annotated parameter's shape never depends on runtime data — it's either always a scalar (singular) or always a list (`many=True`), never one or the other depending on which DAG wired it in.
+
+### Root nodes are exempt — and that's what makes `FromParent` overridable
+
+Zero parents is not a shape violation for either mode. A root node (or a task called/submitted directly, e.g. in a test) has nothing to pull a parent value from, so `FromParent` leaves the parameter unset entirely — the same treatment as a missing key — rather than raising (singular mode) or forcing an empty list (`many=True`). Concretely, this means a `FromParent`-annotated task can double as a root node: submit the value directly instead of via a parent —
+
+```python
+DAGNode("process_records", parameters={"rows": 5})   # no parent needed
+await process_records.submit(queue="default", rows=5)  # same, via the task wrapper
+```
+
+— or rely on the function's own Python default. Only a *wrong* parent count (2+ parents on a singular slot) is a real structural bug and keeps raising unconditionally; 0 parents never is, because there's no data to lose by falling through.
+
+### A missing key falls back to the function's own Python default
+
+If the key is absent from the one (correctly singular) parent's results — or there's no parent at all — `FromParent` simply leaves the parameter unset: the function's own Python default applies, or a standard `TypeError: missing required argument` is raised if it has none:
+
+```python
+async def process_records(rows: Annotated[int, FromParent("rows")] = 0, **kwargs) -> dict:
+    ...  # rows falls back to 0 if the parent didn't produce "rows", or there is no parent
+```
+
+This is deliberate: a missing key (or a missing parent) is a normal "optional value" case, handled the same way any other optional parameter is handled in Python. A *wrong* parent count is not a missing-value case — it's a DAG wiring bug, and no default (jobbers' or Python's) is allowed to silently swallow it.
+
+### Direct function calls
+
+Calling a registered task function directly — in a test, or from a script, via `my_task(**kwargs)` — bypasses this resolution entirely, exactly like `Depends()`. `TaskWrapper.__call__` is a raw passthrough to the underlying function; only `TaskProcessor.process()` (the worker's execution path) resolves `FromParent` params. Called directly, you must supply `FromParent`-annotated parameters as ordinary keyword arguments, the same way you'd supply a `Depends()`-annotated one.
+
+### Manual access
+
+For anything `FromParent` can't express — needing a producer's task ID rather than just its results, or deciding at runtime which keys to read — call `await task.parent_results()` directly; see [dag-composition.md](dag-composition.md#fetching-parent-results-manually). For an `on_error` callback that needs to know *why* its predecessor failed, use `await task.parent_errors()` instead — `parent_results()` returns `{}` for a permanently-failed parent (its function raised before returning anything); `parent_errors()` returns that parent's `errors` list.
