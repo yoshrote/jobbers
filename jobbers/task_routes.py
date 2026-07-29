@@ -409,7 +409,7 @@ def _validate_dag_against_registry(roots: list[Any]) -> None:
                 status_code=400,
                 detail=f"Unknown task '{node._name}@{node._version}'. Register it with @register_task before submitting.",
             )
-        for successor, _, error_node, _ in node._successors:
+        for successor, _, error_node in node._successors:
             worklist.append(successor)
             if error_node is not None:
                 worklist.append(error_node)
