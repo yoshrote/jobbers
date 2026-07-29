@@ -18,7 +18,7 @@ from jobbers.adapters.redis import (
 )
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.dag import DAGNode, DAGTaskSpec
+from jobbers.models.dag import DAGNode, DagRunStatus, DAGTaskSpec
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
@@ -911,6 +911,189 @@ async def test_cancel_terminal_task_raises(state_manager):
         await state_manager.request_task_cancellation(ULID1)
 
 
+# ── request_dag_cancellation ───────────────────────────────────────────────────
+#
+# Uses state_manager_real_ta (real RedisTaskState/RedisTaskSubmit via FakeRedis)
+# rather than the Dummy-backed `state_manager` fixture: get_dag_run is not
+# implemented on DummyTaskState (see tests/conftest.py), and per CLAUDE.md this
+# dispatch-adjacent, race-prone path needs a real-backend test regardless.
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_returns_none_for_unknown_run(state_manager_real_ta):
+    """request_dag_cancellation returns None when the DAG run has never been registered."""
+    result = await state_manager_real_ta.request_dag_cancellation(ULID())
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_sweeps_every_status_bucket(state_manager_real_ta):
+    """
+    A single sweep correctly buckets SCHEDULED/SUBMITTED/STARTED/already-terminal tasks.
+
+    SCHEDULED and SUBMITTED tasks are cancelled immediately; STARTED is left for the
+    trailing broadcast; already-terminal (COMPLETED) tasks are counted but untouched.
+    """
+    dag_run_id = ULID()
+    scheduled_id, submitted_id, started_id, completed_id = ULID(), ULID(), ULID(), ULID()
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+
+    scheduled_task = Task(
+        id=scheduled_id, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(scheduled_task)
+    scheduled_task.set_status(TaskStatus.SCHEDULED)
+    await state_manager_real_ta.task_scheduler.add(scheduled_task, run_at)
+    await state_manager_real_ta.task_state.save_task(scheduled_task)
+
+    submitted_task = Task(
+        id=submitted_id, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(submitted_task)
+
+    started_task = Task(
+        id=started_id, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(started_task)
+    started_task.set_status(TaskStatus.STARTED)
+    await state_manager_real_ta.task_state.save_task(started_task)
+
+    completed_task = Task(
+        id=completed_id, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(completed_task)
+    completed_task.set_status(TaskStatus.COMPLETED)
+    await state_manager_real_ta.task_state.save_task(completed_task)
+
+    result = await state_manager_real_ta.request_dag_cancellation(dag_run_id)
+
+    assert result is not None
+    assert result.already_terminal == 1
+    assert result.cancelled_immediately == 2
+    assert result.signalled_running == 1
+    assert {(t.task_id, t.status) for t in result.tasks} == {
+        (scheduled_id, "cancelled"),
+        (submitted_id, "cancelled"),
+        (started_id, "signalled"),
+        (completed_id, "already_terminal"),
+    }
+
+    assert (await state_manager_real_ta.task_state.get_task(scheduled_id)).status == TaskStatus.CANCELLED
+    assert (await state_manager_real_ta.task_state.get_task(submitted_id)).status == TaskStatus.CANCELLED
+    # STARTED tasks are only signalled here, not directly transitioned.
+    assert (await state_manager_real_ta.task_state.get_task(started_id)).status == TaskStatus.STARTED
+    assert (await state_manager_real_ta.task_state.get_task(completed_id)).status == TaskStatus.COMPLETED
+    assert await state_manager_real_ta.task_scheduler.next_due(["default"]) is None
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is True
+    # started_id is still STARTED (unresolved) -- the run isn't fully settled yet.
+    run_after = await state_manager_real_ta.get_dag_run(dag_run_id)
+    assert run_after.status == DagRunStatus.CANCELLING
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_settles_run_status_to_cancelled(state_manager_real_ta):
+    """
+    get_dag_run reports CANCELLED (not stuck at CANCELLING) once the sweep is the only work left.
+
+    Regression test: the SCHEDULED/SUBMITTED/UNSUBMITTED branch cancels tasks
+    directly, bypassing TaskProcessor -- which is what normally calls
+    finalize_dag_run_task -> record_dag_run_task_terminal on a terminal
+    transition. Without an equivalent call here, the run's completed/failed
+    counters would never reach len(task_ids), and get_dag_run's CANCELLING-vs-
+    CANCELLED derivation (state_manager.py's request_dag_cancellation docstring)
+    would report CANCELLING forever even after every task has actually stopped.
+    """
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    task_b = Task(
+        id=ULID2, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(task_a)
+    await state_manager_real_ta.submit_task(task_b)
+
+    await state_manager_real_ta.request_dag_cancellation(dag_run_id)
+
+    run = await state_manager_real_ta.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status == DagRunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_signals_all_started_tasks_via_one_broadcast(state_manager_real_ta):
+    """
+    N concurrently-STARTED tasks in one DAG run are all cancelled via a single broadcast.
+
+    This is the core noise-avoidance property of DAG cancellation (see
+    docs/dag-cancellation-design.md): publish_dag_cancellation is called exactly
+    once regardless of how many STARTED tasks the run has, and every worker-local
+    cancel_event for that run fires off that one message.
+    """
+    dag_run_id = ULID()
+    task_ids = [ULID() for _ in range(5)]
+    for tid in task_ids:
+        task = Task(
+            id=tid, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+        )
+        await state_manager_real_ta.submit_task(task)
+        task.set_status(TaskStatus.STARTED)
+        await state_manager_real_ta.task_state.save_task(task)
+
+    with contextlib.ExitStack() as stack:
+        for tid in task_ids:
+            stack.enter_context(state_manager_real_ta.cancel_event(tid, dag_run_id))
+
+        cancel_listener = asyncio.create_task(state_manager_real_ta.run_cancel_listener())
+        await asyncio.sleep(0.05)  # let the listener subscribe
+
+        with patch.object(
+            state_manager_real_ta.cancellation_bus,
+            "publish_dag_cancellation",
+            wraps=state_manager_real_ta.cancellation_bus.publish_dag_cancellation,
+        ) as mock_publish:
+            result = await state_manager_real_ta.request_dag_cancellation(dag_run_id)
+            await asyncio.sleep(0.1)  # let the listener process the one broadcast
+
+        assert result is not None
+        assert result.signalled_running == 5
+        mock_publish.assert_awaited_once_with(dag_run_id)
+        assert all(state_manager_real_ta._cancel_events[tid].event.is_set() for tid in task_ids)
+
+        cancel_listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancel_listener
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_no_broadcast_when_nothing_started(state_manager_real_ta):
+    """No pub/sub message is published when the run has no STARTED tasks to signal."""
+    dag_run_id = ULID()
+    task = Task(id=ULID1, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED)
+    await state_manager_real_ta.submit_task(task)
+
+    with patch.object(
+        state_manager_real_ta.cancellation_bus, "publish_dag_cancellation", new_callable=AsyncMock
+    ) as mock_publish:
+        result = await state_manager_real_ta.request_dag_cancellation(dag_run_id)
+
+    assert result is not None
+    assert result.signalled_running == 0
+    mock_publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mark_and_is_dag_run_cancelling_proxy(state_manager_real_ta):
+    """mark_dag_run_cancelling/is_dag_run_cancelling proxy through to the task_state adapter."""
+    dag_run_id = ULID()
+    task = Task(id=ULID1, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED)
+    await state_manager_real_ta.submit_task(task)
+
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is False
+    await state_manager_real_ta.mark_dag_run_cancelling(dag_run_id)
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is True
+
+
 # ── submit_task (rate-limited branch) ─────────────────────────────────────────
 
 
@@ -993,6 +1176,56 @@ def test_cancel_event_registers_and_deregisters(state_manager):
         assert ULID1 in state_manager._cancel_events
 
     assert ULID1 not in state_manager._cancel_events
+
+
+def test_cancel_event_stores_dag_run_id(state_manager):
+    """cancel_event registers dag_run_id alongside the event, for signal_cancel_dag to match on."""
+    dag_run_id = ULID2
+    with state_manager.cancel_event(ULID1, dag_run_id):
+        assert state_manager._cancel_events[ULID1].dag_run_id == dag_run_id
+
+
+def test_cancel_event_defaults_dag_run_id_to_none(state_manager):
+    """cancel_event's dag_run_id parameter is optional, for callers with no DAG run."""
+    with state_manager.cancel_event(ULID1):
+        assert state_manager._cancel_events[ULID1].dag_run_id is None
+
+
+# ── signal_cancel_dag ─────────────────────────────────────────────────────────
+
+
+def test_signal_cancel_dag_fires_matching_events_only(state_manager):
+    """signal_cancel_dag sets the event for every in-flight task with a matching dag_run_id, and no others."""
+    dag_run_id = ULID2
+    other_dag_run_id = ULID()
+    with (
+        state_manager.cancel_event(ULID1, dag_run_id),
+        state_manager.cancel_event(other_dag_run_id, other_dag_run_id),
+    ):
+        count = state_manager.signal_cancel_dag(dag_run_id)
+
+        assert count == 1
+        assert state_manager._cancel_events[ULID1].event.is_set()
+        assert not state_manager._cancel_events[other_dag_run_id].event.is_set()
+
+
+def test_signal_cancel_dag_fires_all_matching_events(state_manager):
+    """signal_cancel_dag fires every in-flight task belonging to the run, not just one."""
+    dag_run_id = ULID2
+    task_ids = [ULID(), ULID(), ULID()]
+    with contextlib.ExitStack() as stack:
+        for tid in task_ids:
+            stack.enter_context(state_manager.cancel_event(tid, dag_run_id))
+
+        count = state_manager.signal_cancel_dag(dag_run_id)
+
+        assert count == 3
+        assert all(state_manager._cancel_events[tid].event.is_set() for tid in task_ids)
+
+
+def test_signal_cancel_dag_returns_zero_when_no_matching_tasks(state_manager):
+    """signal_cancel_dag returns 0 and is a no-op when no in-flight task belongs to the run."""
+    assert state_manager.signal_cancel_dag(ULID()) == 0
 
 
 # ── monitor_task_cancellation ──────────────────────────────────────────────────

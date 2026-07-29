@@ -214,7 +214,14 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
             DAGRunSummary(
                 dag_run_id=ULID.from_bytes(dag_id_bytes),
                 name=(meta or {}).get("name", ""),
-                status=DagRunStatus((meta or {}).get("status", DagRunStatus.RUNNING.value)),
+                # Once cancellation is requested, the raw "status" field is superseded
+                # here -- see get_dag_run's docstring for why this list view can't
+                # afford to distinguish CANCELLING from CANCELLED cheaply.
+                status=(
+                    DagRunStatus.CANCELLING
+                    if (meta or {}).get("cancelled_at") is not None
+                    else DagRunStatus((meta or {}).get("status", DagRunStatus.RUNNING.value))
+                ),
                 submitted_at=dt.datetime.fromtimestamp(score, dt.UTC),
             )
             for (dag_id_bytes, score), meta in zip(raw, meta_docs, strict=True)
@@ -241,13 +248,43 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
             "dict[str, Any] | None",
             await self.data_store.json().get(self.DAG_RUN_META(dag_run_id=dag_run_id)),
         )
+        status = DagRunStatus((meta or {}).get("status", DagRunStatus.RUNNING.value))
+        cancelled_at = (meta or {}).get("cancelled_at")
+        if cancelled_at is not None:
+            # Once cancellation is requested, the raw "status" field (still being
+            # written by record_dag_run_task_terminal's running/partial_failure/failed
+            # recompute) is superseded here: a cancelled/cancelling run reports
+            # CANCELLED once every registered task has reached a terminal outcome,
+            # CANCELLING until then. Cancelled tasks never leave DAG_RUN_PENDING (see
+            # finalize_dag_run_task), so "pending count reaches 0" can't be used as the
+            # settled signal -- completed+failed reaching the full task count can.
+            completed = int((meta or {}).get("completed", 0))
+            failed = int((meta or {}).get("failed", 0))
+            status = (
+                DagRunStatus.CANCELLED if (completed + failed) >= len(task_ids) else DagRunStatus.CANCELLING
+            )
         return DAGRunDetail(
             dag_run_id=dag_run_id,
             name=(meta or {}).get("name", ""),
-            status=DagRunStatus((meta or {}).get("status", DagRunStatus.RUNNING.value)),
+            status=status,
             submitted_at=submitted_at,
             task_ids=task_ids,
         )
+
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        """Idempotently record that cancellation was requested for this run (JSON.SET NX)."""
+        now = dt.datetime.now(dt.UTC).timestamp()
+        await self.data_store.json().set(
+            self.DAG_RUN_META(dag_run_id=dag_run_id), "$.cancelled_at", now, nx=True
+        )
+
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        """Cheap check: has cancellation been requested for this run."""
+        meta = cast(
+            "dict[str, Any] | None",
+            await self.data_store.json().get(self.DAG_RUN_META(dag_run_id=dag_run_id)),
+        )
+        return bool(meta and meta.get("cancelled_at") is not None)
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Remove DAG run index entries and all their per-run structures older than ``max_age``."""

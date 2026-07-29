@@ -572,6 +572,9 @@ def _make_state_manager():
     state_manager = AsyncMock(spec=StateManager)
     state_manager.task_scheduler = AsyncMock(spec=RedisTaskScheduler)
     state_manager.task_state = AsyncMock()
+    # Default to "not cancelling" so the post_process/_handle_retry DAG-cancellation
+    # gates don't short-circuit tests that aren't exercising that feature.
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=False)
 
     async def _schedule_retry_task(task: Task, run_at: dt.datetime) -> Task:
         return task
@@ -680,6 +683,125 @@ async def test_expected_exception_max_retries_fails_even_with_scheduler():
     assert result.retry_attempt == 3
     state_manager.fail_task.assert_called_once_with(task)
     state_manager.schedule_retry_task.assert_not_called()
+
+
+# ── _handle_retry: DAG-cancellation gate ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_cancelled_instead_of_scheduled_when_dag_run_cancelling():
+    """
+    A retryable failure that would normally be SCHEDULED is CANCELLED instead when the DAG is cancelling.
+
+    Cancellation wins over "retries remaining" -- see docs/dag-cancellation-design.md §4.4.
+    """
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+        dag_run_id=dag_run_id,
+    )
+    state_manager = _make_state_manager()
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=True)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config()  # has retry_delay=5 -> would normally schedule
+    task_config = task_config.model_copy(update={"function": task_function})
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.CANCELLED
+    state_manager.schedule_retry_task.assert_not_called()
+    state_manager.queue_retry_task.assert_not_called()
+    state_manager.fail_task.assert_not_called()
+    state_manager.finalize_dag_run_task.assert_awaited_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_cancelled_instead_of_queued_when_dag_run_cancelling():
+    """A retryable failure that would normally be re-queued immediately is CANCELLED instead when cancelling."""
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+        dag_run_id=dag_run_id,
+    )
+    state_manager = _make_state_manager()
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=True)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    # No retry_delay -> would normally be an immediate requeue (queue_retry_task).
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        max_retries=3,
+        expected_exceptions=(ValueError,),
+    )
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.CANCELLED
+    state_manager.queue_retry_task.assert_not_called()
+    state_manager.schedule_retry_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_retries_normally_when_dag_run_not_cancelling():
+    """Sanity check: an explicit is_dag_run_cancelling=False still retries normally (gate is a no-op)."""
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+        dag_run_id=dag_run_id,
+    )
+    state_manager = _make_state_manager()
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=False)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config()
+    task_config = task_config.model_copy(update={"function": task_function})
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.SCHEDULED
+    state_manager.schedule_retry_task.assert_called_once_with(task, ANY)
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_skips_cancelling_check_for_non_dag_task():
+    """A standalone (non-DAG) task's retry path never calls is_dag_run_cancelling."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config()
+    task_config = task_config.model_copy(update={"function": task_function})
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.SCHEDULED
+    state_manager.is_dag_run_cancelling.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1407,6 +1529,50 @@ async def test_post_process_triggers_dag_callbacks():
     state_manager.submit_tasks_batch.assert_awaited_once()
     submitted = state_manager.submit_tasks_batch.call_args[0][0][0]
     assert submitted.name == child_spec.name
+
+
+@pytest.mark.asyncio
+async def test_post_process_skipped_when_dag_run_cancelling():
+    """post_process spawns no descendants when the task's DAG run is marked cancelling."""
+    dag_run_id = ULID()
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    state_manager = _make_state_manager()
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=True)
+
+    processor = TaskProcessor(state_manager)
+    await processor.post_process(parent)
+
+    state_manager.submit_tasks_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_process_skips_cancelling_check_for_non_dag_task():
+    """A standalone (non-DAG) task's post_process never calls is_dag_run_cancelling."""
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    state_manager = _make_state_manager()
+
+    processor = TaskProcessor(state_manager)
+    await processor.post_process(parent)
+
+    state_manager.is_dag_run_cancelling.assert_not_awaited()
+    state_manager.submit_tasks_batch.assert_awaited_once()
 
 
 @pytest.mark.asyncio

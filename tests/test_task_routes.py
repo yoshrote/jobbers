@@ -1185,6 +1185,76 @@ async def test_get_dag_not_found(state_manager):
     assert response.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_cancel_dag_not_found(state_manager):
+    """POST /dags/{dag_run_id}/cancel returns 404 when the run does not exist."""
+    state_manager.request_dag_cancellation = AsyncMock(return_value=None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/cancel")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cancel_dag_default_response_omits_task_breakdown(state_manager):
+    """POST /dags/{dag_run_id}/cancel returns the aggregate summary without a per-task list by default."""
+    from jobbers.models.dag import DAGCancelResult, DAGCancelTaskResult
+
+    result = DAGCancelResult(
+        dag_run_id=DAG_RUN_ID,
+        already_terminal=1,
+        cancelled_immediately=2,
+        signalled_running=3,
+        tasks=[
+            DAGCancelTaskResult(task_id=ULID1, status="cancelled"),
+            DAGCancelTaskResult(task_id=ULID2, status="signalled"),
+        ],
+    )
+    state_manager.request_dag_cancellation = AsyncMock(return_value=result)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/cancel")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data == {
+        "dag_run_id": str(DAG_RUN_ID),
+        "already_terminal": 1,
+        "cancelled_immediately": 2,
+        "signalled_running": 3,
+    }
+    state_manager.request_dag_cancellation.assert_called_once_with(DAG_RUN_ID)
+
+
+@pytest.mark.asyncio
+async def test_cancel_dag_verbose_includes_task_breakdown(state_manager):
+    """POST /dags/{dag_run_id}/cancel?verbose=true includes the per-task breakdown."""
+    from jobbers.models.dag import DAGCancelResult, DAGCancelTaskResult
+
+    result = DAGCancelResult(
+        dag_run_id=DAG_RUN_ID,
+        already_terminal=0,
+        cancelled_immediately=1,
+        signalled_running=1,
+        tasks=[
+            DAGCancelTaskResult(task_id=ULID1, status="cancelled"),
+            DAGCancelTaskResult(task_id=ULID2, status="signalled"),
+        ],
+    )
+    state_manager.request_dag_cancellation = AsyncMock(return_value=result)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/cancel", params={"verbose": "true"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["tasks"] == [
+        {"task_id": str(ULID1), "status": "cancelled"},
+        {"task_id": str(ULID2), "status": "signalled"},
+    ]
+
+
 # ── task routing endpoints ─────────────────────────────────────────────────────
 
 

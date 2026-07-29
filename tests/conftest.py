@@ -76,6 +76,7 @@ class DummyTaskState:
     def __init__(self) -> None:
         self._store: dict[ULID, Task] = {}
         self._heartbeats: dict[ULID, float] = {}
+        self._cancelling: set[ULID] = set()
 
     # ── TaskStateProtocol: reads ──────────────────────────────────────────────
 
@@ -144,6 +145,12 @@ class DummyTaskState:
 
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
         raise NotImplementedError("DummyTaskState.mark_dag_run_complete")
+
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        self._cancelling.add(dag_run_id)
+
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        return dag_run_id in self._cancelling
 
     async def ensure_index(self) -> None:
         raise NotImplementedError("DummyTaskState.ensure_index")

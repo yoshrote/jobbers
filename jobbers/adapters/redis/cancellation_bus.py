@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 
 from ulid import ULID
 
+from jobbers.protocols import CancellationMessage
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
@@ -29,21 +31,28 @@ class RedisCancellationBus:
         self._client = client
 
     async def publish_cancellation(self, task_id: ULID) -> None:
-        await self._client.publish(self.CHANNEL, str(task_id))
+        await self._client.publish(self.CHANNEL, f"task:{task_id}")
 
-    def listen_cancellations(self) -> AsyncGenerator[ULID, None]:
+    async def publish_dag_cancellation(self, dag_run_id: ULID) -> None:
+        await self._client.publish(self.CHANNEL, f"dag:{dag_run_id}")
+
+    def listen_cancellations(self) -> AsyncGenerator[CancellationMessage, None]:
         return self._listen_gen()
 
-    async def _listen_gen(self) -> AsyncGenerator[ULID, None]:
+    async def _listen_gen(self) -> AsyncGenerator[CancellationMessage, None]:
         async with self._client.pubsub() as pubsub:
             await pubsub.subscribe(self.CHANNEL)
             while True:
                 message = await pubsub.get_message(ignore_subscribe_messages=True)
                 if message is not None:
                     raw = message["data"]
-                    task_id_str = raw.decode() if isinstance(raw, bytes) else raw
-                    try:
-                        yield ULID.from_str(task_id_str)
-                    except Exception:
-                        logger.warning("Invalid task_id in cancellations channel: %r", task_id_str)
+                    payload = raw.decode() if isinstance(raw, bytes) else raw
+                    kind, sep, raw_id = payload.partition(":")
+                    if sep and kind in ("task", "dag"):
+                        try:
+                            yield CancellationMessage(kind, ULID.from_str(raw_id))  # type: ignore[arg-type]
+                        except Exception:
+                            logger.warning("Invalid id in cancellations channel: %r", payload)
+                    else:
+                        logger.warning("Malformed cancellations channel message: %r", payload)
                 await asyncio.sleep(0.01)

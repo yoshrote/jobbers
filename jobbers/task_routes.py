@@ -731,3 +731,30 @@ async def get_dag(dag_run_id: str) -> dict[str, Any]:
         "submitted_at": result.submitted_at.isoformat(),
         "task_ids": [str(t) for t in result.task_ids],
     }
+
+
+@app.post("/dags/{dag_run_id}/cancel")
+async def cancel_dag(dag_run_id: str, verbose: bool = False) -> dict[str, Any]:
+    """
+    Cancel every non-terminal task in a DAG run.
+
+    SCHEDULED/SUBMITTED tasks are cancelled immediately; STARTED tasks are signalled
+    via a single DAG-wide pub/sub broadcast rather than one message per task. Pass
+    ``?verbose=true`` for a per-task breakdown; the default response is a fixed-size
+    aggregate summary regardless of run size.
+    """
+    uid = _parse_ulid(dag_run_id, "dag_run_id")
+    logger.info("Requesting cancellation for DAG run %s", dag_run_id)
+    sm = db.get_state_manager()
+    result = await sm.request_dag_cancellation(uid)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"DAG run '{dag_run_id}' not found.")
+    response: dict[str, Any] = {
+        "dag_run_id": str(result.dag_run_id),
+        "already_terminal": result.already_terminal,
+        "cancelled_immediately": result.cancelled_immediately,
+        "signalled_running": result.signalled_running,
+    }
+    if verbose:
+        response["tasks"] = [{"task_id": str(t.task_id), "status": t.status} for t in result.tasks]
+    return response

@@ -153,7 +153,7 @@ class TaskProcessor:
         self._current_promise: Awaitable[Any] | None = None
 
     async def run(self, task: Task) -> None:
-        with self.state_manager.cancel_event(task.id):
+        with self.state_manager.cancel_event(task.id, task.dag_run_id):
             try:
                 async with asyncio.TaskGroup() as tg:
                     process_task = tg.create_task(self.process(task))
@@ -350,6 +350,12 @@ class TaskProcessor:
         logger.info("Task %s started (attempt %d).", task.id, task.retry_attempt + 1)
 
     async def post_process(self, task: Task, dynamic_fanout: DynamicFanOut | None = None) -> None:
+        if task.dag_run_id and await self.state_manager.is_dag_run_cancelling(task.dag_run_id):
+            # Run is being cancelled; don't spawn new descendants (fan-out arms,
+            # fan-in collectors, SimpleCallback chains). The task's own terminal
+            # bookkeeping (finalize_dag_run_task) still runs normally afterwards.
+            return
+
         # Detect outer fan-in callbacks that should be delegated to a grandcollector
         # instead of being decremented by this task, from either fan-out mechanism:
         # a declarative DynamicFanOutCallback in the spec (mermaid `-->>`), or a
@@ -627,6 +633,11 @@ class TaskProcessor:
 
     async def _handle_retry(self, task: Task, error_message: str) -> Task:
         task.errors.append(error_message)
+        if task.dag_run_id and await self.state_manager.is_dag_run_cancelling(task.dag_run_id):
+            # Cancellation wins over "retries remaining" -- don't resubmit work into
+            # a run that's supposed to be stopping. See docs/dag-cancellation-design.md §4.4.
+            await self.handle_user_cancelled_task(task)
+            return task
         if not task.should_retry():
             task.set_status(TaskStatus.FAILED)
             await self.state_manager.fail_task(task)

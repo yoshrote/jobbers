@@ -1846,6 +1846,58 @@
           }
         }
       }
+    },
+    "/dags/{dag_run_id}/cancel": {
+      "post": {
+        "summary": "Cancel Dag",
+        "description": "Cancel every non-terminal task in a DAG run.\n\nSCHEDULED/SUBMITTED tasks are cancelled immediately; STARTED tasks are signalled\nvia a single DAG-wide pub/sub broadcast rather than one message per task. Pass\n``?verbose=true`` for a per-task breakdown; the default response is a fixed-size\naggregate summary regardless of run size.",
+        "operationId": "cancel_dag_dags__dag_run_id__cancel_post",
+        "parameters": [
+          {
+            "name": "dag_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Dag Run Id"
+            }
+          },
+          {
+            "name": "verbose",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Verbose"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Cancel Dag Dags  Dag Run Id  Cancel Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

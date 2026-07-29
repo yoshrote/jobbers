@@ -1007,6 +1007,103 @@ async def test_mark_dag_run_complete_noop_when_failed_count_nonzero(task_adapter
     assert detail.status == DagRunStatus.FAILED
 
 
+# ── mark_dag_run_cancelling / is_dag_run_cancelling ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_is_dag_run_cancelling_false_before_requested(task_adapter):
+    """is_dag_run_cancelling returns False until mark_dag_run_cancelling has been called."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    assert await state.is_dag_run_cancelling(ULID1) is False
+
+
+@pytest.mark.asyncio
+async def test_mark_dag_run_cancelling_then_is_cancelling_true(task_adapter):
+    """mark_dag_run_cancelling makes is_dag_run_cancelling report True."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.mark_dag_run_cancelling(ULID1)
+
+    assert await state.is_dag_run_cancelling(ULID1) is True
+
+
+@pytest.mark.asyncio
+async def test_mark_dag_run_cancelling_is_idempotent(task_adapter):
+    """Calling mark_dag_run_cancelling twice does not raise and stays cancelling."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    await state.mark_dag_run_cancelling(ULID1)
+
+    assert await state.is_dag_run_cancelling(ULID1) is True
+
+
+@pytest.mark.asyncio
+async def test_get_dag_run_status_cancelling_while_tasks_still_pending(task_adapter):
+    """get_dag_run reports CANCELLING once requested but before every task has a terminal outcome."""
+    state, submit = task_adapter
+    task_a = make_task(ULID2, submitted_at=FROZEN_TIME)
+    task_b = make_task(ULID3, submitted_at=FROZEN_TIME)
+    task_a.dag_run_id = ULID1
+    task_b.dag_run_id = ULID1
+    await submit.submit_task(task_a)
+    await submit.submit_task(task_b)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    await state.record_dag_run_task_terminal(ULID1, "completed")  # only 1 of 2 tasks settled
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.CANCELLING
+
+
+@pytest.mark.asyncio
+async def test_get_dag_run_status_cancelled_once_all_tasks_settled(task_adapter):
+    """get_dag_run reports CANCELLED once every registered task has a recorded terminal outcome."""
+    state, submit = task_adapter
+    task_a = make_task(ULID2, submitted_at=FROZEN_TIME)
+    task_b = make_task(ULID3, submitted_at=FROZEN_TIME)
+    task_a.dag_run_id = ULID1
+    task_b.dag_run_id = ULID1
+    await submit.submit_task(task_a)
+    await submit.submit_task(task_b)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_get_dag_runs_list_shows_cancelling_once_requested(task_adapter):
+    """get_dag_runs (list view) shows CANCELLING for any run with cancellation requested."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    # Even a fully-settled run shows CANCELLING in the cheap list view -- only
+    # get_dag_run distinguishes CANCELLED (see module docstring / design doc).
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+
+    runs, _ = await state.get_dag_runs(DAGRunPagination())
+    assert runs[0].status == DagRunStatus.CANCELLING
+
+
 # ── fan-in ────────────────────────────────────────────────────────────────────
 
 

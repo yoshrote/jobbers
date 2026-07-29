@@ -521,7 +521,12 @@ class SQLTaskState:
                 DAGRunSummary(
                     dag_run_id=ULID.from_str(row.dag_run_id),
                     name=row.name,
-                    status=DagRunStatus(row.status),
+                    # Once cancellation is requested, the raw "status" column is
+                    # superseded here -- see get_dag_run's docstring for why this list
+                    # view can't afford to distinguish CANCELLING from CANCELLED cheaply.
+                    status=(
+                        DagRunStatus.CANCELLING if row.cancelled_at is not None else DagRunStatus(row.status)
+                    ),
                     submitted_at=_ensure_utc_nn(row.submitted_at),
                 )
                 for row in result.all()
@@ -544,13 +549,46 @@ class SQLTaskState:
             # ULIDs sort lexicographically by creation time; sort here so task_ids
             # is chronologically ordered regardless of the row order SQL returns.
             task_ids = sorted(ULID.from_str(row.id) for row in task_result.all())
+        status = DagRunStatus(run_row.status)
+        if run_row.cancelled_at is not None:
+            # Once cancellation is requested, the raw "status" column (still being
+            # written by record_dag_run_task_terminal's running/partial_failure/failed
+            # recompute) is superseded here: a cancelled/cancelling run reports
+            # CANCELLED once every registered task has reached a terminal outcome,
+            # CANCELLING until then. Cancelled tasks never leave dag_run_pending (see
+            # finalize_dag_run_task), so "pending count reaches 0" can't be used as the
+            # settled signal -- completed+failed reaching the full task count can.
+            settled = (run_row.completed_count + run_row.failed_count) >= len(task_ids)
+            status = DagRunStatus.CANCELLED if settled else DagRunStatus.CANCELLING
         return DAGRunDetail(
             dag_run_id=dag_run_id,
             name=run_row.name,
-            status=DagRunStatus(run_row.status),
+            status=status,
             submitted_at=_ensure_utc_nn(run_row.submitted_at),
             task_ids=task_ids,
         )
+
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        """Idempotently record that cancellation was requested for this run."""
+        dag_run_id_str = str(dag_run_id)
+        now = dt.datetime.now(dt.UTC)
+        async with self._sf() as session:
+            async with session.begin():
+                await session.execute(
+                    update(dag_runs)
+                    .where(dag_runs.c.dag_run_id == dag_run_id_str, dag_runs.c.cancelled_at.is_(None))
+                    .values(cancelled_at=now)
+                )
+
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        """Cheap check: has cancellation been requested for this run."""
+        dag_run_id_str = str(dag_run_id)
+        async with self._sf() as session:
+            result = await session.execute(
+                select(dag_runs.c.cancelled_at).where(dag_runs.c.dag_run_id == dag_run_id_str)
+            )
+            row = result.first()
+            return row is not None and row.cancelled_at is not None
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete DAG run entries (and their pending rows) older than ``max_age``."""

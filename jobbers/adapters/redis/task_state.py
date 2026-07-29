@@ -172,16 +172,25 @@ class RedisTaskState(SharedTaskAdapterMixin):
         )
         pipe = self.data_store.pipeline(transaction=False)
         for dag_id_bytes, _ in raw:
-            pipe.hmget(self.DAG_RUN_META(dag_run_id=ULID.from_bytes(dag_id_bytes)), "name", "status")
+            pipe.hmget(
+                self.DAG_RUN_META(dag_run_id=ULID.from_bytes(dag_id_bytes)), "name", "status", "cancelled_at"
+            )
         meta_rows = cast("list[list[bytes | None]]", await pipe.execute()) if raw else []
         summaries = [
             DAGRunSummary(
                 dag_run_id=ULID.from_bytes(dag_id_bytes),
                 name=name.decode() if name else "",
-                status=DagRunStatus(status.decode()) if status else DagRunStatus.RUNNING,
+                # Once cancellation is requested, the raw "status" field is superseded
+                # here -- see get_dag_run's docstring for why this list view can't
+                # afford to distinguish CANCELLING from CANCELLED cheaply.
+                status=(
+                    DagRunStatus.CANCELLING
+                    if cancelled_at
+                    else (DagRunStatus(status.decode()) if status else DagRunStatus.RUNNING)
+                ),
                 submitted_at=dt.datetime.fromtimestamp(score, dt.UTC),
             )
-            for (dag_id_bytes, score), (name, status) in zip(raw, meta_rows, strict=True)
+            for (dag_id_bytes, score), (name, status, cancelled_at) in zip(raw, meta_rows, strict=True)
         ]
         return summaries, total
 
@@ -201,17 +210,48 @@ class RedisTaskState(SharedTaskAdapterMixin):
         # time, so sorting restores the submission-order guarantee callers rely on
         # (e.g. the /dags/{dag_run_id} response) at no extra I/O cost.
         task_ids = sorted(ULID.from_bytes(b) for b in raw_ids)
-        name_raw, status_raw = cast(
+        name_raw, status_raw, cancelled_raw, completed_raw, failed_raw = cast(
             "list[bytes | None]",
-            await self.data_store.hmget(self.DAG_RUN_META(dag_run_id=dag_run_id), "name", "status"),
+            await self.data_store.hmget(
+                self.DAG_RUN_META(dag_run_id=dag_run_id),
+                "name",
+                "status",
+                "cancelled_at",
+                "completed",
+                "failed",
+            ),
         )
+        status = DagRunStatus(status_raw.decode()) if status_raw else DagRunStatus.RUNNING
+        if cancelled_raw:
+            # Once cancellation is requested, the raw "status" field (still being
+            # written by record_dag_run_task_terminal's running/partial_failure/failed
+            # recompute) is superseded here: a cancelled/cancelling run reports
+            # CANCELLED once every registered task has reached a terminal outcome,
+            # CANCELLING until then. Cancelled tasks never leave DAG_RUN_PENDING (see
+            # finalize_dag_run_task), so "pending count reaches 0" can't be used as the
+            # settled signal -- completed+failed reaching the full task count can.
+            completed = int(completed_raw or 0)
+            failed = int(failed_raw or 0)
+            status = (
+                DagRunStatus.CANCELLED if (completed + failed) >= len(task_ids) else DagRunStatus.CANCELLING
+            )
         return DAGRunDetail(
             dag_run_id=dag_run_id,
             name=name_raw.decode() if name_raw else "",
-            status=DagRunStatus(status_raw.decode()) if status_raw else DagRunStatus.RUNNING,
+            status=status,
             submitted_at=submitted_at,
             task_ids=task_ids,
         )
+
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        """Idempotently record that cancellation was requested for this run (HSETNX)."""
+        now = dt.datetime.now(dt.UTC).timestamp()
+        await self.data_store.hsetnx(self.DAG_RUN_META(dag_run_id=dag_run_id), "cancelled_at", now)
+
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        """Cheap check: has cancellation been requested for this run."""
+        val = await self.data_store.hget(self.DAG_RUN_META(dag_run_id=dag_run_id), "cancelled_at")
+        return val is not None
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Remove DAG run index entries and all their per-run structures older than ``max_age``."""

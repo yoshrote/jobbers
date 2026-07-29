@@ -15,7 +15,7 @@ from ulid import ULID
 
 from jobbers import registry
 from jobbers.models.cron_dag import ConcurrencyPolicy
-from jobbers.models.dag import collect_fan_in_keys
+from jobbers.models.dag import DAGCancelResult, DAGCancelTaskResult, collect_fan_in_keys
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
@@ -71,6 +71,14 @@ class ConcurrencyStager:
         self._stage_fn(pipe, task_id)
 
 
+@dataclass
+class _CancelHandle:
+    """Per-in-flight-task cancel wait state, registered for the duration of TaskProcessor.run()."""
+
+    event: asyncio.Event
+    dag_run_id: ULID | None
+
+
 class TaskException(Exception):
     "Top-level exception for stuff gone wrong."
 
@@ -114,7 +122,7 @@ class StateManager:
         self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
         self.submission_limiter = SubmissionRateLimiter(self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
-        self._cancel_events: dict[ULID, asyncio.Event] = {}
+        self._cancel_events: dict[ULID, _CancelHandle] = {}
         self.dead_queue: DeadQueueProtocol = dead_queue
         self.task_scheduler = task_scheduler
         self.cron_dag_scheduler = cron_dag_scheduler
@@ -183,19 +191,28 @@ class StateManager:
             self.current_tasks_by_queue[task.queue].remove(task.id)
 
     @contextmanager
-    def cancel_event(self, task_id: ULID) -> Iterator[None]:
-        self._cancel_events[task_id] = asyncio.Event()
+    def cancel_event(self, task_id: ULID, dag_run_id: ULID | None = None) -> Iterator[None]:
+        self._cancel_events[task_id] = _CancelHandle(asyncio.Event(), dag_run_id)
         try:
             yield
         finally:
             self._cancel_events.pop(task_id, None)
 
     def signal_cancel(self, task_id: ULID) -> bool:
-        event = self._cancel_events.get(task_id)
-        if event is not None:
-            event.set()
+        handle = self._cancel_events.get(task_id)
+        if handle is not None:
+            handle.event.set()
             return True
         return False
+
+    def signal_cancel_dag(self, dag_run_id: ULID) -> int:
+        """Fire the cancel event for every in-flight task on this worker belonging to dag_run_id."""
+        n = 0
+        for handle in self._cancel_events.values():
+            if handle.dag_run_id == dag_run_id:
+                handle.event.set()
+                n += 1
+        return n
 
     async def clean(
         self,
@@ -646,19 +663,114 @@ class StateManager:
                 raise TaskException(f"Task has status '{task.status}' and cannot be cancelled.")
         return task
 
+    async def request_dag_cancellation(self, dag_run_id: ULID) -> DAGCancelResult | None:
+        """
+        Cancel every non-terminal task belonging to a DAG run.
+
+        Marks the run cancelling (idempotent) before touching any task, so the
+        TaskProcessor.post_process / _handle_retry gates (which check
+        is_dag_run_cancelling) start rejecting new descendants/retries as early as
+        possible. SCHEDULED/SUBMITTED (and the practically-unreachable UNSUBMITTED —
+        see docs/dag-cancellation-design.md) tasks are cancelled directly in this
+        sweep; STARTED tasks are left to a single trailing publish_dag_cancellation
+        broadcast instead of one publish per task, so a large fan-out's worth of
+        concurrently-running arms is cancelled with one pub/sub message.
+
+        Returns None if the run does not exist.
+        """
+        run = await self.get_dag_run(dag_run_id)
+        if run is None:
+            return None
+        await self.task_state.mark_dag_run_cancelling(dag_run_id)
+
+        fetched = await self.task_state.get_tasks_bulk(run.task_ids)
+
+        already_terminal: list[Task] = []
+        scheduled: list[Task] = []
+        submitted_or_unsubmitted: list[Task] = []
+        started: list[Task] = []
+        for task in fetched:
+            if task is None:
+                continue
+            if task.status in TaskStatus.terminal_statuses():
+                already_terminal.append(task)
+            elif task.status == TaskStatus.STARTED:
+                started.append(task)
+            elif task.status == TaskStatus.SCHEDULED:
+                scheduled.append(task)
+            else:
+                # SUBMITTED, or UNSUBMITTED (practically unreachable via persisted
+                # storage -- see docs/dag-cancellation-design.md §4.4). Cancelling
+                # directly with a best-effort, harmless-if-absent queue removal
+                # covers both the same way.
+                submitted_or_unsubmitted.append(task)
+
+        to_cancel = scheduled + submitted_or_unsubmitted
+        for task in to_cancel:
+            task.set_status(TaskStatus.CANCELLED)
+
+        if to_cancel:
+            if self._atomic_state is not None and self._atomic_scheduler is not None:
+                pipe = self._atomic_state.pipeline(transaction=True)
+                for task in scheduled:
+                    self._atomic_scheduler.stage_remove(pipe, task.id, task.queue)
+                    self._atomic_state.stage_save(pipe, task)
+                for task in submitted_or_unsubmitted:
+                    # A no-op ZREM/DELETE for a task never enqueued (UNSUBMITTED) —
+                    # harmless, same as removing an already-absent queue member.
+                    self._atomic_state.stage_remove_from_queue(pipe, task)
+                    self._atomic_state.stage_save(pipe, task)
+                await pipe.execute()
+            else:
+                for task in scheduled:
+                    await self.task_scheduler.remove(task.id, task.queue)
+                    await self.task_state.save_task(task)
+                for task in submitted_or_unsubmitted:
+                    await self.task_state.save_task(task)
+
+            # These tasks never go through TaskProcessor (which is what normally
+            # calls finalize_dag_run_task -> record_dag_run_task_terminal on a
+            # terminal transition), so the run's aggregate completed/failed
+            # counters would otherwise never reflect them -- and get_dag_run's
+            # CANCELLING-vs-CANCELLED derivation (§4.4) depends on those counters
+            # reaching len(task_ids) to ever report CANCELLED. Mirror what
+            # finalize_dag_run_task would have recorded: CANCELLED is a stuck
+            # status, so only the counters are updated -- these tasks intentionally
+            # stay in DAG_RUN_PENDING like any other stuck-status task.
+            await asyncio.gather(*(self.record_dag_run_task_terminal(t) for t in to_cancel))
+
+        if started:
+            await self.cancellation_bus.publish_dag_cancellation(dag_run_id)
+
+        tasks_result = (
+            [DAGCancelTaskResult(task_id=t.id, status="already_terminal") for t in already_terminal]
+            + [DAGCancelTaskResult(task_id=t.id, status="cancelled") for t in to_cancel]
+            + [DAGCancelTaskResult(task_id=t.id, status="signalled") for t in started]
+        )
+        return DAGCancelResult(
+            dag_run_id=dag_run_id,
+            already_terminal=len(already_terminal),
+            cancelled_immediately=len(to_cancel),
+            signalled_running=len(started),
+            tasks=tasks_result,
+        )
+
     async def monitor_task_cancellation(self, task_id: ULID) -> None:
         """Wait for a cancel signal for this task and raise UserCancellationError when it arrives."""
-        event = self._cancel_events.get(task_id)
-        if event is None:
+        handle = self._cancel_events.get(task_id)
+        if handle is None:
             return
-        await event.wait()
+        await handle.event.wait()
         logger.info("Received cancellation signal for task %s", task_id)
         raise UserCancellationError(f"Task {task_id} was cancelled by user request.")
 
     async def run_cancel_listener(self) -> None:
         """Subscribe to the shared cancellations channel and signal matching active tasks."""
-        async for task_id in self.cancellation_bus.listen_cancellations():
-            self.signal_cancel(task_id)
+        async for msg in self.cancellation_bus.listen_cancellations():
+            if msg.kind == "task":
+                self.signal_cancel(msg.id)
+            else:
+                self.signal_cancel_dag(msg.id)
 
     # Proxy methods
     async def get_refresh_tag(self, role: str) -> ULID:
@@ -1066,6 +1178,14 @@ class StateManager:
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
         """Set the run's status to complete iff it has never recorded a failed task."""
         await self.task_state.mark_dag_run_complete(dag_run_id)
+
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        """Idempotently record that cancellation was requested for this run."""
+        await self.task_state.mark_dag_run_cancelling(dag_run_id)
+
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        """Cheap check: has cancellation been requested for this run."""
+        return await self.task_state.is_dag_run_cancelling(dag_run_id)
 
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         """Mark task_id resolved in the DAG run's pending set; return the remaining count."""

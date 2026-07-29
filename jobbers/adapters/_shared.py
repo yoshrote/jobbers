@@ -207,6 +207,14 @@ class SharedTaskAdapterMixin(ABC):
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
         """Set status='complete' iff failed_count == 0. No-op if the run's record is missing."""
 
+    @abstractmethod
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        """Idempotently record that cancellation was requested for this run."""
+
+    @abstractmethod
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        """Cheap check: has cancellation been requested for this run."""
+
     # ---------------------------------------------------------------------------
     # Shared implementations (identical across all backends)
     # ---------------------------------------------------------------------------
