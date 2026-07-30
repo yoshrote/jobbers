@@ -52,7 +52,7 @@ services:
       OTEL_LOGS_EXPORTER: "otlp"
       OTEL_PYTHON_LOG_CORRELATION: "true"
       REDIS_URL: "redis://redis:6379"
-    command: /usr/local/bin/jobbers_manager /usr/src/app/end2end.py
+    command: /opt/venv/bin/jobbers_manager /usr/src/app/end2end.py
     ports:
       - "8000:8000"
     volumes:
@@ -76,12 +76,14 @@ services:
       OTEL_LOGS_EXPORTER: "otlp"
       OTEL_PYTHON_LOG_CORRELATION: "true"
       REDIS_URL: "redis://redis:6379"
-    command: /usr/local/bin/jobbers_worker /usr/src/app/end2end.py
+    command: /opt/venv/bin/jobbers_worker /usr/src/app/end2end.py
     volumes:
       - .:/usr/src/app
     depends_on:
-      - redis
-      - collector
+      redis:
+        condition: service_healthy
+      collector:
+        condition: service_started
   frontend:
     build: ./frontend
     ports:

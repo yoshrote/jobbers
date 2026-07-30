@@ -80,8 +80,10 @@ services:
     volumes:
       - .:/usr/src/app
     depends_on:
-      - redis
-      - collector
+      redis:
+        condition: service_healthy
+      collector:
+        condition: service_started
   scheduler:
     build: .
     environment:
@@ -95,12 +97,14 @@ services:
       SCHEDULER_BATCH_SIZE: "10"
       SCHEDULER_POLL_INTERVAL: "1.0"
       SCHEDULER_ROLE: "default"
-    command: /opt/venv/bin/jobbers_scheduler /usr/src/app/end2end.py
+    command: /opt/venv/bin/jobbers_scheduler
     volumes:
       - .:/usr/src/app
     depends_on:
-      - redis
-      - collector
+      redis:
+        condition: service_healthy
+      collector:
+        condition: service_started
   frontend:
     build:
       context: ./frontend
