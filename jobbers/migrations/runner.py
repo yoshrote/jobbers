@@ -42,7 +42,10 @@ async def ensure_redis_json_routing_indexes(redis_url: str) -> None:
     from jobbers.adapters.redis_json import RedisJSONRoutingBackend
     from jobbers.db import REDIS_PROTOCOL_VERSION
 
-    client = redis.from_url(redis_url, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False)
+    # socket_timeout=None: see the matching comment in db.py:get_client().
+    client = redis.from_url(
+        redis_url, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False, socket_timeout=None
+    )
     try:
         await RedisJSONRoutingBackend(client).ensure_indexes()
     finally:

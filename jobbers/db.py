@@ -57,7 +57,14 @@ _pre_registered_routing_backend: RoutingBackendProtocol | None = None
 def get_client() -> redis.Redis:
     global _client
     if _client is None:
-        _client = redis.from_url(DEFAULT_REDIS_URL, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False)
+        # socket_timeout=None: redis-py 8.0 changed this default from None to 5
+        # seconds, which races the server-side timeout on blocking commands
+        # (e.g. TaskGenerator's BZPOPMIN with timeout=0, meaning "block
+        # forever") -- the client-side read would time out first. See
+        # https://github.com/redis/redis-py/issues/4091.
+        _client = redis.from_url(
+            DEFAULT_REDIS_URL, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False, socket_timeout=None
+        )
     return _client
 
 
