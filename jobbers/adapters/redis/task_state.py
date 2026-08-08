@@ -53,6 +53,27 @@ _MARK_DAG_RUN_COMPLETE_SCRIPT = """
     return 1
 """
 
+# Mirror image of _RECORD_DAG_RUN_TERMINAL_SCRIPT's 'failed' branch: decrements 'failed'
+# by ARGV[1] (floored at 0) instead of incrementing either counter, and recomputes status
+# the same way. Used by reconcile_dag_run_task_retry to undo count stuck tasks' earlier
+# failure records before they're resubmitted (see docs/dag-resume-design.md §2.2), in one
+# round trip rather than one call per task. No-op (returns 0) if the run's meta hash is
+# missing.
+_RECONCILE_DAG_RUN_TASK_RETRY_SCRIPT = """
+    if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+    local failed = tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0
+    local count = tonumber(ARGV[1])
+    failed = math.max(0, failed - count)
+    redis.call('HSET', KEYS[1], 'failed', failed)
+    local completed = tonumber(redis.call('HGET', KEYS[1], 'completed')) or 0
+    local status = 'running'
+    if failed > 0 then
+        if completed > 0 then status = 'partial_failure' else status = 'failed' end
+    end
+    redis.call('HSET', KEYS[1], 'status', status)
+    return 1
+"""
+
 
 class RedisTaskState(SharedTaskAdapterMixin):
     """
@@ -71,6 +92,9 @@ class RedisTaskState(SharedTaskAdapterMixin):
         super().__init__(data_store)
         self._record_dag_run_terminal_script = data_store.register_script(_RECORD_DAG_RUN_TERMINAL_SCRIPT)
         self._mark_dag_run_complete_script = data_store.register_script(_MARK_DAG_RUN_COMPLETE_SCRIPT)
+        self._reconcile_dag_run_task_retry_script = data_store.register_script(
+            _RECONCILE_DAG_RUN_TASK_RETRY_SCRIPT
+        )
 
     # -- Storage primitives --------------------------------------------------
 
@@ -252,6 +276,16 @@ class RedisTaskState(SharedTaskAdapterMixin):
         """Cheap check: has cancellation been requested for this run."""
         val = await self.data_store.hget(self.DAG_RUN_META(dag_run_id=dag_run_id), "cancelled_at")
         return val is not None
+
+    async def clear_dag_run_cancellation(self, dag_run_id: ULID) -> None:
+        """Clear a previously-set cancellation marker (HDEL). No-op if it wasn't set."""
+        await self.data_store.hdel(self.DAG_RUN_META(dag_run_id=dag_run_id), "cancelled_at")
+
+    async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
+        """Undo ``count`` earlier 'failed' terminal-outcome records for tasks about to be retried."""
+        await self._reconcile_dag_run_task_retry_script(
+            keys=[self.DAG_RUN_META(dag_run_id=dag_run_id)], args=[count]
+        )
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Remove DAG run index entries and all their per-run structures older than ``max_age``."""

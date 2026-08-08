@@ -638,6 +638,55 @@ async def test_init_fan_in_extends_ttl_for_longer_later_registration(redis_task_
 
 
 @pytest.mark.asyncio
+async def test_dag_run_fan_in_alive_false_before_any_fan_in(redis_task_adapter):
+    """dag_run_fan_in_alive is False for a dag_run_id that never called init_fan_in."""
+    state, submit = redis_task_adapter
+    assert await state.dag_run_fan_in_alive(ULID()) is False
+
+
+@pytest.mark.asyncio
+async def test_dag_run_fan_in_alive_true_after_init(redis_task_adapter):
+    """dag_run_fan_in_alive is True once the shared fan-in hash has been created."""
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:alive", {ULID1})
+    assert await state.dag_run_fan_in_alive(dag_run_id) is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_dag_run_fan_in_ttl_extends_expiry(redis_task_adapter):
+    """refresh_dag_run_fan_in_ttl extends (never shrinks) both fan-in hashes' TTL."""
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:refresh", {ULID1}, ttl=100)
+
+    await state.refresh_dag_run_fan_in_ttl(dag_run_id, ttl=200000)
+
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id)) > 100
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id)) > 200
+
+
+@pytest.mark.asyncio
+async def test_refresh_dag_run_fan_in_ttl_does_not_shrink_expiry(redis_task_adapter):
+    """A shorter refresh ttl must not truncate an existing longer-lived expiry."""
+    state, submit = redis_task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:no-shrink", {ULID1}, ttl=200000)
+    long_ttl = await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id))
+
+    await state.refresh_dag_run_fan_in_ttl(dag_run_id, ttl=100)
+
+    assert await state.data_store.ttl(state.DAG_RUN_FANIN(dag_run_id=dag_run_id)) >= long_ttl - 5
+
+
+@pytest.mark.asyncio
+async def test_refresh_dag_run_fan_in_ttl_noop_when_absent(redis_task_adapter):
+    """refresh_dag_run_fan_in_ttl on a dag_run_id with no fan-in tracking does not raise."""
+    state, submit = redis_task_adapter
+    await state.refresh_dag_run_fan_in_ttl(ULID())
+
+
+@pytest.mark.asyncio
 async def test_read_for_watch_returns_task(redis_task_adapter):
     """read_for_watch returns the task when it exists."""
     state, submit = redis_task_adapter

@@ -1104,6 +1104,148 @@ async def test_get_dag_runs_list_shows_cancelling_once_requested(task_adapter):
     assert runs[0].status == DagRunStatus.CANCELLING
 
 
+# ── clear_dag_run_cancellation ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clear_dag_run_cancellation_makes_is_cancelling_false(task_adapter):
+    """clear_dag_run_cancellation undoes a prior mark_dag_run_cancelling."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    await state.clear_dag_run_cancellation(ULID1)
+
+    assert await state.is_dag_run_cancelling(ULID1) is False
+
+
+@pytest.mark.asyncio
+async def test_clear_dag_run_cancellation_noop_when_not_cancelling(task_adapter):
+    """clear_dag_run_cancellation on a run that was never marked cancelling does not raise."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.clear_dag_run_cancellation(ULID1)
+
+    assert await state.is_dag_run_cancelling(ULID1) is False
+
+
+# ── reconcile_dag_run_task_retry ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_decrements_failed_count(task_adapter):
+    """reconcile_dag_run_task_retry undoes exactly one prior 'failed' record."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.reconcile_dag_run_task_retry(ULID1)
+
+    # One of the two failures was undone: status stays 'failed' (still one left),
+    # but a further reconcile + a completion should now be able to reach 'complete'.
+    await state.reconcile_dag_run_task_retry(ULID1)
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_floors_at_zero(task_adapter):
+    """reconcile_dag_run_task_retry never takes the failed counter below zero."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    # No prior failures recorded -- must be a no-op, not go negative.
+    await state.reconcile_dag_run_task_retry(ULID1)
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_count_decrements_in_one_call(task_adapter):
+    """A single call with count=N undoes N prior 'failed' records, same as N calls with count=1."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+
+    await state.reconcile_dag_run_task_retry(ULID1, count=2)
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.FAILED  # one failure still outstanding
+
+    await state.reconcile_dag_run_task_retry(ULID1, count=1)
+    await state.mark_dag_run_complete(ULID1)
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_count_floors_at_zero(task_adapter):
+    """A count larger than the outstanding failures floors at zero rather than going negative."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+
+    await state.reconcile_dag_run_task_retry(ULID1, count=5)
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_noop_when_run_missing(task_adapter):
+    """reconcile_dag_run_task_retry on an unknown dag_run_id does not raise."""
+    state, submit = task_adapter
+    await state.reconcile_dag_run_task_retry(ULID())
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_recomputes_partial_failure_back_to_running(task_adapter):
+    """After undoing the only failure, a run with a completion recorded reads as running, not partial_failure."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.PARTIAL_FAILURE
+
+    await state.reconcile_dag_run_task_retry(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.RUNNING
+
+
 # ── fan-in ────────────────────────────────────────────────────────────────────
 
 
@@ -1175,6 +1317,25 @@ async def test_delegate_fan_in_swaps_id_in_tracking_and_members_sets(task_adapte
     members = set(await state.get_fan_in_members(dag_run_id, fan_in_key))
     assert new_id in members
     assert ULID1 not in members
+
+
+@pytest.mark.asyncio
+async def test_dag_run_fan_in_alive_true_after_init_fan_in(task_adapter):
+    """dag_run_fan_in_alive is True once a run has registered fan-in tracking."""
+    state, submit = task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:alive-common", {ULID1})
+    assert await state.dag_run_fan_in_alive(dag_run_id) is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_dag_run_fan_in_ttl_does_not_raise(task_adapter):
+    """refresh_dag_run_fan_in_ttl is safe to call both with and without existing fan-in tracking."""
+    state, submit = task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:refresh-common", {ULID1})
+    await state.refresh_dag_run_fan_in_ttl(dag_run_id)
+    await state.refresh_dag_run_fan_in_ttl(ULID())  # never initialised -- must not raise
 
 
 # ── compare_and_set_status ────────────────────────────────────────────────────

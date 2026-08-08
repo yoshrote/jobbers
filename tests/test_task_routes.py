@@ -1255,6 +1255,101 @@ async def test_cancel_dag_verbose_includes_task_breakdown(state_manager):
     ]
 
 
+@pytest.mark.asyncio
+async def test_resume_check_dag_returns_precheck_result(state_manager):
+    """GET /dags/{dag_run_id}/resume-check returns the precheck's resumable/reason/stuck_task_ids."""
+    from jobbers.models.dag import DAGResumePrecheck
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(
+            dag_run_id=DAG_RUN_ID, resumable=True, reason=None, stuck_task_ids=[ULID1, ULID2]
+        )
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/dags/{DAG_RUN_ID}/resume-check")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "dag_run_id": str(DAG_RUN_ID),
+        "resumable": True,
+        "reason": None,
+        "stuck_task_ids": [str(ULID1), str(ULID2)],
+    }
+    state_manager.can_resume_dag_run.assert_called_once_with(DAG_RUN_ID)
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_not_found_returns_404(state_manager):
+    """POST /dags/{dag_run_id}/resume returns 404 when the run was never registered."""
+    from jobbers.models.dag import DAGResumePrecheck
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(
+            dag_run_id=DAG_RUN_ID, resumable=False, reason="dag_run_not_found_or_expired"
+        )
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_not_resumable_returns_409_with_reason(state_manager):
+    """POST /dags/{dag_run_id}/resume returns 409 with the precheck's reason for other non-resumable cases."""
+    from jobbers.models.dag import DAGResumePrecheck
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(dag_run_id=DAG_RUN_ID, resumable=False, reason="no_stuck_tasks")
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no_stuck_tasks"
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_success_returns_resumed_task_ids(state_manager):
+    """POST /dags/{dag_run_id}/resume returns the resumed task IDs on success."""
+    from jobbers.models.dag import DAGResumePrecheck, DAGResumeResult
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(dag_run_id=DAG_RUN_ID, resumable=True, stuck_task_ids=[ULID1])
+    )
+    state_manager.resume_dag_run = AsyncMock(
+        return_value=DAGResumeResult(dag_run_id=DAG_RUN_ID, resumed_task_ids=[ULID1])
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
+
+    assert response.status_code == 200
+    assert response.json() == {"dag_run_id": str(DAG_RUN_ID), "resumed_task_ids": [str(ULID1)]}
+    state_manager.resume_dag_run.assert_called_once_with(DAG_RUN_ID)
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_race_between_precheck_and_resume_returns_409(state_manager):
+    """A TaskException raised by resume_dag_run itself (post-precheck race) still surfaces as 409."""
+    from jobbers.models.dag import DAGResumePrecheck
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(dag_run_id=DAG_RUN_ID, resumable=True, stuck_task_ids=[ULID1])
+    )
+    state_manager.resume_dag_run = AsyncMock(
+        side_effect=TaskException("DAG run is not resumable: no_stuck_tasks")
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
+
+    assert response.status_code == 409
+
+
 # ── task routing endpoints ─────────────────────────────────────────────────────
 
 

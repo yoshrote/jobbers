@@ -152,6 +152,18 @@ class DummyTaskState:
     async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
         return dag_run_id in self._cancelling
 
+    async def clear_dag_run_cancellation(self, dag_run_id: ULID) -> None:
+        self._cancelling.discard(dag_run_id)
+
+    async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
+        raise NotImplementedError("DummyTaskState.reconcile_dag_run_task_retry")
+
+    async def dag_run_fan_in_alive(self, dag_run_id: ULID) -> bool:
+        raise NotImplementedError("DummyTaskState.dag_run_fan_in_alive")
+
+    async def refresh_dag_run_fan_in_ttl(self, dag_run_id: ULID, ttl: int = 86400) -> None:
+        raise NotImplementedError("DummyTaskState.refresh_dag_run_fan_in_ttl")
+
     async def ensure_index(self) -> None:
         raise NotImplementedError("DummyTaskState.ensure_index")
 

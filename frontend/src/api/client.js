@@ -274,3 +274,27 @@ export const getDag = (dagRunId) => get(`/dags/${dagRunId}`)
  */
 export const cancelDag = (dagRunId, verbose) =>
   post(`/dags/${dagRunId}/cancel`, null, verbose ? { verbose: true } : undefined)
+
+/**
+ * GET /dags/{dag_run_id}/resume-check
+ *
+ * Read-only check for whether a DAG run can currently be resumed. No side effects.
+ * @param {string} dagRunId
+ * @returns {{
+ *   dag_run_id: string,
+ *   resumable: boolean,
+ *   reason: 'dag_run_not_found_or_expired' | 'task_history_incomplete' | 'no_stuck_tasks' | 'fan_in_tracking_expired' | null,
+ *   stuck_task_ids: string[]
+ * }}
+ */
+export const getDagResumeCheck = (dagRunId) => get(`/dags/${dagRunId}/resume-check`)
+
+/**
+ * POST /dags/{dag_run_id}/resume
+ *
+ * Retries every FAILED/STALLED/CANCELLED/DROPPED task in the run from its stored
+ * parameters and lets the DAG continue from there.
+ * @param {string} dagRunId
+ * @returns {{ dag_run_id: string, resumed_task_ids: string[] }}
+ */
+export const resumeDag = (dagRunId) => post(`/dags/${dagRunId}/resume`)

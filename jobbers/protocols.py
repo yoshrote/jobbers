@@ -283,6 +283,14 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
         """
         ...
 
+    async def dag_run_fan_in_alive(self, dag_run_id: ULID) -> bool:
+        """Whether this run's fan-in tracking is still present (not expired/swept)."""
+        ...
+
+    async def refresh_dag_run_fan_in_ttl(self, dag_run_id: ULID, ttl: int = 86400) -> None:
+        """Extend (never shrink) this run's fan-in tracking TTL. No-op if it doesn't exist."""
+        ...
+
     # DAG run index
     async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[DAGRunSummary], int]: ...
     async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None: ...
@@ -316,6 +324,31 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
 
     async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
         """Cheap check: has cancellation been requested for this run? False if the run doesn't exist."""
+        ...
+
+    async def clear_dag_run_cancellation(self, dag_run_id: ULID) -> None:
+        """
+        Clear a previously-set cancellation marker (see docs/dag-resume-design.md §4.3).
+
+        Required before resuming a cancelled run: TaskProcessor's is_dag_run_cancelling
+        gates in post_process/_handle_retry would otherwise keep suppressing the
+        resumed task's own descendants/retries. No-op if the run isn't cancelling.
+        """
+        ...
+
+    # DAG run resume support (docs/dag-resume-design.md)
+    async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
+        """
+        Undo ``count`` earlier 'failed' terminal-outcome records for tasks about to be retried.
+
+        record_dag_run_task_terminal's 'failed' counter is otherwise monotonic (see
+        docs/dag-resume-design.md §2.2) -- without this, a stuck task that's resumed
+        and succeeds would leave the run at partial_failure forever, since the
+        original failure's increment is never undone by a later success. Takes a
+        ``count`` rather than requiring one call per task so resuming N stuck tasks
+        in a run costs one round trip, not N. Floored at 0; no-op if the run's
+        record is missing.
+        """
         ...
 
     # Lifecycle

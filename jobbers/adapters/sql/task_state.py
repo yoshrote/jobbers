@@ -590,6 +590,29 @@ class SQLTaskState:
             row = result.first()
             return row is not None and row.cancelled_at is not None
 
+    async def clear_dag_run_cancellation(self, dag_run_id: ULID) -> None:
+        """Clear a previously-set cancellation marker. No-op if it wasn't set or the run is missing."""
+        dag_run_id_str = str(dag_run_id)
+        async with self._sf() as session:
+            async with session.begin():
+                await session.execute(
+                    update(dag_runs).where(dag_runs.c.dag_run_id == dag_run_id_str).values(cancelled_at=None)
+                )
+
+    async def dag_run_fan_in_alive(self, dag_run_id: ULID) -> bool:
+        """
+        Report that SQL fan-in tracking is always alive, since it has no independent TTL or sweep.
+
+        clean_dag_runs only deletes dag_runs/dag_run_pending rows -- so fan-in
+        tracking (task_fan_in/fan_in_anchors) is always considered alive here;
+        StateManager.can_resume_dag_run's earlier get_dag_run check already covers
+        the "run itself is gone" case.
+        """
+        return True
+
+    async def refresh_dag_run_fan_in_ttl(self, dag_run_id: ULID, ttl: int = 86400) -> None:
+        """No-op: SQL fan-in tracking has no TTL to refresh (see dag_run_fan_in_alive)."""
+
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:
         """Delete DAG run entries (and their pending rows) older than ``max_age``."""
         cutoff = now - max_age
@@ -677,6 +700,32 @@ class SQLTaskState:
                         status=case(
                             (new_failed == 0, DagRunStatus.RUNNING.value),
                             (new_completed > 0, DagRunStatus.PARTIAL_FAILURE.value),
+                            else_=DagRunStatus.FAILED.value,
+                        ),
+                    )
+                )
+
+    async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
+        """
+        Undo ``count`` earlier 'failed' terminal-outcome records for tasks about to be retried.
+
+        Mirrors record_dag_run_task_terminal's status recompute but decrements
+        'failed' by ``count`` (floored at 0) instead of incrementing either counter,
+        in a single UPDATE regardless of how many tasks are being resumed. No-op
+        (matches 0 rows) if the run's record is missing.
+        """
+        dag_run_id_str = str(dag_run_id)
+        new_failed = case((dag_runs.c.failed_count > count, dag_runs.c.failed_count - count), else_=0)
+        async with self._sf() as session:
+            async with session.begin():
+                await session.execute(
+                    update(dag_runs)
+                    .where(dag_runs.c.dag_run_id == dag_run_id_str)
+                    .values(
+                        failed_count=new_failed,
+                        status=case(
+                            (new_failed == 0, DagRunStatus.RUNNING.value),
+                            (dag_runs.c.completed_count > 0, DagRunStatus.PARTIAL_FAILURE.value),
                             else_=DagRunStatus.FAILED.value,
                         ),
                     )

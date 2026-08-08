@@ -736,6 +736,53 @@ class DAGCancelResult(BaseModel):
         return str(value)
 
 
+class DAGResumeReason(StrEnum):
+    """Why a run is not currently resumable, per StateManager.can_resume_dag_run (docs/dag-resume-design.md §4.1)."""
+
+    # get_dag_run returned None (never existed, or its index was pruned by clean_dag_runs).
+    DAG_RUN_NOT_FOUND_OR_EXPIRED = "dag_run_not_found_or_expired"
+    # The run's index survived but at least one sibling task's blob was pruned by
+    # clean_terminal_tasks.
+    TASK_HISTORY_INCOMPLETE = "task_history_incomplete"
+    # Every task is still active or already succeeded; nothing in
+    # TaskStatus.stuck_statuses() to retry.
+    NO_STUCK_TASKS = "no_stuck_tasks"
+    # The run uses fan-in and its shared tracking hash has outlived its fan_in_ttl.
+    FAN_IN_TRACKING_EXPIRED = "fan_in_tracking_expired"
+
+
+class DAGResumePrecheck(BaseModel):
+    """Read-only result of StateManager.can_resume_dag_run — no side effects."""
+
+    dag_run_id: ULID
+    resumable: bool
+    reason: DAGResumeReason | None = None
+    stuck_task_ids: list[ULID] = []
+
+    @field_serializer("dag_run_id", when_used="json")
+    def serialize_dag_run_id(self, value: ULID) -> str:
+        return str(value)
+
+    @field_serializer("stuck_task_ids", when_used="json")
+    def serialize_stuck_task_ids(self, value: list[ULID]) -> list[str]:
+        return [str(v) for v in value]
+
+
+class DAGResumeResult(BaseModel):
+    """Result of StateManager.resume_dag_run: the stuck tasks that were resubmitted."""
+
+    dag_run_id: ULID
+    resumed_task_ids: list[ULID]
+
+    @field_serializer("dag_run_id", when_used="json")
+    def serialize_dag_run_id(self, value: ULID) -> str:
+        return str(value)
+
+    @field_serializer("resumed_task_ids", when_used="json")
+    def serialize_resumed_task_ids(self, value: list[ULID]) -> list[str]:
+        return [str(v) for v in value]
+
+
 # Avoid circular import at module level – Task is only referenced inside methods.
 if TYPE_CHECKING:
     from jobbers.models.task import Task

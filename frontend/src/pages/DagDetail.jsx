@@ -1,13 +1,17 @@
 import mermaid from 'mermaid'
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { cancelDag, getDag, getTaskStatus } from '../api/client'
+import { cancelDag, getDag, getDagResumeCheck, getTaskStatus, resumeDag } from '../api/client'
 import DagStatusBadge from '../components/DagStatusBadge'
 import StatusBadge from '../components/StatusBadge'
 
 mermaid.initialize({ startOnLoad: false, theme: 'default' })
 
 const DAG_CANCELLABLE = new Set(['running', 'partial_failure', 'failed'])
+// Statuses where a run might have stuck (FAILED/STALLED/CANCELLED/DROPPED) tasks to
+// retry -- worth spending a resume-check call on. 'running'/'cancelling'/'complete'
+// never do.
+const DAG_RESUME_CHECKABLE = new Set(['partial_failure', 'failed', 'cancelled'])
 
 const STATUS_CLASS = {
   failed:    'status_error',
@@ -75,6 +79,7 @@ export default function DagDetail() {
   const [loading, setLoading] = useState(true)
   const [error, setError]     = useState(null)
   const [msg, setMsg]         = useState(null)
+  const [resumeCheck, setResumeCheck] = useState(null)
 
   async function load() {
     setLoading(true)
@@ -90,6 +95,12 @@ export default function DagDetail() {
 
       const root = taskResults.find((t) => t.dag_diagram)
       if (root) setDiagram(applyStatusColors(root.dag_diagram, taskResults))
+
+      if (DAG_RESUME_CHECKABLE.has(dagRun.status)) {
+        getDagResumeCheck(dagRunId).then(setResumeCheck).catch(() => setResumeCheck(null))
+      } else {
+        setResumeCheck(null)
+      }
     } catch (e) {
       setError(e.message)
     } finally {
@@ -113,6 +124,17 @@ export default function DagDetail() {
     }
   }
 
+  async function handleResume() {
+    if (!window.confirm('Resume this DAG run? Stuck tasks will be retried from their stored parameters.')) return
+    try {
+      const res = await resumeDag(dagRunId)
+      setMsg(`Resume requested: ${res.resumed_task_ids.length} task(s) resubmitted.`)
+      load()
+    } catch (e) {
+      setError(e.message)
+    }
+  }
+
   if (loading) return <p className="loading-msg">Loading…</p>
   if (error)   return <p className="error-msg">{error}</p>
   if (!run)    return <p className="empty-msg">DAG run not found.</p>
@@ -124,6 +146,16 @@ export default function DagDetail() {
         <button className="btn btn-secondary" onClick={load}>Refresh</button>
         {DAG_CANCELLABLE.has(run.status) && (
           <button className="btn btn-danger" onClick={handleCancel}>Cancel DAG</button>
+        )}
+        {DAG_RESUME_CHECKABLE.has(run.status) && (
+          <button
+            className="btn btn-primary"
+            onClick={handleResume}
+            disabled={!resumeCheck?.resumable}
+            title={resumeCheck && !resumeCheck.resumable ? resumeCheck.reason : undefined}
+          >
+            Resume DAG
+          </button>
         )}
       </div>
 

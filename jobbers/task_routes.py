@@ -15,7 +15,7 @@ from ulid import ULID
 
 from jobbers import db, registry
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.dag import DAGRunPagination, DAGTaskSpec, FanInCardinalityError
+from jobbers.models.dag import DAGResumeReason, DAGRunPagination, DAGTaskSpec, FanInCardinalityError
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
@@ -758,3 +758,51 @@ async def cancel_dag(dag_run_id: str, verbose: bool = False) -> dict[str, Any]:
     if verbose:
         response["tasks"] = [{"task_id": str(t.task_id), "status": t.status} for t in result.tasks]
     return response
+
+
+@app.get("/dags/{dag_run_id}/resume-check")
+async def check_dag_resumable(dag_run_id: str) -> dict[str, Any]:
+    """
+    Read-only check for whether a DAG run can currently be resumed.
+
+    No side effects -- safe to poll for driving a "Resume" button's enabled state.
+    """
+    uid = _parse_ulid(dag_run_id, "dag_run_id")
+    sm = db.get_state_manager()
+    result = await sm.can_resume_dag_run(uid)
+    return {
+        "dag_run_id": str(result.dag_run_id),
+        "resumable": result.resumable,
+        "reason": result.reason,
+        "stuck_task_ids": [str(t) for t in result.stuck_task_ids],
+    }
+
+
+@app.post("/dags/{dag_run_id}/resume")
+async def resume_dag(dag_run_id: str) -> dict[str, Any]:
+    """
+    Retry every FAILED/STALLED/CANCELLED/DROPPED task in a DAG run from its stored parameters.
+
+    Requires the run's task history, DAG run index, and (if the run uses fan-in)
+    fan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in
+    TTL expiry -- see GET /dags/{dag_run_id}/resume-check and
+    docs/dag-resume-design.md for what each unresumable reason means.
+    """
+    uid = _parse_ulid(dag_run_id, "dag_run_id")
+    logger.info("Requesting resume for DAG run %s", dag_run_id)
+    sm = db.get_state_manager()
+    precheck = await sm.can_resume_dag_run(uid)
+    if not precheck.resumable:
+        if precheck.reason == DAGResumeReason.DAG_RUN_NOT_FOUND_OR_EXPIRED:
+            raise HTTPException(status_code=404, detail=f"DAG run '{dag_run_id}' not found.")
+        raise HTTPException(status_code=409, detail=precheck.reason)
+    try:
+        result = await sm.resume_dag_run(uid)
+    except TaskException as ex:
+        # Rare race: state changed between the precheck above and resume_dag_run's
+        # own internal re-check (e.g. the run's history expired in between).
+        raise HTTPException(status_code=409, detail=str(ex)) from ex
+    return {
+        "dag_run_id": str(result.dag_run_id),
+        "resumed_task_ids": [str(t) for t in result.resumed_task_ids],
+    }

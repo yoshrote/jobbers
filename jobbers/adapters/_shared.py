@@ -512,6 +512,30 @@ class SharedTaskAdapterMixin(ABC):
             args=[fan_in_key, str(old_id), str(new_id)],
         )
 
+    async def dag_run_fan_in_alive(self, dag_run_id: ULID) -> bool:
+        """
+        Whether this run's shared fan-in tracking hash is still present (not TTL-expired).
+
+        One DAG_RUN_FANIN key covers every collector registered under this run (see the
+        class docstring), so this single EXISTS check answers "has this run's fan-in
+        tracking expired" regardless of how many FanInCallback/DynamicFanOutCallback
+        edges it has. Used by StateManager.can_resume_dag_run to detect a run that's
+        been stuck longer than its fan_in_ttl before attempting to resume it.
+        """
+        return bool(await self.data_store.exists(self.DAG_RUN_FANIN(dag_run_id=dag_run_id)))
+
+    async def refresh_dag_run_fan_in_ttl(self, dag_run_id: ULID, ttl: int = 86400) -> None:
+        """
+        Extend (never shrink) this run's fan-in tracking TTL ahead of a resume.
+
+        No-op if the keys don't exist -- EXPIRE on a missing key is a harmless 0-return,
+        matching stage_init_fan_in's own NX/GT-only-extends convention.
+        """
+        pipe = self.data_store.pipeline(transaction=False)
+        pipe.expire(self.DAG_RUN_FANIN(dag_run_id=dag_run_id), ttl, gt=True)
+        pipe.expire(self.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id), ttl * 2, gt=True)
+        await pipe.execute()
+
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         """Atomically move task_id from the DAG run's pending set to closed; return the remaining count."""
         results: list[int] = await self._close_dag_run_task_script(

@@ -18,7 +18,7 @@ from jobbers.adapters.redis import (
 )
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.dag import DAGNode, DagRunStatus, DAGTaskSpec
+from jobbers.models.dag import DAGNode, DagRunStatus, DAGTaskSpec, FanInCallback
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
@@ -1092,6 +1092,193 @@ async def test_mark_and_is_dag_run_cancelling_proxy(state_manager_real_ta):
     assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is False
     await state_manager_real_ta.mark_dag_run_cancelling(dag_run_id)
     assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is True
+
+
+# ── can_resume_dag_run / resume_dag_run ────────────────────────────────────────
+#
+# Uses state_manager_real_ta for the same reason as request_dag_cancellation's
+# tests: get_dag_run/fan-in tracking aren't implemented on DummyTaskState, and
+# per CLAUDE.md this dispatch-adjacent, race-prone path needs a real-backend test.
+
+
+async def _make_stuck_task(sm, task_id, dag_run_id, status, **kwargs):
+    """Submit a task, then drive it to a stuck terminal status via the same path TaskProcessor would."""
+    task = Task(
+        id=task_id,
+        name="my_task",
+        queue="default",
+        dag_run_id=dag_run_id,
+        status=TaskStatus.SUBMITTED,
+        **kwargs,
+    )
+    await sm.submit_task(task)
+    task.set_status(status)
+    await sm.task_state.save_task(task)
+    await sm.finalize_dag_run_task(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_not_found(state_manager_real_ta):
+    """can_resume_dag_run reports dag_run_not_found_or_expired for an unregistered run."""
+    result = await state_manager_real_ta.can_resume_dag_run(ULID())
+    assert result.resumable is False
+    assert result.reason == "dag_run_not_found_or_expired"
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_task_history_incomplete(state_manager_real_ta):
+    """A run whose index survived but whose task blob was pruned is not resumable."""
+    dag_run_id = ULID()
+    task = await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED)
+    await state_manager_real_ta.task_state.delete_task(task)  # simulate clean_terminal_tasks pruning the blob
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is False
+    assert result.reason == "task_history_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_no_stuck_tasks(state_manager_real_ta):
+    """A run with no stuck tasks (e.g. already fully succeeded) is not resumable."""
+    dag_run_id = ULID()
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.COMPLETED)
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is False
+    assert result.reason == "no_stuck_tasks"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [TaskStatus.FAILED, TaskStatus.STALLED, TaskStatus.CANCELLED, TaskStatus.DROPPED]
+)
+async def test_can_resume_dag_run_resumable_for_every_stuck_status(state_manager_real_ta, status):
+    """Every TaskStatus.stuck_statuses() member is reported as a resumable stuck task."""
+    dag_run_id = ULID()
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, status)
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is True
+    assert result.stuck_task_ids == [ULID1]
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_fan_in_tracking_expired(state_manager_real_ta):
+    """A run that declares a fan-in edge but has no live tracking hash is not resumable."""
+    dag_run_id = ULID()
+    fan_in_callback = FanInCallback(
+        task=DAGTaskSpec(id=ULID2, name="collector_task", queue="default"), fan_in_key="fan-in:missing"
+    )
+    await _make_stuck_task(
+        state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED, dag_callbacks=[fan_in_callback]
+    )
+    # init_fan_in was never called for "fan-in:missing" -- its tracking hash doesn't exist.
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is False
+    assert result.reason == "fan_in_tracking_expired"
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_fan_in_tracking_alive(state_manager_real_ta):
+    """A run whose declared fan-in tracking hash is still present is resumable."""
+    dag_run_id = ULID()
+    fan_in_callback = FanInCallback(
+        task=DAGTaskSpec(id=ULID2, name="collector_task", queue="default"), fan_in_key="fan-in:alive"
+    )
+    await state_manager_real_ta.task_state.init_fan_in(dag_run_id, "fan-in:alive", {ULID1})
+    await _make_stuck_task(
+        state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED, dag_callbacks=[fan_in_callback]
+    )
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is True
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_raises_when_not_resumable(state_manager_real_ta):
+    """resume_dag_run raises TaskException with the precheck's reason embedded."""
+    with pytest.raises(TaskException, match="dag_run_not_found_or_expired"):
+        await state_manager_real_ta.resume_dag_run(ULID())
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_resubmits_stuck_task_from_stored_parameters(state_manager_real_ta):
+    """resume_dag_run resets retry_attempt, marks the errors list, and re-enqueues the task."""
+    dag_run_id = ULID()
+    task = await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED)
+    task.retry_attempt = 3
+    task.errors = ["boom"]
+    await state_manager_real_ta.task_state.save_task(task)
+
+    result = await state_manager_real_ta.resume_dag_run(dag_run_id)
+
+    assert result.dag_run_id == dag_run_id
+    assert result.resumed_task_ids == [ULID1]
+    resumed = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert resumed is not None
+    assert resumed.status == TaskStatus.SUBMITTED
+    assert resumed.retry_attempt == 0
+    assert resumed.errors[0] == "boom"
+    assert resumed.errors[-1].startswith("--- resumed by operator")
+    popped = await state_manager_real_ta.task_submit.get_next_task({"default"})
+    assert popped is not None
+    assert popped.id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_clears_cancellation_marker(state_manager_real_ta):
+    """resume_dag_run clears a run's cancelled_at marker, or the resumed task's own retries/descendants would be suppressed."""
+    dag_run_id = ULID()
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.CANCELLED)
+    await state_manager_real_ta.mark_dag_run_cancelling(dag_run_id)
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is True
+
+    await state_manager_real_ta.resume_dag_run(dag_run_id)
+
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is False
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_reconciles_failed_counter_so_run_can_complete(state_manager_real_ta):
+    """
+    After a resumed task goes on to succeed, the run can reach COMPLETE.
+
+    Regression guard for docs/dag-resume-design.md §2.2: record_dag_run_task_terminal's
+    'failed' counter is otherwise monotonic, so without reconcile_dag_run_task_retry a
+    run that fully recovers via resume would be stuck reporting partial_failure forever.
+    """
+    dag_run_id = ULID()
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED)
+    await state_manager_real_ta.resume_dag_run(dag_run_id)
+
+    resumed = await state_manager_real_ta.task_state.get_task(ULID1)
+    resumed.set_status(TaskStatus.COMPLETED)
+    await state_manager_real_ta.task_state.save_task(resumed)
+    await state_manager_real_ta.finalize_dag_run_task(resumed)
+
+    run = await state_manager_real_ta.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_resubmits_only_stuck_tasks_in_mixed_run(state_manager_real_ta):
+    """A run with one still-active task and one stuck task only resubmits the stuck one."""
+    dag_run_id = ULID()
+    active_task = Task(
+        id=ULID2, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(active_task)
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED)
+
+    result = await state_manager_real_ta.resume_dag_run(dag_run_id)
+
+    assert result.resumed_task_ids == [ULID1]
+    still_active = await state_manager_real_ta.task_state.get_task(ULID2)
+    assert still_active is not None
+    assert still_active.status == TaskStatus.SUBMITTED
 
 
 # ── submit_task (rate-limited branch) ─────────────────────────────────────────

@@ -15,7 +15,16 @@ from ulid import ULID
 
 from jobbers import registry
 from jobbers.models.cron_dag import ConcurrencyPolicy
-from jobbers.models.dag import DAGCancelResult, DAGCancelTaskResult, collect_fan_in_keys
+from jobbers.models.dag import (
+    DAGCancelResult,
+    DAGCancelTaskResult,
+    DAGResumePrecheck,
+    DAGResumeReason,
+    DAGResumeResult,
+    DynamicFanOutCallback,
+    FanInCallback,
+    collect_fan_in_keys,
+)
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
@@ -48,6 +57,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
+
+
+def _dag_run_uses_fan_in(tasks: list[Task]) -> bool:
+    """
+    Whether any task in a DAG run registers a fan-in edge.
+
+    Used by StateManager.can_resume_dag_run to decide whether a missing
+    DAG_RUN_FANIN tracking hash is actually a problem -- a run built entirely from
+    SimpleCallback chains never calls init_fan_in, so it never had one to expire.
+    """
+    return any(
+        isinstance(cb, (FanInCallback, DynamicFanOutCallback)) for t in tasks for cb in t.dag_callbacks
+    )
 
 
 @dataclass
@@ -754,6 +776,95 @@ class StateManager:
             signalled_running=len(started),
             tasks=tasks_result,
         )
+
+    async def can_resume_dag_run(self, dag_run_id: ULID) -> DAGResumePrecheck:
+        """
+        Read-only check for whether a DAG run can be resumed right now (docs/dag-resume-design.md §4.1).
+
+        Does not mutate anything -- safe to call repeatedly (e.g. to drive a "Resume"
+        button's enabled state). ``resume_dag_run`` re-derives the same checks itself
+        rather than trusting an earlier precheck result, since the two are separate
+        round trips and state could change in between.
+        """
+        run = await self.get_dag_run(dag_run_id)
+        if run is None:
+            return DAGResumePrecheck(
+                dag_run_id=dag_run_id, resumable=False, reason=DAGResumeReason.DAG_RUN_NOT_FOUND_OR_EXPIRED
+            )
+
+        fetched = await self.task_state.get_tasks_bulk(run.task_ids)
+        if any(t is None for t in fetched):
+            return DAGResumePrecheck(
+                dag_run_id=dag_run_id, resumable=False, reason=DAGResumeReason.TASK_HISTORY_INCOMPLETE
+            )
+        run_tasks = cast("list[Task]", fetched)
+
+        stuck = [t for t in run_tasks if t.status in TaskStatus.stuck_statuses()]
+        if not stuck:
+            return DAGResumePrecheck(dag_run_id=dag_run_id, resumable=False, reason=DAGResumeReason.NO_STUCK_TASKS)
+
+        if _dag_run_uses_fan_in(run_tasks) and not await self.task_state.dag_run_fan_in_alive(dag_run_id):
+            return DAGResumePrecheck(
+                dag_run_id=dag_run_id, resumable=False, reason=DAGResumeReason.FAN_IN_TRACKING_EXPIRED
+            )
+
+        return DAGResumePrecheck(dag_run_id=dag_run_id, resumable=True, stuck_task_ids=[t.id for t in stuck])
+
+    async def resume_dag_run(self, dag_run_id: ULID) -> DAGResumeResult:
+        """
+        Retry every stuck task in a DAG run from its stored parameters (docs/dag-resume-design.md §4.3).
+
+        Reuses each stuck task's existing blob (parameters, dag_callbacks, parent_ids
+        unchanged) rather than reading from the DLQ, so this works regardless of
+        dead_letter_policy and covers CANCELLED tasks, which are never DLQ'd. Once a
+        resumed task completes, the normal TaskProcessor.post_process ->
+        generate_callbacks() path continues the DAG exactly as it would on a first
+        attempt -- no separate graph-replay logic is needed here.
+
+        Raises TaskException if the run isn't currently resumable; see
+        can_resume_dag_run for the specific reasons.
+        """
+        precheck = await self.can_resume_dag_run(dag_run_id)
+        if not precheck.resumable:
+            raise TaskException(f"DAG run {dag_run_id} is not resumable: {precheck.reason}")
+
+        if await self.is_dag_run_cancelling(dag_run_id):
+            # Must happen before the resumed tasks go SUBMITTED, or TaskProcessor's
+            # post_process/_handle_retry gates (docs/dag-cancellation-design.md §4.4)
+            # would keep treating this run as cancelling and suppress their
+            # descendants/retries the moment they run again.
+            await self.task_state.clear_dag_run_cancellation(dag_run_id)
+
+        await self.task_state.refresh_dag_run_fan_in_ttl(dag_run_id)
+
+        fetched = await self.task_state.get_tasks_bulk(precheck.stuck_task_ids)
+        stuck_tasks = cast("list[Task]", [t for t in fetched if t is not None])
+
+        # finalize_dag_run_task recorded exactly one 'failed' increment per stuck task
+        # when it first became stuck (see §2.2) -- undo all of those in one round trip
+        # before resubmitting, or the run can never report 'complete' again even if
+        # every resumed task goes on to succeed.
+        if stuck_tasks:
+            await self.task_state.reconcile_dag_run_task_retry(dag_run_id, count=len(stuck_tasks))
+
+        now = dt.datetime.now(dt.UTC)
+        for task in stuck_tasks:
+            task.errors.append(f"--- resumed by operator, dag_run_id={dag_run_id}, at {now.isoformat()} ---")
+            task.retry_attempt = 0
+            task.set_status(TaskStatus.SUBMITTED)
+
+        if self._atomic_state is not None:
+            pipe = self._atomic_state.pipeline(transaction=True)
+            for task in stuck_tasks:
+                self._atomic_state.stage_requeue(pipe, task)
+            await pipe.execute()
+        else:
+            # Saga: blob is the source of truth, write it before the queue pointer
+            # that references it (same ordering rationale as resubmit_dead_tasks).
+            await asyncio.gather(*(self.task_state.save_task(t) for t in stuck_tasks))
+            await asyncio.gather(*(self.task_submit.enqueue(t) for t in stuck_tasks))
+
+        return DAGResumeResult(dag_run_id=dag_run_id, resumed_task_ids=[t.id for t in stuck_tasks])
 
     async def monitor_task_cancellation(self, task_id: ULID) -> None:
         """Wait for a cancel signal for this task and raise UserCancellationError when it arrives."""
