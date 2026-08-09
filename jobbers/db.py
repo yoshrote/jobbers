@@ -46,6 +46,23 @@ TASK_SCHEDULER_BACKEND = os.environ.get("TASK_SCHEDULER_BACKEND", "redis")
 CRON_DAG_SCHEDULER_BACKEND = os.environ.get("CRON_DAG_SCHEDULER_BACKEND", "redis")
 FORCE_SAGA_MODE = os.environ.get("FORCE_SAGA_MODE", "false").lower() == "true"
 
+
+def needed_sql_features() -> set[str]:
+    """Return the SQL table groups actually required, based on which backends are currently set to "sql"."""
+    features: set[str] = set()
+    if os.environ.get("ROUTING_BACKEND", "sql") == "sql":
+        features.add("routing")
+    if TASK_BACKEND == "sql":
+        features.add("task_state")
+    if DLQ_BACKEND == "sql":
+        features.add("dead_letter")
+    if TASK_SCHEDULER_BACKEND == "sql":
+        features.add("task_schedule")
+    if CRON_DAG_SCHEDULER_BACKEND == "sql":
+        features.add("cron_dag")
+    return features
+
+
 _client: redis.Redis | None = None
 _state_manager: StateManager | None = None
 _engine: AsyncEngine | None = None
@@ -199,18 +216,7 @@ async def init_state_manager() -> StateManager:
     client = get_client()
 
     # Determine which SQL features are needed so we run only the required migrations.
-    needed_sql_features: set[str] = set()
-    routing_backend_type = os.environ.get("ROUTING_BACKEND", "sql")
-    if routing_backend_type == "sql":
-        needed_sql_features.add("routing")
-    if TASK_BACKEND == "sql":
-        needed_sql_features.add("task_state")
-    if DLQ_BACKEND == "sql":
-        needed_sql_features.add("dead_letter")
-    if TASK_SCHEDULER_BACKEND == "sql":
-        needed_sql_features.add("task_schedule")
-    if CRON_DAG_SCHEDULER_BACKEND == "sql":
-        needed_sql_features.add("cron_dag")
+    sql_features = needed_sql_features()
 
     routing_backend = await _create_routing_backend(client)
 
@@ -219,7 +225,7 @@ async def init_state_manager() -> StateManager:
     if TASK_BACKEND == "sql":
         from jobbers.adapters.sql import SQLTaskState, SQLTaskSubmit
 
-        sf = await _get_or_create_sql(needed_sql_features)
+        sf = await _get_or_create_sql(sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         _task_adapter = SQLTaskState(sf, dsn=dsn)
         task_submit = SQLTaskSubmit(sf, dsn=dsn)
@@ -231,7 +237,7 @@ async def init_state_manager() -> StateManager:
     if DLQ_BACKEND == "sql":
         from jobbers.adapters.sql import SQLDeadQueue
 
-        sf = await _get_or_create_sql(needed_sql_features)
+        sf = await _get_or_create_sql(sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         dead_queue: DeadQueueProtocol = SQLDeadQueue(sf, dsn=dsn)
     else:
@@ -241,7 +247,7 @@ async def init_state_manager() -> StateManager:
     if TASK_SCHEDULER_BACKEND == "sql":
         from jobbers.adapters.sql import SQLTaskScheduler
 
-        sf = await _get_or_create_sql(needed_sql_features)
+        sf = await _get_or_create_sql(sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         task_scheduler: RedisTaskScheduler | SQLTaskScheduler = SQLTaskScheduler(
             sf, routing_backend.get_all_queues, dsn=dsn
@@ -252,7 +258,7 @@ async def init_state_manager() -> StateManager:
     if CRON_DAG_SCHEDULER_BACKEND == "sql":
         from jobbers.adapters.sql import SQLCronDAGScheduler
 
-        sf = await _get_or_create_sql(needed_sql_features)
+        sf = await _get_or_create_sql(sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         cron_dag_scheduler: RedisCronDAGScheduler | SQLCronDAGScheduler | StaticCronDAGScheduler = (
             SQLCronDAGScheduler(sf, dsn=dsn)

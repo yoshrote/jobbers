@@ -26,13 +26,15 @@ async def run_migrations(
 
     - ``None`` (default) — create all tables (backward-compatible behaviour).
     - A set of feature names (``"routing"``, ``"task_state"``, ``"dead_letter"``,
-      ``"task_schedule"``) — create only the tables for those features.
+      ``"task_schedule"``, ``"cron_dag"``) — create only the tables for those
+      features. An empty set creates nothing (distinct from ``None`` -- this is
+      what an all-non-SQL deployment should get).
     """
     tables: list[Table] | None
     if features is None:
         tables = None
     else:
-        tables = [t for f in features for t in TABLE_GROUPS.get(f, [])] or None
+        tables = [t for f in features for t in TABLE_GROUPS.get(f, [])]
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: metadata.create_all(c, tables=tables))
 
@@ -54,10 +56,12 @@ async def ensure_redis_json_routing_indexes(redis_url: str) -> None:
 
 async def run_cli() -> None:
     """CLI entry point: apply the schema to the configured database, plus any RedisJSON indexes."""
+    from jobbers.db import needed_sql_features
+
     db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
     engine = create_async_engine(db_path)
     try:
-        await run_migrations(engine)
+        await run_migrations(engine, features=needed_sql_features())
     finally:
         await engine.dispose()
 

@@ -2,7 +2,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from jobbers.db import DEFAULT_REDIS_URL, REDIS_PROTOCOL_VERSION, close_client, get_client, set_client
+import jobbers.db as db
+from jobbers.db import (
+    DEFAULT_REDIS_URL,
+    REDIS_PROTOCOL_VERSION,
+    close_client,
+    get_client,
+    needed_sql_features,
+    set_client,
+)
 
 
 @pytest.fixture
@@ -72,3 +80,36 @@ async def test_close_client_no_existing_client():
     with patch("jobbers.db._client", None):
         # Ensure no exception is raised
         await close_client()
+
+
+def test_needed_sql_features_all_redis_is_empty(monkeypatch):
+    """No backend set to sql -- jobbers_migrate should create nothing."""
+    monkeypatch.setattr(db, "TASK_BACKEND", "redis")
+    monkeypatch.setattr(db, "DLQ_BACKEND", "redis")
+    monkeypatch.setattr(db, "TASK_SCHEDULER_BACKEND", "redis")
+    monkeypatch.setattr(db, "CRON_DAG_SCHEDULER_BACKEND", "redis")
+    monkeypatch.setenv("ROUTING_BACKEND", "redis")
+
+    assert needed_sql_features() == set()
+
+
+def test_needed_sql_features_only_configured_backends(monkeypatch):
+    """Only the backends actually set to sql contribute a feature."""
+    monkeypatch.setattr(db, "TASK_BACKEND", "sql")
+    monkeypatch.setattr(db, "DLQ_BACKEND", "redis")
+    monkeypatch.setattr(db, "TASK_SCHEDULER_BACKEND", "sql")
+    monkeypatch.setattr(db, "CRON_DAG_SCHEDULER_BACKEND", "redis")
+    monkeypatch.setenv("ROUTING_BACKEND", "redis_json")
+
+    assert needed_sql_features() == {"task_state", "task_schedule"}
+
+
+def test_needed_sql_features_default_routing_is_sql(monkeypatch):
+    """ROUTING_BACKEND defaults to sql, so routing is included even with no env vars set."""
+    monkeypatch.setattr(db, "TASK_BACKEND", "redis_json")
+    monkeypatch.setattr(db, "DLQ_BACKEND", "redis")
+    monkeypatch.setattr(db, "TASK_SCHEDULER_BACKEND", "redis")
+    monkeypatch.setattr(db, "CRON_DAG_SCHEDULER_BACKEND", "redis")
+    monkeypatch.delenv("ROUTING_BACKEND", raising=False)
+
+    assert needed_sql_features() == {"routing"}
