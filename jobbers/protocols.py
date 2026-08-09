@@ -328,7 +328,7 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
 
     async def clear_dag_run_cancellation(self, dag_run_id: ULID) -> None:
         """
-        Clear a previously-set cancellation marker (see docs/dag-resume-design.md §4.3).
+        Clear a previously-set cancellation marker (see "Resuming DAG runs" in docs/interacting-with-dags.md).
 
         Required before resuming a cancelled run: TaskProcessor's is_dag_run_cancelling
         gates in post_process/_handle_retry would otherwise keep suppressing the
@@ -336,13 +336,13 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
         """
         ...
 
-    # DAG run resume support (docs/dag-resume-design.md)
+    # DAG run resume support (see "Resuming DAG runs" in docs/interacting-with-dags.md)
     async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
         """
         Undo ``count`` earlier 'failed' terminal-outcome records for tasks about to be retried.
 
-        record_dag_run_task_terminal's 'failed' counter is otherwise monotonic (see
-        docs/dag-resume-design.md §2.2) -- without this, a stuck task that's resumed
+        record_dag_run_task_terminal's 'failed' counter is otherwise monotonic --
+        without this, a stuck task that's resumed
         and succeeds would leave the run at partial_failure forever, since the
         original failure's increment is never undone by a later success. Takes a
         ``count`` rather than requiring one call per task so resuming N stuck tasks

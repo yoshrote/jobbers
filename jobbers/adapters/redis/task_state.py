@@ -56,7 +56,7 @@ _MARK_DAG_RUN_COMPLETE_SCRIPT = """
 # Mirror image of _RECORD_DAG_RUN_TERMINAL_SCRIPT's 'failed' branch: decrements 'failed'
 # by ARGV[1] (floored at 0) instead of incrementing either counter, and recomputes status
 # the same way. Used by reconcile_dag_run_task_retry to undo count stuck tasks' earlier
-# failure records before they're resubmitted (see docs/dag-resume-design.md §2.2), in one
+# failure records before they're resubmitted, in one
 # round trip rather than one call per task. No-op (returns 0) if the run's meta hash is
 # missing.
 _RECONCILE_DAG_RUN_TASK_RETRY_SCRIPT = """

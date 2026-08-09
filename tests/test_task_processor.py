@@ -693,7 +693,7 @@ async def test_expected_exception_cancelled_instead_of_scheduled_when_dag_run_ca
     """
     A retryable failure that would normally be SCHEDULED is CANCELLED instead when the DAG is cancelling.
 
-    Cancellation wins over "retries remaining" -- see docs/dag-cancellation-design.md §4.4.
+    Cancellation wins over "retries remaining" -- see "Cancelling DAG runs" in docs/interacting-with-dags.md.
     """
     dag_run_id = ULID()
     task = Task(

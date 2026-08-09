@@ -1026,7 +1026,7 @@ async def test_request_dag_cancellation_signals_all_started_tasks_via_one_broadc
     N concurrently-STARTED tasks in one DAG run are all cancelled via a single broadcast.
 
     This is the core noise-avoidance property of DAG cancellation (see
-    docs/dag-cancellation-design.md): publish_dag_cancellation is called exactly
+    "Cancelling DAG runs" in docs/interacting-with-dags.md): publish_dag_cancellation is called exactly
     once regardless of how many STARTED tasks the run has, and every worker-local
     cancel_event for that run fires off that one message.
     """
@@ -1245,7 +1245,7 @@ async def test_resume_dag_run_reconciles_failed_counter_so_run_can_complete(stat
     """
     After a resumed task goes on to succeed, the run can reach COMPLETE.
 
-    Regression guard for docs/dag-resume-design.md §2.2: record_dag_run_task_terminal's
+    Regression guard: record_dag_run_task_terminal's
     'failed' counter is otherwise monotonic, so without reconcile_dag_run_task_retry a
     run that fully recovers via resume would be stuck reporting partial_failure forever.
     """

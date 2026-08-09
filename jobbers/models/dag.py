@@ -737,7 +737,7 @@ class DAGCancelResult(BaseModel):
 
 
 class DAGResumeReason(StrEnum):
-    """Why a run is not currently resumable, per StateManager.can_resume_dag_run (docs/dag-resume-design.md §4.1)."""
+    """Why a run is not currently resumable, per StateManager.can_resume_dag_run (see docs/interacting-with-dags.md)."""
 
     # get_dag_run returned None (never existed, or its index was pruned by clean_dag_runs).
     DAG_RUN_NOT_FOUND_OR_EXPIRED = "dag_run_not_found_or_expired"

@@ -222,7 +222,7 @@ Recommended cron setup:
 A long-running process that handles two scheduling concerns on each poll:
 
 1. **Retry delays** — re-enqueues tasks that are waiting out a backoff delay when their `run_at` arrives.
-2. **Cron DAGs** — fires recurring `CronDAGEntry` runs when their cron expression comes due; see [interacting-with-tasks.md — Cron DAGs](interacting-with-tasks.md#cron-dags).
+2. **Cron DAGs** — fires recurring `CronDAGEntry` runs when their cron expression comes due; see [interacting-with-dags.md — Cron DAGs](interacting-with-dags.md#2-cron-dags).
 
 Run exactly **one** Scheduler per Redis instance. A brief overlap of two instances (e.g. during a rolling restart) is tolerated for cron DAG dispatch when `CRON_DAG_SCHEDULER_BACKEND` is `redis` or `sql` — a short-TTL dispatch lock backed by that shared storage prevents both instances from submitting the same due run. This protection does **not** apply to `CRON_DAG_SCHEDULER_BACKEND=static`: its dispatch lock is private, in-process memory, so two static-backed Scheduler instances can both dispatch the same cron entry with no coordination at all. Do not run more than one Scheduler instance, even briefly, against the static cron backend.
 

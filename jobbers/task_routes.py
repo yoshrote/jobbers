@@ -786,7 +786,7 @@ async def resume_dag(dag_run_id: str) -> dict[str, Any]:
     Requires the run's task history, DAG run index, and (if the run uses fan-in)
     fan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in
     TTL expiry -- see GET /dags/{dag_run_id}/resume-check and
-    docs/dag-resume-design.md for what each unresumable reason means.
+    docs/interacting-with-dags.md for what each unresumable reason means.
     """
     uid = _parse_ulid(dag_run_id, "dag_run_id")
     logger.info("Requesting resume for DAG run %s", dag_run_id)

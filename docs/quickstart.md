@@ -48,7 +48,7 @@ task = await send_email.submit(queue="default", recipient="user@example.com", su
 print(task.id, task.status)  # SUBMITTED
 ```
 
-See [interacting-with-tasks.md](interacting-with-tasks.md) for all submission paths including the HTTP API, one-shot scheduling, cron, cancellation, and DLQ recovery.
+See [interacting-with-tasks.md](interacting-with-tasks.md) for standalone submission, one-shot scheduling, cancellation, and DLQ recovery, and [interacting-with-dags.md](interacting-with-dags.md) for DAG submission, cron, and DAG-run cancellation/resume.
 
 ### Dependency injection
 

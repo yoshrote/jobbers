@@ -635,7 +635,7 @@ class TaskProcessor:
         task.errors.append(error_message)
         if task.dag_run_id and await self.state_manager.is_dag_run_cancelling(task.dag_run_id):
             # Cancellation wins over "retries remaining" -- don't resubmit work into
-            # a run that's supposed to be stopping. See docs/dag-cancellation-design.md §4.4.
+            # a run that's supposed to be stopping. See "Cancelling DAG runs" in docs/interacting-with-dags.md.
             await self.handle_user_cancelled_task(task)
             return task
         if not task.should_retry():

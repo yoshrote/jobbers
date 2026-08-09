@@ -693,7 +693,7 @@ class StateManager:
         TaskProcessor.post_process / _handle_retry gates (which check
         is_dag_run_cancelling) start rejecting new descendants/retries as early as
         possible. SCHEDULED/SUBMITTED (and the practically-unreachable UNSUBMITTED —
-        see docs/dag-cancellation-design.md) tasks are cancelled directly in this
+        see below) tasks are cancelled directly in this
         sweep; STARTED tasks are left to a single trailing publish_dag_cancellation
         broadcast instead of one publish per task, so a large fan-out's worth of
         concurrently-running arms is cancelled with one pub/sub message.
@@ -722,7 +722,7 @@ class StateManager:
                 scheduled.append(task)
             else:
                 # SUBMITTED, or UNSUBMITTED (practically unreachable via persisted
-                # storage -- see docs/dag-cancellation-design.md §4.4). Cancelling
+                # storage). Cancelling
                 # directly with a best-effort, harmless-if-absent queue removal
                 # covers both the same way.
                 submitted_or_unsubmitted.append(task)
@@ -779,7 +779,7 @@ class StateManager:
 
     async def can_resume_dag_run(self, dag_run_id: ULID) -> DAGResumePrecheck:
         """
-        Read-only check for whether a DAG run can be resumed right now (docs/dag-resume-design.md §4.1).
+        Read-only check for whether a DAG run can be resumed right now (see docs/interacting-with-dags.md).
 
         Does not mutate anything -- safe to call repeatedly (e.g. to drive a "Resume"
         button's enabled state). ``resume_dag_run`` re-derives the same checks itself
@@ -812,7 +812,7 @@ class StateManager:
 
     async def resume_dag_run(self, dag_run_id: ULID) -> DAGResumeResult:
         """
-        Retry every stuck task in a DAG run from its stored parameters (docs/dag-resume-design.md §4.3).
+        Retry every stuck task in a DAG run from its stored parameters (see docs/interacting-with-dags.md).
 
         Reuses each stuck task's existing blob (parameters, dag_callbacks, parent_ids
         unchanged) rather than reading from the DLQ, so this works regardless of
@@ -830,7 +830,7 @@ class StateManager:
 
         if await self.is_dag_run_cancelling(dag_run_id):
             # Must happen before the resumed tasks go SUBMITTED, or TaskProcessor's
-            # post_process/_handle_retry gates (docs/dag-cancellation-design.md §4.4)
+            # post_process/_handle_retry gates (see "Cancelling DAG runs" in docs/interacting-with-dags.md)
             # would keep treating this run as cancelling and suppress their
             # descendants/retries the moment they run again.
             await self.task_state.clear_dag_run_cancellation(dag_run_id)

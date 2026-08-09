@@ -1,15 +1,15 @@
 # Interacting with Tasks
 
-This document covers the full lifecycle of interacting with tasks in Jobbers: submitting new work, scheduling it, cancelling in-flight tasks, and recovering work from the dead letter queue. Submission and scheduling get work into the system; cancellation and DLQ resubmit manage tasks that are already there. Each operation is available both programmatically (Python) and over the HTTP API.
+This document covers the full lifecycle of interacting with a single, standalone task in Jobbers: submitting new work, scheduling it, cancelling it in-flight, and recovering it from the dead letter queue. Submission and scheduling get work into the system; cancellation and DLQ resubmit manage tasks that are already there. Each operation is available both programmatically (Python) and over the HTTP API.
+
+If your task is one node in a DAG rather than a standalone submission, see [interacting-with-dags.md](interacting-with-dags.md) instead — DAG runs are cancelled and recovered as a group (`POST /dags/{dag_run_id}/cancel` / `.../resume`), not one task at a time, and recovery there normally does **not** go through the DLQ (see [§4](#4-resubmitting-from-the-dead-letter-queue) below).
 
 ## Quick reference
 
 | Operation | Use when |
 | --- | --- |
 | **Submit to queue** | Work needs to happen now |
-| **Submit a DAG** | Work is structured as dependent steps or parallel branches |
 | **Schedule a task** | Work must happen at a specific future datetime (one-shot) |
-| **Cron** | Work repeats on a schedule (daily jobs, periodic pipelines) |
 | **Cancel** | A task needs to be stopped before or during execution |
 | **DLQ resubmit** | A permanently-failed task should be retried after fixing the underlying cause |
 
@@ -60,57 +60,7 @@ Returns the task summary including the assigned `id` and `status: "submitted"`.
 
 ---
 
-## 2. Submit a DAG to a queue
-
-A DAG submits a graph of tasks where each node runs after its predecessors complete. Fan-out, fan-in, and error-callback patterns are all supported. See [dag-composition.md](dag-composition.md) for the full reference.
-
-### Programmatic
-
-```python
-from jobbers.models.dag import DAGNode
-from jobbers.db import get_state_manager
-
-root   = DAGNode("ingest_data")
-middle = DAGNode("transform_data")
-end    = DAGNode("publish_results")
-
-root.then(middle)
-middle.then(end)
-
-dag_run_id, submitted_roots = await get_state_manager().submit_dag(root)
-```
-
-`submit_dag` accepts multiple root nodes for multi-root DAGs. It returns the shared `dag_run_id` (a ULID) and the list of root `Task` objects that were enqueued.
-
-Using `@register_task` wrappers:
-
-```python
-root = ingest_data.node(queue="etl")
-middle = transform_data.node(queue="etl")
-end = publish_results.node(queue="etl")
-root.then(middle)
-middle.then(end)
-dag_run_id, _ = await get_state_manager().submit_dag(root)
-```
-
-### HTTP
-
-The API accepts a [Mermaid flowchart](mermaid-dag-spec.md) and assigns ULIDs automatically:
-
-```http
-POST /submit-dag
-Content-Type: application/json
-
-{
-  "diagram": "graph LR\n  A[ingest_data] --> B[transform_data] --> C[publish_results]"
-}
-```
-
-Returns `dag_run_id` and the IDs of the submitted root tasks. All task names in the diagram must already be registered on the workers that will receive them.
-
----
-
-## 3. Submit a task to the scheduler
+## 2. Submit a task to the scheduler
 
 Use the scheduler when a task should run at a specific future time. The task is persisted in the scheduler store with a `run_at` timestamp and a `SCHEDULED` status. The Scheduler process polls for due tasks and promotes them back to `SUBMITTED` on their target queue when the time arrives.
 
@@ -166,89 +116,12 @@ GET /scheduled-tasks?queue=notifications
 Returns tasks currently waiting in the scheduler with their `scheduled_at` timestamps.
 
 > **Retries vs. one-shot scheduling:** `schedule_new_task` / `POST /schedule-task` is for tasks you want to run once at a specific time. Tasks that fail and have a `retry_delay` configured are also moved through the scheduler automatically by the worker — you do not need to call the schedule API for that.
+>
+> A DAG (including a single-task DAG) can be scheduled to fire repeatedly on a cron expression — see [Cron DAGs in interacting-with-dags.md](interacting-with-dags.md#2-cron-dags).
 
 ---
 
-## 4. Cron configuration
-
-A `CronDAGEntry` wraps any DAG (including a single-task DAG) with a cron expression and fires it repeatedly. The Scheduler process computes the next `run_at` after each fire and re-adds the entry to the schedule. `ConcurrencyPolicy` controls overlap between runs.
-
-### Programmatic
-
-```python
-import datetime as dt
-from croniter import croniter
-from jobbers.models.cron_dag import CronDAGEntry, ConcurrencyPolicy
-from jobbers.models.dag import DAGNode
-from jobbers.db import get_state_manager
-
-# Single-task cron: wrap a one-node DAG
-root = DAGNode("generate_report", parameters={"format": "pdf"})
-entry = CronDAGEntry(
-    name="daily_report",
-    cron_expr="0 6 * * *",             # 06:00 UTC every day
-    dag_spec=root.to_spec(),
-    concurrency_policy=ConcurrencyPolicy.SKIP_IF_RUNNING,
-)
-
-sm = get_state_manager()
-await sm.add_cron_dag(entry)
-```
-
-For a multi-task DAG, build the graph first then pass the root spec:
-
-```python
-ingest  = DAGNode("nightly_ingest")
-process = DAGNode("nightly_process")
-ingest.then(process)
-
-entry = CronDAGEntry(
-    name="nightly_pipeline",
-    cron_expr="0 2 * * *",
-    dag_spec=ingest.to_spec(),
-    concurrency_policy=ConcurrencyPolicy.SKIP_IF_RUNNING,
-)
-await sm.add_cron_dag(entry)
-```
-
-`CronDAGEntry` is stored in the `CronDAGScheduler` backend. The entry persists across restarts — call `sm.remove_cron_dag(entry.id)` to cancel it permanently.
-
-### HTTP
-
-```http
-POST /cron-dags
-Content-Type: application/json
-
-{
-  "name": "nightly_pipeline",
-  "cron_expr": "0 2 * * *",
-  "diagram": "graph LR\n  A[nightly_ingest] --> B[nightly_process]",
-  "enabled": true,
-  "concurrency_policy": "skip_if_running"
-}
-```
-
-Returns the entry including its assigned `id` and `next_run_at`.
-
-Other lifecycle endpoints:
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/cron-dags` | List all entries with next run times |
-| `GET` | `/cron-dags/{id}` | Retrieve a single entry |
-| `PUT` | `/cron-dags/{id}` | Replace diagram/settings; resets the schedule |
-| `DELETE` | `/cron-dags/{id}` | Remove permanently |
-
-### `ConcurrencyPolicy`
-
-| Value | Behaviour |
-| --- | --- |
-| `always` (default) | Fire even if the previous run is still active |
-| `skip_if_running` | Skip this fire if any task from the previous run is still active |
-
----
-
-## 5. Cancelling tasks
+## 3. Cancelling tasks
 
 Cancellation is best-effort. The outcome depends on the task's current status when the request arrives:
 
@@ -291,9 +164,11 @@ Individual errors do not abort the rest of the batch.
 
 ---
 
-## 6. Resubmitting from the dead letter queue
+## 4. Resubmitting from the dead letter queue
 
 Tasks with `dead_letter_policy=DeadLetterPolicy.SAVE` are written to the dead letter queue (DLQ) when they permanently fail (all retries exhausted). You can inspect them, resubmit them back onto their original queue, or discard them.
+
+> **DAG tasks:** this endpoint resubmits a task in isolation — for a task that's part of a DAG run, that skips the run's fan-in tracking and aggregate counters, which can leave the run's status inconsistent with what actually happened. Prefer [resuming the run](interacting-with-dags.md#4-resuming-dag-runs) (`POST /dags/{dag_run_id}/resume`), which resubmits every stuck task in the run and keeps that bookkeeping intact. DLQ resubmit here is for standalone tasks that aren't part of a DAG.
 
 ### Browse the DLQ
 
