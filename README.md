@@ -105,9 +105,7 @@ curl http://localhost:8000/task-status/01JXXX...
 
 ### Patterns
 
-Chains, fan-out, fan-in, and diamond (fan-out followed by fan-in) are all expressed naturally through the edge structure. A task can also produce a **dynamic fan-out** at runtime — returning a variable number of child tasks based on its output — using the Python `DAGNode` / `DynamicFanOut` API when the branch count is not known at authoring time. Static and dynamic patterns compose freely within the same graph.
-
-> TODO: Design syntax to support dynamic fan-out
+Chains, fan-out, fan-in, and diamond (fan-out followed by fan-in) are all expressed naturally through the edge structure. A task can also produce a **dynamic fan-out** at runtime — returning a variable number of child tasks based on its output — using the Python `DAGNode` / `DynamicFanOut` API, or the `-->>` diagram edge (`A -->> B` makes `A` the dispatcher and `B` the arm-chain root template; `--o` marks the arm terminal that fans into the collector) when the branch count is not known at authoring time. Static and dynamic patterns compose freely within the same graph. See the [Dynamic fan-out](docs/mermaid-dag-spec.md#dynamic-fan-out) section of the Mermaid DAG spec for the full grammar.
 
 Downstream tasks receive upstream results either by calling `parent_results()` inside the function body, or by annotating a parameter `Annotated[T, FromParent("key")]`, which the worker resolves before calling the function. A chain-position task (exactly one parent) resolves a plain scalar; a fan-in collector needs `FromParent(..., many=True)`, which always resolves to a list.
 

@@ -69,7 +69,9 @@ async def add(x, y):
 
 **Jobbers:** Each task's state (status, retry count, results, heartbeat) is stored explicitly as a blob via `TaskStateProtocol`, not reconstructed via replay. There is no determinism constraint on task code — a task function can call any I/O, use real `random`/`time`, anything. The tradeoff is that only the *task's own state* survives a crash; a task does not get to "resume mid-function" the way a Temporal workflow does. DAG-level continuation (which downstream nodes have run) is tracked via the fan-in/fan-out bookkeeping in `TaskStateProtocol`, not via replaying the orchestrating code.
 
-**Verdict:** Temporal wins decisively for workflows that need to suspend indefinitely (e.g., "wait up to 30 days for a signal") or resume mid-function after a crash with full local state intact. Jobbers wins for simplicity of task code — no determinism discipline, no replay model to reason about, and ordinary debugging tools work unmodified.
+`POST /dags/{dag_run_id}/resume` (and its read-only precheck, `GET /dags/{dag_run_id}/resume-check`) narrows one specific corner of this gap: a DAG run with tasks stuck in `FAILED`/`STALLED`/`CANCELLED`/`DROPPED` can be resumed by retrying those tasks from their stored `parameters`/`dag_callbacks`/`parent_ids`, and the run's aggregate counters are reconciled so it can reach `complete` instead of staying at `partial_failure` forever. This is *task-level* retry-in-place, not Temporal's *function-level* replay — a resumed task starts over from its own beginning, not from wherever inside its body it crashed, and the mechanism only exists for DAG runs, not standalone tasks. It's also explicitly time-bounded: resume stops being possible once the Cleaner's `--completed-task-age` has pruned the run's task blobs or index, or once a stuck fan-in has outlived its `fan_in_ttl` — there is no equivalent of Temporal's indefinite (subject to retention policy) event history to replay from. `GET /dags/{dag_run_id}/resume-check` reports which of those, if any, makes a given run currently unresumable.
+
+**Verdict:** Temporal still wins decisively for workflows that need to suspend indefinitely (e.g., "wait up to 30 days for a signal") or resume mid-function after a crash with full local state intact — that is a structural property of Temporal's replay model that Jobbers' explicit-state design cannot replicate. Jobbers wins for simplicity of task code — no determinism discipline, no replay model to reason about, and ordinary debugging tools work unmodified. DAG resume gives Jobbers a real, if narrower, answer to "a run got stuck, continue it from where it stopped" — but it's bounded by retention and operates at task granularity, not the open-ended, function-level durability Temporal provides by default.
 
 ---
 
@@ -135,9 +137,9 @@ await workflow.execute_activity(
 
 **Temporal:** `WorkflowHandle.cancel()` requests cooperative cancellation (the workflow observes a `CancelledError` at the next yield point, same cooperative model as Jobbers); `terminate()` forcibly kills it without running cleanup. Full execution history is queryable via the Web UI or API indefinitely (subject to retention policy).
 
-**Jobbers:** `GET /task-status/{id}`, `GET /tasks?status=...`, `GET /active-tasks`, `POST /cancel-task` — cooperative cancellation via the same yield-point model.
+**Jobbers:** `GET /task-status/{id}`, `GET /tasks?status=...`, `GET /active-tasks`, `POST /cancel-task` — cooperative cancellation via the same yield-point model. At the DAG level, `POST /dags/{dag_run_id}/cancel` cancels every non-terminal task in a run with one call — `SCHEDULED`/`SUBMITTED` tasks are cancelled immediately, `STARTED` tasks are signalled via a single DAG-wide pub/sub broadcast rather than one message per task.
 
-**Verdict:** Comparable cancellation semantics. Temporal's retained history is richer (full causal chain of events) but Jobbers' task-status API is simpler to query for the common case ("is this task done, and what was the result").
+**Verdict:** Comparable cancellation semantics. Temporal's retained history is richer (full causal chain of events) but Jobbers' task-status API is simpler to query for the common case ("is this task done, and what was the result"). Both now offer single-call cancellation of an entire run — Temporal's `WorkflowHandle.cancel()` naturally covers the whole workflow since it's one execution; Jobbers' `POST /dags/{id}/cancel` achieves the same result for a DAG by sweeping every task in the run.
 
 ---
 
@@ -170,9 +172,10 @@ await workflow.execute_activity(
 | **Orchestration style** | Imperative code (loops, conditionals, `await`) | Explicit DAG graph (Mermaid) | Temporal more expressive; Jobbers more inspectable/diffable |
 | **Retry policies** | Per-activity-call-site `RetryPolicy` | Per-task-type at registration | Comparable; different granularity |
 | **Human-in-the-loop** | Signals, queries, updates | None (cancel only) | Temporal-only capability |
+| **Stuck-run recovery** | Automatic — replay resumes any workflow, indefinitely, from history | `POST /dags/{id}/resume` retries stuck tasks in place, bounded by Cleaner/fan-in retention | Temporal wins on scope and durability; Jobbers narrows the gap for the "DAG stuck, retry from here" case specifically |
 | **Cron scheduling** | Schedules API + overlap policies | Cron DAGs + REST CRUD | Comparable; neither does sub-minute natively |
 | **Observability** | Full event history; OTEL via interceptors | OTEL + metrics out of the box; React UI | Different strengths (causal history vs. aggregate health) |
-| **Cancellation** | Cooperative (`cancel`) or forced (`terminate`) | Cooperative only | Similar cooperative model |
+| **Cancellation** | Cooperative (`cancel`) or forced (`terminate`); whole-workflow by nature | Cooperative only; `POST /dags/{id}/cancel` covers a whole DAG run in one call | Similar cooperative model; both now have single-call, run-level cancellation |
 | **Self-hosting complexity** | High (multi-service + DB + optional ES) | Low (4 processes + Redis) | Temporal Cloud removes this burden at a cost |
 | **Security** | mTLS, namespaces, Cloud auth/RBAC | Proxy-layer only | Temporal has a real built-in story; Jobbers does not |
 | **Language support** | Go, Java, Python, TypeScript, .NET, PHP, Ruby | Python (asyncio) only | Temporal is polyglot |
@@ -191,4 +194,5 @@ await workflow.execute_activity(
 - You want a much smaller operational footprint — Redis plus four lightweight processes, no dedicated visibility store or multi-service server.
 - You want OpenTelemetry metrics and traces out of the box without wiring SDK interceptors.
 - You don't need mid-execution human interaction (signals/queries) — cancellation and a queryable status API are sufficient.
+- "A DAG run got stuck, retry the failed branch" covers your recovery needs — Jobbers' resume is bounded by retention and works at task granularity, but it doesn't require the workflow-replay machinery Temporal needs to provide the same outcome.
 - You're already asyncio-native Python and don't need polyglot workers.
