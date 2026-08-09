@@ -23,7 +23,7 @@ Run the migration tool before starting any process for the first time:
 jobbers_migrate
 ```
 
-This creates the SQL tables used for queue/role/task-state/DLQ/scheduler config (whichever backends are set to `sql`), and — when `ROUTING_BACKEND=redis_json` — creates the RediSearch routing indexes ahead of time instead of waiting for the first process to start.
+This creates the SQL tables for whichever of `ROUTING_BACKEND` / `TASK_BACKEND` / `DLQ_BACKEND` / `TASK_SCHEDULER_BACKEND` / `CRON_DAG_SCHEDULER_BACKEND` are actually set to `sql` (an all-non-SQL deployment creates nothing) — same selective logic every process already applies to itself at startup. When `ROUTING_BACKEND=redis_json`, it also creates the RediSearch routing indexes ahead of time instead of waiting for the first process to start.
 
 ### Frontend
 
@@ -305,6 +305,7 @@ All four processes emit OTLP metrics automatically. No instrumentation code is r
 | `task_execution_time` | Histogram (ms) | `queue`, `task`, `status` | Time from `started_at` to `completed_at` |
 | `task_end_to_end_latency` | Histogram (ms) | `queue`, `task`, `status` | Time from `submitted_at` to `completed_at` |
 | `tasks_retried` | Counter | `queue`, `task`, `version` | Retry events |
+| `tasks_dead_lettered` | Counter | `queue`, `task`, `version` | Tasks moved to DLQ on retry exhaustion (`fail_task`). Also incremented by the Cleaner when it moves a stalled task to the DLQ. |
 
 **Emitted by the Worker (task_generator):**
 
@@ -320,7 +321,6 @@ All four processes emit OTLP metrics automatically. No instrumentation code is r
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
 | `cancellations_requested` | Counter | `queue`, `task` | Cancel signals sent |
-| `tasks_dead_lettered` | Counter | `queue`, `task`, `version` | Tasks moved to DLQ |
 
 **Useful derived signals:**
 

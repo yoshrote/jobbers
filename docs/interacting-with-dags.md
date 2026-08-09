@@ -223,7 +223,7 @@ Resume depends on state that the Cleaner will eventually prune, so it isn't avai
 | `no_stuck_tasks` | Every task is still active or already succeeded — nothing to retry. |
 | `fan_in_tracking_expired` | The run uses fan-in and its shared tracking hash has outlived its `fan_in_ttl` (see [dag-composition.md](dag-composition.md) on fan-in TTLs). |
 
-Tasks configured with `cleanup_on` that matches a terminal status are deleted as soon as they reach it (see [The Cleaner in README2.md](../README2.md#the-cleaner)) — a run built entirely from such tasks may lose resumability faster than one relying solely on the Cleaner's age-based sweep.
+Tasks configured with `cleanup_on` that matches a terminal status are deleted as soon as they reach it (see [The Cleaner in README.md](../README.md#the-cleaner)) — a run built entirely from such tasks may lose resumability faster than one relying solely on the Cleaner's age-based sweep.
 
 ### Checking resumability
 

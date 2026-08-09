@@ -44,7 +44,7 @@ Counts the number of network round-trips and server-side operations per call. Lu
 
 | Operation | `redis` | `redis_json` | `sql` |
 | --- | --- | --- | --- |
-| `submit_task` | 1 Lua script: `EXISTS` + `ZADD` + `SET` + `SADD`/`SREM` + 2×`ZADD` (DAG) | 1 Lua script: `EXISTS` + `ZADD` + `JSON.SET` + `SADD`/`SREM` + `ZADD` (DAG) | 2 transactions: `UPSERT tasks` + `UPDATE`/`INSERT task_queue` + optional `SELECT`/`INSERT dag_runs` |
+| `submit_task` | 1 Lua script: `EXISTS` + `ZADD` + `SET` + `SADD`/`SREM` + `ZADD` + `SADD` + 4×`HSETNX` (DAG) | 1 Lua script: `EXISTS` + `ZADD` + `JSON.SET` + `SADD`/`SREM` + `ZADD` (DAG) | 1 transaction: `UPSERT tasks` + `UPDATE`/`INSERT task_queue` + optional `INSERT dag_runs`/`dag_run_pending` |
 | `submit_rate_limited_task` | 1 Lua script: `ZREMRANGEBYSCORE` + `ZCARD` + 2×`ZADD` + `SET` + `SADD`/`SREM` + 2×`ZADD` (DAG) | 1 Lua script: same, `JSON.SET` instead of `SET` | 1 transaction: `INSERT` anchor row (savepoint, ignore conflict) + `SELECT ... FOR UPDATE` anchor + `DELETE` expired `rate_limit_entries` + `SELECT COUNT` + `UPSERT rate_limit_entries` + `UPSERT tasks` + `UPDATE`/`INSERT task_queue` |
 | `get_next_task` (pop) | 1 Lua script: `ZPOPMIN` + `GET` | 1 Lua script: `ZPOPMIN` + `JSON.GET` | 1 transaction: `SELECT FOR UPDATE` + `DELETE task_queue` + `SELECT tasks` |
 
@@ -55,7 +55,7 @@ Counts the number of network round-trips and server-side operations per call. Lu
 | `get_task` (single lookup) | 1× `GET` | 1× `JSON.GET` | 1× `SELECT` |
 | `save_task` (update) | 1 pipeline: `SET` + optional `ZADD` heartbeat | 1 pipeline: `JSON.SET` + optional `ZADD` heartbeat | 1× `UPDATE` |
 | `get_all_tasks` (list + filter) | 1× `ZRANGE`/`ZRANGEBYSCORE` (fetches `limit × 5` IDs) + **N× `GET`** (one per candidate), filtered in Python | 1× `FT.SEARCH` with server-side filter and sort | 1× `SELECT` with `WHERE` + `ORDER BY` + `LIMIT` |
-| `get_dag_run` (DAG fan-in) | 1× `ZRANGE` on `dag-run:{id}:tasks` sorted set + N× `GET` | 1× `FT.SEARCH` filtering by `dag_run_id` tag | 1× `SELECT` joining `tasks` on `dag_run_id` |
+| `get_dag_run` (DAG fan-in) | `ZSCORE`(`dag-runs`) + `SUNION`(pending, closed sets) + `HMGET`(meta hash) — 3 round trips, no per-task fetch | same shape with `JSON.GET`(meta doc) in place of `HMGET` — 3 round trips, no `FT.SEARCH` | 2 sequential `SELECT`s (`dag_runs`, then `tasks WHERE dag_run_id = ...`) — no join |
 
 The critical difference in `get_all_tasks`: `redis` does **N+1 round-trips** (one range scan followed by one `GET` per candidate), and may return fewer than `limit` results when filters are selective relative to the `limit × 5` prefetch window. `redis_json` and `sql` both complete in a single server-side query.
 
@@ -149,9 +149,9 @@ Filters (`task_name`, `task_version`, `status`) are applied in Python after fetc
 
 **Offset applied before filtering.** Both `ZRANGEBYSCORE` and `ZRANGE` apply `offset` to raw sorted-set positions, not to filtered results. With a non-zero offset and active filters, pages can overlap (a task already seen on page N can re-appear on page N+1) or leave gaps (tasks that would survive the filter are skipped because their raw position falls below the offset window). Reliable paginated queries require either no filters or switching to `redis_json` / `sql`.
 
-#### DLQ `get_by_filter` — filtered queries are unordered and unbounded
+#### DLQ `get_by_filter` — filtered queries are unbounded (but still ordered)
 
-`get_by_filter` returns results ordered by `failed_at` only when no filter is provided — that path uses `ZREVRANGE` on the main DLQ sorted set. Any filter (queue, task name, or both) switches to set membership lookups (`SMEMBERS` or `SINTER`), which return members in arbitrary order. The version filter is always applied in Python after bulk-fetching all matching blobs. The `limit` parameter trims the final Python list but does not bound how many task blobs are fetched from Redis — every filtered query reads all matches regardless of the requested page size.
+Any filter (queue, task name, or both) switches from `ZREVRANGE` on the main DLQ sorted set to a set membership lookup (`SMEMBERS` or `SINTER`), which returns members in arbitrary order — but the filtered path then re-sorts those members newest-first by looking up each one's `failed_at` score in the main DLQ sorted set, so filtered results end up ordered the same as the unfiltered path (matching RedisJSON's ordering). The version filter is always applied in Python after bulk-fetching all matching blobs. The `limit` parameter trims the final Python list but does not bound how many task blobs are fetched from Redis — every filtered query reads all matches regardless of the requested page size.
 
 ---
 

@@ -56,7 +56,7 @@ Long-running tasks call `await task.heartbeat()` periodically. The Cleaner proce
 
 ### Graceful shutdown
 
-Workers respond to SIGTERM according to a per-task `on_shutdown` policy (see [task definition reference](docs/task-definition-reference.md#shutdown-behavior)):
+Workers respond to SIGTERM according to a per-task `on_shutdown` policy (see [task definition reference](docs/task-definition-reference.md#shutdown-behaviour)):
 
 | Policy | Behaviour |
 | --- | --- |
