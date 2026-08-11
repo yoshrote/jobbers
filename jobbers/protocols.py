@@ -27,7 +27,8 @@ Task storage / dead-letter queue (split-store protocols):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, NamedTuple, runtime_checkable
+from enum import StrEnum
+from typing import TYPE_CHECKING, NamedTuple, runtime_checkable
 
 from typing_extensions import Protocol
 
@@ -119,21 +120,27 @@ class RoutingBackendProtocol(Protocol):
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
 
 
-CancellationKind = Literal["task", "dag"]
+class CancellationKind(StrEnum):
+    """Discriminator for a CancellationMessage: cancel a task, a whole DAG run, or abort a stale-marked task."""
+
+    TASK = "task"
+    DAG = "dag"
+    STALE = "stale"
 
 
 class CancellationMessage(NamedTuple):
-    """A parsed cancellation-bus message: cancel one task, or every task in a DAG run."""
+    """A parsed cancellation-bus message: cancel one task, cancel every task in a DAG run, or abort a task the Cleaner already marked STALLED."""
 
     kind: CancellationKind
     id: ULID
 
 
 class CancellationBusProtocol(Protocol):  # pragma: no cover
-    """Pub/sub channel for in-flight task and DAG-run cancellation signals."""
+    """Pub/sub channel for in-flight task, DAG-run, and stale-task cancellation signals."""
 
     async def publish_cancellation(self, task_id: ULID) -> None: ...
     async def publish_dag_cancellation(self, dag_run_id: ULID) -> None: ...
+    async def publish_stale_cancellation(self, task_id: ULID) -> None: ...
     def listen_cancellations(self) -> AsyncIterator[CancellationMessage]: ...
 
 
@@ -258,6 +265,20 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
 
         Redis: implemented via WATCH/MULTI on the task key.
         SQL: implemented via ``UPDATE ... WHERE status = ? RETURNING status``.
+        """
+        ...
+
+    async def save_task_if_status(self, task: Task, expected: TaskStatus) -> bool:
+        """
+        Persist ``task`` exactly as given only if the *stored* task's status equals ``expected``.
+
+        Unlike ``compare_and_set_status``, which re-reads the stored task and flips only
+        its status, this persists the caller-supplied ``task`` object in full. Returns
+        False -- the write is dropped -- if the stored status has already moved on (e.g.
+        the Cleaner marked it STALLED while this worker was still computing a result).
+
+        Redis: implemented via WATCH/MULTI on the task key.
+        SQL: implemented via ``UPDATE ... WHERE id = ? AND status = ?``.
         """
         ...
 
@@ -466,6 +487,24 @@ class AtomicTaskStateProtocol(TaskStateProtocol, Protocol):  # pragma: no cover
         additional staged operations before committing.
 
         Returns True if dispatched, False if the task was not found or already cancelled.
+        Locking strategy: WATCH/MULTI (Redis) or SELECT FOR UPDATE (SQL).
+        """
+        ...
+
+    async def atomic_save_if_status(
+        self,
+        task: Task,
+        expected: TaskStatus,
+        stage_extra: Callable[[TransactionHandle], None],
+    ) -> bool:
+        """
+        Apply the same guard as ``save_task_if_status``, plus a same-transaction extra staged op.
+
+        Reads the stored task's status under lock; if it matches ``expected``, stages
+        the caller-supplied ``task`` save and calls stage_extra(pipe) (e.g. a dead-letter
+        add) before committing both atomically. Returns False -- nothing staged or
+        committed -- if the stored status no longer matches.
+
         Locking strategy: WATCH/MULTI (Redis) or SELECT FOR UPDATE (SQL).
         """
         ...

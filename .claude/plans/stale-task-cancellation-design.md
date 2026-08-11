@@ -1,6 +1,6 @@
 # Stale Task Cancellation — Design Proposal
 
-Status: **draft, pending review** — no implementation yet.
+Status: implemented.
 
 ## 1. Problem
 
@@ -123,7 +123,10 @@ diff than teaching the parser a variable number of segments, and avoids the
 tail if the reason were tacked onto the existing `"task"` kind instead.
 
 ```python
-CancellationKind = Literal["task", "dag", "stale"]
+class CancellationKind(StrEnum):
+    TASK = "task"
+    DAG = "dag"
+    STALE = "stale"
 
 class CancellationBusProtocol(Protocol):
     async def publish_cancellation(self, task_id: ULID) -> None: ...
@@ -134,7 +137,8 @@ class CancellationBusProtocol(Protocol):
 
 `RedisCancellationBus.publish_stale_cancellation` publishes `f"stale:{task_id}"`;
 `_listen_gen`'s `kind in ("task", "dag")` check (`cancellation_bus.py:51`) becomes
-`kind in ("task", "dag", "stale")`. No other parsing change.
+`kind in (CancellationKind.TASK, CancellationKind.DAG, CancellationKind.STALE)`. No
+other parsing change.
 
 ### 4.2 Cleaner wiring
 
@@ -158,16 +162,22 @@ registered) is exactly as cheap and side-effect-free as today's fire-and-forget
 ### 4.3 In-process dispatch: a signal that never touches status
 
 `_CancelHandle` gains a reason so `signal_cancel` can tell `monitor_task_cancellation`
-which kind of cancellation fired:
+which kind of cancellation fired. Same reasoning as `CancellationKind`'s conversion —
+this is another fixed, closed set of string values, so it gets its own `StrEnum`
+rather than a `Literal`:
 
 ```python
+class CancelReason(StrEnum):
+    USER = "user"
+    STALE = "stale"
+
 @dataclass
 class _CancelHandle:
     event: asyncio.Event
     dag_run_id: ULID | None
-    reason: Literal["user", "stale"] = "user"
+    reason: CancelReason = CancelReason.USER
 
-def signal_cancel(self, task_id: ULID, reason: Literal["user", "stale"] = "user") -> bool:
+def signal_cancel(self, task_id: ULID, reason: CancelReason = CancelReason.USER) -> bool:
     handle = self._cancel_events.get(task_id)
     if handle is not None:
         handle.reason = reason
@@ -180,10 +190,10 @@ def signal_cancel(self, task_id: ULID, reason: Literal["user", "stale"] = "user"
 
 ```python
 async for msg in self.cancellation_bus.listen_cancellations():
-    if msg.kind == "task":
+    if msg.kind == CancellationKind.TASK:
         self.signal_cancel(msg.id)
-    elif msg.kind == "stale":
-        self.signal_cancel(msg.id, reason="stale")
+    elif msg.kind == CancellationKind.STALE:
+        self.signal_cancel(msg.id, reason=CancelReason.STALE)
     else:
         self.signal_cancel_dag(msg.id)
 ```
@@ -204,7 +214,7 @@ async def monitor_task_cancellation(self, task_id: ULID) -> None:
     if handle is None:
         return
     await handle.event.wait()
-    if handle.reason == "stale":
+    if handle.reason == CancelReason.STALE:
         logger.warning("Task %s aborted locally: already marked STALLED by cleaner.", task_id)
         raise StaleTaskCancelledError(f"Task {task_id} was marked stale by the cleaner.")
     logger.info("Received cancellation signal for task %s", task_id)
@@ -246,14 +256,14 @@ save the task with its still-`STARTED` local status, re-persisting over the Clea
 except asyncio.CancelledError as exc:
     if task.status == TaskStatus.CANCELLED:
         pass  # user cancellation already handled; keep CANCELLED status
-    elif self.state_manager.cancel_reason(task.id) == "stale":
+    elif self.state_manager.cancel_reason(task.id) == CancelReason.STALE:
         pass  # cleaner already marked this task STALLED; nothing to persist
     else:
         ex = exc
         await self.handle_system_cancelled_task(task)
 ```
 
-`cancel_reason(task_id) -> str | None` is a small new read-only accessor on
+`cancel_reason(task_id) -> CancelReason | None` is a small new read-only accessor on
 `StateManager` (`self._cancel_events.get(task_id)` and return `.reason` or `None`) so
 `TaskProcessor` doesn't reach into the private `_cancel_events` dict directly — the
 handle is still present at this point because `run()`'s `with
@@ -325,15 +335,16 @@ WATCH-based guard) and folding the CAS into its separate active-run-marker pipel
 is a bigger change than this feature needs; flagged as a follow-up if it turns out to
 matter in practice.
 
-**Decision needed:** should a late-arriving success ever be allowed to overturn
-`STALLED`? Recommendation: **no — `STALLED` stays authoritative, the late write is
-dropped and only recorded as a metric.** This matches
-`docs/dag-resume-design.md`'s model, where a stuck task's *only* sanctioned path back
-to `SUBMITTED` is an explicit operator-triggered resume (`resume_dag_run`), not a race
-between the Cleaner and whichever writer happens to land last. If this default turns
-out to be wrong in practice (e.g. heartbeat timeouts are frequently too aggressive for
-some task type), the fix is tuning `max_heartbeat_interval` for that task, not
-relaxing this guard.
+**Decided:** a late-arriving success never overturns `STALLED` — `STALLED` stays
+authoritative, the late write is dropped, and the event is surfaced (not silently
+swallowed) via the `logger.warning` call and `tasks_completed_after_stale` counter
+increment shown above, so an operator can tell whether `max_heartbeat_interval` is
+mistuned for that task type. This matches `docs/dag-resume-design.md`'s model, where a
+stuck task's *only* sanctioned path back to `SUBMITTED` is an explicit
+operator-triggered resume (`resume_dag_run`), not a race between the Cleaner and
+whichever writer happens to land last. If the default heartbeat window turns out to be
+wrong in practice for some task type, the fix is tuning `max_heartbeat_interval` for
+that task, not relaxing this guard. See §9, decision 3.
 
 ### 4.5 Metrics
 
@@ -428,11 +439,64 @@ with a dual-publish transition if this project ever needs zero-downtime rollouts
    built around `stuck_statuses()`.
 3. **Late completions after a stale mark are dropped, not applied** (§4.4) —
    `STALLED` is authoritative once the Cleaner has written it; recovery is
-   operator-triggered resume, not a race between writers. Recorded via
-   `tasks_completed_after_stale` for visibility into how often this actually happens.
+   operator-triggered resume, not a race between writers. Surfaced via a
+   `logger.warning` log line and the `tasks_completed_after_stale` counter so an
+   operator can tell how often this happens and whether `max_heartbeat_interval` needs
+   retuning for that task type.
 4. **`complete_cron_task`'s path is out of scope** (§4.4) — a fast-follow if stale cron
    tasks turn out to matter in practice.
 5. **Rollout: plain cutover** (§7) — consistent with the precedent set in
    `docs/dag-cancellation-design.md` §7; no production users yet.
 
-This design is ready to move into implementation planning.
+## 10. Implementation notes (decisions made during/after implementation)
+
+1. **`save_task_if_status` split into a base method + an Atomic-only
+   `atomic_save_if_status`.** `fail_task`'s atomic branch stages a task save *and* a
+   DLQ add in one transaction; a bare 2-arg `save_task_if_status` had no way to fold
+   the DLQ add into the same guarded write without reopening the exact race this
+   feature closes (task DLQ'd even though its guarded save was dropped, or vice
+   versa). Added `atomic_save_if_status(task, expected, stage_extra)` on
+   `AtomicTaskStateProtocol`, mirroring the existing `compare_and_set_status` (base) /
+   `atomic_dispatch_scheduled` (atomic, `stage_extra`) split — same precedent, same
+   shape. `fail_task`'s atomic branch uses it; the saga branch uses the plain
+   `save_task_if_status` and gates the separate `dead_queue.add_to_dlq` call on the
+   returned `applied` bool.
+2. **Gap 1 resolved: `expected=TaskStatus.STARTED` is hardcoded, not threaded as a
+   parameter**, in `handle_success`, `fail_task`, and `handle_user_cancelled_task`.
+   Traced all call sites — every one is entered with the task's *stored* status still
+   `STARTED` (set by `mark_task_as_started` at the top of `process()` and never
+   mutated before any of the three writers run) — so the doc's "analogously" for
+   `handle_user_cancelled_task` needed no further design work.
+3. **A second, previously-unguarded race was found and closed post-implementation:
+   the Cleaner's own `STALLED` write was itself unconditional.** `clean()`'s stale
+   loop staged `stage_save`/`save_task` using the in-memory snapshot from
+   `get_stale_tasks()`, with no check that the *stored* status still matched what was
+   scanned. A worker that legitimately completes/fails/cancels a task in the window
+   between the Cleaner's scan and its write (via the CAS-guarded paths above,
+   §4.4) could have that real outcome silently overwritten back to `STALLED` — and,
+   if `dead_letter_policy=SAVE`, incorrectly DLQ'd — by the Cleaner moments later.
+   This is the mirror image of the problem this whole feature set out to fix. Closed
+   by adding `StateManager._mark_task_stale(task, needs_dlq, now)`, which CAS-guards
+   the Cleaner's write against `TaskStatus.STARTED` the same way (atomic branch folds
+   heartbeat removal + DLQ add into `atomic_save_if_status`'s `stage_extra`; saga
+   branch uses `save_task_if_status` then a separate heartbeat removal). A task that
+   resolved first is now left untouched — no STALLED overwrite, no DLQ, no stale
+   cancellation published. Covered by
+   `test_mark_task_stale_drops_write_when_task_resolved_during_race_window`
+   (`tests/test_state_manager.py`) against a real `RedisTaskState`.
+4. **Test-double bug found via (3): `DummyTaskState.get_stale_tasks` yielded the same
+   object reference stored in `_store`**, not a fresh copy — real backends always
+   deserialize a new object per read, so mutating a scanned snapshot (`task.set_status
+   (STALLED)`) never affects "what's stored" until an explicit write. The Dummy's
+   aliasing meant the new CAS guard's comparison was corrupted by the Cleaner's own
+   pre-write mutation. Fixed by yielding `task.model_copy(deep=True)`
+   (`tests/conftest.py`) to match real-backend semantics.
+5. **Two doc corrections found during implementation, no design impact:**
+   `RedisCancellationBus` is constructed at `db.py:278`, not `272`; the contract-test
+   home named in §8 (`tests/adapters/test_task_adapter_common.py`) doesn't exist — the
+   real file is `tests/adapters/test_task_state_common.py`, which already hosts
+   `compare_and_set_status`'s contract tests in the same pattern.
+
+This design is implemented; see `jobbers/state_manager.py`, `jobbers/task_processor.py`,
+`jobbers/protocols.py`, `jobbers/adapters/_shared.py`,
+`jobbers/adapters/sql/task_state.py`, and `jobbers/adapters/redis/cancellation_bus.py`.

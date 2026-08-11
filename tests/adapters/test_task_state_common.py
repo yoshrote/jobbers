@@ -1373,6 +1373,56 @@ async def test_compare_and_set_status_returns_false_for_missing_task(task_adapte
     assert result is False
 
 
+# ── save_task_if_status ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_save_task_if_status_succeeds_and_persists_full_task(task_adapter):
+    """save_task_if_status persists the caller's full task -- not just status -- when expected matches."""
+    state, submit = task_adapter
+    await submit.submit_task(make_task(status=TaskStatus.STARTED))
+    updated = await state.get_task(ULID1)
+    assert updated is not None
+    updated.set_status(TaskStatus.COMPLETED)
+    updated.results = {"answer": 42}
+
+    result = await state.save_task_if_status(updated, TaskStatus.STARTED)
+
+    assert result is True
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    assert saved.results == {"answer": 42}
+
+
+@pytest.mark.asyncio
+async def test_save_task_if_status_fails_when_status_differs(task_adapter):
+    """save_task_if_status returns False and leaves every field unchanged when expected does not match."""
+    state, submit = task_adapter
+    await submit.submit_task(make_task(status=TaskStatus.SUBMITTED))
+    updated = await state.get_task(ULID1)
+    assert updated is not None
+    updated.set_status(TaskStatus.COMPLETED)
+    updated.results = {"answer": 42}
+
+    result = await state.save_task_if_status(updated, TaskStatus.STARTED)
+
+    assert result is False
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert saved.results == {}
+
+
+@pytest.mark.asyncio
+async def test_save_task_if_status_returns_false_for_missing_task(task_adapter):
+    """save_task_if_status returns False when the task does not exist."""
+    state, submit = task_adapter
+    missing = make_task(task_id=ULID(), status=TaskStatus.COMPLETED)
+    result = await state.save_task_if_status(missing, TaskStatus.STARTED)
+    assert result is False
+
+
 # ── clean ─────────────────────────────────────────────────────────────────────
 
 

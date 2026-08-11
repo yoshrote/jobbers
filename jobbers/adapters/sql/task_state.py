@@ -301,6 +301,30 @@ class SQLTaskState:
         await pipe.execute()
         return True
 
+    async def atomic_save_if_status(
+        self,
+        task: Task,
+        expected: TaskStatus,
+        stage_extra: Callable[[TransactionHandle], None],
+    ) -> bool:
+        """
+        Apply the same guard as ``save_task_if_status``, plus a same-transaction extra staged op.
+
+        Uses SELECT FOR UPDATE (non-SQLite) to lock the row for the duration of the
+        transaction — no retry loop required, unlike the Redis WATCH/MULTI path.
+        Returns False -- nothing staged or committed -- if the stored status no longer
+        matches ``expected``.
+        """
+        pipe = self.pipeline(transaction=True)
+        current = await self.read_for_watch(pipe, task.id)
+        if current is None or current.status != expected:
+            await pipe.execute()
+            return False
+        self.stage_save(pipe, task)
+        stage_extra(pipe)
+        await pipe.execute()
+        return True
+
     # ── TaskStateProtocol: direct reads/writes ─────────────────────────────
 
     async def save_task(self, task: Task) -> None:
@@ -341,6 +365,19 @@ class SQLTaskState:
                     update(tasks)
                     .where(tasks.c.id == str(task_id), tasks.c.status == expected.value)
                     .values(status=new.value)
+                )
+                return bool(result.rowcount == 1)  # type: ignore[attr-defined]
+
+    async def save_task_if_status(self, task: Task, expected: TaskStatus) -> bool:
+        """Persist ``task`` exactly as given only if the stored status equals ``expected``."""
+        row = _task_to_row(task)
+        values = {k: v for k, v in row.items() if k != "id"}
+        async with self._sf() as session:
+            async with session.begin():
+                result = await session.execute(
+                    update(tasks)
+                    .where(tasks.c.id == row["id"], tasks.c.status == expected.value)
+                    .values(**values)
                 )
                 return bool(result.rowcount == 1)  # type: ignore[attr-defined]
 

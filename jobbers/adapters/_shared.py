@@ -276,6 +276,30 @@ class SharedTaskAdapterMixin(ABC):
             except WatchError:
                 continue
 
+    async def save_task_if_status(self, task: Task, expected: TaskStatus) -> bool:
+        """
+        Persist ``task`` exactly as given only if the stored task's status equals ``expected``.
+
+        Uses WATCH/MULTI for optimistic locking: retries on concurrent modification.
+        Unlike ``compare_and_set_status``, stages the caller-supplied ``task`` object
+        rather than a re-read-and-flipped copy.
+        """
+        task_key = self.TASK_DETAILS(task_id=task.id)
+        while True:
+            pipe = self.data_store.pipeline()
+            await pipe.watch(task_key)
+            current = await self.read_for_watch(pipe, task.id)
+            if current is None or current.status != expected:
+                await pipe.unwatch()  # type: ignore[no-untyped-call]
+                return False
+            pipe.multi()  # type: ignore[no-untyped-call]
+            self.stage_save(pipe, task)
+            try:
+                await pipe.execute()
+                return True
+            except WatchError:
+                continue
+
     async def atomic_dispatch_scheduled(
         self,
         task: Task,
@@ -300,6 +324,36 @@ class SharedTaskAdapterMixin(ABC):
             task.set_status(TaskStatus.SUBMITTED)
             pipe.multi()  # type: ignore[no-untyped-call]
             self.stage_requeue(pipe, task)
+            stage_extra(pipe)
+            try:
+                await pipe.execute()
+                return True
+            except WatchError:
+                continue
+
+    async def atomic_save_if_status(
+        self,
+        task: Task,
+        expected: TaskStatus,
+        stage_extra: Callable[[TransactionHandle], None],
+    ) -> bool:
+        """
+        Apply the same guard as ``save_task_if_status``, plus a same-transaction extra staged op.
+
+        Reads the stored task under WATCH; if its status matches ``expected``, stages
+        the caller-supplied ``task`` save and calls stage_extra(pipe) (e.g. a
+        dead-letter add) before committing both atomically. Retries on WatchError.
+        """
+        task_key = self.TASK_DETAILS(task_id=task.id)
+        while True:
+            pipe = self.data_store.pipeline()
+            await pipe.watch(task_key)
+            current = await self.read_for_watch(pipe, task.id)
+            if current is None or current.status != expected:
+                await pipe.unwatch()  # type: ignore[no-untyped-call]
+                return False
+            pipe.multi()  # type: ignore[no-untyped-call]
+            self.stage_save(pipe, task)
             stage_extra(pipe)
             try:
                 await pipe.execute()

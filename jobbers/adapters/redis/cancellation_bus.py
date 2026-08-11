@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from ulid import ULID
 
-from jobbers.protocols import CancellationMessage
+from jobbers.protocols import CancellationKind, CancellationMessage
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -36,6 +36,9 @@ class RedisCancellationBus:
     async def publish_dag_cancellation(self, dag_run_id: ULID) -> None:
         await self._client.publish(self.CHANNEL, f"dag:{dag_run_id}")
 
+    async def publish_stale_cancellation(self, task_id: ULID) -> None:
+        await self._client.publish(self.CHANNEL, f"stale:{task_id}")
+
     def listen_cancellations(self) -> AsyncGenerator[CancellationMessage, None]:
         return self._listen_gen()
 
@@ -48,10 +51,10 @@ class RedisCancellationBus:
                     raw = message["data"]
                     payload = raw.decode() if isinstance(raw, bytes) else raw
                     kind, sep, raw_id = payload.partition(":")
-                    if sep and kind in ("task", "dag"):
+                    if sep:
                         try:
-                            yield CancellationMessage(kind, ULID.from_str(raw_id))  # type: ignore[arg-type]
-                        except Exception:
+                            yield CancellationMessage(CancellationKind(kind), ULID.from_str(raw_id))
+                        except ValueError:
                             logger.warning("Invalid id in cancellations channel: %r", payload)
                     else:
                         logger.warning("Malformed cancellations channel message: %r", payload)

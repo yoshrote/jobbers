@@ -24,7 +24,14 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
-from jobbers.state_manager import StateManager, TaskException, TaskRateLimitedError, UserCancellationError
+from jobbers.state_manager import (
+    CancelReason,
+    StaleTaskCancelledError,
+    StateManager,
+    TaskException,
+    TaskRateLimitedError,
+    UserCancellationError,
+)
 from tests.conftest import DummyCronDAGScheduler, DummyTaskSubmit
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -268,6 +275,128 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager_
     assert saved is not None
     assert saved.status == TaskStatus.STALLED
     assert await redis.zscore("task-heartbeats:default", ULID1.bytes) is None
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_publishes_stale_cancellation_and_counts_it(redis, state_manager_real_ta):
+    """Marking a task STALLED publishes a stale cancellation and increments stale_cancellations_published."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_state.save_task(started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
+    )
+    with (
+        patch.object(registry, "get_task_config", return_value=stale_config),
+        patch.object(
+            state_manager_real_ta.cancellation_bus, "publish_stale_cancellation", new=AsyncMock()
+        ) as mock_publish,
+        patch("jobbers.state_manager.stale_cancellations_published") as mock_counter,
+    ):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    mock_publish.assert_awaited_once_with(ULID1)
+    mock_counter.add.assert_called_once_with(1, {"queue": "default", "task": "my_task", "version": 0})
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_signals_live_worker_via_real_cancellation_bus(redis, state_manager_real_ta):
+    """
+    End-to-end: a live worker receives the Cleaner's stale cancellation over the real bus.
+
+    The Cleaner's stale sweep publishes over the real cancellation bus, a worker's
+    run_cancel_listener consumes it, and the registered monitor raises
+    StaleTaskCancelledError -- while the persisted status stays STALLED and the
+    heartbeat is removed exactly once. Exercises the atomicity/ordering-sensitive
+    interaction between clean() and a live in-flight worker, per CLAUDE.md's rule that
+    this needs a real backend, not just DummyTaskAdapter.
+    """
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_state.save_task(started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
+    )
+
+    listener = asyncio.create_task(state_manager_real_ta.run_cancel_listener())
+    try:
+        with state_manager_real_ta.cancel_event(ULID1):
+            monitor = asyncio.create_task(state_manager_real_ta.monitor_task_cancellation(ULID1))
+            await asyncio.sleep(0.05)  # let the listener subscribe
+
+            with patch.object(registry, "get_task_config", return_value=stale_config):
+                await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+            with pytest.raises(StaleTaskCancelledError):
+                await asyncio.wait_for(monitor, timeout=1.0)
+    finally:
+        listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await listener
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert await redis.zscore("task-heartbeats:default", ULID1.bytes) is None
+
+
+@pytest.mark.asyncio
+async def test_mark_task_stale_drops_write_when_task_resolved_during_race_window(
+    redis, state_manager_real_ta
+):
+    """
+    _mark_task_stale guards against the inverse race: a worker's own write lands between the Cleaner's snapshot and its STALLED write.
+
+    A worker's CAS-guarded completion write lands between the Cleaner's stale-scan
+    snapshot and the Cleaner's own STALLED write. The Cleaner's write must lose -- not
+    silently overwrite a real COMPLETED result back to STALLED (and incorrectly DLQ it).
+    """
+    await state_manager_real_ta.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
+    # A snapshot of the task the way clean()'s stale scan would have captured it, with
+    # the local mutation to STALLED already applied (mirroring clean()'s own logic)
+    # before the guarded write.
+    snapshot = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STALLED)
+
+    # Simulate a worker completing the task in the race window -- after the Cleaner's
+    # scan but before the Cleaner's write -- via the same CAS-guarded save handle_success uses.
+    completed = Task(
+        id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED, results={"ok": True}
+    )
+    worker_applied = await state_manager_real_ta.task_state.save_task_if_status(completed, TaskStatus.STARTED)
+    assert worker_applied is True
+
+    applied = await state_manager_real_ta._mark_task_stale(
+        snapshot, needs_dlq=True, now=dt.datetime.now(dt.UTC)
+    )
+
+    assert applied is False
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    assert saved.results == {"ok": True}
+    assert await state_manager_real_ta.dead_queue.get_by_ids([str(ULID1)]) == []
 
 
 @pytest.mark.asyncio
@@ -682,6 +811,9 @@ def make_task_config(dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NON
 @pytest.mark.asyncio
 async def test_fail_task_no_dlq_writes_redis_only(redis, state_manager):
     """fail_task with NONE policy updates Redis but does not touch the DLQ."""
+    await state_manager.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
     task.task_config = make_task_config(DeadLetterPolicy.NONE)
 
@@ -695,6 +827,9 @@ async def test_fail_task_no_dlq_writes_redis_only(redis, state_manager):
 @pytest.mark.asyncio
 async def test_fail_task_with_dlq_writes_both_stores(redis, state_manager):
     """fail_task with SAVE policy updates Redis and writes to the DLQ."""
+    await state_manager.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
     task.task_config = make_task_config(DeadLetterPolicy.SAVE)
 
@@ -705,6 +840,38 @@ async def test_fail_task_with_dlq_writes_both_stores(redis, state_manager):
     dlq = await state_manager.dead_queue.get_by_ids([str(ULID1)])
     assert len(dlq) == 1
     assert dlq[0].id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_fail_task_drops_write_and_dlq_add_when_marked_stale_meanwhile(redis, state_manager_real_ta):
+    """
+    fail_task's atomic+DLQ branch is CAS-guarded against a Cleaner-marked-stale task.
+
+    If the Cleaner already marked the task STALLED, the write and the DLQ add are both
+    dropped rather than applied. Exercises atomic_save_if_status's stage_extra path
+    against a real WATCH/MULTI backend, per CLAUDE.md's rule that atomicity-sensitive
+    interactions need a real backend, not a DummyTaskAdapter.
+    """
+    await state_manager_real_ta.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
+    # Simulate the Cleaner marking the task STALLED while a worker is still computing a result.
+    marked_stale = await state_manager_real_ta.task_state.compare_and_set_status(
+        ULID1, TaskStatus.STARTED, TaskStatus.STALLED
+    )
+    assert marked_stale is True
+
+    stale_copy = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
+    stale_copy.task_config = make_task_config(DeadLetterPolicy.SAVE)
+
+    with patch("jobbers.state_manager.tasks_completed_after_stale") as mock_counter:
+        await state_manager_real_ta.fail_task(stale_copy)
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert await state_manager_real_ta.dead_queue.get_by_ids([str(ULID1)]) == []
+    mock_counter.add.assert_called_once_with(1, {"queue": "default", "task": "my_task"})
 
 
 # ── resubmit_dead_tasks ───────────────────────────────────────────────────────
@@ -1440,6 +1607,38 @@ async def test_monitor_task_cancellation_does_not_exit_without_message(state_man
         monitor.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await monitor
+
+
+@pytest.mark.asyncio
+async def test_monitor_task_cancellation_raises_stale_error_on_stale_signal(state_manager):
+    """monitor_task_cancellation raises StaleTaskCancelledError (not UserCancellationError) for a stale-reason signal."""
+    task_id = ULID1
+    with state_manager.cancel_event(task_id):
+        monitor = asyncio.create_task(state_manager.monitor_task_cancellation(task_id))
+        state_manager.signal_cancel(task_id, reason=CancelReason.STALE)
+        with pytest.raises(StaleTaskCancelledError):
+            await monitor
+
+
+# ── cancel_reason ─────────────────────────────────────────────────────────────
+
+
+def test_cancel_reason_returns_none_when_no_handle_registered(state_manager):
+    """cancel_reason returns None for a task with no in-flight cancel handle."""
+    assert state_manager.cancel_reason(ULID1) is None
+
+
+def test_cancel_reason_defaults_to_user(state_manager):
+    """cancel_reason defaults to CancelReason.USER for a freshly registered handle."""
+    with state_manager.cancel_event(ULID1):
+        assert state_manager.cancel_reason(ULID1) == CancelReason.USER
+
+
+def test_cancel_reason_reflects_stale_signal(state_manager):
+    """cancel_reason reports CancelReason.STALE after a stale-reason signal_cancel call."""
+    with state_manager.cancel_event(ULID1):
+        state_manager.signal_cancel(ULID1, reason=CancelReason.STALE)
+        assert state_manager.cancel_reason(ULID1) == CancelReason.STALE
 
 
 # ── schedule_new_task ─────────────────────────────────────────────────────────
@@ -2213,6 +2412,9 @@ async def _schedule_saga(sm: StateManager, task: Task, run_at: dt.datetime) -> N
 @pytest.mark.asyncio
 async def test_fail_task_with_dlq_saga_mode(saga_state_manager):
     """fail_task calls dead_queue.add_to_dlq directly when adapters are non-atomic."""
+    await saga_state_manager.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
     task.task_config = make_task_config(DeadLetterPolicy.SAVE)
 
@@ -2228,6 +2430,9 @@ async def test_fail_task_with_dlq_saga_mode(saga_state_manager):
 @pytest.mark.asyncio
 async def test_fail_task_no_dlq_saga_mode(saga_state_manager):
     """fail_task with NONE policy saves the task without touching the DLQ in saga mode."""
+    await saga_state_manager.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
     task.task_config = make_task_config(DeadLetterPolicy.NONE)
 

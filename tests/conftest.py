@@ -96,6 +96,13 @@ class DummyTaskState:
         task.set_status(new)  # type: ignore[arg-type]
         return True
 
+    async def save_task_if_status(self, task: Task, expected: object) -> bool:
+        current = self._store.get(task.id)
+        if current is None or current.status != expected:
+            return False
+        self._store[task.id] = task
+        return True
+
     async def get_active_tasks(self, queues: object) -> list[Task]:
         return [t for tid, t in self._store.items() if tid in self._heartbeats]
 
@@ -105,7 +112,11 @@ class DummyTaskState:
             if score < cutoff:
                 task = self._store.get(task_id)
                 if task is not None:
-                    yield task
+                    # Real backends always deserialize a fresh object per read, decoupled
+                    # from whatever the caller does to it afterward -- yield a copy here
+                    # too, so mutating the snapshot (e.g. clean()'s task.set_status(STALLED))
+                    # doesn't corrupt the "stored" object a later CAS check reads against.
+                    yield task.model_copy(deep=True)
 
     async def get_all_tasks(self, pagination: object) -> list[Task]:
         raise NotImplementedError("DummyTaskState.get_all_tasks")
@@ -244,6 +255,16 @@ class AtomicDummyTaskState(DummyTaskState):
         task.set_status(TaskStatus.SUBMITTED)
         pipe = self._data_store.pipeline(transaction=True)  # type: ignore[union-attr]
         self.stage_requeue(pipe, task)
+        stage_extra(pipe)  # type: ignore[operator]
+        await pipe.execute()
+        return True
+
+    async def atomic_save_if_status(self, task: Task, expected: object, stage_extra: object) -> bool:
+        current = self._store.get(task.id)
+        if current is None or current.status != expected:
+            return False
+        pipe = self._data_store.pipeline(transaction=True)  # type: ignore[union-attr]
+        self.stage_save(pipe, task)
         stage_extra(pipe)  # type: ignore[operator]
         await pipe.execute()
         return True

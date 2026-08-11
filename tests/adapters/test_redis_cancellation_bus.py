@@ -55,6 +55,22 @@ async def test_publish_dag_cancellation_delivers_dag_kind(redis):
 
 
 @pytest.mark.asyncio
+async def test_publish_stale_cancellation_delivers_stale_kind(redis):
+    """publish_stale_cancellation is received as a CancellationMessage(kind='stale', id=...)."""
+    bus = RedisCancellationBus(redis)
+    task_id = ULID()
+
+    listener = asyncio.create_task(_next_message(bus))
+    await asyncio.sleep(0.05)  # let the listener subscribe
+    await bus.publish_stale_cancellation(task_id)
+
+    msg = await asyncio.wait_for(listener, timeout=1.0)
+    assert msg is not None
+    assert msg.kind == "stale"
+    assert msg.id == task_id
+
+
+@pytest.mark.asyncio
 async def test_publish_dag_cancellation_does_not_publish_per_task_messages(redis):
     """A single publish_dag_cancellation call produces exactly one message on the channel."""
     bus = RedisCancellationBus(redis)

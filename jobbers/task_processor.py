@@ -21,7 +21,13 @@ from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import get_task_config
-from jobbers.state_manager import StateManager, TaskRateLimitedError, UserCancellationError
+from jobbers.state_manager import (
+    CancelReason,
+    StaleTaskCancelledError,
+    StateManager,
+    TaskRateLimitedError,
+    UserCancellationError,
+)
 from jobbers.utils.di import DependencyResolver
 from jobbers.utils.di import Depends as _Depends
 
@@ -104,6 +110,7 @@ tasks_retried = meter.create_counter("tasks_retried", unit="1")
 execution_time = meter.create_histogram("task_execution_time", unit="ms")
 end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms")
 post_process_failures = meter.create_counter("post_process_failures", unit="1")
+tasks_completed_after_stale = meter.create_counter("tasks_completed_after_stale", unit="1")
 
 _OMIT = object()  # sentinel: key legitimately absent — let the function's own Python default apply
 
@@ -162,9 +169,9 @@ class TaskProcessor:
                     process_task.add_done_callback(lambda t: monitor_task.cancel())
             except ExceptionGroup as eg:
                 for exc in eg.exceptions:
-                    # Treat UserCancellationError as a normal control flow signal to exit the TaskGroup;
-                    # re-raise any other exceptions.
-                    if not isinstance(exc, UserCancellationError):
+                    # Treat UserCancellationError/StaleTaskCancelledError as normal control
+                    # flow signals to exit the TaskGroup; re-raise any other exceptions.
+                    if not isinstance(exc, (UserCancellationError, StaleTaskCancelledError)):
                         raise  # Re-raise to exit the TaskGroup in run()
 
     async def process(self, task: Task) -> Task:
@@ -244,6 +251,8 @@ class TaskProcessor:
                     except asyncio.CancelledError as exc:
                         if task.status == TaskStatus.CANCELLED:
                             pass  # user cancellation already handled; keep CANCELLED status
+                        elif self.state_manager.cancel_reason(task.id) == CancelReason.STALE:
+                            pass  # cleaner already marked this task STALLED; nothing to persist
                         else:
                             ex = exc
                             await self.handle_system_cancelled_task(task)
@@ -318,6 +327,8 @@ class TaskProcessor:
         """Monitor for task cancellation and handle it."""
         try:
             await self.state_manager.monitor_task_cancellation(task.id)
+        except StaleTaskCancelledError:
+            raise  # nothing to persist -- the cleaner's STALLED write is already authoritative
         except UserCancellationError:
             await self.handle_user_cancelled_task(task)
             raise  # Re-raise to exit the TaskGroup in run()
@@ -623,7 +634,10 @@ class TaskProcessor:
     async def handle_user_cancelled_task(self, task: Task) -> None:
         logger.info("Task %s was cancelled by user.", task.id)
         task.set_status(TaskStatus.CANCELLED)
-        await self.state_manager.save_task(task)
+        applied = await self.state_manager.task_state.save_task_if_status(task, TaskStatus.STARTED)
+        if not applied:
+            logger.warning("Task %s cancelled after being marked stale; discarding this result.", task.id)
+            tasks_completed_after_stale.add(1, {"queue": task.queue, "task": task.name})
 
     async def handle_unexpected_exception(self, task: Task, exc: Exception) -> None:
         logger.exception("Exception occurred while processing task %s: %s", task.id, exc)
@@ -667,4 +681,7 @@ class TaskProcessor:
         if task.cron_id is not None:
             await self.state_manager.complete_cron_task(task)
         else:
-            await self.state_manager.save_task(task)
+            applied = await self.state_manager.task_state.save_task_if_status(task, TaskStatus.STARTED)
+            if not applied:
+                logger.warning("Task %s completed after being marked stale; discarding this result.", task.id)
+                tasks_completed_after_stale.add(1, {"queue": task.queue, "task": task.name})

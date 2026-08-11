@@ -7,6 +7,7 @@ import random
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, cast
 
 from croniter import croniter
@@ -29,6 +30,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_status import TaskStatus
+from jobbers.protocols import CancellationKind
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -57,6 +59,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 meter = metrics.get_meter(__name__)
 tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
+stale_cancellations_published = meter.create_counter("stale_cancellations_published", unit="1")
+tasks_completed_after_stale = meter.create_counter("tasks_completed_after_stale", unit="1")
 
 
 def _dag_run_uses_fan_in(tasks: list[Task]) -> bool:
@@ -93,12 +97,20 @@ class ConcurrencyStager:
         self._stage_fn(pipe, task_id)
 
 
+class CancelReason(StrEnum):
+    """Why a _CancelHandle's event was set: a user-initiated cancel, or the Cleaner marking the task STALLED."""
+
+    USER = "user"
+    STALE = "stale"
+
+
 @dataclass
 class _CancelHandle:
     """Per-in-flight-task cancel wait state, registered for the duration of TaskProcessor.run()."""
 
     event: asyncio.Event
     dag_run_id: ULID | None
+    reason: CancelReason = CancelReason.USER
 
 
 class TaskException(Exception):
@@ -109,6 +121,12 @@ class TaskException(Exception):
 
 class UserCancellationError(Exception):
     """Exception raised when a task is cancelled by user request."""
+
+    pass
+
+
+class StaleTaskCancelledError(Exception):
+    """Raised when a worker is told to abort a task the Cleaner already marked STALLED."""
 
     pass
 
@@ -220,9 +238,10 @@ class StateManager:
         finally:
             self._cancel_events.pop(task_id, None)
 
-    def signal_cancel(self, task_id: ULID) -> bool:
+    def signal_cancel(self, task_id: ULID, reason: CancelReason = CancelReason.USER) -> bool:
         handle = self._cancel_events.get(task_id)
         if handle is not None:
+            handle.reason = reason
             handle.event.set()
             return True
         return False
@@ -235,6 +254,36 @@ class StateManager:
                 handle.event.set()
                 n += 1
         return n
+
+    def cancel_reason(self, task_id: ULID) -> CancelReason | None:
+        """Return the reason the last-fired cancel signal was raised for this task, if any."""
+        handle = self._cancel_events.get(task_id)
+        return handle.reason if handle is not None else None
+
+    async def _mark_task_stale(self, task: Task, needs_dlq: bool, now: dt.datetime) -> bool:
+        """
+        CAS-guard the Cleaner's STALLED write against the task's currently stored status.
+
+        ``task`` is a snapshot captured earlier in clean()'s stale scan -- a live worker
+        may have legitimately completed/failed/cancelled it in the meantime via its own
+        CAS-guarded write. Only applies the write (and only stages a DLQ add) if the
+        *stored* status is still STARTED; otherwise the worker's outcome wins and this
+        is a no-op. Returns whether the write was applied.
+        """
+        if self._atomic_state is not None:
+            atomic_state = self._atomic_state
+            atomic_dlq = self._atomic_dlq
+
+            def _stage_extra(pipe: TransactionHandle) -> None:
+                atomic_state.stage_remove_heartbeat(pipe, task)
+                if needs_dlq and atomic_dlq is not None:
+                    atomic_dlq.stage_add(pipe, task, now)
+
+            return await atomic_state.atomic_save_if_status(task, TaskStatus.STARTED, _stage_extra)
+        applied = await self.task_state.save_task_if_status(task, TaskStatus.STARTED)
+        if applied:
+            await self.task_state.remove_task_heartbeat(task)
+        return applied
 
     async def clean(
         self,
@@ -281,14 +330,12 @@ class StateManager:
                     continue
                 stale_tasks_by_type[(task.name, task.version)].append(task)
 
-            stale_pipes = []
-            stale_saga_tasks: list[Task] = []
-            dlq_saga_tasks: list[Task] = []
-            for (task_type, task_version), tasks in stale_tasks_by_type.items():
+            stale_candidates: list[tuple[Task, bool]] = []
+            for (task_type, task_version), type_tasks in stale_tasks_by_type.items():
                 task_config = registry.get_task_config(task_type, task_version)
                 if task_config and task_config.max_heartbeat_interval:
                     needs_dlq = task_config.dead_letter_policy == DeadLetterPolicy.SAVE
-                    for task in tasks:
+                    for task in type_tasks:
                         if (
                             task.heartbeat_at
                             and (now - task.heartbeat_at) > task_config.max_heartbeat_interval
@@ -299,31 +346,40 @@ class StateManager:
                             # TaskProcessor._maybe_cleanup), preserving fan-in
                             # tracking and sibling task records within their TTLs.
                             task.set_status(TaskStatus.STALLED)
-                            if self._atomic_state is not None:
-                                pipe = self._atomic_state.pipeline(transaction=True)
-                                self._atomic_state.stage_save(pipe, task)
-                                self._atomic_state.stage_remove_heartbeat(pipe, task)
-                                if needs_dlq and self._atomic_dlq is not None:
-                                    self._atomic_dlq.stage_add(pipe, task, now)
-                                elif needs_dlq:
-                                    dlq_saga_tasks.append(task)
-                                stale_pipes.append(pipe.execute())
-                            else:
-                                stale_saga_tasks.append(task)
-                                if needs_dlq:
-                                    dlq_saga_tasks.append(task)
-                            if needs_dlq:
-                                logger.info("Task %s sent to dead letter queue.", task.id)
-                                tasks_dead_lettered.add(
-                                    1, {"queue": task.queue, "task": task.name, "version": task.version}
-                                )
-            if stale_pipes:
-                await asyncio.gather(*stale_pipes)
-            for stale_task in stale_saga_tasks:
-                await self.task_state.save_task(stale_task)
-                await self.task_state.remove_task_heartbeat(stale_task)
-            if dlq_saga_tasks:
-                await asyncio.gather(*(self.dead_queue.add_to_dlq(t, now) for t in dlq_saga_tasks))
+                            stale_candidates.append((task, needs_dlq))
+
+            if stale_candidates:
+                applied_flags = await asyncio.gather(
+                    *(self._mark_task_stale(task, needs_dlq, now) for task, needs_dlq in stale_candidates)
+                )
+
+                dlq_saga_tasks: list[Task] = []
+                stale_cancel_publishes = []
+                for (task, needs_dlq), applied in zip(stale_candidates, applied_flags, strict=True):
+                    if not applied:
+                        # A live worker's own CAS-guarded write (handle_success/fail_task/
+                        # handle_user_cancelled_task) landed first between the stale scan
+                        # and this write -- its outcome is authoritative, not the Cleaner's.
+                        logger.info(
+                            "Task %s resolved before the Cleaner could mark it stale; skipping.", task.id
+                        )
+                        continue
+                    if needs_dlq and (self._atomic_state is None or self._atomic_dlq is None):
+                        dlq_saga_tasks.append(task)
+                    if needs_dlq:
+                        logger.info("Task %s sent to dead letter queue.", task.id)
+                        tasks_dead_lettered.add(
+                            1, {"queue": task.queue, "task": task.name, "version": task.version}
+                        )
+                    stale_cancel_publishes.append(self.cancellation_bus.publish_stale_cancellation(task.id))
+                    stale_cancellations_published.add(
+                        1, {"queue": task.queue, "task": task.name, "version": task.version}
+                    )
+
+                if dlq_saga_tasks:
+                    await asyncio.gather(*(self.dead_queue.add_to_dlq(t, now) for t in dlq_saga_tasks))
+                if stale_cancel_publishes:
+                    await asyncio.gather(*stale_cancel_publishes)
 
         await asyncio.gather(*clean_ops)
 
@@ -381,22 +437,33 @@ class StateManager:
         return tasks
 
     async def fail_task(self, task: Task) -> Task:
-        """Persist a failed task and any DLQ side effects in a single atomic transaction."""
+        """
+        Persist a failed task and any DLQ side effects in a single atomic transaction.
+
+        Guarded by a compare-and-set against the stored status: if the Cleaner already
+        marked this task STALLED, the write (and any DLQ add) is dropped rather than
+        clobbering that verdict.
+        """
         now = dt.datetime.now(dt.UTC)
         needs_dlq = bool(task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE)
         if self._atomic_state is not None and self._atomic_dlq is not None:
-            pipe = self._atomic_state.pipeline(transaction=True)
-            self._atomic_state.stage_save(pipe, task)
-            if needs_dlq:
-                logger.info("Task %s sent to dead letter queue.", task.id)
-                self._atomic_dlq.stage_add(pipe, task, now)
-            await pipe.execute()
+            atomic_dlq = self._atomic_dlq
+
+            def _stage_dlq(pipe: TransactionHandle) -> None:
+                if needs_dlq:
+                    atomic_dlq.stage_add(pipe, task, now)
+
+            applied = await self._atomic_state.atomic_save_if_status(task, TaskStatus.STARTED, _stage_dlq)
         else:
-            await self.task_state.save_task(task)
-            if needs_dlq:
-                logger.info("Task %s sent to dead letter queue.", task.id)
+            applied = await self.task_state.save_task_if_status(task, TaskStatus.STARTED)
+            if applied and needs_dlq:
                 await self.dead_queue.add_to_dlq(task, now)
+        if not applied:
+            logger.warning("Task %s failed after being marked stale; discarding this result.", task.id)
+            tasks_completed_after_stale.add(1, {"queue": task.queue, "task": task.name})
+            return task
         if needs_dlq:
+            logger.info("Task %s sent to dead letter queue.", task.id)
             tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
         return task
 
@@ -801,7 +868,9 @@ class StateManager:
 
         stuck = [t for t in run_tasks if t.status in TaskStatus.stuck_statuses()]
         if not stuck:
-            return DAGResumePrecheck(dag_run_id=dag_run_id, resumable=False, reason=DAGResumeReason.NO_STUCK_TASKS)
+            return DAGResumePrecheck(
+                dag_run_id=dag_run_id, resumable=False, reason=DAGResumeReason.NO_STUCK_TASKS
+            )
 
         if _dag_run_uses_fan_in(run_tasks) and not await self.task_state.dag_run_fan_in_alive(dag_run_id):
             return DAGResumePrecheck(
@@ -867,19 +936,24 @@ class StateManager:
         return DAGResumeResult(dag_run_id=dag_run_id, resumed_task_ids=[t.id for t in stuck_tasks])
 
     async def monitor_task_cancellation(self, task_id: ULID) -> None:
-        """Wait for a cancel signal for this task and raise UserCancellationError when it arrives."""
+        """Wait for a cancel signal for this task and raise the matching error when it arrives."""
         handle = self._cancel_events.get(task_id)
         if handle is None:
             return
         await handle.event.wait()
+        if handle.reason == CancelReason.STALE:
+            logger.warning("Task %s aborted locally: already marked STALLED by cleaner.", task_id)
+            raise StaleTaskCancelledError(f"Task {task_id} was marked stale by the cleaner.")
         logger.info("Received cancellation signal for task %s", task_id)
         raise UserCancellationError(f"Task {task_id} was cancelled by user request.")
 
     async def run_cancel_listener(self) -> None:
         """Subscribe to the shared cancellations channel and signal matching active tasks."""
         async for msg in self.cancellation_bus.listen_cancellations():
-            if msg.kind == "task":
+            if msg.kind == CancellationKind.TASK:
                 self.signal_cancel(msg.id)
+            elif msg.kind == CancellationKind.STALE:
+                self.signal_cancel(msg.id, reason=CancelReason.STALE)
             else:
                 self.signal_cancel_dag(msg.id)
 

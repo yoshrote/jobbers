@@ -3,7 +3,7 @@ import contextlib
 import datetime as dt
 import logging
 from typing import Annotated
-from unittest.mock import ANY, AsyncMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 from ulid import ULID
@@ -23,7 +23,13 @@ from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
-from jobbers.state_manager import StateManager, TaskRateLimitedError, UserCancellationError
+from jobbers.state_manager import (
+    CancelReason,
+    StaleTaskCancelledError,
+    StateManager,
+    TaskRateLimitedError,
+    UserCancellationError,
+)
 from jobbers.task_processor import TaskProcessor, _spec_to_dag_node
 
 
@@ -67,8 +73,9 @@ async def test_task_processor_success():
 
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
-    # save_task called once when starting; complete_task called when done
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    # save_task called once when starting; the CAS-guarded save_task_if_status when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
 
 
 @pytest.mark.asyncio
@@ -478,8 +485,9 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
 
-    # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    # save_task called when starting; the CAS-guarded save_task_if_status when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
 
 
 @pytest.mark.asyncio
@@ -519,8 +527,9 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
 
-    # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    # save_task called when starting; the CAS-guarded save_task_if_status when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
 
 
 @pytest.mark.asyncio
@@ -560,8 +569,9 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
 
-    # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    # save_task called when starting; the CAS-guarded save_task_if_status when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
 
 
 # ── scheduled-retry tests (TaskScheduler present + retry_delay configured) ───
@@ -951,8 +961,10 @@ async def test_task_processor_run_exits_early_on_cancel_signal():
         await processor.run(task)
 
     assert task.status == TaskStatus.CANCELLED
-    # State was saved at least twice: once when started, once when interrupted.
-    assert state_manager.save_task.call_count >= 2
+    # State was saved once when started (save_task), and once via the CAS-guarded
+    # save_task_if_status when the user cancellation was handled.
+    assert state_manager.save_task.call_count >= 1
+    assert state_manager.task_state.save_task_if_status.await_count >= 1
 
 
 @pytest.mark.asyncio
@@ -987,6 +999,40 @@ async def test_process_does_not_overwrite_cancelled_status_on_system_cancel():
 
     mock_sys.assert_not_called()
     assert task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_process_skips_system_cancel_when_cancel_reason_is_stale():
+    """
+    process() skips handle_system_cancelled_task when the cancel reason is STALE.
+
+    The Cleaner's STALLED write is already authoritative -- nothing should be persisted
+    for a task aborted locally because it was marked stale.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    state_manager.cancel_reason = MagicMock(return_value=CancelReason.STALE)
+
+    async def cancel_immediately() -> dict[str, object]:
+        raise asyncio.CancelledError()
+
+    task_config = TaskConfig(name="test_task", version=1, function=cancel_immediately, timeout=60)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        with patch.object(processor, "handle_system_cancelled_task", new_callable=AsyncMock) as mock_sys:
+            await processor.process(task)
+
+    mock_sys.assert_not_called()
+    # Nothing in the stale path touches local status: it stays whatever it was locally.
+    assert task.status == TaskStatus.STARTED
 
 
 # ── _handle_dynamic_fanout ────────────────────────────────────────────────────
@@ -1498,6 +1544,37 @@ async def test_monitor_task_cancellation_calls_handle_user_cancelled_task():
     mock_handle.assert_called_once_with(task)
 
 
+@pytest.mark.asyncio
+async def test_monitor_task_cancellation_reraises_stale_error_without_handling():
+    """
+    monitor_task_cancellation re-raises StaleTaskCancelledError without calling any handler.
+
+    Unlike UserCancellationError, there's nothing to persist -- the Cleaner's STALLED
+    write is already authoritative.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    state_manager.monitor_task_cancellation.side_effect = StaleTaskCancelledError("stale")
+
+    processor = TaskProcessor(state_manager)
+    with (
+        patch.object(processor, "handle_user_cancelled_task", new_callable=AsyncMock) as mock_user,
+        patch.object(processor, "handle_system_cancelled_task", new_callable=AsyncMock) as mock_sys,
+    ):
+        with pytest.raises((StaleTaskCancelledError, ExceptionGroup)):
+            await processor.monitor_task_cancellation(task)
+
+    mock_user.assert_not_called()
+    mock_sys.assert_not_called()
+
+
 # ── post_process with dag_callbacks ──────────────────────────────────────────
 
 
@@ -1812,6 +1889,41 @@ async def test_run_reraises_non_user_cancellation_error():
             await processor.run(task)
 
 
+@pytest.mark.asyncio
+async def test_run_treats_stale_task_cancelled_error_as_clean_exit():
+    """run() suppresses StaleTaskCancelledError from monitor_task_cancellation, same as UserCancellationError."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+
+    task_started = asyncio.Event()
+
+    async def slow_task():
+        task_started.set()
+        await asyncio.sleep(30)
+        return {}  # pragma: no cover
+
+    task_config = TaskConfig(name="test_task", version=1, function=slow_task, timeout=60)
+
+    async def stale_monitor(_task):
+        await task_started.wait()
+        raise StaleTaskCancelledError(str(_task.id))
+
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch.object(TaskProcessor, "monitor_task_cancellation", side_effect=stale_monitor),
+    ):
+        processor = TaskProcessor(state_manager)
+        # No exception should propagate out of run() -- StaleTaskCancelledError is
+        # treated as a normal control-flow signal, same as UserCancellationError.
+        await processor.run(task)
+
+
 # ── post_process_error ────────────────────────────────────────────────────────
 
 
@@ -1979,8 +2091,8 @@ async def test_non_failed_terminal_statuses_do_not_trigger_error_callback(trigge
 
 
 @pytest.mark.asyncio
-async def test_handle_success_without_cron_id_calls_save_task():
-    """handle_success saves the task directly when cron_id is None."""
+async def test_handle_success_without_cron_id_calls_save_task_if_status():
+    """handle_success CAS-guards the save against the task's prior STARTED status when cron_id is None."""
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -1993,8 +2105,30 @@ async def test_handle_success_without_cron_id_calls_save_task():
     processor = TaskProcessor(state_manager)
     await processor.handle_success(task)
 
-    state_manager.save_task.assert_awaited_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
     assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_handle_success_drops_write_and_counts_when_task_marked_stale():
+    """When save_task_if_status's CAS fails (task marked STALLED meanwhile), the result is dropped and counted."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.STARTED,
+        queue="default",
+        cron_id=None,
+    )
+    state_manager = _make_state_manager()
+    state_manager.task_state.save_task_if_status.return_value = False
+    processor = TaskProcessor(state_manager)
+
+    with patch("jobbers.task_processor.tasks_completed_after_stale") as mock_counter:
+        await processor.handle_success(task)
+
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
+    mock_counter.add.assert_called_once_with(1, {"queue": task.queue, "task": task.name})
 
 
 @pytest.mark.asyncio
@@ -2017,6 +2151,49 @@ async def test_handle_success_with_cron_id_uses_complete_cron_task():
     state_manager.save_task.assert_not_awaited()
     state_manager.complete_cron_task.assert_awaited_once_with(task)
     assert task.status == TaskStatus.COMPLETED
+
+
+# ── handle_user_cancelled_task ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_user_cancelled_task_calls_save_task_if_status():
+    """handle_user_cancelled_task CAS-guards the save against the task's prior STARTED status."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.STARTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    processor = TaskProcessor(state_manager)
+
+    await processor.handle_user_cancelled_task(task)
+
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
+    assert task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_handle_user_cancelled_task_drops_write_and_counts_when_task_marked_stale():
+    """When save_task_if_status's CAS fails (task marked STALLED meanwhile), the cancellation is dropped and counted."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.STARTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    state_manager.task_state.save_task_if_status.return_value = False
+    processor = TaskProcessor(state_manager)
+
+    with patch("jobbers.task_processor.tasks_completed_after_stale") as mock_counter:
+        await processor.handle_user_cancelled_task(task)
+
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
+    mock_counter.add.assert_called_once_with(1, {"queue": task.queue, "task": task.name})
 
 
 @pytest.mark.asyncio
