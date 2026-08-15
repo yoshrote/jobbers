@@ -21,6 +21,7 @@ from jobbers.adapters.redis_json import RedisJSONTaskState, RedisJSONTaskSubmit
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.migrations.runner import run_migrations
 from jobbers.models.cron_dag import CronDAGEntry
+from jobbers.models.dag import DAGRunDetail, DagRunStatus
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_routing import RoutingConfig
@@ -142,8 +143,18 @@ class DummyTaskState:
     async def get_dag_runs(self, pagination: object) -> object:
         raise NotImplementedError("DummyTaskState.get_dag_runs")
 
-    async def get_dag_run(self, dag_run_id: ULID) -> object:
-        raise NotImplementedError("DummyTaskState.get_dag_run")
+    async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None:
+        """Derive run detail from _store rather than tracking a separate index."""
+        task_ids = [tid for tid, t in self._store.items() if t.dag_run_id == dag_run_id]
+        if not task_ids:
+            return None
+        return DAGRunDetail(
+            dag_run_id=dag_run_id,
+            name=str(dag_run_id),
+            status=DagRunStatus.RUNNING,
+            submitted_at=dt.datetime.now(dt.UTC),
+            task_ids=task_ids,
+        )
 
     async def clean_dag_runs(self, now: object, max_age: object) -> None:
         raise NotImplementedError("DummyTaskState.clean_dag_runs")
@@ -152,7 +163,7 @@ class DummyTaskState:
         raise NotImplementedError("DummyTaskState.close_dag_run_task")
 
     async def record_dag_run_task_terminal(self, dag_run_id: ULID, outcome: object) -> None:
-        raise NotImplementedError("DummyTaskState.record_dag_run_task_terminal")
+        """No-op: saga-mode tests exercising this only assert on the task-save sequence."""
 
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
         raise NotImplementedError("DummyTaskState.mark_dag_run_complete")
@@ -167,13 +178,13 @@ class DummyTaskState:
         self._cancelling.discard(dag_run_id)
 
     async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
-        raise NotImplementedError("DummyTaskState.reconcile_dag_run_task_retry")
+        """No-op: saga-mode tests exercising this only assert on the task-save/enqueue sequence."""
 
     async def dag_run_fan_in_alive(self, dag_run_id: ULID) -> bool:
         raise NotImplementedError("DummyTaskState.dag_run_fan_in_alive")
 
     async def refresh_dag_run_fan_in_ttl(self, dag_run_id: ULID, ttl: int = 86400) -> None:
-        raise NotImplementedError("DummyTaskState.refresh_dag_run_fan_in_ttl")
+        """No-op: saga-mode tests exercising this only assert on the task-save/enqueue sequence."""
 
     async def ensure_index(self) -> None:
         raise NotImplementedError("DummyTaskState.ensure_index")

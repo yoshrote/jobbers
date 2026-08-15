@@ -31,6 +31,7 @@ from jobbers.state_manager import (
     UserCancellationError,
 )
 from jobbers.task_processor import TaskProcessor, _spec_to_dag_node
+from jobbers.utils.mermaid_dag import parse_mermaid_dag
 
 
 @pytest.fixture(autouse=True)
@@ -1314,6 +1315,86 @@ async def test_handle_dynamic_fanout_arm_with_static_diamond_inits_both_fan_ins(
 
 
 @pytest.mark.asyncio
+async def test_handle_declarative_fanout_arm_with_internal_fan_in_inits_both_fan_ins():
+    """
+    A mermaid-parsed dispatcher whose arm itself contains a diamond wires up correctly end to end.
+
+    Round-trip regression: parse_mermaid_dag's arm-internal fan-in wiring
+    (mermaid_dag.py's arm_fan_in_collectors branch) only matters once the resulting
+    spec is rebuilt into a live DAGNode tree by _spec_to_dag_node when the arm
+    actually dispatches -- this is the only test exercising both halves together,
+    using a real parsed DynamicFanOutCallback rather than one built by hand.
+    """
+    text = """
+    flowchart TD
+        A["dispatch"]
+        B["arm_root"]
+        C["branch_1"]
+        D["branch_2"]
+        E["arm_merge"]
+        G["arm_terminal"]
+        F["collector"]
+        A -->> B
+        B --> C
+        B --> D
+        C --> E
+        D --> E
+        E --> G
+        G --o F
+    """
+    roots = parse_mermaid_dag(text)
+    fanout_cb = roots[0].to_spec().dag_callbacks[0]
+    assert isinstance(fanout_cb, DynamicFanOutCallback)
+
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatch",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        results={"items": [{}]},
+    )
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_tasks_batch = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_declarative_fanout(parent, fanout_cb)
+
+    # Two fan-in sets initialised: the arm-internal diamond (arm_merge) and the
+    # outer collector waiting on the arm's terminal (arm_terminal).
+    init_calls = {c[0][1]: c[0][2] for c in state_manager.init_fan_in.call_args_list}
+    assert all(c[0][0] == dag_run_id for c in state_manager.init_fan_in.call_args_list)
+    assert len(init_calls) == 2
+
+    submitted_arms = state_manager.submit_tasks_batch.call_args[0][0]
+    assert len(submitted_arms) == 1
+    arm_root_task = submitted_arms[0]
+
+    # _spec_to_dag_node must have rebuilt: arm_root -> SimpleCallback(branch_1, branch_2)
+    branch_cbs = {c.task.name: c for c in arm_root_task.dag_callbacks if isinstance(c, SimpleCallback)}
+    assert set(branch_cbs) == {"branch_1", "branch_2"}
+
+    # ...each branch -> FanInCallback sharing one key into arm_merge...
+    b1_fan_in = next(c for c in branch_cbs["branch_1"].task.dag_callbacks if isinstance(c, FanInCallback))
+    b2_fan_in = next(c for c in branch_cbs["branch_2"].task.dag_callbacks if isinstance(c, FanInCallback))
+    assert b1_fan_in.fan_in_key == b2_fan_in.fan_in_key
+    assert b1_fan_in.task.name == "arm_merge"
+    assert b1_fan_in.fan_in_key in init_calls
+
+    # ...and arm_merge -> arm_terminal, chaining onward to the fan-out boundary.
+    merge_spec = b1_fan_in.task
+    assert len(merge_spec.dag_callbacks) == 1
+    assert isinstance(merge_spec.dag_callbacks[0], SimpleCallback)
+    assert merge_spec.dag_callbacks[0].task.name == "arm_terminal"
+
+
+@pytest.mark.asyncio
 async def test_handle_dynamic_fanout_with_outer_fan_in_delegates_to_collector():
     """When the parent has outer FanInCallbacks the collector inherits them and delegate_fan_in is called."""
     dag_run_id = ULID()
@@ -1495,6 +1576,50 @@ async def test_handle_declarative_fanout_preserves_nested_dispatch_on_arm_task()
     nested_cbs = [cb for cb in arm_task.dag_callbacks if isinstance(cb, DynamicFanOutCallback)]
     assert len(nested_cbs) == 1, "the arm task must still carry its own nested DynamicFanOutCallback"
     assert nested_cbs[0].arm_root.name == "inner_worker"
+
+
+@pytest.mark.asyncio
+async def test_process_injects_resolved_dependency_into_task_kwargs():
+    """
+    A Depends()-annotated task parameter receives the DependencyResolver's resolved value.
+
+    di.py's DependencyResolver is thoroughly unit-tested in isolation; this covers the
+    separate step of actually mapping a resolved dependency into the running task's
+    kwargs (the loop in process() that checks `isinstance(meta, _Depends)`), which no
+    existing task_processor test exercises.
+    """
+    from jobbers.utils.di import Depends, inspect_task_dependencies
+
+    def get_greeting() -> str:
+        return "hello"
+
+    captured: dict[str, object] = {}
+
+    async def task_function(greeting: Annotated[str, Depends(get_greeting)]) -> None:
+        captured["greeting"] = greeting
+
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        dependency_graph=inspect_task_dependencies(task_function),
+        timeout=10,
+    )
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert captured["greeting"] == "hello"
+    assert result.status == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio

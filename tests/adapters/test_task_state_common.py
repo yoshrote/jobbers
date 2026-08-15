@@ -655,6 +655,68 @@ async def test_stage_submit_task_saves_task_data(task_adapter):
 
 
 @pytest.mark.asyncio
+async def test_stage_submit_task_registers_dag_run(task_adapter):
+    """stage_submit_task registers the task's dag_run_id, not just the saga `submit_task` path."""
+    state, submit = task_adapter
+    task = make_task()
+    task.dag_run_id = ULID1
+    task.dag_run_name = "my-run"
+    pipe = state.pipeline(transaction=True)
+    state.stage_submit_task(pipe, task)
+    await pipe.execute()
+
+    result = await state.get_dag_run(ULID1)
+    assert result is not None
+    assert result.task_ids == [task.id]
+    runs, total = await state.get_dag_runs(DAGRunPagination())
+    assert total == 1
+    assert runs[0].dag_run_id == ULID1
+    assert runs[0].name == "my-run"
+
+
+@pytest.mark.asyncio
+async def test_stage_submit_task_dag_run_shared_by_multiple_tasks(task_adapter):
+    """Two tasks staged into the same dag_run_id both register as pending without conflict."""
+    state, submit = task_adapter
+    dag_run_id = ULID1
+    task_a = make_task(ULID2)
+    task_b = make_task(ULID3)
+    task_a.dag_run_id = dag_run_id
+    task_b.dag_run_id = dag_run_id
+
+    pipe = state.pipeline(transaction=True)
+    state.stage_submit_task(pipe, task_a)
+    await pipe.execute()
+    # Second task registers against the already-existing dag_runs row.
+    pipe = state.pipeline(transaction=True)
+    state.stage_submit_task(pipe, task_b)
+    await pipe.execute()
+
+    result = await state.get_dag_run(dag_run_id)
+    assert result is not None
+    assert set(result.task_ids) == {ULID2, ULID3}
+    runs, total = await state.get_dag_runs(DAGRunPagination())
+    assert total == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_submit_task_dag_run_reregistration_is_idempotent(task_adapter):
+    """Re-staging the same task into the same dag_run_id (e.g. a retry) does not error."""
+    state, submit = task_adapter
+    task = make_task()
+    task.dag_run_id = ULID1
+
+    for _ in range(2):
+        pipe = state.pipeline(transaction=True)
+        state.stage_submit_task(pipe, task)
+        await pipe.execute()
+
+    result = await state.get_dag_run(ULID1)
+    assert result is not None
+    assert result.task_ids == [task.id]
+
+
+@pytest.mark.asyncio
 async def test_stage_remove_from_queue_noop_when_absent(task_adapter):
     """stage_remove_from_queue does not raise when the task is not in the queue."""
     state, submit = task_adapter
@@ -712,6 +774,103 @@ async def test_atomic_dispatch_scheduled_returns_false_when_missing(task_adapter
     # do not save — task is absent
     dispatched = await state.atomic_dispatch_scheduled(task, lambda _pipe: None)
     assert dispatched is False
+
+
+# ── atomic_save_if_status ────────────────────────────────────────────────────
+# This is what the Cleaner's stale-task sweep (StateManager._mark_task_stale)
+# calls to CAS-guard a STALLED write -- plus an optional DLQ add -- against a
+# live worker's own CAS-guarded write landing first. No common contract test
+# exercised it before, on any backend.
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_applies_when_status_matches(task_adapter):
+    """atomic_save_if_status saves the task and returns True when the stored status matches."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.STARTED)
+    await state.save_task(task)
+
+    task.set_status(TaskStatus.STALLED)
+    applied = await state.atomic_save_if_status(task, TaskStatus.STARTED, lambda _pipe: None)
+
+    assert applied is True
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_returns_false_when_status_mismatch(task_adapter):
+    """
+    atomic_save_if_status leaves the stored task untouched when its status no longer matches.
+
+    Mirrors the race it guards against: a live worker's own write (e.g. handle_success)
+    landed between the Cleaner's stale scan and this call, so the stored status is no
+    longer STARTED -- the worker's outcome must win, not the Cleaner's stale write.
+    """
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.COMPLETED)
+    await state.save_task(task)
+
+    stale_snapshot = make_task(status=TaskStatus.STARTED)
+    stale_snapshot.set_status(TaskStatus.STALLED)
+    applied = await state.atomic_save_if_status(stale_snapshot, TaskStatus.STARTED, lambda _pipe: None)
+
+    assert applied is False
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_returns_false_when_missing(task_adapter):
+    """atomic_save_if_status returns False without staging anything when the task doesn't exist."""
+    state, _ = task_adapter
+    task = make_task(status=TaskStatus.STARTED)
+    # do not save — task is absent
+    applied = await state.atomic_save_if_status(task, TaskStatus.STARTED, lambda _pipe: None)
+    assert applied is False
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_commits_stage_extra_in_same_transaction(task_adapter):
+    """stage_extra's staged op (e.g. heartbeat removal) commits atomically with the save."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.STARTED)
+    task.heartbeat_at = FROZEN_TIME  # very old — would normally be stale
+    await state.save_task(task)
+    await state.update_task_heartbeat(task)
+
+    applied = await state.atomic_save_if_status(
+        task, TaskStatus.STARTED, lambda pipe: state.stage_remove_heartbeat(pipe, task)
+    )
+
+    assert applied is True
+    stale = [t async for t in state.get_stale_tasks({"default"}, dt.timedelta(seconds=0))]
+    assert not any(t.id == ULID1 for t in stale)
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_does_not_apply_stage_extra_when_status_mismatch(task_adapter):
+    """When the guard fails, stage_extra's op must not be committed either."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.COMPLETED)
+    task.heartbeat_at = FROZEN_TIME
+    await state.save_task(task)
+    await state.update_task_heartbeat(task)
+
+    stale_snapshot = make_task(status=TaskStatus.STARTED)
+    stale_snapshot.set_status(TaskStatus.STALLED)
+    applied = await state.atomic_save_if_status(
+        stale_snapshot,
+        TaskStatus.STARTED,
+        lambda pipe: state.stage_remove_heartbeat(pipe, stale_snapshot),
+    )
+
+    assert applied is False
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.heartbeat_at == FROZEN_TIME
 
 
 # ── ensure_index ──────────────────────────────────────────────────────────────

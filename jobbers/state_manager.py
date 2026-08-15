@@ -530,6 +530,9 @@ class StateManager:
             if not applied:
                 return task  # task was cancelled or already processed
             task.set_status(TaskStatus.SUBMITTED)
+            # compare_and_set_status only persisted the status flip on the blob;
+            # actually placing the task in its queue is a separate step in saga mode.
+            await self.task_submit.enqueue(task)
             await self.task_scheduler.remove(task.id, task.queue)
             logger.info("Task %s dispatched to queue %s.", task.id, task.queue)
             return task

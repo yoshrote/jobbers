@@ -392,6 +392,93 @@ async def test_remove_cleans_up_secondary_indexes(dead_queue):
     assert await dq.get_by_filter(task_name="mytask") == []
 
 
+# ── remove_from_dlq / stage_remove (single-item saga + atomic paths) ───────────
+# `remove_many` above only exercises the bulk-delete path. `remove_from_dlq`
+# (direct saga write) and `stage_remove` (atomic pipeline write) are the
+# methods StateManager.resubmit_dead_tasks actually calls, and are otherwise
+# never invoked against a real backend by any test in the suite.
+
+
+@pytest.mark.asyncio
+async def test_remove_from_dlq_deletes_entry(dead_queue):
+    dq, adapter = dead_queue
+    task = make_task()
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
+
+    await dq.remove_from_dlq(task.id, task.queue, task.name)
+
+    assert await dq.get_by_ids([str(task.id)]) == []
+
+
+@pytest.mark.asyncio
+async def test_remove_from_dlq_leaves_other_entries_intact(dead_queue):
+    dq, adapter = dead_queue
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    for t in (t1, t2):
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
+
+    await dq.remove_from_dlq(t1.id, t1.queue, t1.name)
+
+    assert await dq.get_by_ids([str(t1.id)]) == []
+    assert len(await dq.get_by_ids([str(t2.id)])) == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_from_dlq_nonexistent_is_silent(dead_queue):
+    dq, _ = dead_queue
+    await dq.remove_from_dlq(ULID.from_str("01JQC31AJP7TSA9X8AEP64XG99"), "default", "my_task")
+
+
+@pytest.mark.asyncio
+async def test_stage_remove_deletes_entry(dead_queue):
+    dq, adapter = dead_queue
+    task = make_task()
+    await adapter.save_task(task)
+    await add_to_dlq(dq, task, FAILED_AT)
+
+    pipe = dq.pipeline()
+    dq.stage_remove(pipe, task.id, task.queue, task.name)
+    await pipe.execute()
+
+    assert await dq.get_by_ids([str(task.id)]) == []
+
+
+@pytest.mark.asyncio
+async def test_stage_remove_leaves_other_entries_intact(dead_queue):
+    dq, adapter = dead_queue
+    t1 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG01")
+    t2 = make_task(task_id="01JQC31AJP7TSA9X8AEP64XG02")
+    for t in (t1, t2):
+        await adapter.save_task(t)
+        await add_to_dlq(dq, t, FAILED_AT)
+
+    pipe = dq.pipeline()
+    dq.stage_remove(pipe, t1.id, t1.queue, t1.name)
+    await pipe.execute()
+
+    assert await dq.get_by_ids([str(t1.id)]) == []
+    assert len(await dq.get_by_ids([str(t2.id)])) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_to_dlq_direct_write_upserts_existing_entry(dead_queue):
+    """`add_to_dlq` (the direct saga write, not `stage_add`) both inserts and updates."""
+    dq, adapter = dead_queue
+    task = make_task(errors=["first failure"])
+    await adapter.save_task(task)
+    await dq.add_to_dlq(task, EARLIER)
+
+    task.errors = ["first failure", "second failure"]
+    await adapter.save_task(task)
+    await dq.add_to_dlq(task, LATER)
+
+    history = await dq.get_history(str(task.id))
+    assert [h["error"] for h in history] == ["first failure", "second failure"]
+
+
 # ── remove_many ───────────────────────────────────────────────────────────────
 
 

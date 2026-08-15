@@ -1677,6 +1677,144 @@ async def test_submit_dag_defaults_name_to_dag_run_id():
     assert captured["name"] == str(captured["dag_run_id"])
 
 
+# ── Cron DAG CRUD happy paths ─────────────────────────────────────────────────
+
+
+def _registered_cron_task_config() -> TaskConfig:
+    async def task_function(**kwargs: object) -> None: ...
+
+    return TaskConfig(name="my_task", version=1, function=task_function)
+
+
+@pytest.mark.asyncio
+async def test_create_cron_dag_success(state_manager):
+    """POST /cron-dags persists the entry and returns its full representation."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/cron-dags",
+                json={"name": "nightly", "cron_expr": "0 6 * * *", "diagram": diagram},
+            )
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["name"] == "nightly"
+    assert data["cron_expr"] == "0 6 * * *"
+    assert data["enabled"] is True
+    assert data["concurrency_policy"] == "always"
+    assert data["next_run_at"] is not None
+
+    stored = await state_manager.cron_dag_scheduler.get(ULID.from_str(data["id"]))
+    assert stored is not None
+    assert stored.name == "nightly"
+
+
+@pytest.mark.asyncio
+async def test_list_cron_dags_returns_created_entries(state_manager):
+    """GET /cron-dags lists previously created entries with a total count."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await client.post(
+                "/cron-dags", json={"name": "first", "cron_expr": "0 6 * * *", "diagram": diagram}
+            )
+            await client.post(
+                "/cron-dags", json={"name": "second", "cron_expr": "0 7 * * *", "diagram": diagram}
+            )
+            response = await client.get("/cron-dags")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert {e["name"] for e in data["cron_dags"]} == {"first", "second"}
+
+
+@pytest.mark.asyncio
+async def test_get_cron_dag_returns_entry(state_manager):
+    """GET /cron-dags/{id} returns 200 with the entry's full representation."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            create_response = await client.post(
+                "/cron-dags", json={"name": "nightly", "cron_expr": "0 6 * * *", "diagram": diagram}
+            )
+            cron_id = create_response.json()["id"]
+            response = await client.get(f"/cron-dags/{cron_id}")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == cron_id
+    assert response.json()["name"] == "nightly"
+
+
+@pytest.mark.asyncio
+async def test_get_cron_dag_not_found_returns_404(state_manager):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/cron-dags/{ULID1}")
+
+    assert response.status_code == 404
+    assert str(ULID1) in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_cron_dag_success(state_manager):
+    """PUT /cron-dags/{id} replaces the diagram/settings but preserves id and created_at."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            create_response = await client.post(
+                "/cron-dags", json={"name": "nightly", "cron_expr": "0 6 * * *", "diagram": diagram}
+            )
+            cron_id = create_response.json()["id"]
+            created_at = create_response.json()["created_at"]
+
+            response = await client.put(
+                f"/cron-dags/{cron_id}",
+                json={
+                    "name": "nightly-updated",
+                    "cron_expr": "0 7 * * *",
+                    "diagram": diagram,
+                    "enabled": False,
+                },
+            )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == cron_id
+    assert data["created_at"] == created_at
+    assert data["name"] == "nightly-updated"
+    assert data["cron_expr"] == "0 7 * * *"
+    assert data["enabled"] is False
+
+    stored = await state_manager.cron_dag_scheduler.get(ULID.from_str(cron_id))
+    assert stored is not None
+    assert stored.cron_expr == "0 7 * * *"
+
+
+@pytest.mark.asyncio
+async def test_delete_cron_dag_success(state_manager):
+    """DELETE /cron-dags/{id} removes the entry; a subsequent GET returns 404."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            create_response = await client.post(
+                "/cron-dags", json={"name": "nightly", "cron_expr": "0 6 * * *", "diagram": diagram}
+            )
+            cron_id = create_response.json()["id"]
+
+            delete_response = await client.delete(f"/cron-dags/{cron_id}")
+            get_response = await client.get(f"/cron-dags/{cron_id}")
+
+    assert delete_response.status_code == 200
+    assert cron_id in delete_response.json()["message"]
+    assert get_response.status_code == 404
+
+
 # ── PUT /cron-dags/{id} branches ─────────────────────────────────────────────
 
 

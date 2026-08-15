@@ -2570,6 +2570,150 @@ async def test_clean_stale_task_saga_mode(saga_state_manager):
     assert ULID1 not in saga_state_manager.task_state._heartbeats
 
 
+@pytest.mark.asyncio
+async def test_save_task_saga_mode(saga_state_manager):
+    """StateManager.save_task delegates directly to task_state.save_task when non-atomic."""
+    sm = saga_state_manager
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+
+    result = await sm.save_task(task)
+
+    assert result is task
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STARTED
+
+
+@pytest.mark.asyncio
+async def test_mark_task_stale_saga_mode_skips_when_already_resolved(saga_state_manager):
+    """
+    _mark_task_stale's saga path drops a stale write once the live worker resolves it first.
+
+    A live worker's own CAS-guarded write (e.g. handle_success) already changed the
+    stored status before this runs. ``task`` here plays the role of the snapshot
+    clean() captured earlier in its stale scan -- it still says STARTED even though
+    the store has since moved on.
+    """
+    sm = saga_state_manager
+    await sm.task_state.save_task(Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED))
+
+    stale_snapshot = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    stale_snapshot.heartbeat_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    stale_snapshot.set_status(TaskStatus.STALLED)
+
+    applied = await sm._mark_task_stale(stale_snapshot, needs_dlq=False, now=dt.datetime.now(dt.UTC))
+
+    assert applied is False
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED  # the live worker's outcome wins
+
+
+# ── dispatch_scheduled_task saga mode ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scheduled_task_saga_mode(saga_state_manager):
+    """
+    dispatch_scheduled_task's saga path CASes SCHEDULED->SUBMITTED, enqueues, then removes.
+
+    Regression coverage: the saga branch previously CASed the status and removed the
+    scheduler entry but never called task_submit.enqueue(), so the task was marked
+    SUBMITTED yet never actually reachable by a worker.
+    """
+    sm = saga_state_manager
+    task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
+    run_at = FROZEN_TIME
+    await sm.task_state.save_task(task)
+    await _schedule_saga(sm, task, run_at)
+
+    due = await sm.task_scheduler.next_due(["default"])
+    assert due is not None
+    result = await sm.dispatch_scheduled_task(due)
+
+    assert result.status == TaskStatus.SUBMITTED
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert ULID1 in sm.task_submit.queued
+    assert await sm.task_scheduler.next_due(["default"]) is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scheduled_task_saga_mode_skips_cancelled(saga_state_manager):
+    """In saga mode, a task cancelled after scheduler acquisition is not dispatched."""
+    sm = saga_state_manager
+    cancelled = Task(
+        id=ULID1, name="retry_task", queue="default", status=TaskStatus.CANCELLED, retry_attempt=1
+    )
+    await sm.task_state.save_task(cancelled)
+
+    stale = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
+    result = await sm.dispatch_scheduled_task(stale)
+
+    assert result is stale
+    assert ULID1 not in sm.task_submit.queued
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.CANCELLED
+
+
+# ── request_dag_cancellation saga mode ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_saga_mode(saga_state_manager):
+    """request_dag_cancellation saves each cancelled task sequentially when adapters are non-atomic."""
+    sm = saga_state_manager
+    dag_run_id = ULID2
+    scheduled = Task(
+        id=ULID1, name="my_task", queue="default", status=TaskStatus.SCHEDULED, dag_run_id=dag_run_id
+    )
+    await sm.task_state.save_task(scheduled)
+    await _schedule_saga(sm, scheduled, FROZEN_TIME + dt.timedelta(hours=1))
+
+    result = await sm.request_dag_cancellation(dag_run_id)
+
+    assert result is not None
+    assert result.already_terminal == 0
+    assert result.cancelled_immediately == 1
+    assert result.signalled_running == 0
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.CANCELLED
+    assert await sm.task_scheduler.get_run_at(ULID1) is None
+
+
+# ── resume_dag_run saga mode ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_saga_mode(saga_state_manager):
+    """resume_dag_run saves and re-enqueues each stuck task sequentially when adapters are non-atomic."""
+    sm = saga_state_manager
+    dag_run_id = ULID2
+    stuck = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_run_id=dag_run_id,
+        errors=["boom"],
+        retry_attempt=3,
+    )
+    await sm.task_state.save_task(stuck)
+
+    result = await sm.resume_dag_run(dag_run_id)
+
+    assert result.dag_run_id == dag_run_id
+    assert result.resumed_task_ids == [ULID1]
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert saved.retry_attempt == 0
+    assert ULID1 in sm.task_submit.queued
+
+
 # ── recover_orphaned_scheduled ───────────────────────────────────────────────
 
 
@@ -2684,6 +2828,55 @@ async def test_dispatch_cron_dag_no_pipeline(cron_saga_state_manager):
     submitted = list(cron_saga_state_manager.task_state._store.values())
     assert len(submitted) == 1
     assert submitted[0].status == TaskStatus.SUBMITTED
+
+
+@pytest.mark.asyncio
+async def test_complete_cron_task_same_backend_atomic_pipeline(state_manager_real_ta):
+    """When cron and task-state share a backend, complete_cron_task folds both ops into one pipeline."""
+    sm = state_manager_real_ta
+    # Sanity: RedisTaskState and RedisCronDAGScheduler share the same Redis client here,
+    # so backend_key matches and _atomic_cron is set -- this is the "same pipeline" mode.
+    assert sm._atomic_cron is not None
+
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
+    await sm.cron_dag_scheduler.add(entry, FROZEN_TIME)
+    task_id = ULID()
+    await sm.cron_dag_scheduler.set_active_run(entry.id, task_id, ttl=3600)
+
+    task = Task(id=task_id, name="my_job", queue="default", status=TaskStatus.COMPLETED, cron_id=entry.id)
+
+    await sm.complete_cron_task(task)
+
+    saved = await sm.task_state.get_task(task_id)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    assert await sm.cron_dag_scheduler.get_active_run(entry.id) is None
+
+
+@pytest.mark.asyncio
+async def test_reschedule_cron_entries_bulk_atomic_pipeline(state_manager_real_ta):
+    """reschedule_cron_entries_bulk stages every entry into one pipeline when the cron scheduler is atomic."""
+    sm = state_manager_real_ta
+
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry_a = CronDAGEntry(name="nightly-a", cron_expr="0 0 * * *", dag_spec=spec)
+    entry_b = CronDAGEntry(name="nightly-b", cron_expr="0 0 * * *", dag_spec=spec)
+    await sm.cron_dag_scheduler.add(entry_a, FROZEN_TIME)
+    await sm.cron_dag_scheduler.add(entry_b, FROZEN_TIME)
+
+    await sm.reschedule_cron_entries_bulk([(entry_a, FROZEN_TIME), (entry_b, FROZEN_TIME)])
+
+    next_a = await sm.cron_dag_scheduler.get_next_run_at(entry_a.id)
+    next_b = await sm.cron_dag_scheduler.get_next_run_at(entry_b.id)
+    assert next_a is not None
+    assert next_a > FROZEN_TIME
+    assert next_b is not None
+    assert next_b > FROZEN_TIME
 
 
 @pytest.mark.asyncio

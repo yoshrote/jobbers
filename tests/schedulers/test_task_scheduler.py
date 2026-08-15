@@ -63,6 +63,49 @@ async def test_add_replaces_existing(scheduler, dummy_task_adapter):
     assert await scheduler.next_due(["default"]) is not None
 
 
+# ── direct add/remove (saga path) ───────────────────────────────────────────
+# The tests above exercise `stage_add`/`stage_remove` (the atomic pipeline
+# path) exclusively. `add`/`remove` are the direct-write saga-mode methods
+# StateManager falls back to when the scheduler isn't paired with an atomic
+# task-state adapter, and were otherwise never invoked against a real backend.
+
+
+@pytest.mark.asyncio
+async def test_direct_add_and_next_due(scheduler, dummy_task_adapter):
+    task = make_task()
+    await dummy_task_adapter.save_task(task)
+    await scheduler.add(task, PAST)
+    result = await scheduler.next_due(["default"])
+    assert result is not None
+    assert result.id == task.id
+
+
+@pytest.mark.asyncio
+async def test_direct_remove_prevents_next_due(scheduler, dummy_task_adapter):
+    task = make_task()
+    await dummy_task_adapter.save_task(task)
+    await scheduler.add(task, PAST)
+    await scheduler.remove(task.id, task.queue)
+    assert await scheduler.next_due(["default"]) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_add_replaces_existing(scheduler, dummy_task_adapter):
+    """Re-adding a task via the direct `add` upserts its run_at rather than erroring."""
+    task = make_task()
+    await dummy_task_adapter.save_task(task)
+    await scheduler.add(task, FUTURE)
+    await scheduler.add(task, PAST)
+    result = await scheduler.next_due(["default"])
+    assert result is not None
+    assert result.id == task.id
+
+
+@pytest.mark.asyncio
+async def test_direct_remove_nonexistent_is_silent(scheduler):
+    await scheduler.remove(ULID(), "default")
+
+
 # ── run_at filtering ──────────────────────────────────────────────────────────
 
 
