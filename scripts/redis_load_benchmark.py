@@ -92,6 +92,7 @@ class LevelResult:
     concurrency: int
     n_tasks: int
     sleep_ms: int
+    fetchers: int
     max_connections: int
     submit_seconds: float
     submit_ops_per_sec: float
@@ -166,21 +167,47 @@ async def _sample_peak_clients(client: "redis.Redis", peak: list[int], stop: asy
 
 
 async def _run_worker_loop(
-    sm: "StateManager", role: str, n_tasks: int, concurrency: int
+    sm: "StateManager", role: str, n_tasks: int, concurrency: int, fetchers: int = 1
 ) -> tuple[list[float], bool]:
-    """Drain up to n_tasks tasks with up to `concurrency` in flight; mirrors worker_proc.main().
+    """Drain up to n_tasks tasks with up to `concurrency` in flight.
+
+    fetchers=1 mirrors worker_proc.main() exactly: a single sequential fetch loop
+    (one BZPOPMIN in flight at a time) dispatching into a semaphore-gated pool of
+    executors. fetchers>1 is the parallel-fetcher prototype: that many independent
+    loops each pop concurrently via `state_manager.get_next_task()`, so up to
+    `fetchers` BZPOPMIN calls can be in flight at once (still bounded by `concurrency`,
+    since each loop acquires an execution slot before popping, same as fetchers=1).
+
+    The queue set is resolved via a single `TaskGenerator.queues()` call up front and
+    shared read-only across all fetch loops -- NOT re-resolved per fetcher per
+    iteration the way TaskGenerator.__anext__ normally does. That's a deliberate
+    correctness fix, not just an optimization: StateManager's per-role refresh
+    notification (RedisRoutingNotifications) caches a single pub/sub connection per
+    role, and concurrent `poll_refresh_signal()` calls against that one connection
+    from multiple fetchers race on the underlying stream reader (confirmed: raises
+    "readuntil() called while another coroutine is already waiting for incoming
+    data"). A real multi-fetcher implementation needs the same fix -- a single
+    owner polling for queue/role config changes, shared read-only by all fetch
+    loops -- not each fetcher independently calling TaskGenerator.queues().
+
+    A shared attempt budget (`remaining`) -- decremented synchronously, so it's
+    race-free under asyncio's cooperative scheduling even without a lock -- caps
+    total fetch attempts at n_tasks across all fetchers, so no fetcher can block
+    forever on BZPOPMIN waiting for a task that was never seeded.
 
     Returns (latencies_ms, hit_max_connections). If the pool is exhausted mid-run
     (redis.exceptions.MaxConnectionsError), stops early rather than crashing the
     whole sweep -- that failure point is itself the data point we want.
     """
-    task_generator = TaskGenerator(sm, role, max_tasks=n_tasks)
-    await task_generator.queues()
+    coordinator = TaskGenerator(sm, role, max_tasks=0)
+    queues = await coordinator.queues()
 
     semaphore = asyncio.Semaphore(concurrency)
     latencies_ms: list[float] = []
     lock = asyncio.Lock()
     hit_max_connections = False
+    remaining = [n_tasks]
+    active: list[asyncio.Task[None]] = []
 
     async def run_task(task: Task) -> None:
         nonlocal hit_max_connections
@@ -195,24 +222,30 @@ async def _run_worker_loop(
                 latencies_ms.append(elapsed_ms)
             semaphore.release()
 
-    active: list[asyncio.Task[None]] = []
-    try:
+    async def fetch_loop() -> None:
+        nonlocal hit_max_connections
         while not hit_max_connections:
+            if remaining[0] <= 0:  # check + decrement below run back-to-back, no
+                return  # `await` between them -- atomic under asyncio's single thread.
+            remaining[0] -= 1
             await semaphore.acquire()
             if hit_max_connections:
                 semaphore.release()
-                break
+                return
             try:
-                task = await anext(task_generator)
-            except StopAsyncIteration:
-                semaphore.release()
-                break
+                task = await sm.get_next_task(queues)
             except MaxConnectionsError:
                 semaphore.release()
                 hit_max_connections = True
-                break
+                return
+            if task is None:  # shouldn't happen given the exact attempt budget above
+                semaphore.release()
+                continue
             t = asyncio.create_task(run_task(task))
             active.append(t)
+
+    try:
+        await asyncio.gather(*(fetch_loop() for _ in range(fetchers)))
     finally:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
@@ -228,9 +261,10 @@ async def run_level(
     sleep_ms: int,
     submit_concurrency: int,
     max_connections: int,
+    fetchers: int,
 ) -> LevelResult:
-    queue = f"bench-{concurrency}-{sleep_ms}"
-    role = f"bench-role-{concurrency}-{sleep_ms}"
+    queue = f"bench-{concurrency}-{sleep_ms}-{fetchers}"
+    role = f"bench-role-{concurrency}-{sleep_ms}-{fetchers}"
     await _ensure_queue_and_role(sm, queue, role)
 
     submit_hit_max_connections = False
@@ -257,7 +291,9 @@ async def run_level(
     latencies_ms: list[float] = []
     run_hit_max_connections = False
     if not submit_hit_max_connections:
-        latencies_ms, run_hit_max_connections = await _run_worker_loop(sm, role, n_tasks, concurrency)
+        latencies_ms, run_hit_max_connections = await _run_worker_loop(
+            sm, role, n_tasks, concurrency, fetchers
+        )
     run_seconds = time.perf_counter() - start
 
     stop_event.set()
@@ -283,6 +319,7 @@ async def run_level(
         concurrency=concurrency,
         n_tasks=n_tasks,
         sleep_ms=sleep_ms,
+        fetchers=fetchers,
         max_connections=max_connections,
         submit_seconds=submit_seconds,
         submit_ops_per_sec=n_tasks / submit_seconds if submit_seconds else 0.0,
@@ -303,7 +340,7 @@ async def run_level(
 
 def _print_table(results: list[LevelResult]) -> None:
     header = (
-        f"{'conc':>5} {'sleep_ms':>8} {'done/n':>9} {'run_s':>7} {'tasks/s':>8} "
+        f"{'conc':>5} {'fetch':>5} {'sleep_ms':>8} {'done/n':>9} {'run_s':>7} {'tasks/s':>8} "
         f"{'redis_ops/s':>11} {'clients(base->peak)':>20} {'mem_delta_mb':>12} "
         f"{'p50_ms':>7} {'p95_ms':>7} {'p99_ms':>7} {'maxconn':>8}"
     )
@@ -313,7 +350,7 @@ def _print_table(results: list[LevelResult]) -> None:
         clients = f"{r.redis_connected_clients_baseline}->{r.redis_connected_clients_peak}"
         done = f"{r.tasks_completed}/{r.n_tasks}"
         print(
-            f"{r.concurrency:>5} {r.sleep_ms:>8} {done:>9} {r.run_seconds:>7.2f} "
+            f"{r.concurrency:>5} {r.fetchers:>5} {r.sleep_ms:>8} {done:>9} {r.run_seconds:>7.2f} "
             f"{r.throughput_tasks_per_sec:>8.1f} {r.redis_ops_per_sec:>11.1f} {clients:>20} "
             f"{r.redis_used_memory_delta_bytes / 1e6:>12.2f} "
             f"{r.latency_ms_p50:>7.1f} {r.latency_ms_p95:>7.1f} {r.latency_ms_p99:>7.1f} "
@@ -347,7 +384,10 @@ async def main_async(args: argparse.Namespace) -> None:
         n_tasks = args.tasks_per_level or max(500, concurrency * 20)
         n_tasks = min(n_tasks, args.max_tasks_per_level)
         submit_concurrency = min(concurrency, args.submit_concurrency)
-        print(f"\n=== concurrency={concurrency} n_tasks={n_tasks} sleep_ms={args.sleep_ms} ===")
+        print(
+            f"\n=== concurrency={concurrency} fetchers={args.fetchers} n_tasks={n_tasks} "
+            f"sleep_ms={args.sleep_ms} ==="
+        )
         result = await run_level(
             redis_client,
             sm,
@@ -356,6 +396,7 @@ async def main_async(args: argparse.Namespace) -> None:
             args.sleep_ms,
             submit_concurrency,
             effective_max_connections,
+            args.fetchers,
         )
         results.append(result)
         status = " *** MaxConnectionsError ***" if result.max_connections_error else ""
@@ -411,6 +452,17 @@ def main() -> None:
         default=0,
         help="Simulated per-task work time in ms (0 = pure Redis-bound ceiling; try 50-200 for a "
         "more realistic light-task scenario).",
+    )
+    parser.add_argument(
+        "--fetchers",
+        type=int,
+        default=1,
+        help="Number of concurrent BZPOPMIN fetch loops. 1 (default) exactly mirrors "
+        "worker_proc.main() today -- one sequential fetch loop. >1 is the parallel-fetcher "
+        "prototype: that many independent TaskGenerator instances each pop concurrently, "
+        "still gated by --concurrency execution slots. Kept as its own flag (not swept "
+        "automatically) so it's easy to compare against the fetchers=1 baseline at the "
+        "same --concurrency levels.",
     )
     parser.add_argument(
         "--submit-concurrency",

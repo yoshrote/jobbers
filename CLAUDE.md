@@ -245,7 +245,7 @@ Config file format (`routing.json`):
 | `ROUTING_BACKEND` | `"sql"` | All (`"sql"`, `"redis"`, `"redis_json"`, or `"static"`) |
 | `CRON_DAG_SCHEDULER_BACKEND` | `"redis"` | All (`"redis"`, `"sql"`, or `"static"`); `static` is read-only in-memory (state resets on restart) |
 | `REDIS_URL` | `redis://localhost:6379` | All (accepts redis-py query-string params too, e.g. `?max_connections=300&socket_timeout=5`) |
-| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (used when any backend is `"sql"`; use PostgreSQL for multi-worker deployments) |
+| `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (used when any backend is `"sql"`; use PostgreSQL for multi-worker deployments). Accepts `?pool_size=...&max_overflow=...&pool_timeout=...` query params (non-SQLite DSNs only — SQLite's pool class rejects these kwargs). SQLAlchemy doesn't support this natively; `db.py` pops these params off the URL itself before constructing the engine, so the DBAPI driver never sees them. Combined connection ceiling is `pool_size + max_overflow` (defaults 5 + 10 = 15), well below redis-py's 100-connection default for `REDIS_URL`. |
 | `STATIC_CONFIG_FILE` | — | All (path to JSON/YAML routing config; requires `ROUTING_BACKEND=static`) |
 
 ## Testing

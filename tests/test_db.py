@@ -1,6 +1,7 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.engine import make_url
 
 import jobbers.db as db
 from jobbers.db import (
@@ -102,6 +103,60 @@ def test_needed_sql_features_only_configured_backends(monkeypatch):
     monkeypatch.setenv("ROUTING_BACKEND", "redis_json")
 
     assert needed_sql_features() == {"task_state", "task_schedule"}
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_sql_pops_pool_params_from_url_for_non_sqlite(monkeypatch):
+    """?pool_size=...&max_overflow=...&pool_timeout=... on SQL_PATH are popped off the URL and
+    forwarded as engine kwargs -- SQLAlchemy would otherwise forward them straight to the
+    DBAPI driver's connect(), which rejects unrecognized kwargs."""
+    monkeypatch.setattr(db, "_engine", None)
+    monkeypatch.setattr(db, "_session_factory", None)
+    monkeypatch.setenv(
+        "SQL_PATH",
+        "postgresql+asyncpg://user:pass@host/db?pool_size=20&max_overflow=5&pool_timeout=10",
+    )
+
+    mock_engine = MagicMock()
+    mock_engine.sync_engine = MagicMock()
+
+    with (
+        patch("jobbers.db.create_async_engine", return_value=mock_engine) as mock_create,
+        patch("jobbers.db.event.listens_for", return_value=lambda fn: fn),
+        patch("jobbers.db.run_migrations", new=AsyncMock()),
+        patch("jobbers.db.async_sessionmaker", return_value=AsyncMock()),
+    ):
+        await db._get_or_create_sql(set())
+
+    mock_create.assert_called_once_with(
+        make_url("postgresql+asyncpg://user:pass@host/db"),
+        pool_size=20,
+        max_overflow=5,
+        pool_timeout=10.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_sql_ignores_pool_params_for_sqlite(monkeypatch):
+    """Pool params are never popped/forwarded for SQLite DSNs -- its pool class (StaticPool)
+    rejects them outright."""
+    monkeypatch.setattr(db, "_engine", None)
+    monkeypatch.setattr(db, "_session_factory", None)
+    sql_path = "sqlite+aiosqlite:///:memory:?pool_size=20&max_overflow=5"
+    monkeypatch.setenv("SQL_PATH", sql_path)
+
+    mock_engine = MagicMock()
+    mock_engine.sync_engine = MagicMock()
+
+    with (
+        patch("jobbers.db.create_async_engine", return_value=mock_engine) as mock_create,
+        patch("jobbers.db.event.listens_for", return_value=lambda fn: fn),
+        patch("jobbers.db.run_migrations", new=AsyncMock()),
+        patch("jobbers.db.async_sessionmaker", return_value=AsyncMock()),
+    ):
+        await db._get_or_create_sql(set())
+
+    mock_create.assert_called_once_with(make_url(sql_path))
 
 
 def test_needed_sql_features_default_routing_is_sql(monkeypatch):

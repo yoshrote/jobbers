@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import redis.asyncio as redis
 from sqlalchemy import event
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from jobbers.adapters import (
@@ -45,6 +46,14 @@ DLQ_BACKEND = os.environ.get("DLQ_BACKEND", "redis")
 TASK_SCHEDULER_BACKEND = os.environ.get("TASK_SCHEDULER_BACKEND", "redis")
 CRON_DAG_SCHEDULER_BACKEND = os.environ.get("CRON_DAG_SCHEDULER_BACKEND", "redis")
 FORCE_SAGA_MODE = os.environ.get("FORCE_SAGA_MODE", "false").lower() == "true"
+
+# SQLAlchemy engine-construction kwargs recognized as SQL_PATH query params (popped off
+# the URL before it reaches the DBAPI driver -- see _get_or_create_sql).
+_SQL_POOL_URL_PARAMS: dict[str, type[int] | type[float]] = {
+    "pool_size": int,
+    "max_overflow": int,
+    "pool_timeout": float,
+}
 
 
 def needed_sql_features() -> set[str]:
@@ -165,7 +174,25 @@ async def _get_or_create_sql(features: set[str]) -> async_sessionmaker[AsyncSess
         return _session_factory
 
     db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
-    _engine = create_async_engine(db_path)
+    # SQLAlchemy's async engine pool (AsyncAdaptedQueuePool) defaults to pool_size=5,
+    # max_overflow=10 -- a ceiling of 15 connections per process, far tighter than
+    # redis-py's 100-connection default. Unlike redis-py, SQLAlchemy doesn't natively
+    # support tuning these via a URL query param -- unrecognized query params are
+    # forwarded straight to the DBAPI driver's connect() call, which rejects them
+    # (asyncpg raises TypeError on an unknown `pool_size` kwarg). To keep the same
+    # `?pool_size=...&max_overflow=...&pool_timeout=...` convention SQL_PATH shares with
+    # REDIS_URL, pop the recognized params off the URL ourselves before constructing the
+    # engine, passing them as explicit kwargs instead. SQLite's pool (StaticPool) doesn't
+    # accept these kwargs at all, hence the guard.
+    engine_kwargs: dict[str, int | float] = {}
+    url = make_url(db_path)
+    if url.query and "sqlite" not in db_path:
+        remaining_query = dict(url.query)
+        for param, cast in _SQL_POOL_URL_PARAMS.items():
+            if param in remaining_query:
+                engine_kwargs[param] = cast(remaining_query.pop(param))  # type: ignore[arg-type]
+        url = url.set(query=remaining_query)
+    _engine = create_async_engine(url, **engine_kwargs)
 
     @event.listens_for(_engine.sync_engine, "connect")
     def set_sqlite_pragma(dbapi_conn: object, connection_record: object) -> None:

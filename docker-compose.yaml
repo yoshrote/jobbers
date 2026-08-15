@@ -42,6 +42,22 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: jobbers
+      POSTGRES_PASSWORD: jobbers
+      POSTGRES_DB: jobbers
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobbers"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
   manager:
     build: .
     environment:
@@ -124,4 +140,5 @@ services:
 volumes:
   frontend_nm:
   redis_data:
-  openobserve_data:  
+  postgres_data:
+  openobserve_data:

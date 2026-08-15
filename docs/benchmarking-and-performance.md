@@ -1,8 +1,13 @@
 # Benchmarking and Performance
 
-How much Redis load a Jobbers worker generates as concurrency scales, what that implies for `WORKER_CONCURRENT_TASKS` and Redis connection/server settings, and how to reproduce or extend the numbers yourself with [`scripts/redis_load_benchmark.py`](../scripts/redis_load_benchmark.py).
+How much load a Jobbers worker generates on its storage backend as concurrency scales, what that implies for `WORKER_CONCURRENT_TASKS` and connection/server settings, and how to reproduce or extend the numbers yourself.
 
-Scope: this document covers the `redis_json` backend (`TASK_BACKEND=redis_json`, `DLQ_BACKEND=redis_json`, `ROUTING_BACKEND=redis_json`) — the default and the most common production configuration. The general shape of the findings (one `BZPOPMIN` in flight per worker process, connection-pool sizing) applies to the plain `redis` backend too, but exact round-trip counts differ; see [task-backend-feature-matrix.md](task-backend-feature-matrix.md) for backend differences.
+Two companion scripts, one per backend family:
+
+- [`scripts/redis_load_benchmark.py`](../scripts/redis_load_benchmark.py) — the `redis_json` backend (`TASK_BACKEND=redis_json`, `DLQ_BACKEND=redis_json`, `ROUTING_BACKEND=redis_json`), the default and most common production configuration. The general shape of its findings (one `BZPOPMIN` in flight per worker process, connection-pool sizing) applies to the plain `redis` backend too, but exact round-trip counts differ; see [task-backend-feature-matrix.md](task-backend-feature-matrix.md) for backend differences.
+- [`scripts/sql_load_benchmark.py`](../scripts/sql_load_benchmark.py) — the `sql` backend (`TASK_BACKEND=sql`, `DLQ_BACKEND=sql`, `TASK_SCHEDULER_BACKEND=sql`, `ROUTING_BACKEND=sql`) against **PostgreSQL only**. SQLite is deliberately out of scope for this benchmark — its pool class rejects the connection-pool tuning being measured, and it serializes writers at the file level, so it can't represent the concurrency this exercises. MySQL is untested territory for this codebase (see the [SQL backend](#sql-backend-postgresql) section) and not covered here.
+
+Redis- and SQL-specific findings are in their own sections below, each ending with its own "using the benchmark script" walkthrough. For the short answer to "what do I actually set `WORKER_CONCURRENT_TASKS` to," skip to [Summary: sizing `WORKER_CONCURRENT_TASKS`](#summary-sizing-worker_concurrent_tasks) at the end.
 
 ---
 
@@ -81,7 +86,7 @@ Throughput scales near-linearly with concurrency up to ~50, then hits the **same
 
 Reproduced directly: a burst of 150 simultaneous Redis calls (150 concurrent task submissions/completions) against the default pool:
 
-```
+```text
 redis.exceptions.MaxConnectionsError: Too many connections
 ```
 
@@ -93,6 +98,31 @@ Retried with `--max-connections 300` (or, in production, `REDIS_URL="...?max_con
 | 150 | 300 | success | 468.5 | 150→150 |
 
 **Connections are never reclaimed** — redis-py's pool has no idle-connection GC; it only grows to its historical peak simultaneous demand and stays there for the life of the process. A single burst (a synchronized retry storm, a fleet-wide restart, a backlog catch-up after downtime) can permanently inflate a process's connection count until it restarts. Also note connections aren't held for a task's full duration — redis-py returns a connection to the pool after each command completes (except inside a `WATCH`/`MULTI` block) — so the connection count you need is driven by **how many Redis commands can land at the exact same instant**, not by steady-state concurrency. This is why the 50ms-task sweep above needed only ~30 connections at concurrency=200: individual commands are fast, so the odds of many landing simultaneously stay low outside of bursts.
+
+### 4. Parallelizing the pop loop helps, but with quickly diminishing returns and a real latency cost
+
+Since Finding 1 pins the per-process ceiling on the single sequential `BZPOPMIN` fetch loop, the natural next question is whether running multiple concurrent fetch loops (`--fetchers N`, prototyped in the benchmark script) raises that ceiling. It does, but not by much, and not for free.
+
+**A correctness hazard surfaced immediately.** The naive version — `N` independent `TaskGenerator` instances, each calling `.queues()` every iteration like `worker_proc.main()` does — crashed:
+
+```text
+RuntimeError: readuntil() called while another coroutine is already waiting for incoming data
+```
+
+`TaskGenerator.queues()` calls `StateManager.poll_refresh_signal(role)`, which reads from `RedisRoutingNotifications`'s **single cached pub/sub connection per role**. Two fetch loops for the same role polling that one connection concurrently race on the same underlying socket reader. This is a real, currently-dormant hazard: today it can't fire because every worker process only ever runs one `TaskGenerator`, but it would fire immediately for anyone implementing multiple concurrent fetchers per process without addressing it. **The fix** (implemented in the benchmark, and the pattern any real implementation would need): resolve the queue set via a single call, shared read-only across all fetch loops, instead of each loop independently polling for refresh-tag/routing-version changes. The tradeoff is that queue/role config changes are no longer picked up per-iteration by every fetcher — a real implementation would need one dedicated owner (e.g. a background task) periodically refreshing a shared value, not each fetcher polling independently.
+
+**With that fixed**, at concurrency=25, zero-work tasks, 1500 tasks/level:
+
+| fetchers | tasks/s | redis ops/s | p50 / p95 / p99 latency (ms) |
+| ---: | ---: | ---: | --- |
+| 1 | 470.9 | 8,490 | 3.3 / 4.7 / 5.5 |
+| 2 | 558.6 | 9,509 | 9.1 / 11.2 / 12.2 |
+| 4 | 580.9 | 9,890 | 18.1 / 21.6 / 27.0 |
+| 8 | 572.5 | 9,754 | 29.1 / 39.1 / 47.0 |
+
+Throughput gains **~19% going from 1→2 fetchers, another ~4% from 2→4, then flattens (and slightly regresses) from 4→8** — almost all of the available benefit is captured by 2-4 fetchers. Meanwhile **p99 latency grows roughly linearly with fetcher count** (~6-9ms per additional fetcher), because each additional fetcher is more concurrent work competing for the same event loop and connection pool without a proportional throughput return past 2-4. Redis-side ops/sec moved only slightly (~8,500 → ~9,900, still far from Redis's real ceiling), confirming the added fetchers mostly bought *local* scheduling parallelism, not additional Redis capacity.
+
+**Takeaway:** parallel fetchers are a real, usable lever if you need more than the single-fetcher ceiling from one process — 2-4 fetchers captured most of the throughput gain in this environment — but treat it as a throughput/latency tradeoff to dial in, not a free multiplier, and don't reach for a large fetcher count expecting proportional gains. For most deployments, adding worker *processes* (Finding 1's recommendation) is still the simpler lever, since it scales linearly without the shared-loop contention this introduces. The `--fetchers` flag exists in the benchmark script for exactly this kind of exploration, not as a recommended production default.
 
 ---
 
@@ -114,10 +144,11 @@ These numbers were measured on loopback (Redis Stack in Docker, same host, sub-m
 - Size it to your actual task duration: `concurrency ≈ target_throughput_per_process × avg_task_duration_seconds`. Setting it far above that only holds idle Redis connections for no throughput benefit (see Finding 1).
 - Measure your real per-process ceiling with this benchmark against Redis on your production network path (see [Extrapolating to your environment](#extrapolating-to-your-environment)) — don't assume the loopback numbers above.
 - Once you hit that per-process ceiling, **scale by adding worker processes/replicas**, not by raising concurrency further. Redis has enormous headroom left at the measured ceiling (~8,700 ops/sec against a backend capable of far more); a worker fleet is far more likely to be bottlenecked by the tasks' own external I/O or CPU than by this access pattern.
+- If a per-process ceiling above ~500 tasks/sec is genuinely needed and adding processes isn't viable, parallelizing the fetch loop (Finding 4) is a real but modest lever — expect most of the benefit from 2-4 concurrent fetchers, with p99 latency rising roughly linearly per fetcher added. This is not currently implemented in `worker_proc.py`; it exists only as a prototype in the benchmark script (`--fetchers`). Promoting it to production would require the same fix the prototype needed — a single shared owner for queue/role config refresh, not one per fetcher — see Finding 4 before attempting it.
 
 ### Redis connection tuning
 
-- Tune `max_connections` — and any other redis-py connection setting — as a **query parameter on `REDIS_URL`**, e.g. `REDIS_URL="redis://host:6379?max_connections=300"`. No code change is needed; redis-py's `from_url()` parses these and they take precedence over any explicit kwarg. This is the mechanism used throughout Jobbers for connection tuning — don't add a separate env var for it.
+- Tune `max_connections` — and any other redis-py connection setting — as a **query parameter on `REDIS_URL`**, e.g. `REDIS_URL="redis://host:6379?max_connections=300"`. No code change is needed; redis-py's `from_url()` parses these and they take precedence over any explicit kwarg. This is the mechanism used throughout Jobbers for connection tuning.
 - Size `max_connections` for your **worst burst**, not steady state — a rough floor is `WORKER_CONCURRENT_TASKS + 15-20%` headroom, since connections are never reclaimed once opened (Finding 3).
 - Every Jobbers process opens its own independent pool. Make sure Redis's own `maxclients` (default 10000) comfortably covers the **sum across your whole fleet** (manager + N workers + scheduler + cleaner).
 - Don't override `socket_timeout` — `jobbers/db.py` deliberately leaves it `None` to avoid racing `BZPOPMIN`'s server-side infinite block (a documented redis-py 8.0 regression).
@@ -152,6 +183,12 @@ REDIS_URL=redis://localhost:16379 python scripts/redis_load_benchmark.py \
 # probe the connection-pool ceiling directly
 REDIS_URL=redis://localhost:16379 python scripts/redis_load_benchmark.py \
     --concurrency 150 --submit-concurrency 150 --tasks-per-level 300 --max-connections 300
+
+# compare the parallel-fetcher prototype against the fetchers=1 baseline
+REDIS_URL=redis://localhost:16379 python scripts/redis_load_benchmark.py \
+    --concurrency 25 --fetchers 1 --tasks-per-level 1500 --max-connections 400 --out baseline.json
+REDIS_URL=redis://localhost:16379 python scripts/redis_load_benchmark.py \
+    --concurrency 25 --fetchers 4 --tasks-per-level 1500 --max-connections 400 --out fetchers4.json
 ```
 
 ### CLI reference
@@ -162,19 +199,21 @@ REDIS_URL=redis://localhost:16379 python scripts/redis_load_benchmark.py \
 | `--tasks-per-level` | `0` (auto: `max(500, concurrency*20)`) | Tasks to process at each level. |
 | `--max-tasks-per-level` | `5000` | Cap applied even when auto-sizing. |
 | `--sleep-ms` | `0` | Simulated per-task work time. `0` isolates the pop-loop/Redis-bound ceiling; `50`-`200` approximates a light real task. |
+| `--fetchers` | `1` | Number of concurrent `BZPOPMIN` fetch loops (see [Finding 4](#4-parallelizing-the-pop-loop-helps-but-with-quickly-diminishing-returns-and-a-real-latency-cost)). `1` exactly mirrors `worker_proc.main()`'s single sequential fetch loop; `>1` is the parallel-fetcher prototype, not something `worker_proc.py` does today. Not swept automatically — run separate invocations at different values to compare, same pattern as `--max-connections`. |
 | `--submit-concurrency` | `20` | Concurrency used to *seed* each level's queue, kept independent of the worker concurrency under test so submission itself doesn't exhaust the pool. Raise this deliberately (e.g. to match `--concurrency`) to test a submission burst. |
 | `--max-connections` | `0` (library default: 100) | This script's own `max_connections`, as a distinct flag so it's easy to vary across a sweep. Production tuning uses a `REDIS_URL` query param instead (see [Redis connection tuning](#redis-connection-tuning)) — this flag exists for benchmarking convenience, not as a new production knob. |
 | `--out` | `redis_load_benchmark_results.json` | Path to write JSON results. |
 
 ### Interpreting the output table
 
-```
- conc sleep_ms    done/n   run_s  tasks/s redis_ops/s  clients(base->peak) mem_delta_mb  p50_ms  p95_ms  p99_ms  maxconn
+```text
+ conc fetch sleep_ms    done/n   run_s  tasks/s redis_ops/s  clients(base->peak) mem_delta_mb  p50_ms  p95_ms  p99_ms  maxconn
 ```
 
 | Column | Meaning |
 | --- | --- |
 | `conc` | The `WORKER_CONCURRENT_TASKS`-equivalent level for this row. |
+| `fetch` | The `--fetchers` value used for this row (`1` unless overridden). |
 | `done/n` | Tasks completed vs. requested. Less than `n` means the run stopped early — check `maxconn`. |
 | `run_s` | Wall-clock time for the worker loop to drain this level's queue. |
 | `tasks/s` | End-to-end throughput as seen by the worker loop (`done / run_s`). This is the number to compare against your target throughput when sizing `WORKER_CONCURRENT_TASKS`. |
@@ -190,4 +229,167 @@ REDIS_URL=redis://localhost:16379 python scripts/redis_load_benchmark.py \
 
 ### Extending it
 
-The script is intentionally a thin driver over real `StateManager`/`TaskGenerator`/`TaskProcessor` calls, not a bespoke load generator — to test a different scenario, the natural extension points are `_register_bench_task` (swap in a task body closer to your real workload) and the `--concurrency`/`--sleep-ms`/`--max-connections` sweep dimensions already exposed. Keep any new dimension you want to sweep as its own CLI flag (matching the existing pattern) rather than folding it into an env var, so scripted sweeps stay simple.
+The script is intentionally a thin driver over real `StateManager`/`TaskGenerator`/`TaskProcessor` calls, not a bespoke load generator — to test a different scenario, the natural extension points are `_register_bench_task` (swap in a task body closer to your real workload) and the `--concurrency`/`--sleep-ms`/`--fetchers`/`--max-connections` sweep dimensions already exposed. Keep any new dimension you want to sweep as its own CLI flag (matching the existing pattern) rather than folding it into an env var, so scripted sweeps stay simple.
+
+Note that `_run_worker_loop`'s multi-fetcher path resolves the queue set once at the start of a level rather than re-checking it every pop iteration (see Finding 4) — if you extend the script to run longer levels where queue/role config might change mid-run, add a periodic shared refresh rather than reverting to one `TaskGenerator.queues()` call per fetcher, which reintroduces the pub/sub race.
+
+---
+
+## SQL backend (PostgreSQL)
+
+Everything in this section is `TASK_BACKEND=sql` (paired with `DLQ_BACKEND=sql`, `TASK_SCHEDULER_BACKEND=sql`, `ROUTING_BACKEND=sql`) against **PostgreSQL**, measured with [`scripts/sql_load_benchmark.py`](../scripts/sql_load_benchmark.py) — the same methodology as the Redis benchmark above (drives real `StateManager`/`TaskGenerator`/`TaskProcessor` code, not synthetic traffic), adapted for SQL's different pop semantics and connection-pool model.
+
+**Why not SQLite:** SQLite's pool class (`StaticPool`) rejects `pool_size`/`max_overflow` outright, and SQLite serializes writers at the file level — it can't represent the multi-connection concurrency this benchmark measures. **Why not MySQL:** untested anywhere in this codebase. The SQL adapters' comments explicitly reason about Postgres's READ COMMITTED isolation semantics for the concurrency-sensitive paths (fan-in, atomic dispatch, rate limiting); MySQL's different default isolation level (REPEATABLE READ) means those same code paths would need independent correctness verification, not just a performance run, before trusting results there.
+
+**Architectural note — Redis is still required.** Even with every `*_BACKEND` set to `"sql"`, a Jobbers deployment still needs a running Redis instance: `StateManager`'s cancellation bus and routing-refresh notifications (`RedisCancellationBus` / `RedisRoutingNotifications`) are unconditionally Redis-backed in `db.py`'s `init_state_manager()`, regardless of `TASK_BACKEND`. A plain `redis:latest` is sufficient for this path — Redis Stack/RedisJSON is not required. There is currently no all-SQL, Redis-free deployment mode.
+
+### Local setup
+
+`docker-compose.yaml` includes a `postgres` service (added alongside `redis` for local benchmarking/testing — not wired as the default `SQL_PATH` for the `manager`/`worker`/`scheduler` services, which still default to SQLite unless you override `SQL_PATH` yourself):
+
+```bash
+docker compose up -d postgres redis
+pip install -e ".[postgres]"   # installs asyncpg, not a default dependency
+```
+
+### Redis round-trips vs. SQL statements per task lifecycle stage
+
+SQL has no single-round-trip atomic primitive analogous to a Redis Lua script — each stage is one or more SQL statements inside one transaction (`BEGIN` + statements + `COMMIT`, all against the same checked-out connection). Compare against the [redis_json round-trip table](#redis-round-trips-per-task-lifecycle-stage) above:
+
+| Stage | Statements (in one txn) | Detail |
+| --- | --- | --- |
+| Submit (new task) | ~4 | Upsert `tasks` (`UPDATE` then `INSERT` since the row doesn't exist yet) + upsert `task_queue` (same `UPDATE`-then-`INSERT` pattern) |
+| Worker pop | 3 | `SELECT ... FOR UPDATE SKIP LOCKED` (find oldest queued id) + `DELETE FROM task_queue` + `SELECT` the task row |
+| Heartbeat set | 1 | `UPDATE tasks SET heartbeat_at = ...` |
+| Heartbeat remove | 1 | `UPDATE tasks SET heartbeat_at = NULL` |
+| Completion (success) | 1 | `UPDATE tasks ... WHERE status = 'STARTED'` — the compare-and-set is a single `WHERE`-guarded `UPDATE`, no separate read-then-write step |
+| Immediate retry | ~4 | Same upsert shape as submit |
+
+Notably, SQL's compare-and-set operations (completion, `compare_and_set_status`) are **cheaper** than Redis's — a single `UPDATE ... WHERE status = ?` is atomic by construction, with no `WATCH`/`MULTI`/retry-on-conflict dance needed (Postgres's row lock handles it). Submit is **more expensive** than Redis's single-Lua-script submit, since there's no equivalent to bundling multiple statements into one round trip.
+
+### Findings
+
+**1. Same fetch-loop-bound ceiling pattern as Redis, but roughly 3x lower.** Zero-work tasks (`--sleep-ms 0`), 500 tasks/level, default pool (`pool_size=5`, `max_overflow=10`):
+
+| concurrency | tasks/s | pg xact/s | connections (base→peak) |
+| ---: | ---: | ---: | --- |
+| 1 | 50.4 | 265 | 3→3 |
+| 5 | 152.4 | 706 | 7→7 |
+| 15 | 150.7 | 630 | 7→7 |
+| 50 | 154.4 | 629 | 7→7 |
+
+Throughput plateaus past concurrency≈5 at **~150 tasks/sec/process** — the same single-sequential-fetch-loop architecture as Redis (Finding 1 above), just capped lower because each SQL round trip costs more than each Redis round trip locally (see Finding 3). Peak connections stayed at 7 through concurrency=50 — well under the 15-connection default pool, for the same reason as Redis: connections are held only for the duration of each transaction, not the task's full lifetime, so realistic per-task SQL traffic doesn't naturally pile up connections at moderate concurrency.
+
+**2. The default connection pool is far tighter than Redis's.** SQLAlchemy's async engine defaults to `pool_size=5` + `max_overflow=10` — a **15-connection ceiling per process**, versus redis-py's 100-connection default. Unlike `REDIS_URL`, this isn't natively a query-string-tunable DBAPI setting — `pool_size`/`max_overflow`/`pool_timeout` are SQLAlchemy engine-construction kwargs, and passing them as raw URL query params fails outright (SQLAlchemy forwards unrecognized query params straight to the DBAPI driver's `connect()` call; asyncpg raises `TypeError: connect() got an unexpected keyword argument 'pool_size'`). `jobbers/db.py` didn't expose a way to tune them at all before this benchmark. It now supports the same `?pool_size=...&max_overflow=...&pool_timeout=...` convention on `SQL_PATH` that `REDIS_URL` supports for redis-py — implemented by popping the recognized params off the URL itself before constructing the engine, so the DBAPI driver never sees them (non-SQLite `SQL_PATH` only — SQLite's `StaticPool` rejects these kwargs outright).
+
+**3. SQLAlchemy's pool degrades gracefully (queues), while redis-py's fails fast.** This is a meaningful behavioral difference, not just a numbers difference. redis-py's pool raises `MaxConnectionsError` **immediately** when the pool is full. SQLAlchemy's pool instead **blocks the caller**, queuing up to `pool_timeout` (default 30s) waiting for a connection to free up, only raising `sqlalchemy.exc.TimeoutError` if that elapses. In practice this means a Postgres connection-pool bottleneck shows up first as **added latency** (silent queueing), not an error — which can mask the problem until something else times out first (an HTTP request deadline on the Manager API, for instance), or until a sustained-enough burst finally exceeds `pool_timeout` itself. Demonstrated directly: realistic jobbers-sized bursts (up to 200 concurrent submits against the 15-connection default) never triggered `TimeoutError` at all — individual round trips are fast enough locally that connections cycle back through the pool before 200 "concurrent" Python coroutines create genuine simultaneous demand. Reproducing the failure required either an artificially tiny pool (`--pool-size 1 --max-overflow 0`) or a deliberately short `--pool-timeout`.
+
+**4. Parallel fetchers help less here than for Redis, at a much steeper latency cost.** At concurrency=25, zero-work tasks:
+
+| fetchers | pool_size / max_overflow | tasks/s | pg xact/s | p50 / p95 / p99 latency (ms) |
+| ---: | --- | ---: | ---: | --- |
+| 1 | 5 / 10 (default) | 148.1 | 656 | 16.4 / 22.0 / 28.4 |
+| 8 | 20 / 20 | 178.2 | 828 | 88.1 / 123.3 / 204.7 |
+
++20% throughput for a **~5.4x p50 / ~7.2x p99 latency increase** — a markedly worse tradeoff than Redis's parallel-fetcher experiment (Finding 4 above: +19% throughput for a much smaller latency cost). `SELECT ... FOR UPDATE SKIP LOCKED` contention against the same small `task_queue` table under concurrent fetchers costs more here than Redis's lock-free sorted-set pop. **Takeaway: parallel fetchers are a weaker lever for the SQL backend than for Redis** — prefer adding worker processes over `--fetchers` if you need more than ~150 tasks/sec/process from SQL.
+
+**5. `synchronous_commit` materially affects both throughput and latency.** Postgres defaults to `synchronous_commit = on` — every `COMMIT` waits for a WAL fsync. Disabling it for a test run (`ALTER SYSTEM SET synchronous_commit = off; SELECT pg_reload_conf();`) at concurrency=5-25, zero-work tasks:
+
+| `synchronous_commit` | tasks/s | p50 / p99 latency (ms) |
+| --- | ---: | --- |
+| `on` (default) | ~150 | 16.4 / 28.4 |
+| `off` | ~197 | 12.4 / 15-17 |
+
+**+30-33% throughput, and p99 dropped to near p50** (less variance — no more waiting on fsync completion). This is a real, standard Postgres tuning lever, not a Jobbers-specific one — but it trades a small durability window (the last few committed transactions may not survive an OS/Postgres crash, though the database itself stays consistent; no corruption risk) for throughput and latency. Whether that trade is acceptable depends on how you'd want a worker restart to behave if a handful of just-completed tasks' terminal status were lost — the Cleaner's stale-task detection would likely just re-flag them as stalled rather than silently losing them, but verify that matches your tolerance before enabling it in production.
+
+### Recommendations
+
+- **Install `asyncpg`** (`pip install -e ".[postgres]"`) and point `SQL_PATH` at Postgres for any multi-worker deployment — this was already documented guidance; this benchmark confirms SQLite would not represent real concurrent behavior.
+- **Tune the connection pool explicitly** via `?pool_size=...&max_overflow=...&pool_timeout=...` on `SQL_PATH` — the same convention as `REDIS_URL`, and no code change needed. The SQLAlchemy defaults (5 / 10 / 30s) are conservative. Size `pool_size + max_overflow` per process the same way as Redis's `max_connections` (Finding 3 in the Redis section): headroom over `WORKER_CONCURRENT_TASKS`, summed across your whole fleet against Postgres's own `max_connections` (defaults to 100 server-side — the same number as redis-py's client-side default, coincidentally).
+- **Don't rely on pool exhaustion to reveal itself as an error.** Because SQLAlchemy queues rather than fails fast, watch p95/p99 task latency (already emitted via the `task_execution_time`/`task_end_to_end_latency` OTel metrics — see [operations.md](operations.md#opentelemetry-metrics)) for creeping growth as a leading indicator, rather than waiting for `TimeoutError` to show up in logs.
+- **Prefer adding worker processes over `--fetchers`** if one process's ~150 tasks/sec ceiling (this environment's number — re-measure on your network path) isn't enough; the latency cost of parallel fetchers is steeper here than for Redis (Finding 4).
+- **Consider `synchronous_commit = off`** only after confirming the durability tradeoff (Finding 5) is acceptable for your task volume and recovery expectations — it's a genuine throughput/latency win, not a Jobbers-specific hack, but it's a deliberate choice to make explicitly, not a default to flip blindly.
+- **Postgres server config, same principles as the Redis section:** run a dedicated instance if possible (row-lock contention on `task_queue`/`tasks` under concurrent workers is sensitive to noisy-neighbor I/O latency); ensure `max_connections` covers your fleet's summed pool ceilings; standard Postgres operational practices (autovacuum tuning, WAL sizing) apply as they would to any moderate-write-volume OLTP workload — nothing Jobbers-specific beyond what's covered above.
+
+### Using the SQL benchmark script
+
+```bash
+docker compose up -d postgres redis
+pip install -e ".[postgres]"
+
+# basic sweep
+SQL_PATH="postgresql+asyncpg://jobbers:jobbers@localhost:5432/jobbers" \
+REDIS_URL=redis://localhost:6379 python scripts/sql_load_benchmark.py \
+    --concurrency 1,5,10,25,50,100 --tasks-per-level 1500
+
+# probe the connection-pool ceiling directly (SQLAlchemy queues rather than fails fast --
+# see Finding 3 -- so a short --pool-timeout is needed to see the failure quickly)
+SQL_PATH="..." REDIS_URL=... python scripts/sql_load_benchmark.py \
+    --concurrency 20 --submit-concurrency 20 --pool-size 1 --max-overflow 0 --pool-timeout 0.01
+
+# compare the parallel-fetcher prototype against the fetchers=1 baseline
+SQL_PATH="..." REDIS_URL=... python scripts/sql_load_benchmark.py \
+    --concurrency 25 --fetchers 1 --tasks-per-level 500 --out baseline.json
+SQL_PATH="..." REDIS_URL=... python scripts/sql_load_benchmark.py \
+    --concurrency 25 --fetchers 8 --pool-size 20 --max-overflow 20 --tasks-per-level 500 --out fetchers8.json
+```
+
+Default credentials/DSN match the `postgres` service added to `docker-compose.yaml`: user/password/db all `jobbers`, port `5432`.
+
+#### CLI reference
+
+Mirrors `redis_load_benchmark.py`'s flags (`--concurrency`, `--tasks-per-level`, `--max-tasks-per-level`, `--sleep-ms`, `--fetchers`, `--submit-concurrency`, `--out`) with SQL-specific additions:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--pool-size` | unset (SQLAlchemy default: 5) | This run's `pool_size`, applied as a `SQL_PATH` query param (same mechanism as production tuning — see Finding 2). `0` is a valid, meaningful value (no persistent pooled connections) — distinct from leaving it unset. |
+| `--max-overflow` | unset (SQLAlchemy default: 10) | This run's `max_overflow`, applied the same way. `0` is a valid, meaningful value (no bursting beyond `pool_size`) — distinct from leaving it unset. Combined ceiling is `pool_size + max_overflow`. |
+| `--pool-timeout` | unset (SQLAlchemy default: 30s) | This run's `pool_timeout`, in seconds, applied the same way. Lower it to make a pool-exhaustion sweep fail fast instead of waiting up to 30s per level (see Finding 3). |
+
+#### Interpreting the output table
+
+```text
+ conc fetch sleep_ms    done/n   run_s  tasks/s  pg_xact/s  conns(base->peak)  db_delta_mb  p50_ms  p95_ms  p99_ms  poolerr
+```
+
+Same shape as the Redis table, with SQL-flavored columns: `pg_xact/s` is `pg_stat_database.xact_commit` delta over the run (the closest Postgres analog to Redis's `total_commands_processed` — each transaction bundles one stage's statements, similar to how a Lua script bundles Redis's). `conns(base->peak)` comes from `pg_stat_activity` filtered to the target database, sampled the same way as Redis's `connected_clients`. `db_delta_mb` is `pg_database_size()` delta — noisy at small task counts, same caveat as Redis's `mem_delta_mb`. `poolerr` is `ERROR` on `sqlalchemy.exc.TimeoutError` (during submission or the worker loop); the sweep stops at the first level that errors.
+
+One measurement quirk: `pg_xact/s` can read `0` (or, on an error-terminated row, a meaningless huge number from dividing by a near-zero elapsed time) on very small/fast runs — Postgres's statistics view has a brief refresh lag relative to the query that reads it. Use `--tasks-per-level` of at least a few hundred for a reliable reading; treat any row flagged `ERROR` as having no meaningful timing/throughput columns regardless of what they show.
+
+#### Extending it
+
+Same philosophy as the Redis script: a thin driver over real `StateManager`/`TaskGenerator`/`TaskProcessor` calls. The multi-fetcher path shares the same shared-queue-set fix as the Redis script (see [Redis: Extending it](#extending-it)) for the same reason — `RedisRoutingNotifications`'s per-role pub/sub connection is shared regardless of `TASK_BACKEND`, since routing notifications are always Redis-backed (see the architectural note at the top of this section).
+
+---
+
+## Summary: sizing `WORKER_CONCURRENT_TASKS`
+
+Both backends follow the same underlying model, so one formula covers both:
+
+```text
+WORKER_CONCURRENT_TASKS ≈ min(target_throughput_per_process, measured_ceiling) × avg_task_duration_seconds
+```
+
+**Why this formula.** `WORKER_CONCURRENT_TASKS` doesn't set throughput directly — it sets how many already-popped tasks can be executing at once (Redis Finding 1 / SQL Finding 1). By Little's Law, sustaining a given throughput with a given per-task duration requires that many concurrent slots: to hold 100 tasks/sec in flight at 200ms each, you need `100 × 0.2 = 20` slots. But no amount of concurrency lets one process exceed its **measured per-process ceiling** — the sequential fetch loop's own rate (~470-490 tasks/sec for Redis, ~150 tasks/sec for SQL, *in this benchmark's environment*; re-measure on your production network path per [Extrapolating to your environment](#extrapolating-to-your-environment)). Once `concurrency × (1 / avg_task_duration)` reaches that ceiling, more concurrency just holds idle connections for no additional throughput (Redis Finding 1, SQL Finding 1) — so the formula's `min()` caps the useful range.
+
+**Practical range:** treat the formula's output as a floor, not an exact target — real task durations vary, and a semaphore that's just barely large enough will occasionally sit idle waiting on the next pop between tasks finishing. Multiply by **1.5-2x** for headroom against that variance; there's little downside to modest over-provisioning (Finding 1 in both sections shows throughput plateaus rather than degrading once you're past the saturation point), but under-provisioning leaves real throughput on the table. Don't go below **~5** even for near-instant tasks — the default (`WORKER_CONCURRENT_TASKS=5`) is already a reasonable floor for that case, since sub-millisecond tasks don't benefit from more concurrency regardless (Redis Finding 1's zero-work sweep plateaued by concurrency≈5).
+
+**Worked examples**, assuming you want to saturate one process's full ceiling (i.e. `target_throughput_per_process = measured_ceiling` — see below if your target is lower than the ceiling), using this benchmark's measured ceilings (re-measure your own before trusting these for capacity planning):
+
+| avg task duration | Redis: concurrency (×1.5 headroom) | SQL: concurrency (×1.5 headroom) |
+| --- | ---: | ---: |
+| ~0ms (near-instant) | 5 (floor) | 5 (floor) |
+| 10ms | ~7 | 5 (floor) |
+| 50ms | ~36 | ~11 |
+| 200ms | ~144 | ~45 |
+| 1s | ~720 | ~225 |
+
+The 1s row is arithmetically what "saturate the ceiling with 1-second tasks" requires, but treat triple-digit-plus concurrency as a signal to sanity-check assumptions rather than a number to deploy blindly — this benchmark measured Jobbers' own bookkeeping overhead, not per-task memory/thread/external-API-rate-limit costs, and those are far more likely to constrain a process running hundreds of genuinely-1-second tasks concurrently than anything measured here.
+
+**If your target throughput is lower than the ceiling** (the common case — most deployments don't need to saturate a single process), skip the table and use `target_throughput_per_process × avg_task_duration_seconds × 1.5`, floor 5, directly — no need to reach the ceiling at all.
+
+**When the target exceeds one process's ceiling** (`target_throughput_per_process > measured_ceiling`, regardless of task duration): don't raise `WORKER_CONCURRENT_TASKS` past the ceiling-saturating value above — set concurrency to saturate that ceiling and **add more worker processes/replicas** for the rest of the needed throughput (Redis Finding 1 / SQL Finding 1's primary recommendation). Redis has far more headroom to scale into per process than SQL (~470-490 vs. ~150 tasks/sec here) — an SQL-backed deployment will need proportionally more worker processes for the same aggregate throughput target.
+
+**Parallel fetchers (`--fetchers`) are not part of this formula.** They're a secondary lever, prototyped in both benchmark scripts, for squeezing more out of a *single* process when adding processes genuinely isn't viable — and a weaker one for SQL than Redis (compare Redis Finding 4's +19% throughput for a moderate latency cost against SQL Finding 4's +20% for a ~5-7x latency cost). Reach for more worker processes first.
+
+**Once concurrency is set, size the connection pool from it**, not the other way around: `max_connections` (Redis, via `?max_connections=...` on `REDIS_URL`) or `pool_size + max_overflow` (SQL, via the same convention on `SQL_PATH`) should be `WORKER_CONCURRENT_TASKS` plus ~15-20% headroom for bursts, per Redis Finding 3 / SQL Finding 2-3 — summed across your whole fleet against the server's own connection ceiling (Redis's `maxclients`, Postgres's `max_connections`).
