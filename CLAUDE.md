@@ -78,6 +78,7 @@ All four run as separate processes (separate Docker containers in production).
 - **Four interchangeable routing backends:** `sql`, `redis`, `redis_json`, `static` (see Routing Backends below)
 - **React 19 + Vite 7 + React Router 6** (no TypeScript, plain CSS)
 - **OpenTelemetry** (OTLP → OpenObserve)
+- **uvloop** (optional, `pip install -e ".[uvloop]"`, POSIX-only) — Worker/Scheduler/Cleaner install it as the event loop policy if present (`jobbers/utils/asyncio_config.py`); the Manager gets it automatically via uvicorn's default `loop="auto"`. Silently falls back to the standard asyncio loop when not installed.
 
 ## Task Lifecycle
 
@@ -247,6 +248,7 @@ Config file format (`routing.json`):
 | `REDIS_URL` | `redis://localhost:6379` | All (accepts redis-py query-string params too, e.g. `?max_connections=300&socket_timeout=5`) |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (used when any backend is `"sql"`; use PostgreSQL for multi-worker deployments). Accepts `?pool_size=...&max_overflow=...&pool_timeout=...` query params (non-SQLite DSNs only — SQLite's pool class rejects these kwargs). SQLAlchemy doesn't support this natively; `db.py` pops these params off the URL itself before constructing the engine, so the DBAPI driver never sees them. Combined connection ceiling is `pool_size + max_overflow` (defaults 5 + 10 = 15), well below redis-py's 100-connection default for `REDIS_URL`. |
 | `STATIC_CONFIG_FILE` | — | All (path to JSON/YAML routing config; requires `ROUTING_BACKEND=static`) |
+| `ASYNCIO_DEBUG` | `"false"` | Worker, Scheduler, Cleaner (`jobbers/utils/asyncio_config.py`); enables asyncio debug mode (slow-callback logging, extra coroutine-origin tracking). Adds real overhead — leave off outside local debugging. |
 
 ## Testing
 

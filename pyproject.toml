@@ -63,6 +63,12 @@ test = [
     "mypy",
     "typing_extensions>=4.6.0",
 ]
+postgres = [
+    "asyncpg",
+]
+uvloop = [
+    "uvloop; sys_platform != 'win32'",
+]
 
 [tool.hatch.version]
 path = "jobbers/__init__.py"

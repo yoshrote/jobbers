@@ -6,7 +6,10 @@ import sys
 
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.utils.asyncio_config import asyncio_debug_enabled, install_uvloop
 from jobbers.utils.otel import enable_otel, shutdown_otel
+
+logger = logging.getLogger(__name__)
 
 parser = argparse.ArgumentParser(description="Jobbers Cleaner")
 parser.add_argument(
@@ -98,7 +101,11 @@ def run() -> None:
 
     args = parser.parse_args()
 
+    if install_uvloop():
+        logger.info("uvloop installed as the event loop policy")
+
     loop = asyncio.get_event_loop()
+    loop.set_debug(asyncio_debug_enabled())
     try:
         loop.run_until_complete(cleaner(args))
     finally:
