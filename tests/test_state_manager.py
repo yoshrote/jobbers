@@ -2595,7 +2595,9 @@ async def test_mark_task_stale_saga_mode_skips_when_already_resolved(saga_state_
     the store has since moved on.
     """
     sm = saga_state_manager
-    await sm.task_state.save_task(Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED))
+    await sm.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED)
+    )
 
     stale_snapshot = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
     stale_snapshot.heartbeat_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)

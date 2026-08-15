@@ -107,9 +107,12 @@ def test_needed_sql_features_only_configured_backends(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_or_create_sql_pops_pool_params_from_url_for_non_sqlite(monkeypatch):
-    """?pool_size=...&max_overflow=...&pool_timeout=... on SQL_PATH are popped off the URL and
-    forwarded as engine kwargs -- SQLAlchemy would otherwise forward them straight to the
-    DBAPI driver's connect(), which rejects unrecognized kwargs."""
+    """
+    Pool-tuning params on SQL_PATH are popped off the URL and forwarded as engine kwargs.
+
+    ?pool_size=...&max_overflow=...&pool_timeout=... -- SQLAlchemy would otherwise forward
+    them straight to the DBAPI driver's connect(), which rejects unrecognized kwargs.
+    """
     monkeypatch.setattr(db, "_engine", None)
     monkeypatch.setattr(db, "_session_factory", None)
     monkeypatch.setenv(
@@ -138,8 +141,11 @@ async def test_get_or_create_sql_pops_pool_params_from_url_for_non_sqlite(monkey
 
 @pytest.mark.asyncio
 async def test_get_or_create_sql_ignores_pool_params_for_sqlite(monkeypatch):
-    """Pool params are never popped/forwarded for SQLite DSNs -- its pool class (StaticPool)
-    rejects them outright."""
+    """
+    Pool params are never popped/forwarded for SQLite DSNs.
+
+    SQLite's pool class (StaticPool) rejects them outright.
+    """
     monkeypatch.setattr(db, "_engine", None)
     monkeypatch.setattr(db, "_session_factory", None)
     sql_path = "sqlite+aiosqlite:///:memory:?pool_size=20&max_overflow=5"

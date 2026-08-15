@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""
-Benchmark the Postgres load a Jobbers worker generates as concurrency scales, when
+r"""
+Benchmark the Postgres load a Jobbers worker generates as concurrency scales.
+
 TASK_BACKEND=sql (paired with DLQ_BACKEND=sql, TASK_SCHEDULER_BACKEND=sql,
 ROUTING_BACKEND=sql).
 
@@ -36,6 +37,15 @@ Usage:
     # before constructing the engine; see docs/benchmarking-and-performance.md.
     SQL_PATH="...?pool_size=5&max_overflow=10" REDIS_URL=... python scripts/sql_load_benchmark.py \\
         --concurrency 50
+
+This benchmarks a single worker process's fetch loop (one sequential pop in flight,
+dispatching into a semaphore-gated pool of executors -- exactly what worker_proc.main()
+runs). An earlier version of this script also prototyped parallel fetch loops within one
+process; that prototype is gone. It bought less throughput here than for the Redis
+backend, at a much steeper latency cost (see scripts/redis_load_benchmark.py's docstring
+for the correctness hazard it also surfaced). Running additional worker *processes*
+scales linearly with none of that complexity or risk, so that's the recommended lever --
+see docs/benchmarking-and-performance.md.
 
 Results are printed as a table and written as JSON to --out (default:
 sql_load_benchmark_results.json in the current directory).
@@ -74,33 +84,32 @@ if "sqlite" in os.environ["SQL_PATH"]:
         "serializes writers at the file level. See the module docstring."
     )
 
-import asyncpg  # type: ignore[import-untyped]  # noqa: E402
-from sqlalchemy.engine import make_url  # noqa: E402
-from sqlalchemy.exc import TimeoutError as SQLPoolTimeoutError  # noqa: E402
-from ulid import ULID  # noqa: E402
+import asyncpg  # type: ignore[import-untyped]
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import TimeoutError as SQLPoolTimeoutError
+from ulid import ULID
 
-from jobbers import db  # noqa: E402
-from jobbers.models.queue_config import QueueConfig  # noqa: E402
-from jobbers.models.task import Task  # noqa: E402
-from jobbers.models.task_config import DeadLetterPolicy  # noqa: E402
-from jobbers.registry import clear_registry, register_task  # noqa: E402
-from jobbers.task_generator import TaskGenerator  # noqa: E402
-from jobbers.task_processor import TaskProcessor  # noqa: E402
+from jobbers import db
+from jobbers.models.queue_config import QueueConfig
+from jobbers.models.task import Task
+from jobbers.models.task_config import DeadLetterPolicy
+from jobbers.registry import clear_registry, register_task
+from jobbers.task_generator import TaskGenerator
+from jobbers.task_processor import TaskProcessor
 
 if TYPE_CHECKING:
     from jobbers.state_manager import StateManager
 
 BENCH_TASK_NAME = "bench_noop"
 BENCH_TASK_VERSION = 1
-# Brief backoff when a poll-based pop finds nothing -- SQL has no blocking-pop primitive
-# like Redis's BZPOPMIN, so a "no row available right now" result is a normal outcome
-# under concurrent SELECT ... FOR UPDATE SKIP LOCKED contention, not an error.
-_POLL_BACKOFF_SECS = 0.002
 
 
 def _raw_dsn(sql_path: str) -> str:
-    """Strip the +driver suffix and any query params (pool_size etc.) for raw asyncpg.connect(),
-    which wants a plain postgresql://user:pass@host/db URL with no SQLAlchemy-only params."""
+    """
+    Strip the +driver suffix and any query params for raw asyncpg.connect().
+
+    asyncpg wants a plain postgresql://user:pass@host/db URL with no SQLAlchemy-only params.
+    """
     url = make_url(sql_path).set(drivername="postgresql", query={})
     return url.render_as_string(hide_password=False)
 
@@ -111,10 +120,11 @@ def _dbname(sql_path: str) -> str:
 
 @dataclass
 class LevelResult:
+    """Results of a single concurrency-level run in the sweep."""
+
     concurrency: int
     n_tasks: int
     sleep_ms: int
-    fetchers: int
     pool_size: int
     max_overflow: int
     submit_seconds: float
@@ -135,6 +145,8 @@ class LevelResult:
 
 @dataclass
 class SweepResults:
+    """All per-level results from a full concurrency sweep."""
+
     levels: list[LevelResult] = field(default_factory=list)
 
 
@@ -154,12 +166,12 @@ async def _register_bench_task(sleep_ms: int) -> None:
     )(_bench_noop)
 
 
-async def _ensure_queue_and_role(sm: "StateManager", queue: str, role: str) -> None:
+async def _ensure_queue_and_role(sm: StateManager, queue: str, role: str) -> None:
     await sm.routing.create_queue_config(QueueConfig(name=queue, max_concurrent=0))
     await sm.routing.create_role(role, {queue})
 
 
-async def _submit_tasks(sm: "StateManager", queue: str, n: int, submit_concurrency: int) -> float:
+async def _submit_tasks(sm: StateManager, queue: str, n: int, submit_concurrency: int) -> float:
     sem = asyncio.Semaphore(submit_concurrency)
 
     async def _one() -> None:
@@ -172,11 +184,9 @@ async def _submit_tasks(sm: "StateManager", queue: str, n: int, submit_concurren
     return time.perf_counter() - start
 
 
-async def _pg_stats(conn: "asyncpg.Connection", dbname: str) -> dict[str, Any]:
+async def _pg_stats(conn: asyncpg.Connection, dbname: str) -> dict[str, Any]:
     connections = await conn.fetchval("SELECT count(*) FROM pg_stat_activity WHERE datname = $1", dbname)
-    row = await conn.fetchrow(
-        "SELECT xact_commit FROM pg_stat_database WHERE datname = $1", dbname
-    )
+    row = await conn.fetchrow("SELECT xact_commit FROM pg_stat_database WHERE datname = $1", dbname)
     size = await conn.fetchval("SELECT pg_database_size($1)", dbname)
     return {
         "connections": connections or 0,
@@ -186,7 +196,7 @@ async def _pg_stats(conn: "asyncpg.Connection", dbname: str) -> dict[str, Any]:
 
 
 async def _sample_peak_connections(
-    conn: "asyncpg.Connection", dbname: str, peak: list[int], stop: asyncio.Event
+    conn: asyncpg.Connection, dbname: str, peak: list[int], stop: asyncio.Event
 ) -> None:
     while not stop.is_set():
         try:
@@ -201,34 +211,27 @@ async def _sample_peak_connections(
 
 
 async def _run_worker_loop(
-    sm: "StateManager", role: str, n_tasks: int, concurrency: int, fetchers: int = 1
+    sm: StateManager, role: str, n_tasks: int, concurrency: int
 ) -> tuple[list[float], bool]:
-    """Drain up to n_tasks tasks with up to `concurrency` in flight, using `fetchers`
-    concurrent pop loops (see scripts/redis_load_benchmark.py's _run_worker_loop for the
-    parallel-fetcher rationale and the shared-queue-set fix for the RedisRoutingNotifications
-    per-role pub/sub hazard -- that hazard applies here too, since routing notifications are
-    always Redis-backed regardless of TASK_BACKEND).
-
-    Unlike Redis's blocking BZPOPMIN, SQL's get_next_task (SELECT ... FOR UPDATE SKIP LOCKED)
-    is non-blocking and can legitimately return None under concurrent contention even when
-    tasks remain. The fetch budget is therefore decremented only on a *confirmed* successful
-    pop, with a brief backoff (_POLL_BACKOFF_SECS) and retry on None -- decrementing
-    before-the-attempt (as the Redis script does, safely, since its pop never returns None
-    in a closed benchmark run) would let a poll-based backend exit early having "spent" its
-    budget on unproductive polls, leaving tasks undrained.
-
-    Returns (latencies_ms, hit_pool_timeout). If the SQLAlchemy connection pool is exhausted
-    mid-run (sqlalchemy.exc.TimeoutError), stops early rather than crashing the whole sweep --
-    that failure point is itself the data point we want.
     """
-    coordinator = TaskGenerator(sm, role, max_tasks=0)
-    queues = await coordinator.queues()
+    Drain up to n_tasks tasks with up to `concurrency` in flight.
+
+    Mirrors worker_proc.main() exactly: a single sequential fetch loop dispatching
+    into a semaphore-gated pool of executors. TaskGenerator.__anext__ handles SQL's
+    non-blocking SELECT ... FOR UPDATE SKIP LOCKED semantics internally (it retries
+    on an empty poll with its own built-in backoff), so this loop just calls anext()
+    the same way the real worker does.
+
+    Returns (latencies_ms, hit_pool_timeout). If the SQLAlchemy connection pool is
+    exhausted mid-run (sqlalchemy.exc.TimeoutError), stops early rather than crashing
+    the whole sweep -- that failure point is itself the data point we want.
+    """
+    task_generator = TaskGenerator(sm, role, max_tasks=n_tasks)
 
     semaphore = asyncio.Semaphore(concurrency)
     latencies_ms: list[float] = []
     lock = asyncio.Lock()
     hit_pool_timeout = False
-    remaining = [n_tasks]
     active: list[asyncio.Task[None]] = []
 
     async def run_task(task: Task) -> None:
@@ -244,31 +247,23 @@ async def _run_worker_loop(
                 latencies_ms.append(elapsed_ms)
             semaphore.release()
 
-    async def fetch_loop() -> None:
-        nonlocal hit_pool_timeout
+    try:
         while not hit_pool_timeout:
-            if remaining[0] <= 0:
-                return
             await semaphore.acquire()
             if hit_pool_timeout:
                 semaphore.release()
-                return
+                break
             try:
-                task = await sm.get_next_task(queues)
+                task = await anext(task_generator)
+            except StopAsyncIteration:
+                semaphore.release()
+                break
             except SQLPoolTimeoutError:
                 semaphore.release()
                 hit_pool_timeout = True
-                return
-            if task is None:
-                semaphore.release()
-                await asyncio.sleep(_POLL_BACKOFF_SECS)
-                continue
-            remaining[0] -= 1  # only decrement on confirmed success -- see docstring
+                break
             t = asyncio.create_task(run_task(task))
             active.append(t)
-
-    try:
-        await asyncio.gather(*(fetch_loop() for _ in range(fetchers)))
     finally:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
@@ -277,20 +272,19 @@ async def _run_worker_loop(
 
 
 async def run_level(
-    stats_conn: "asyncpg.Connection",
-    sampler_conn: "asyncpg.Connection",
+    stats_conn: asyncpg.Connection,
+    sampler_conn: asyncpg.Connection,
     dbname: str,
-    sm: "StateManager",
+    sm: StateManager,
     concurrency: int,
     n_tasks: int,
     sleep_ms: int,
     submit_concurrency: int,
     pool_size: int,
     max_overflow: int,
-    fetchers: int,
 ) -> LevelResult:
-    queue = f"bench-{concurrency}-{sleep_ms}-{fetchers}"
-    role = f"bench-role-{concurrency}-{sleep_ms}-{fetchers}"
+    queue = f"bench-{concurrency}-{sleep_ms}"
+    role = f"bench-role-{concurrency}-{sleep_ms}"
     await _ensure_queue_and_role(sm, queue, role)
 
     submit_hit_pool_timeout = False
@@ -312,9 +306,7 @@ async def run_level(
     latencies_ms: list[float] = []
     run_hit_pool_timeout = False
     if not submit_hit_pool_timeout:
-        latencies_ms, run_hit_pool_timeout = await _run_worker_loop(
-            sm, role, n_tasks, concurrency, fetchers
-        )
+        latencies_ms, run_hit_pool_timeout = await _run_worker_loop(sm, role, n_tasks, concurrency)
     run_seconds = time.perf_counter() - start
 
     stop_event.set()
@@ -334,7 +326,6 @@ async def run_level(
         concurrency=concurrency,
         n_tasks=n_tasks,
         sleep_ms=sleep_ms,
-        fetchers=fetchers,
         pool_size=pool_size,
         max_overflow=max_overflow,
         submit_seconds=submit_seconds,
@@ -358,7 +349,7 @@ async def run_level(
 
 def _print_table(results: list[LevelResult]) -> None:
     header = (
-        f"{'conc':>5} {'fetch':>5} {'sleep_ms':>8} {'done/n':>9} {'run_s':>7} {'tasks/s':>8} "
+        f"{'conc':>5} {'sleep_ms':>8} {'done/n':>9} {'run_s':>7} {'tasks/s':>8} "
         f"{'pg_xact/s':>10} {'conns(base->peak)':>18} {'db_delta_mb':>12} "
         f"{'p50_ms':>7} {'p95_ms':>7} {'p99_ms':>7} {'poolerr':>8}"
     )
@@ -368,7 +359,7 @@ def _print_table(results: list[LevelResult]) -> None:
         conns = f"{r.pg_connections_baseline}->{r.pg_connections_peak}"
         done = f"{r.tasks_completed}/{r.n_tasks}"
         print(
-            f"{r.concurrency:>5} {r.fetchers:>5} {r.sleep_ms:>8} {done:>9} {r.run_seconds:>7.2f} "
+            f"{r.concurrency:>5} {r.sleep_ms:>8} {done:>9} {r.run_seconds:>7.2f} "
             f"{r.throughput_tasks_per_sec:>8.1f} {r.pg_xact_per_sec:>10.1f} {conns:>18} "
             f"{r.pg_db_size_delta_bytes / 1e6:>12.2f} "
             f"{r.latency_ms_p50:>7.1f} {r.latency_ms_p95:>7.1f} {r.latency_ms_p99:>7.1f} "
@@ -398,7 +389,7 @@ async def main_async(args: argparse.Namespace) -> None:
         os.environ["SQL_PATH"] = url.render_as_string(hide_password=False)
 
     sm = await db.init_state_manager()
-    engine = db._engine  # noqa: SLF001 -- benchmark tooling, reading pool config for reporting
+    engine = db._engine
     assert engine is not None  # noqa: S101
     effective_pool_size = engine.pool.size()  # type: ignore[attr-defined]
     effective_max_overflow = getattr(engine.pool, "_max_overflow", 0)
@@ -418,9 +409,8 @@ async def main_async(args: argparse.Namespace) -> None:
             n_tasks = min(n_tasks, args.max_tasks_per_level)
             submit_concurrency = min(concurrency, args.submit_concurrency)
             print(
-                f"\n=== concurrency={concurrency} fetchers={args.fetchers} n_tasks={n_tasks} "
-                f"sleep_ms={args.sleep_ms} pool_size={effective_pool_size} "
-                f"max_overflow={effective_max_overflow} ==="
+                f"\n=== concurrency={concurrency} n_tasks={n_tasks} sleep_ms={args.sleep_ms} "
+                f"pool_size={effective_pool_size} max_overflow={effective_max_overflow} ==="
             )
             result = await run_level(
                 stats_conn,
@@ -433,7 +423,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 submit_concurrency,
                 effective_pool_size,
                 effective_max_overflow,
-                args.fetchers,
             )
             results.append(result)
             status = " *** sqlalchemy.exc.TimeoutError ***" if result.pool_timeout_error else ""
@@ -458,8 +447,7 @@ async def main_async(args: argparse.Namespace) -> None:
         _print_table(results)
 
         sweep = SweepResults(levels=results)
-        with open(args.out, "w") as f:
-            json.dump(asdict(sweep), f, indent=2)
+        await asyncio.to_thread(Path(args.out).write_text, json.dumps(asdict(sweep), indent=2))
         print(f"\nWrote results to {args.out}")
     finally:
         await stats_conn.close()
@@ -467,7 +455,9 @@ async def main_async(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--concurrency",
         default="1,5,10,25,50,100,200",
@@ -491,14 +481,6 @@ def main() -> None:
         default=0,
         help="Simulated per-task work time in ms (0 = pure SQL-bound ceiling; try 50-200 for a "
         "more realistic light-task scenario).",
-    )
-    parser.add_argument(
-        "--fetchers",
-        type=int,
-        default=1,
-        help="Number of concurrent pop loops. 1 (default) mirrors worker_proc.main()'s single "
-        "sequential fetch loop. Not swept automatically -- run separate invocations at "
-        "different values to compare, same pattern as --pool-size.",
     )
     parser.add_argument(
         "--submit-concurrency",
