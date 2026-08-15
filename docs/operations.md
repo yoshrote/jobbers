@@ -132,7 +132,7 @@ Starts a worker process that pulls tasks from Redis queues and executes them. Li
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL for queue/role config |
 | `OTEL_*` | _(same as Manager)_ | OpenTelemetry endpoints |
 
-Scale horizontally by running more worker processes. Workers are fully independent — they coordinate only through Redis and SQL. Workers detect role and queue configuration changes automatically without restart.
+Scale horizontally by running more worker processes. Workers are fully independent — they coordinate only through Redis and SQL. Workers detect role and queue configuration changes automatically without restart. For guidance on sizing `WORKER_CONCURRENT_TASKS` and Redis connection/server settings, plus a reusable load-testing script, see [benchmarking-and-performance.md](benchmarking-and-performance.md).
 
 On `SIGTERM`, each in-flight task is handled according to its `on_shutdown` policy before the process exits.
 

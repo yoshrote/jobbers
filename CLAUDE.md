@@ -244,7 +244,7 @@ Config file format (`routing.json`):
 | `TASK_SCHEDULER_BACKEND` | `"redis"` | All (`"redis"` or `"sql"`) |
 | `ROUTING_BACKEND` | `"sql"` | All (`"sql"`, `"redis"`, `"redis_json"`, or `"static"`) |
 | `CRON_DAG_SCHEDULER_BACKEND` | `"redis"` | All (`"redis"`, `"sql"`, or `"static"`); `static` is read-only in-memory (state resets on restart) |
-| `REDIS_URL` | `redis://localhost:6379` | All |
+| `REDIS_URL` | `redis://localhost:6379` | All (accepts redis-py query-string params too, e.g. `?max_connections=300&socket_timeout=5`) |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (used when any backend is `"sql"`; use PostgreSQL for multi-worker deployments) |
 | `STATIC_CONFIG_FILE` | — | All (path to JSON/YAML routing config; requires `ROUTING_BACKEND=static`) |
 
