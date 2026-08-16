@@ -164,7 +164,7 @@ async def _submit_tasks(sm: StateManager, queue: str, n: int, submit_concurrency
 
 
 async def _redis_info(client: redis.Redis) -> dict[str, Any]:
-    return await client.info()  # type: ignore[no-any-return]
+    return await client.info()
 
 
 async def _sample_peak_clients(client: redis.Redis, peak: list[int], stop: asyncio.Event) -> None:
