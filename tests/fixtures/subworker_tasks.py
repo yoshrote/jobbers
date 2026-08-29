@@ -9,6 +9,7 @@ itself (no test-only imports, no monkeypatching).
 import time
 
 from jobbers.registry import register_task
+from jobbers.subworker.context import heartbeat
 
 
 @register_task(name="subworker_add", version=1)
@@ -24,4 +25,11 @@ def subworker_fail(message: str) -> None:
 @register_task(name="subworker_sleep", version=1)
 def subworker_sleep(seconds: float) -> str:
     time.sleep(seconds)
+    return "done"
+
+
+@register_task(name="subworker_heartbeat_then_done", version=1)
+def subworker_heartbeat_then_done(count: int) -> str:
+    for _ in range(count):
+        heartbeat()
     return "done"

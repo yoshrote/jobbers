@@ -30,7 +30,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
 from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_status import TaskStatus
-from jobbers.protocols import CancellationKind
+from jobbers.protocols import CancellationKind, QueueLimits
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -1145,10 +1145,13 @@ class StateManager:
         """Return the set of queues assigned to a role."""
         return await self.routing.get_queues(role)
 
-    async def get_queue_limits(self, queues: set[str]) -> dict[str, int | None]:
-        """Return per-queue max_concurrent limits, reusing the queue-config cache."""
+    async def get_queue_limits(self, queues: set[str]) -> dict[str, QueueLimits]:
+        """Return per-queue max_concurrent/has_sync_tasks limits, reusing the queue-config cache."""
         results = await asyncio.gather(*(self.get_queue_config(q) for q in queues))
-        return {q: (cfg.max_concurrent if cfg else None) for q, cfg in zip(queues, results)}
+        return {
+            q: (QueueLimits(cfg.max_concurrent, cfg.has_sync_tasks) if cfg else QueueLimits(None, False))
+            for q, cfg in zip(queues, results)
+        }
 
     async def get_all_queues(self) -> list[str]:
         """Return the list of all configured queue names."""

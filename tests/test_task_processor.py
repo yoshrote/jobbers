@@ -20,7 +20,7 @@ from jobbers.models.dag import (
     TaskResult,
 )
 from jobbers.models.task import Task, TaskStatus
-from jobbers.models.task_config import BackoffStrategy
+from jobbers.models.task_config import BackoffStrategy, TaskExecutionMode
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
 from jobbers.state_manager import (
@@ -30,6 +30,9 @@ from jobbers.state_manager import (
     TaskRateLimitedError,
     UserCancellationError,
 )
+from jobbers.subworker.errors import SubworkerTaskFailure
+from jobbers.subworker.pool import SubworkerPool
+from jobbers.subworker.protocols import SubworkerTaskError
 from jobbers.task_processor import TaskProcessor, _spec_to_dag_node
 from jobbers.utils.mermaid_dag import parse_mermaid_dag
 
@@ -3032,3 +3035,224 @@ async def test_maybe_cleanup_runs_after_dynamic_fanout_registers_arms():
     submit_index = call_names.index("submit_tasks_batch")
     close_index = call_names.index("finalize_dag_run_task")
     assert submit_index < close_index, "arms must be registered before the dispatcher closes out of the run"
+
+
+# ── sync_subworker execution mode ────────────────────────────────────────────
+
+
+def _sync_subworker_config(**overrides):
+    defaults = dict(
+        name="sync_task",
+        version=1,
+        function=lambda **kwargs: kwargs,  # never actually called in-process
+        timeout=10,
+        max_retries=3,
+        execution_mode=TaskExecutionMode.SYNC_SUBWORKER,
+    )
+    defaults.update(overrides)
+    return TaskConfig(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_sync_subworker_task_dispatches_via_pool():
+    """A sync_subworker task is routed through the configured SubworkerPool, not called directly."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="sync_task",
+        version=1,
+        parameters={"a": 1},
+        status=TaskStatus.SUBMITTED,
+    )
+    state_manager = _make_state_manager()
+    pool = AsyncMock(spec=SubworkerPool)
+    pool.dispatch = AsyncMock(return_value={"result": "ok"})
+    task_config = _sync_subworker_config()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, subworker_pool=pool)
+        result_task = await processor.process(task)
+
+    assert result_task.status == TaskStatus.COMPLETED
+    assert result_task.results == {"result": "ok"}
+    pool.dispatch.assert_awaited_once()
+    args, kwargs = pool.dispatch.call_args
+    assert args == ("sync_task", 1, {"a": 1})
+    assert kwargs["request_id"] == str(task.id)
+    assert callable(kwargs["on_heartbeat"])
+
+
+@pytest.mark.asyncio
+async def test_sync_subworker_task_without_pool_configured_fails_gracefully():
+    """No subworker pool configured -> the task fails normally instead of crashing process()."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="sync_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+    )
+    state_manager = _make_state_manager()
+    task_config = _sync_subworker_config(max_retries=0)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)  # no subworker_pool
+        result_task = await processor.process(task)
+
+    assert result_task.status == TaskStatus.FAILED
+    assert any("no subworker pool configured" in e for e in result_task.errors)
+    state_manager.fail_task.assert_called_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_sync_subworker_task_failure_matches_expected_exceptions_by_error_type():
+    """SubworkerTaskFailure.error.error_type is matched against expected_exceptions by class name."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="sync_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.UNSUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = _make_state_manager()
+    pool = AsyncMock(spec=SubworkerPool)
+    error = SubworkerTaskError("ValueError", "boom", "traceback", None)
+    pool.dispatch = AsyncMock(side_effect=SubworkerTaskFailure(error))
+    task_config = _sync_subworker_config(expected_exceptions=(ValueError,))
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, subworker_pool=pool)
+        result_task = await processor.process(task)
+
+    assert result_task.status == TaskStatus.SUBMITTED  # retried, not failed
+    assert result_task.retry_attempt == 1
+    assert any("boom" in e for e in result_task.errors)
+
+
+@pytest.mark.asyncio
+async def test_sync_subworker_task_failure_not_in_expected_exceptions_is_unexpected():
+    """An error_type not present in expected_exceptions is treated as unexpected."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="sync_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+    )
+    state_manager = _make_state_manager()
+    pool = AsyncMock(spec=SubworkerPool)
+    error = SubworkerTaskError("RuntimeError", "boom", "traceback", None)
+    pool.dispatch = AsyncMock(side_effect=SubworkerTaskFailure(error))
+    task_config = _sync_subworker_config(expected_exceptions=(ValueError,))
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, subworker_pool=pool)
+        result_task = await processor.process(task)
+
+    assert result_task.status == TaskStatus.FAILED
+    state_manager.fail_task.assert_called_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_sync_subworker_task_dispatch_passes_cancel_grace_period():
+    """
+    dispatch() is called with a cancel_grace_period so it can self-manage cancellation.
+
+    SubworkerPool.dispatch() -- not TaskProcessor -- is responsible for telling the pool
+    to cancel/kill the subworker when its own await is cancelled (see pool.py); this just
+    confirms TaskProcessor passes through the grace period it's configured with.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="sync_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+    )
+    state_manager = _make_state_manager()
+    pool = AsyncMock(spec=SubworkerPool)
+    pool.dispatch = AsyncMock(return_value={"result": "ok"})
+    task_config = _sync_subworker_config()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, subworker_pool=pool)
+        await processor.process(task)
+
+    _, kwargs = pool.dispatch.call_args
+    assert kwargs["cancel_grace_period"] == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_sync_subworker_task_timeout_retries_like_any_other_timeout():
+    """A TimeoutError from dispatch() (see pool.py for the actual cancel/kill handling) still retries."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="sync_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+    )
+    state_manager = _make_state_manager()
+    pool = AsyncMock(spec=SubworkerPool)
+    pool.dispatch = AsyncMock(side_effect=TimeoutError)
+    task_config = _sync_subworker_config(timeout=1)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, subworker_pool=pool)
+        result_task = await processor.process(task)
+
+    assert result_task.status == TaskStatus.SUBMITTED
+    assert any("timed out" in e for e in result_task.errors)
+
+
+@pytest.mark.asyncio
+async def test_sync_subworker_task_cancellation_requeues_like_any_other_cancellation():
+    """CancelledError from dispatch() (see pool.py for the actual cancel/kill handling) still requeues."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="sync_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+    )
+    state_manager = _make_state_manager()
+    pool = AsyncMock(spec=SubworkerPool)
+    pool.dispatch = AsyncMock(side_effect=asyncio.CancelledError())
+    task_config = _sync_subworker_config(on_shutdown=TaskShutdownPolicy.RESUBMIT)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, subworker_pool=pool)
+        with pytest.raises(asyncio.CancelledError):
+            await processor.process(task)
+
+    assert task.status == TaskStatus.SUBMITTED
+    state_manager.requeue_task.assert_called_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_sync_subworker_heartbeat_forwarded_to_state_manager():
+    """A heartbeat from the subworker updates the task's heartbeat via StateManager."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="sync_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+    )
+    state_manager = _make_state_manager()
+    pool = AsyncMock(spec=SubworkerPool)
+
+    async def _dispatch(*args, **kwargs):
+        kwargs["on_heartbeat"]()  # simulate the pool forwarding one heartbeat mid-task
+        await asyncio.sleep(0)  # let the fire-and-forget heartbeat task actually run
+        return {"result": "ok"}
+
+    pool.dispatch = AsyncMock(side_effect=_dispatch)
+    task_config = _sync_subworker_config()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager, subworker_pool=pool)
+        result_task = await processor.process(task)
+
+    assert result_task.status == TaskStatus.COMPLETED
+    state_manager.update_task_heartbeat.assert_awaited_with(task)

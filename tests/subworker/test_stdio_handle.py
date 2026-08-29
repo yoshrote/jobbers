@@ -9,7 +9,7 @@ import uuid
 import pytest
 
 from jobbers.subworker.handles.stdio import StdioSubworkerHandle
-from jobbers.subworker.protocols import ResultMsg, SubworkerExited
+from jobbers.subworker.protocols import HeartbeatMsg, ResultMsg, SubworkerExited
 
 TASK_MODULE = os.path.join(os.path.dirname(__file__), "..", "fixtures", "subworker_tasks.py")
 
@@ -139,3 +139,21 @@ async def test_unknown_task_raises_lookup_error_marshalled():
         assert msg.error.error_type == "LookupError"
     finally:
         await handle.kill(grace_period=2)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_calls_are_delivered_before_the_result():
+    """A task calling jobbers.subworker.context.heartbeat() sends heartbeat frames first."""
+    handle = _make_handle()
+    await handle.start()
+    try:
+        request_id = str(uuid.uuid4())
+        await handle.dispatch(request_id, "subworker_heartbeat_then_done", 1, {"count": 3})
+        msgs = [await handle.recv() for _ in range(4)]
+        assert msgs[:3] == [HeartbeatMsg(request_id)] * 3
+        assert isinstance(msgs[3], ResultMsg)
+        assert msgs[3].ok is True
+        assert msgs[3].result == "done"
+    finally:
+        await handle.kill(grace_period=2)
+

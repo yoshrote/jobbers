@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, cast
 from jobbers.adapters.redis._helpers import _pack
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_routing import RoutingConfig
+from jobbers.protocols import QueueLimits
 from jobbers.utils.serialization import deserialize
 
 if TYPE_CHECKING:
@@ -141,7 +142,7 @@ class RedisQueueConfigAdapter:
 
     # ── Queue limits (batch read) ─────────────────────────────────────────────
 
-    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]:
+    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, QueueLimits]:
         if not queues_set:
             return {}
         ordered = list(queues_set)
@@ -149,13 +150,13 @@ class RedisQueueConfigAdapter:
         for name in ordered:
             pipe.get(self.QUEUE_KEY(name=name))
         raws: list[bytes | None] = await pipe.execute()
-        result: dict[str, int | None] = {}
+        result: dict[str, QueueLimits] = {}
         for name, raw in zip(ordered, raws):
             if raw is None:
-                result[name] = None
+                result[name] = QueueLimits(None, False)
             else:
                 cfg = QueueConfig.model_validate(deserialize(raw))
-                result[name] = cfg.max_concurrent
+                result[name] = QueueLimits(cfg.max_concurrent, cfg.has_sync_tasks)
         return result
 
 

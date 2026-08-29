@@ -24,6 +24,7 @@ import traceback
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from jobbers.registry import get_task_config
+from jobbers.subworker.context import _current_heartbeat_sender
 from jobbers.subworker.errors import TaskCancelledError
 from jobbers.subworker.protocols import (
     HeartbeatMsg,
@@ -129,6 +130,8 @@ class MultiprocessingSubworkerHandle:
         # which is why this is safe to call from a recv() the caller is already awaiting.
         process.join()
         self._reaped = True
+        with contextlib.suppress(OSError):
+            os.remove(self._status_file)
         return SubworkerExited(exit_code=process.exitcode)
 
     async def cancel(self, request_id: str) -> None:
@@ -197,6 +200,10 @@ def _bootstrap_main(conn: Any, task_module: str) -> None:
             logger.warning("Ignoring unexpected message from parent: %r", msg)
             continue
         state["current_request_id"] = msg.request_id
+        def _send_heartbeat(rid: str = msg.request_id) -> None:
+            conn.send(HeartbeatMsg(rid))
+
+        heartbeat_token = _current_heartbeat_sender.set(_send_heartbeat)
         try:
             result = _run_task(msg.task_name, msg.task_version, msg.kwargs)
         except TaskCancelledError as exc:
@@ -220,6 +227,7 @@ def _bootstrap_main(conn: Any, task_module: str) -> None:
         else:
             conn.send(ResultMsg(msg.request_id, True, result, None))
         finally:
+            _current_heartbeat_sender.reset(heartbeat_token)
             state["current_request_id"] = None
     conn.close()
 

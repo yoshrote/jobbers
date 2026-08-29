@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
+from jobbers.protocols import QueueLimits
 
 # ── get_queues / save_role ────────────────────────────────────────────────────
 
@@ -100,21 +101,21 @@ async def test_get_queue_limits_empty_set(queue_config_adapter):
 async def test_get_queue_limits_single_queue_with_limit(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="test_queue", max_concurrent=5))
     result = await queue_config_adapter.get_queue_limits({"test_queue"})
-    assert result == {"test_queue": 5}
+    assert result == {"test_queue": QueueLimits(5, False)}
 
 
 @pytest.mark.asyncio
 async def test_get_queue_limits_single_queue_no_limit(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="unlimited_queue", max_concurrent=None))
     result = await queue_config_adapter.get_queue_limits({"unlimited_queue"})
-    assert result == {"unlimited_queue": None}
+    assert result == {"unlimited_queue": QueueLimits(None, False)}
 
 
 @pytest.mark.asyncio
 async def test_get_queue_limits_single_queue_zero_limit(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="zero_limit_queue", max_concurrent=0))
     result = await queue_config_adapter.get_queue_limits({"zero_limit_queue"})
-    assert result == {"zero_limit_queue": 0}
+    assert result == {"zero_limit_queue": QueueLimits(0, False)}
 
 
 @pytest.mark.asyncio
@@ -123,20 +124,27 @@ async def test_get_queue_limits_multiple_queues(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue2", max_concurrent=10))
     await queue_config_adapter.save_queue_config(QueueConfig(name="queue3", max_concurrent=1))
     result = await queue_config_adapter.get_queue_limits({"queue1", "queue2", "queue3"})
-    assert result == {"queue1": 3, "queue2": 10, "queue3": 1}
+    assert result == {
+        "queue1": QueueLimits(3, False),
+        "queue2": QueueLimits(10, False),
+        "queue3": QueueLimits(1, False),
+    }
 
 
 @pytest.mark.asyncio
 async def test_get_queue_limits_with_nonexistent_queue(queue_config_adapter):
     result = await queue_config_adapter.get_queue_limits({"nonexistent_queue"})
-    assert result == {"nonexistent_queue": None}
+    assert result == {"nonexistent_queue": QueueLimits(None, False)}
 
 
 @pytest.mark.asyncio
 async def test_get_queue_limits_mixed_existing_and_nonexistent(queue_config_adapter):
     await queue_config_adapter.save_queue_config(QueueConfig(name="existing_queue", max_concurrent=7))
     result = await queue_config_adapter.get_queue_limits({"existing_queue", "nonexistent_queue"})
-    assert result == {"existing_queue": 7, "nonexistent_queue": None}
+    assert result == {
+        "existing_queue": QueueLimits(7, False),
+        "nonexistent_queue": QueueLimits(None, False),
+    }
 
 
 @pytest.mark.asyncio
@@ -151,7 +159,7 @@ async def test_get_queue_limits_with_rate_limiting_config(queue_config_adapter):
         )
     )
     result = await queue_config_adapter.get_queue_limits({"rate_limited_queue"})
-    assert result == {"rate_limited_queue": 15}
+    assert result == {"rate_limited_queue": QueueLimits(15, False)}
 
 
 @pytest.mark.asyncio
@@ -162,7 +170,20 @@ async def test_get_queue_limits_large_number_of_queues(queue_config_adapter):
     result = await queue_config_adapter.get_queue_limits(set(queue_names))
     assert len(result) == 20
     for i, name in enumerate(queue_names):
-        assert result[name] == i + 1
+        assert result[name] == QueueLimits(i + 1, False)
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_surfaces_has_sync_tasks(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(
+        QueueConfig(name="sync_queue", max_concurrent=4, has_sync_tasks=True)
+    )
+    await queue_config_adapter.save_queue_config(QueueConfig(name="async_queue", max_concurrent=4))
+    result = await queue_config_adapter.get_queue_limits({"sync_queue", "async_queue"})
+    assert result == {
+        "sync_queue": QueueLimits(4, True),
+        "async_queue": QueueLimits(4, False),
+    }
 
 
 # ── delete_queue ──────────────────────────────────────────────────────────────
@@ -301,6 +322,31 @@ async def test_save_queue_config_overwrites_existing(queue_config_adapter):
     assert result.max_concurrent == 9
 
 
+@pytest.mark.asyncio
+async def test_save_queue_config_has_sync_tasks_round_trips(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="sync_queue", has_sync_tasks=True))
+    result = await queue_config_adapter.get_queue_config("sync_queue")
+    assert result is not None
+    assert result.has_sync_tasks is True
+
+
+@pytest.mark.asyncio
+async def test_save_queue_config_has_sync_tasks_defaults_false(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="plain_queue"))
+    result = await queue_config_adapter.get_queue_config("plain_queue")
+    assert result is not None
+    assert result.has_sync_tasks is False
+
+
+@pytest.mark.asyncio
+async def test_save_queue_config_overwrites_has_sync_tasks(queue_config_adapter):
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q2", has_sync_tasks=True))
+    await queue_config_adapter.save_queue_config(QueueConfig(name="q2", has_sync_tasks=False))
+    result = await queue_config_adapter.get_queue_config("q2")
+    assert result is not None
+    assert result.has_sync_tasks is False
+
+
 # ── save_role return type ──────────────────────────────────────────────────────
 
 
@@ -350,6 +396,17 @@ async def test_create_queue_config_succeeds_when_absent(queue_config_adapter):
     result = await queue_config_adapter.get_queue_config("new_q")
     assert result is not None
     assert result.max_concurrent == 3
+
+
+@pytest.mark.asyncio
+async def test_create_queue_config_persists_has_sync_tasks(queue_config_adapter):
+    created = await queue_config_adapter.create_queue_config(
+        QueueConfig(name="new_sync_q", has_sync_tasks=True)
+    )
+    assert created is True
+    result = await queue_config_adapter.get_queue_config("new_sync_q")
+    assert result is not None
+    assert result.has_sync_tasks is True
 
 
 @pytest.mark.asyncio

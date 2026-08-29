@@ -24,6 +24,7 @@ queues = Table(
     Column("rate_numerator", Integer, nullable=True),
     Column("rate_denominator", Integer, nullable=True),
     Column("rate_period", String, nullable=True),
+    Column("has_sync_tasks", Boolean, nullable=False, server_default="0"),
 )
 
 role_queues = Table(
