@@ -655,6 +655,68 @@ async def test_stage_submit_task_saves_task_data(task_adapter):
 
 
 @pytest.mark.asyncio
+async def test_stage_submit_task_registers_dag_run(task_adapter):
+    """stage_submit_task registers the task's dag_run_id, not just the saga `submit_task` path."""
+    state, submit = task_adapter
+    task = make_task()
+    task.dag_run_id = ULID1
+    task.dag_run_name = "my-run"
+    pipe = state.pipeline(transaction=True)
+    state.stage_submit_task(pipe, task)
+    await pipe.execute()
+
+    result = await state.get_dag_run(ULID1)
+    assert result is not None
+    assert result.task_ids == [task.id]
+    runs, total = await state.get_dag_runs(DAGRunPagination())
+    assert total == 1
+    assert runs[0].dag_run_id == ULID1
+    assert runs[0].name == "my-run"
+
+
+@pytest.mark.asyncio
+async def test_stage_submit_task_dag_run_shared_by_multiple_tasks(task_adapter):
+    """Two tasks staged into the same dag_run_id both register as pending without conflict."""
+    state, submit = task_adapter
+    dag_run_id = ULID1
+    task_a = make_task(ULID2)
+    task_b = make_task(ULID3)
+    task_a.dag_run_id = dag_run_id
+    task_b.dag_run_id = dag_run_id
+
+    pipe = state.pipeline(transaction=True)
+    state.stage_submit_task(pipe, task_a)
+    await pipe.execute()
+    # Second task registers against the already-existing dag_runs row.
+    pipe = state.pipeline(transaction=True)
+    state.stage_submit_task(pipe, task_b)
+    await pipe.execute()
+
+    result = await state.get_dag_run(dag_run_id)
+    assert result is not None
+    assert set(result.task_ids) == {ULID2, ULID3}
+    runs, total = await state.get_dag_runs(DAGRunPagination())
+    assert total == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_submit_task_dag_run_reregistration_is_idempotent(task_adapter):
+    """Re-staging the same task into the same dag_run_id (e.g. a retry) does not error."""
+    state, submit = task_adapter
+    task = make_task()
+    task.dag_run_id = ULID1
+
+    for _ in range(2):
+        pipe = state.pipeline(transaction=True)
+        state.stage_submit_task(pipe, task)
+        await pipe.execute()
+
+    result = await state.get_dag_run(ULID1)
+    assert result is not None
+    assert result.task_ids == [task.id]
+
+
+@pytest.mark.asyncio
 async def test_stage_remove_from_queue_noop_when_absent(task_adapter):
     """stage_remove_from_queue does not raise when the task is not in the queue."""
     state, submit = task_adapter
@@ -712,6 +774,103 @@ async def test_atomic_dispatch_scheduled_returns_false_when_missing(task_adapter
     # do not save — task is absent
     dispatched = await state.atomic_dispatch_scheduled(task, lambda _pipe: None)
     assert dispatched is False
+
+
+# ── atomic_save_if_status ────────────────────────────────────────────────────
+# This is what the Cleaner's stale-task sweep (StateManager._mark_task_stale)
+# calls to CAS-guard a STALLED write -- plus an optional DLQ add -- against a
+# live worker's own CAS-guarded write landing first. No common contract test
+# exercised it before, on any backend.
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_applies_when_status_matches(task_adapter):
+    """atomic_save_if_status saves the task and returns True when the stored status matches."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.STARTED)
+    await state.save_task(task)
+
+    task.set_status(TaskStatus.STALLED)
+    applied = await state.atomic_save_if_status(task, TaskStatus.STARTED, lambda _pipe: None)
+
+    assert applied is True
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_returns_false_when_status_mismatch(task_adapter):
+    """
+    atomic_save_if_status leaves the stored task untouched when its status no longer matches.
+
+    Mirrors the race it guards against: a live worker's own write (e.g. handle_success)
+    landed between the Cleaner's stale scan and this call, so the stored status is no
+    longer STARTED -- the worker's outcome must win, not the Cleaner's stale write.
+    """
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.COMPLETED)
+    await state.save_task(task)
+
+    stale_snapshot = make_task(status=TaskStatus.STARTED)
+    stale_snapshot.set_status(TaskStatus.STALLED)
+    applied = await state.atomic_save_if_status(stale_snapshot, TaskStatus.STARTED, lambda _pipe: None)
+
+    assert applied is False
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_returns_false_when_missing(task_adapter):
+    """atomic_save_if_status returns False without staging anything when the task doesn't exist."""
+    state, _ = task_adapter
+    task = make_task(status=TaskStatus.STARTED)
+    # do not save — task is absent
+    applied = await state.atomic_save_if_status(task, TaskStatus.STARTED, lambda _pipe: None)
+    assert applied is False
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_commits_stage_extra_in_same_transaction(task_adapter):
+    """stage_extra's staged op (e.g. heartbeat removal) commits atomically with the save."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.STARTED)
+    task.heartbeat_at = FROZEN_TIME  # very old — would normally be stale
+    await state.save_task(task)
+    await state.update_task_heartbeat(task)
+
+    applied = await state.atomic_save_if_status(
+        task, TaskStatus.STARTED, lambda pipe: state.stage_remove_heartbeat(pipe, task)
+    )
+
+    assert applied is True
+    stale = [t async for t in state.get_stale_tasks({"default"}, dt.timedelta(seconds=0))]
+    assert not any(t.id == ULID1 for t in stale)
+
+
+@pytest.mark.asyncio
+async def test_atomic_save_if_status_does_not_apply_stage_extra_when_status_mismatch(task_adapter):
+    """When the guard fails, stage_extra's op must not be committed either."""
+    state, submit = task_adapter
+    task = make_task(status=TaskStatus.COMPLETED)
+    task.heartbeat_at = FROZEN_TIME
+    await state.save_task(task)
+    await state.update_task_heartbeat(task)
+
+    stale_snapshot = make_task(status=TaskStatus.STARTED)
+    stale_snapshot.set_status(TaskStatus.STALLED)
+    applied = await state.atomic_save_if_status(
+        stale_snapshot,
+        TaskStatus.STARTED,
+        lambda pipe: state.stage_remove_heartbeat(pipe, stale_snapshot),
+    )
+
+    assert applied is False
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.heartbeat_at == FROZEN_TIME
 
 
 # ── ensure_index ──────────────────────────────────────────────────────────────
@@ -1007,6 +1166,245 @@ async def test_mark_dag_run_complete_noop_when_failed_count_nonzero(task_adapter
     assert detail.status == DagRunStatus.FAILED
 
 
+# ── mark_dag_run_cancelling / is_dag_run_cancelling ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_is_dag_run_cancelling_false_before_requested(task_adapter):
+    """is_dag_run_cancelling returns False until mark_dag_run_cancelling has been called."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    assert await state.is_dag_run_cancelling(ULID1) is False
+
+
+@pytest.mark.asyncio
+async def test_mark_dag_run_cancelling_then_is_cancelling_true(task_adapter):
+    """mark_dag_run_cancelling makes is_dag_run_cancelling report True."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.mark_dag_run_cancelling(ULID1)
+
+    assert await state.is_dag_run_cancelling(ULID1) is True
+
+
+@pytest.mark.asyncio
+async def test_mark_dag_run_cancelling_is_idempotent(task_adapter):
+    """Calling mark_dag_run_cancelling twice does not raise and stays cancelling."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    await state.mark_dag_run_cancelling(ULID1)
+
+    assert await state.is_dag_run_cancelling(ULID1) is True
+
+
+@pytest.mark.asyncio
+async def test_get_dag_run_status_cancelling_while_tasks_still_pending(task_adapter):
+    """get_dag_run reports CANCELLING once requested but before every task has a terminal outcome."""
+    state, submit = task_adapter
+    task_a = make_task(ULID2, submitted_at=FROZEN_TIME)
+    task_b = make_task(ULID3, submitted_at=FROZEN_TIME)
+    task_a.dag_run_id = ULID1
+    task_b.dag_run_id = ULID1
+    await submit.submit_task(task_a)
+    await submit.submit_task(task_b)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    await state.record_dag_run_task_terminal(ULID1, "completed")  # only 1 of 2 tasks settled
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.CANCELLING
+
+
+@pytest.mark.asyncio
+async def test_get_dag_run_status_cancelled_once_all_tasks_settled(task_adapter):
+    """get_dag_run reports CANCELLED once every registered task has a recorded terminal outcome."""
+    state, submit = task_adapter
+    task_a = make_task(ULID2, submitted_at=FROZEN_TIME)
+    task_b = make_task(ULID3, submitted_at=FROZEN_TIME)
+    task_a.dag_run_id = ULID1
+    task_b.dag_run_id = ULID1
+    await submit.submit_task(task_a)
+    await submit.submit_task(task_b)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_get_dag_runs_list_shows_cancelling_once_requested(task_adapter):
+    """get_dag_runs (list view) shows CANCELLING for any run with cancellation requested."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    # Even a fully-settled run shows CANCELLING in the cheap list view -- only
+    # get_dag_run distinguishes CANCELLED (see module docstring / design doc).
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+
+    runs, _ = await state.get_dag_runs(DAGRunPagination())
+    assert runs[0].status == DagRunStatus.CANCELLING
+
+
+# ── clear_dag_run_cancellation ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clear_dag_run_cancellation_makes_is_cancelling_false(task_adapter):
+    """clear_dag_run_cancellation undoes a prior mark_dag_run_cancelling."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.mark_dag_run_cancelling(ULID1)
+    await state.clear_dag_run_cancellation(ULID1)
+
+    assert await state.is_dag_run_cancelling(ULID1) is False
+
+
+@pytest.mark.asyncio
+async def test_clear_dag_run_cancellation_noop_when_not_cancelling(task_adapter):
+    """clear_dag_run_cancellation on a run that was never marked cancelling does not raise."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.clear_dag_run_cancellation(ULID1)
+
+    assert await state.is_dag_run_cancelling(ULID1) is False
+
+
+# ── reconcile_dag_run_task_retry ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_decrements_failed_count(task_adapter):
+    """reconcile_dag_run_task_retry undoes exactly one prior 'failed' record."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.reconcile_dag_run_task_retry(ULID1)
+
+    # One of the two failures was undone: status stays 'failed' (still one left),
+    # but a further reconcile + a completion should now be able to reach 'complete'.
+    await state.reconcile_dag_run_task_retry(ULID1)
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_floors_at_zero(task_adapter):
+    """reconcile_dag_run_task_retry never takes the failed counter below zero."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    # No prior failures recorded -- must be a no-op, not go negative.
+    await state.reconcile_dag_run_task_retry(ULID1)
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_count_decrements_in_one_call(task_adapter):
+    """A single call with count=N undoes N prior 'failed' records, same as N calls with count=1."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+
+    await state.reconcile_dag_run_task_retry(ULID1, count=2)
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.FAILED  # one failure still outstanding
+
+    await state.reconcile_dag_run_task_retry(ULID1, count=1)
+    await state.mark_dag_run_complete(ULID1)
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_count_floors_at_zero(task_adapter):
+    """A count larger than the outstanding failures floors at zero rather than going negative."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+
+    await state.reconcile_dag_run_task_retry(ULID1, count=5)
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_noop_when_run_missing(task_adapter):
+    """reconcile_dag_run_task_retry on an unknown dag_run_id does not raise."""
+    state, submit = task_adapter
+    await state.reconcile_dag_run_task_retry(ULID())
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dag_run_task_retry_recomputes_partial_failure_back_to_running(task_adapter):
+    """After undoing the only failure, a run with a completion recorded reads as running, not partial_failure."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.PARTIAL_FAILURE
+
+    await state.reconcile_dag_run_task_retry(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.RUNNING
+
+
 # ── fan-in ────────────────────────────────────────────────────────────────────
 
 
@@ -1080,6 +1478,25 @@ async def test_delegate_fan_in_swaps_id_in_tracking_and_members_sets(task_adapte
     assert ULID1 not in members
 
 
+@pytest.mark.asyncio
+async def test_dag_run_fan_in_alive_true_after_init_fan_in(task_adapter):
+    """dag_run_fan_in_alive is True once a run has registered fan-in tracking."""
+    state, submit = task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:alive-common", {ULID1})
+    assert await state.dag_run_fan_in_alive(dag_run_id) is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_dag_run_fan_in_ttl_does_not_raise(task_adapter):
+    """refresh_dag_run_fan_in_ttl is safe to call both with and without existing fan-in tracking."""
+    state, submit = task_adapter
+    dag_run_id = ULID()
+    await state.init_fan_in(dag_run_id, "fan-in:refresh-common", {ULID1})
+    await state.refresh_dag_run_fan_in_ttl(dag_run_id)
+    await state.refresh_dag_run_fan_in_ttl(ULID())  # never initialised -- must not raise
+
+
 # ── compare_and_set_status ────────────────────────────────────────────────────
 
 
@@ -1112,6 +1529,56 @@ async def test_compare_and_set_status_returns_false_for_missing_task(task_adapte
     """compare_and_set_status returns False when the task does not exist."""
     state, submit = task_adapter
     result = await state.compare_and_set_status(ULID(), TaskStatus.SUBMITTED, TaskStatus.STARTED)
+    assert result is False
+
+
+# ── save_task_if_status ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_save_task_if_status_succeeds_and_persists_full_task(task_adapter):
+    """save_task_if_status persists the caller's full task -- not just status -- when expected matches."""
+    state, submit = task_adapter
+    await submit.submit_task(make_task(status=TaskStatus.STARTED))
+    updated = await state.get_task(ULID1)
+    assert updated is not None
+    updated.set_status(TaskStatus.COMPLETED)
+    updated.results = {"answer": 42}
+
+    result = await state.save_task_if_status(updated, TaskStatus.STARTED)
+
+    assert result is True
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    assert saved.results == {"answer": 42}
+
+
+@pytest.mark.asyncio
+async def test_save_task_if_status_fails_when_status_differs(task_adapter):
+    """save_task_if_status returns False and leaves every field unchanged when expected does not match."""
+    state, submit = task_adapter
+    await submit.submit_task(make_task(status=TaskStatus.SUBMITTED))
+    updated = await state.get_task(ULID1)
+    assert updated is not None
+    updated.set_status(TaskStatus.COMPLETED)
+    updated.results = {"answer": 42}
+
+    result = await state.save_task_if_status(updated, TaskStatus.STARTED)
+
+    assert result is False
+    saved = await state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert saved.results == {}
+
+
+@pytest.mark.asyncio
+async def test_save_task_if_status_returns_false_for_missing_task(task_adapter):
+    """save_task_if_status returns False when the task does not exist."""
+    state, submit = task_adapter
+    missing = make_task(task_id=ULID(), status=TaskStatus.COMPLETED)
+    result = await state.save_task_if_status(missing, TaskStatus.STARTED)
     assert result is False
 
 

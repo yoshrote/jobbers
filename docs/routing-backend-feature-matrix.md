@@ -10,8 +10,8 @@ The routing backend controls where queue, role, and task-routing config is store
 | SQL dependency | None | Required | None | None |
 | Redis Stack required | No | No | No | Yes |
 | Config durability | In-process memory (reloaded from file/env) | SQL database | Redis persistence | Redis persistence |
-| Atomicity of `delete_queue` | N/A | Full transaction | Two-phase, role-cleanup-first (safe ordering) | Two-phase, role-cleanup-first (safe ordering) |
-| `bump_refresh_tags_for_queue` cost | N/A (raises) | O(SQL join) | O(N roles), pipelined | O(indexed query) |
+| Atomicity of `delete_queue` | N/A | Row deletion is one transaction; refresh-tag bumps happen after, sequentially, not atomic with the deletion | Two-phase, role-cleanup-first (safe ordering) | Two-phase, role-cleanup-first (safe ordering) |
+| `bump_refresh_tags_for_queue` cost | N/A (raises) | O(indexed `SELECT`), no join | O(N roles), pipelined | O(indexed query) |
 | Schema migrations | None | Auto-run at startup | None | RediSearch indexes created at startup, versioned via `SCHEMA_VERSION`; stale generations droppable via `drop_stale_indexes()` |
 | Runtime config changes | No | Yes | Yes | Yes |
 
@@ -29,8 +29,8 @@ The routing backend controls where queue, role, and task-routing config is store
 
 ### Gaps and quirks
 
-- All write operations on queues, roles, and routing configs raise `RoutingBackendReadOnlyError`, surfaced as HTTP 405.
-- The refresh tag is a single ULID set at construction and never changes. Workers will not re-poll their queue config during the lifetime of the process. There is no way to trigger a worker refresh without restarting.
+- All write operations on queues, roles, and routing configs raise `RoutingBackendReadOnlyError`, surfaced as HTTP 405, so nothing in the normal CRUD flow ever bumps a refresh tag.
+- `POST /roles/{role_name}/refresh` still works regardless of `ROUTING_BACKEND` — it only touches the Redis-backed refresh-tag/pub-sub mechanism, not the routing backend's queue/role storage — so it's not blocked for `static`. It's just pointless here: the underlying config never changes, so a triggered refresh hands workers back the same data they already had.
 
 ---
 
@@ -43,13 +43,14 @@ The routing backend controls where queue, role, and task-routing config is store
 - Full ACID transactions for all writes. Every queue, role, and routing config change is atomic.
 - Persistent by default.
 - Schema migrations run automatically at startup; schema drift is tracked.
-- `delete_queue` is a single transaction that cascades to `role_queues` and bumps refresh tags atomically.
-- `bump_refresh_tags_for_queue` uses a SQL JOIN — efficient regardless of role count.
+- `delete_queue`'s row deletion is a single transaction that cascades to `role_queues` via a foreign key.
+- `bump_refresh_tags_for_queue` is a single indexed `SELECT ... WHERE queue = ? DISTINCT` — efficient regardless of role count, no join needed.
 
 ### Gaps
 
 - Adds a SQL database as an infrastructure dependency. The default (`sqlite+aiosqlite:///jobbers.db`) is single-writer and unsuitable for multi-process deployments without care. Multi-process production use needs Postgres via `SQL_PATH`.
 - If the SQL database is unavailable at startup, the process fails — there is no fallback to a cached config.
+- **`delete_queue`'s refresh-tag bump is not part of the transaction:** `StateManager.delete_queue` commits the row deletion first, then loops over the affected roles bumping each one's refresh tag as a separate, sequential Redis write (routing notifications are always Redis-backed, regardless of `ROUTING_BACKEND`). A crash between the commit and the bump loop leaves some roles referencing a queue that's already gone until their next periodic poll.
 
 ---
 
@@ -99,4 +100,4 @@ The routing backend controls where queue, role, and task-routing config is store
 
 **Redis keyspace sharing.** Both `redis` and `redis_json` store routing config (`config:*` / `routing:*` keys) on the same Redis instance as task data (`task:*`, `task-queues:*`, etc.). An aggressive Redis eviction policy (e.g., `allkeys-lru`) can evict routing config under memory pressure, which silently breaks queue and role reads.
 
-**Pub/sub refresh is backend-agnostic.** The Redis pub/sub notification (`queue-config-refresh:{role}`) that triggers immediate worker refresh is published in `task_routes.py` at the call site, not inside the backend implementations. All four backends benefit equally from it on write operations — except `static`, which cannot publish because writes raise errors.
+**Pub/sub refresh is backend-agnostic.** The Redis pub/sub notification (`queue-config-refresh:{role}`) that triggers immediate worker refresh is published inside `RedisRoutingNotifications.bump_refresh_tag` itself — a component every `ROUTING_BACKEND` value shares, since routing notifications are always Redis-backed regardless of where queue/role config lives. `task_routes.py` never publishes directly; it just calls `StateManager.bump_refresh_tag(role)`. All four backends benefit equally from it on write operations — except `static`, whose CRUD writes raise errors before ever reaching a bump call (the manual `POST /roles/{role}/refresh` endpoint is the one exception — see above).

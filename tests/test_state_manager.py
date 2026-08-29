@@ -18,13 +18,20 @@ from jobbers.adapters.redis import (
 )
 from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.dag import DAGNode, DAGTaskSpec
+from jobbers.models.dag import DAGNode, DagRunStatus, DAGTaskSpec, FanInCallback
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
-from jobbers.state_manager import StateManager, TaskException, TaskRateLimitedError, UserCancellationError
+from jobbers.state_manager import (
+    CancelReason,
+    StaleTaskCancelledError,
+    StateManager,
+    TaskException,
+    TaskRateLimitedError,
+    UserCancellationError,
+)
 from tests.conftest import DummyCronDAGScheduler, DummyTaskSubmit
 
 FROZEN_TIME = dt.datetime.fromisoformat("2021-01-01T00:00:00+00:00")
@@ -268,6 +275,128 @@ async def test_clean_stale_time_removes_heartbeat_on_stall(redis, state_manager_
     assert saved is not None
     assert saved.status == TaskStatus.STALLED
     assert await redis.zscore("task-heartbeats:default", ULID1.bytes) is None
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_publishes_stale_cancellation_and_counts_it(redis, state_manager_real_ta):
+    """Marking a task STALLED publishes a stale cancellation and increments stale_cancellations_published."""
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_state.save_task(started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
+    )
+    with (
+        patch.object(registry, "get_task_config", return_value=stale_config),
+        patch.object(
+            state_manager_real_ta.cancellation_bus, "publish_stale_cancellation", new=AsyncMock()
+        ) as mock_publish,
+        patch("jobbers.state_manager.stale_cancellations_published") as mock_counter,
+    ):
+        await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+    mock_publish.assert_awaited_once_with(ULID1)
+    mock_counter.add.assert_called_once_with(1, {"queue": "default", "task": "my_task", "version": 0})
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_time_signals_live_worker_via_real_cancellation_bus(redis, state_manager_real_ta):
+    """
+    End-to-end: a live worker receives the Cleaner's stale cancellation over the real bus.
+
+    The Cleaner's stale sweep publishes over the real cancellation bus, a worker's
+    run_cancel_listener consumes it, and the registered monitor raises
+    StaleTaskCancelledError -- while the persisted status stays STALLED and the
+    heartbeat is removed exactly once. Exercises the atomicity/ordering-sensitive
+    interaction between clean() and a live in-flight worker, per CLAUDE.md's rule that
+    this needs a real backend, not just DummyTaskAdapter.
+    """
+    two_hours_ago = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    started = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.STARTED,
+        started_at=two_hours_ago,
+        heartbeat_at=two_hours_ago,
+    )
+    await state_manager_real_ta.task_state.save_task(started)
+    await redis.zadd("task-heartbeats:default", {ULID1.bytes: two_hours_ago.timestamp()})
+    await state_manager_real_ta.routing.save_queue_config(QueueConfig(name="default"))
+
+    stale_config = TaskConfig(
+        name="my_task", function=dummy_fn, max_heartbeat_interval=dt.timedelta(minutes=5)
+    )
+
+    listener = asyncio.create_task(state_manager_real_ta.run_cancel_listener())
+    try:
+        with state_manager_real_ta.cancel_event(ULID1):
+            monitor = asyncio.create_task(state_manager_real_ta.monitor_task_cancellation(ULID1))
+            await asyncio.sleep(0.05)  # let the listener subscribe
+
+            with patch.object(registry, "get_task_config", return_value=stale_config):
+                await state_manager_real_ta.clean(stale_time=dt.timedelta(minutes=30))
+
+            with pytest.raises(StaleTaskCancelledError):
+                await asyncio.wait_for(monitor, timeout=1.0)
+    finally:
+        listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await listener
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert await redis.zscore("task-heartbeats:default", ULID1.bytes) is None
+
+
+@pytest.mark.asyncio
+async def test_mark_task_stale_drops_write_when_task_resolved_during_race_window(
+    redis, state_manager_real_ta
+):
+    """
+    _mark_task_stale guards against the inverse race: a worker's own write lands between the Cleaner's snapshot and its STALLED write.
+
+    A worker's CAS-guarded completion write lands between the Cleaner's stale-scan
+    snapshot and the Cleaner's own STALLED write. The Cleaner's write must lose -- not
+    silently overwrite a real COMPLETED result back to STALLED (and incorrectly DLQ it).
+    """
+    await state_manager_real_ta.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
+    # A snapshot of the task the way clean()'s stale scan would have captured it, with
+    # the local mutation to STALLED already applied (mirroring clean()'s own logic)
+    # before the guarded write.
+    snapshot = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STALLED)
+
+    # Simulate a worker completing the task in the race window -- after the Cleaner's
+    # scan but before the Cleaner's write -- via the same CAS-guarded save handle_success uses.
+    completed = Task(
+        id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED, results={"ok": True}
+    )
+    worker_applied = await state_manager_real_ta.task_state.save_task_if_status(completed, TaskStatus.STARTED)
+    assert worker_applied is True
+
+    applied = await state_manager_real_ta._mark_task_stale(
+        snapshot, needs_dlq=True, now=dt.datetime.now(dt.UTC)
+    )
+
+    assert applied is False
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    assert saved.results == {"ok": True}
+    assert await state_manager_real_ta.dead_queue.get_by_ids([str(ULID1)]) == []
 
 
 @pytest.mark.asyncio
@@ -682,6 +811,9 @@ def make_task_config(dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NON
 @pytest.mark.asyncio
 async def test_fail_task_no_dlq_writes_redis_only(redis, state_manager):
     """fail_task with NONE policy updates Redis but does not touch the DLQ."""
+    await state_manager.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
     task.task_config = make_task_config(DeadLetterPolicy.NONE)
 
@@ -695,6 +827,9 @@ async def test_fail_task_no_dlq_writes_redis_only(redis, state_manager):
 @pytest.mark.asyncio
 async def test_fail_task_with_dlq_writes_both_stores(redis, state_manager):
     """fail_task with SAVE policy updates Redis and writes to the DLQ."""
+    await state_manager.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
     task.task_config = make_task_config(DeadLetterPolicy.SAVE)
 
@@ -705,6 +840,38 @@ async def test_fail_task_with_dlq_writes_both_stores(redis, state_manager):
     dlq = await state_manager.dead_queue.get_by_ids([str(ULID1)])
     assert len(dlq) == 1
     assert dlq[0].id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_fail_task_drops_write_and_dlq_add_when_marked_stale_meanwhile(redis, state_manager_real_ta):
+    """
+    fail_task's atomic+DLQ branch is CAS-guarded against a Cleaner-marked-stale task.
+
+    If the Cleaner already marked the task STALLED, the write and the DLQ add are both
+    dropped rather than applied. Exercises atomic_save_if_status's stage_extra path
+    against a real WATCH/MULTI backend, per CLAUDE.md's rule that atomicity-sensitive
+    interactions need a real backend, not a DummyTaskAdapter.
+    """
+    await state_manager_real_ta.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
+    # Simulate the Cleaner marking the task STALLED while a worker is still computing a result.
+    marked_stale = await state_manager_real_ta.task_state.compare_and_set_status(
+        ULID1, TaskStatus.STARTED, TaskStatus.STALLED
+    )
+    assert marked_stale is True
+
+    stale_copy = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
+    stale_copy.task_config = make_task_config(DeadLetterPolicy.SAVE)
+
+    with patch("jobbers.state_manager.tasks_completed_after_stale") as mock_counter:
+        await state_manager_real_ta.fail_task(stale_copy)
+
+    saved = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STALLED
+    assert await state_manager_real_ta.dead_queue.get_by_ids([str(ULID1)]) == []
+    mock_counter.add.assert_called_once_with(1, {"queue": "default", "task": "my_task"})
 
 
 # ── resubmit_dead_tasks ───────────────────────────────────────────────────────
@@ -911,6 +1078,376 @@ async def test_cancel_terminal_task_raises(state_manager):
         await state_manager.request_task_cancellation(ULID1)
 
 
+# ── request_dag_cancellation ───────────────────────────────────────────────────
+#
+# Uses state_manager_real_ta (real RedisTaskState/RedisTaskSubmit via FakeRedis)
+# rather than the Dummy-backed `state_manager` fixture: get_dag_run is not
+# implemented on DummyTaskState (see tests/conftest.py), and per CLAUDE.md this
+# dispatch-adjacent, race-prone path needs a real-backend test regardless.
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_returns_none_for_unknown_run(state_manager_real_ta):
+    """request_dag_cancellation returns None when the DAG run has never been registered."""
+    result = await state_manager_real_ta.request_dag_cancellation(ULID())
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_sweeps_every_status_bucket(state_manager_real_ta):
+    """
+    A single sweep correctly buckets SCHEDULED/SUBMITTED/STARTED/already-terminal tasks.
+
+    SCHEDULED and SUBMITTED tasks are cancelled immediately; STARTED is left for the
+    trailing broadcast; already-terminal (COMPLETED) tasks are counted but untouched.
+    """
+    dag_run_id = ULID()
+    scheduled_id, submitted_id, started_id, completed_id = ULID(), ULID(), ULID(), ULID()
+    run_at = FROZEN_TIME + dt.timedelta(hours=1)
+
+    scheduled_task = Task(
+        id=scheduled_id, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(scheduled_task)
+    scheduled_task.set_status(TaskStatus.SCHEDULED)
+    await state_manager_real_ta.task_scheduler.add(scheduled_task, run_at)
+    await state_manager_real_ta.task_state.save_task(scheduled_task)
+
+    submitted_task = Task(
+        id=submitted_id, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(submitted_task)
+
+    started_task = Task(
+        id=started_id, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(started_task)
+    started_task.set_status(TaskStatus.STARTED)
+    await state_manager_real_ta.task_state.save_task(started_task)
+
+    completed_task = Task(
+        id=completed_id, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(completed_task)
+    completed_task.set_status(TaskStatus.COMPLETED)
+    await state_manager_real_ta.task_state.save_task(completed_task)
+
+    result = await state_manager_real_ta.request_dag_cancellation(dag_run_id)
+
+    assert result is not None
+    assert result.already_terminal == 1
+    assert result.cancelled_immediately == 2
+    assert result.signalled_running == 1
+    assert {(t.task_id, t.status) for t in result.tasks} == {
+        (scheduled_id, "cancelled"),
+        (submitted_id, "cancelled"),
+        (started_id, "signalled"),
+        (completed_id, "already_terminal"),
+    }
+
+    assert (await state_manager_real_ta.task_state.get_task(scheduled_id)).status == TaskStatus.CANCELLED
+    assert (await state_manager_real_ta.task_state.get_task(submitted_id)).status == TaskStatus.CANCELLED
+    # STARTED tasks are only signalled here, not directly transitioned.
+    assert (await state_manager_real_ta.task_state.get_task(started_id)).status == TaskStatus.STARTED
+    assert (await state_manager_real_ta.task_state.get_task(completed_id)).status == TaskStatus.COMPLETED
+    assert await state_manager_real_ta.task_scheduler.next_due(["default"]) is None
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is True
+    # started_id is still STARTED (unresolved) -- the run isn't fully settled yet.
+    run_after = await state_manager_real_ta.get_dag_run(dag_run_id)
+    assert run_after.status == DagRunStatus.CANCELLING
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_settles_run_status_to_cancelled(state_manager_real_ta):
+    """
+    get_dag_run reports CANCELLED (not stuck at CANCELLING) once the sweep is the only work left.
+
+    Regression test: the SCHEDULED/SUBMITTED/UNSUBMITTED branch cancels tasks
+    directly, bypassing TaskProcessor -- which is what normally calls
+    finalize_dag_run_task -> record_dag_run_task_terminal on a terminal
+    transition. Without an equivalent call here, the run's completed/failed
+    counters would never reach len(task_ids), and get_dag_run's CANCELLING-vs-
+    CANCELLED derivation (state_manager.py's request_dag_cancellation docstring)
+    would report CANCELLING forever even after every task has actually stopped.
+    """
+    dag_run_id = ULID()
+    task_a = Task(
+        id=ULID1, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    task_b = Task(
+        id=ULID2, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(task_a)
+    await state_manager_real_ta.submit_task(task_b)
+
+    await state_manager_real_ta.request_dag_cancellation(dag_run_id)
+
+    run = await state_manager_real_ta.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status == DagRunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_signals_all_started_tasks_via_one_broadcast(state_manager_real_ta):
+    """
+    N concurrently-STARTED tasks in one DAG run are all cancelled via a single broadcast.
+
+    This is the core noise-avoidance property of DAG cancellation (see
+    "Cancelling DAG runs" in docs/interacting-with-dags.md): publish_dag_cancellation is called exactly
+    once regardless of how many STARTED tasks the run has, and every worker-local
+    cancel_event for that run fires off that one message.
+    """
+    dag_run_id = ULID()
+    task_ids = [ULID() for _ in range(5)]
+    for tid in task_ids:
+        task = Task(
+            id=tid, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+        )
+        await state_manager_real_ta.submit_task(task)
+        task.set_status(TaskStatus.STARTED)
+        await state_manager_real_ta.task_state.save_task(task)
+
+    with contextlib.ExitStack() as stack:
+        for tid in task_ids:
+            stack.enter_context(state_manager_real_ta.cancel_event(tid, dag_run_id))
+
+        cancel_listener = asyncio.create_task(state_manager_real_ta.run_cancel_listener())
+        await asyncio.sleep(0.05)  # let the listener subscribe
+
+        with patch.object(
+            state_manager_real_ta.cancellation_bus,
+            "publish_dag_cancellation",
+            wraps=state_manager_real_ta.cancellation_bus.publish_dag_cancellation,
+        ) as mock_publish:
+            result = await state_manager_real_ta.request_dag_cancellation(dag_run_id)
+            await asyncio.sleep(0.1)  # let the listener process the one broadcast
+
+        assert result is not None
+        assert result.signalled_running == 5
+        mock_publish.assert_awaited_once_with(dag_run_id)
+        assert all(state_manager_real_ta._cancel_events[tid].event.is_set() for tid in task_ids)
+
+        cancel_listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cancel_listener
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_no_broadcast_when_nothing_started(state_manager_real_ta):
+    """No pub/sub message is published when the run has no STARTED tasks to signal."""
+    dag_run_id = ULID()
+    task = Task(id=ULID1, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED)
+    await state_manager_real_ta.submit_task(task)
+
+    with patch.object(
+        state_manager_real_ta.cancellation_bus, "publish_dag_cancellation", new_callable=AsyncMock
+    ) as mock_publish:
+        result = await state_manager_real_ta.request_dag_cancellation(dag_run_id)
+
+    assert result is not None
+    assert result.signalled_running == 0
+    mock_publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mark_and_is_dag_run_cancelling_proxy(state_manager_real_ta):
+    """mark_dag_run_cancelling/is_dag_run_cancelling proxy through to the task_state adapter."""
+    dag_run_id = ULID()
+    task = Task(id=ULID1, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED)
+    await state_manager_real_ta.submit_task(task)
+
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is False
+    await state_manager_real_ta.mark_dag_run_cancelling(dag_run_id)
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is True
+
+
+# ── can_resume_dag_run / resume_dag_run ────────────────────────────────────────
+#
+# Uses state_manager_real_ta for the same reason as request_dag_cancellation's
+# tests: get_dag_run/fan-in tracking aren't implemented on DummyTaskState, and
+# per CLAUDE.md this dispatch-adjacent, race-prone path needs a real-backend test.
+
+
+async def _make_stuck_task(sm, task_id, dag_run_id, status, **kwargs):
+    """Submit a task, then drive it to a stuck terminal status via the same path TaskProcessor would."""
+    task = Task(
+        id=task_id,
+        name="my_task",
+        queue="default",
+        dag_run_id=dag_run_id,
+        status=TaskStatus.SUBMITTED,
+        **kwargs,
+    )
+    await sm.submit_task(task)
+    task.set_status(status)
+    await sm.task_state.save_task(task)
+    await sm.finalize_dag_run_task(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_not_found(state_manager_real_ta):
+    """can_resume_dag_run reports dag_run_not_found_or_expired for an unregistered run."""
+    result = await state_manager_real_ta.can_resume_dag_run(ULID())
+    assert result.resumable is False
+    assert result.reason == "dag_run_not_found_or_expired"
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_task_history_incomplete(state_manager_real_ta):
+    """A run whose index survived but whose task blob was pruned is not resumable."""
+    dag_run_id = ULID()
+    task = await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED)
+    await state_manager_real_ta.task_state.delete_task(task)  # simulate clean_terminal_tasks pruning the blob
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is False
+    assert result.reason == "task_history_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_no_stuck_tasks(state_manager_real_ta):
+    """A run with no stuck tasks (e.g. already fully succeeded) is not resumable."""
+    dag_run_id = ULID()
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.COMPLETED)
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is False
+    assert result.reason == "no_stuck_tasks"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [TaskStatus.FAILED, TaskStatus.STALLED, TaskStatus.CANCELLED, TaskStatus.DROPPED]
+)
+async def test_can_resume_dag_run_resumable_for_every_stuck_status(state_manager_real_ta, status):
+    """Every TaskStatus.stuck_statuses() member is reported as a resumable stuck task."""
+    dag_run_id = ULID()
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, status)
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is True
+    assert result.stuck_task_ids == [ULID1]
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_fan_in_tracking_expired(state_manager_real_ta):
+    """A run that declares a fan-in edge but has no live tracking hash is not resumable."""
+    dag_run_id = ULID()
+    fan_in_callback = FanInCallback(
+        task=DAGTaskSpec(id=ULID2, name="collector_task", queue="default"), fan_in_key="fan-in:missing"
+    )
+    await _make_stuck_task(
+        state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED, dag_callbacks=[fan_in_callback]
+    )
+    # init_fan_in was never called for "fan-in:missing" -- its tracking hash doesn't exist.
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is False
+    assert result.reason == "fan_in_tracking_expired"
+
+
+@pytest.mark.asyncio
+async def test_can_resume_dag_run_fan_in_tracking_alive(state_manager_real_ta):
+    """A run whose declared fan-in tracking hash is still present is resumable."""
+    dag_run_id = ULID()
+    fan_in_callback = FanInCallback(
+        task=DAGTaskSpec(id=ULID2, name="collector_task", queue="default"), fan_in_key="fan-in:alive"
+    )
+    await state_manager_real_ta.task_state.init_fan_in(dag_run_id, "fan-in:alive", {ULID1})
+    await _make_stuck_task(
+        state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED, dag_callbacks=[fan_in_callback]
+    )
+
+    result = await state_manager_real_ta.can_resume_dag_run(dag_run_id)
+    assert result.resumable is True
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_raises_when_not_resumable(state_manager_real_ta):
+    """resume_dag_run raises TaskException with the precheck's reason embedded."""
+    with pytest.raises(TaskException, match="dag_run_not_found_or_expired"):
+        await state_manager_real_ta.resume_dag_run(ULID())
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_resubmits_stuck_task_from_stored_parameters(state_manager_real_ta):
+    """resume_dag_run resets retry_attempt, marks the errors list, and re-enqueues the task."""
+    dag_run_id = ULID()
+    task = await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED)
+    task.retry_attempt = 3
+    task.errors = ["boom"]
+    await state_manager_real_ta.task_state.save_task(task)
+
+    result = await state_manager_real_ta.resume_dag_run(dag_run_id)
+
+    assert result.dag_run_id == dag_run_id
+    assert result.resumed_task_ids == [ULID1]
+    resumed = await state_manager_real_ta.task_state.get_task(ULID1)
+    assert resumed is not None
+    assert resumed.status == TaskStatus.SUBMITTED
+    assert resumed.retry_attempt == 0
+    assert resumed.errors[0] == "boom"
+    assert resumed.errors[-1].startswith("--- resumed by operator")
+    popped = await state_manager_real_ta.task_submit.get_next_task({"default"})
+    assert popped is not None
+    assert popped.id == ULID1
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_clears_cancellation_marker(state_manager_real_ta):
+    """resume_dag_run clears a run's cancelled_at marker, or the resumed task's own retries/descendants would be suppressed."""
+    dag_run_id = ULID()
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.CANCELLED)
+    await state_manager_real_ta.mark_dag_run_cancelling(dag_run_id)
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is True
+
+    await state_manager_real_ta.resume_dag_run(dag_run_id)
+
+    assert await state_manager_real_ta.is_dag_run_cancelling(dag_run_id) is False
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_reconciles_failed_counter_so_run_can_complete(state_manager_real_ta):
+    """
+    After a resumed task goes on to succeed, the run can reach COMPLETE.
+
+    Regression guard: record_dag_run_task_terminal's
+    'failed' counter is otherwise monotonic, so without reconcile_dag_run_task_retry a
+    run that fully recovers via resume would be stuck reporting partial_failure forever.
+    """
+    dag_run_id = ULID()
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED)
+    await state_manager_real_ta.resume_dag_run(dag_run_id)
+
+    resumed = await state_manager_real_ta.task_state.get_task(ULID1)
+    resumed.set_status(TaskStatus.COMPLETED)
+    await state_manager_real_ta.task_state.save_task(resumed)
+    await state_manager_real_ta.finalize_dag_run_task(resumed)
+
+    run = await state_manager_real_ta.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.status == DagRunStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_resubmits_only_stuck_tasks_in_mixed_run(state_manager_real_ta):
+    """A run with one still-active task and one stuck task only resubmits the stuck one."""
+    dag_run_id = ULID()
+    active_task = Task(
+        id=ULID2, name="my_task", queue="default", dag_run_id=dag_run_id, status=TaskStatus.SUBMITTED
+    )
+    await state_manager_real_ta.submit_task(active_task)
+    await _make_stuck_task(state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED)
+
+    result = await state_manager_real_ta.resume_dag_run(dag_run_id)
+
+    assert result.resumed_task_ids == [ULID1]
+    still_active = await state_manager_real_ta.task_state.get_task(ULID2)
+    assert still_active is not None
+    assert still_active.status == TaskStatus.SUBMITTED
+
+
 # ── submit_task (rate-limited branch) ─────────────────────────────────────────
 
 
@@ -995,6 +1532,56 @@ def test_cancel_event_registers_and_deregisters(state_manager):
     assert ULID1 not in state_manager._cancel_events
 
 
+def test_cancel_event_stores_dag_run_id(state_manager):
+    """cancel_event registers dag_run_id alongside the event, for signal_cancel_dag to match on."""
+    dag_run_id = ULID2
+    with state_manager.cancel_event(ULID1, dag_run_id):
+        assert state_manager._cancel_events[ULID1].dag_run_id == dag_run_id
+
+
+def test_cancel_event_defaults_dag_run_id_to_none(state_manager):
+    """cancel_event's dag_run_id parameter is optional, for callers with no DAG run."""
+    with state_manager.cancel_event(ULID1):
+        assert state_manager._cancel_events[ULID1].dag_run_id is None
+
+
+# ── signal_cancel_dag ─────────────────────────────────────────────────────────
+
+
+def test_signal_cancel_dag_fires_matching_events_only(state_manager):
+    """signal_cancel_dag sets the event for every in-flight task with a matching dag_run_id, and no others."""
+    dag_run_id = ULID2
+    other_dag_run_id = ULID()
+    with (
+        state_manager.cancel_event(ULID1, dag_run_id),
+        state_manager.cancel_event(other_dag_run_id, other_dag_run_id),
+    ):
+        count = state_manager.signal_cancel_dag(dag_run_id)
+
+        assert count == 1
+        assert state_manager._cancel_events[ULID1].event.is_set()
+        assert not state_manager._cancel_events[other_dag_run_id].event.is_set()
+
+
+def test_signal_cancel_dag_fires_all_matching_events(state_manager):
+    """signal_cancel_dag fires every in-flight task belonging to the run, not just one."""
+    dag_run_id = ULID2
+    task_ids = [ULID(), ULID(), ULID()]
+    with contextlib.ExitStack() as stack:
+        for tid in task_ids:
+            stack.enter_context(state_manager.cancel_event(tid, dag_run_id))
+
+        count = state_manager.signal_cancel_dag(dag_run_id)
+
+        assert count == 3
+        assert all(state_manager._cancel_events[tid].event.is_set() for tid in task_ids)
+
+
+def test_signal_cancel_dag_returns_zero_when_no_matching_tasks(state_manager):
+    """signal_cancel_dag returns 0 and is a no-op when no in-flight task belongs to the run."""
+    assert state_manager.signal_cancel_dag(ULID()) == 0
+
+
 # ── monitor_task_cancellation ──────────────────────────────────────────────────
 
 
@@ -1020,6 +1607,38 @@ async def test_monitor_task_cancellation_does_not_exit_without_message(state_man
         monitor.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await monitor
+
+
+@pytest.mark.asyncio
+async def test_monitor_task_cancellation_raises_stale_error_on_stale_signal(state_manager):
+    """monitor_task_cancellation raises StaleTaskCancelledError (not UserCancellationError) for a stale-reason signal."""
+    task_id = ULID1
+    with state_manager.cancel_event(task_id):
+        monitor = asyncio.create_task(state_manager.monitor_task_cancellation(task_id))
+        state_manager.signal_cancel(task_id, reason=CancelReason.STALE)
+        with pytest.raises(StaleTaskCancelledError):
+            await monitor
+
+
+# ── cancel_reason ─────────────────────────────────────────────────────────────
+
+
+def test_cancel_reason_returns_none_when_no_handle_registered(state_manager):
+    """cancel_reason returns None for a task with no in-flight cancel handle."""
+    assert state_manager.cancel_reason(ULID1) is None
+
+
+def test_cancel_reason_defaults_to_user(state_manager):
+    """cancel_reason defaults to CancelReason.USER for a freshly registered handle."""
+    with state_manager.cancel_event(ULID1):
+        assert state_manager.cancel_reason(ULID1) == CancelReason.USER
+
+
+def test_cancel_reason_reflects_stale_signal(state_manager):
+    """cancel_reason reports CancelReason.STALE after a stale-reason signal_cancel call."""
+    with state_manager.cancel_event(ULID1):
+        state_manager.signal_cancel(ULID1, reason=CancelReason.STALE)
+        assert state_manager.cancel_reason(ULID1) == CancelReason.STALE
 
 
 # ── schedule_new_task ─────────────────────────────────────────────────────────
@@ -1793,6 +2412,9 @@ async def _schedule_saga(sm: StateManager, task: Task, run_at: dt.datetime) -> N
 @pytest.mark.asyncio
 async def test_fail_task_with_dlq_saga_mode(saga_state_manager):
     """fail_task calls dead_queue.add_to_dlq directly when adapters are non-atomic."""
+    await saga_state_manager.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED, errors=["oops"])
     task.task_config = make_task_config(DeadLetterPolicy.SAVE)
 
@@ -1808,6 +2430,9 @@ async def test_fail_task_with_dlq_saga_mode(saga_state_manager):
 @pytest.mark.asyncio
 async def test_fail_task_no_dlq_saga_mode(saga_state_manager):
     """fail_task with NONE policy saves the task without touching the DLQ in saga mode."""
+    await saga_state_manager.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    )
     task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.FAILED)
     task.task_config = make_task_config(DeadLetterPolicy.NONE)
 
@@ -1945,6 +2570,152 @@ async def test_clean_stale_task_saga_mode(saga_state_manager):
     assert ULID1 not in saga_state_manager.task_state._heartbeats
 
 
+@pytest.mark.asyncio
+async def test_save_task_saga_mode(saga_state_manager):
+    """StateManager.save_task delegates directly to task_state.save_task when non-atomic."""
+    sm = saga_state_manager
+    task = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+
+    result = await sm.save_task(task)
+
+    assert result is task
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.STARTED
+
+
+@pytest.mark.asyncio
+async def test_mark_task_stale_saga_mode_skips_when_already_resolved(saga_state_manager):
+    """
+    _mark_task_stale's saga path drops a stale write once the live worker resolves it first.
+
+    A live worker's own CAS-guarded write (e.g. handle_success) already changed the
+    stored status before this runs. ``task`` here plays the role of the snapshot
+    clean() captured earlier in its stale scan -- it still says STARTED even though
+    the store has since moved on.
+    """
+    sm = saga_state_manager
+    await sm.task_state.save_task(
+        Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.COMPLETED)
+    )
+
+    stale_snapshot = Task(id=ULID1, name="my_task", queue="default", status=TaskStatus.STARTED)
+    stale_snapshot.heartbeat_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)
+    stale_snapshot.set_status(TaskStatus.STALLED)
+
+    applied = await sm._mark_task_stale(stale_snapshot, needs_dlq=False, now=dt.datetime.now(dt.UTC))
+
+    assert applied is False
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED  # the live worker's outcome wins
+
+
+# ── dispatch_scheduled_task saga mode ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scheduled_task_saga_mode(saga_state_manager):
+    """
+    dispatch_scheduled_task's saga path CASes SCHEDULED->SUBMITTED, enqueues, then removes.
+
+    Regression coverage: the saga branch previously CASed the status and removed the
+    scheduler entry but never called task_submit.enqueue(), so the task was marked
+    SUBMITTED yet never actually reachable by a worker.
+    """
+    sm = saga_state_manager
+    task = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
+    run_at = FROZEN_TIME
+    await sm.task_state.save_task(task)
+    await _schedule_saga(sm, task, run_at)
+
+    due = await sm.task_scheduler.next_due(["default"])
+    assert due is not None
+    result = await sm.dispatch_scheduled_task(due)
+
+    assert result.status == TaskStatus.SUBMITTED
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert ULID1 in sm.task_submit.queued
+    assert await sm.task_scheduler.next_due(["default"]) is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_scheduled_task_saga_mode_skips_cancelled(saga_state_manager):
+    """In saga mode, a task cancelled after scheduler acquisition is not dispatched."""
+    sm = saga_state_manager
+    cancelled = Task(
+        id=ULID1, name="retry_task", queue="default", status=TaskStatus.CANCELLED, retry_attempt=1
+    )
+    await sm.task_state.save_task(cancelled)
+
+    stale = Task(id=ULID1, name="retry_task", queue="default", status=TaskStatus.SCHEDULED, retry_attempt=1)
+    result = await sm.dispatch_scheduled_task(stale)
+
+    assert result is stale
+    assert ULID1 not in sm.task_submit.queued
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.CANCELLED
+
+
+# ── request_dag_cancellation saga mode ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_request_dag_cancellation_saga_mode(saga_state_manager):
+    """request_dag_cancellation saves each cancelled task sequentially when adapters are non-atomic."""
+    sm = saga_state_manager
+    dag_run_id = ULID2
+    scheduled = Task(
+        id=ULID1, name="my_task", queue="default", status=TaskStatus.SCHEDULED, dag_run_id=dag_run_id
+    )
+    await sm.task_state.save_task(scheduled)
+    await _schedule_saga(sm, scheduled, FROZEN_TIME + dt.timedelta(hours=1))
+
+    result = await sm.request_dag_cancellation(dag_run_id)
+
+    assert result is not None
+    assert result.already_terminal == 0
+    assert result.cancelled_immediately == 1
+    assert result.signalled_running == 0
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.CANCELLED
+    assert await sm.task_scheduler.get_run_at(ULID1) is None
+
+
+# ── resume_dag_run saga mode ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_run_saga_mode(saga_state_manager):
+    """resume_dag_run saves and re-enqueues each stuck task sequentially when adapters are non-atomic."""
+    sm = saga_state_manager
+    dag_run_id = ULID2
+    stuck = Task(
+        id=ULID1,
+        name="my_task",
+        queue="default",
+        status=TaskStatus.FAILED,
+        dag_run_id=dag_run_id,
+        errors=["boom"],
+        retry_attempt=3,
+    )
+    await sm.task_state.save_task(stuck)
+
+    result = await sm.resume_dag_run(dag_run_id)
+
+    assert result.dag_run_id == dag_run_id
+    assert result.resumed_task_ids == [ULID1]
+    saved = await sm.task_state.get_task(ULID1)
+    assert saved is not None
+    assert saved.status == TaskStatus.SUBMITTED
+    assert saved.retry_attempt == 0
+    assert ULID1 in sm.task_submit.queued
+
+
 # ── recover_orphaned_scheduled ───────────────────────────────────────────────
 
 
@@ -2059,6 +2830,55 @@ async def test_dispatch_cron_dag_no_pipeline(cron_saga_state_manager):
     submitted = list(cron_saga_state_manager.task_state._store.values())
     assert len(submitted) == 1
     assert submitted[0].status == TaskStatus.SUBMITTED
+
+
+@pytest.mark.asyncio
+async def test_complete_cron_task_same_backend_atomic_pipeline(state_manager_real_ta):
+    """When cron and task-state share a backend, complete_cron_task folds both ops into one pipeline."""
+    sm = state_manager_real_ta
+    # Sanity: RedisTaskState and RedisCronDAGScheduler share the same Redis client here,
+    # so backend_key matches and _atomic_cron is set -- this is the "same pipeline" mode.
+    assert sm._atomic_cron is not None
+
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
+    await sm.cron_dag_scheduler.add(entry, FROZEN_TIME)
+    task_id = ULID()
+    await sm.cron_dag_scheduler.set_active_run(entry.id, task_id, ttl=3600)
+
+    task = Task(id=task_id, name="my_job", queue="default", status=TaskStatus.COMPLETED, cron_id=entry.id)
+
+    await sm.complete_cron_task(task)
+
+    saved = await sm.task_state.get_task(task_id)
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    assert await sm.cron_dag_scheduler.get_active_run(entry.id) is None
+
+
+@pytest.mark.asyncio
+async def test_reschedule_cron_entries_bulk_atomic_pipeline(state_manager_real_ta):
+    """reschedule_cron_entries_bulk stages every entry into one pipeline when the cron scheduler is atomic."""
+    sm = state_manager_real_ta
+
+    from jobbers.models.dag import DAGTaskSpec
+
+    spec = DAGTaskSpec(name="my_job", queue="default")
+    entry_a = CronDAGEntry(name="nightly-a", cron_expr="0 0 * * *", dag_spec=spec)
+    entry_b = CronDAGEntry(name="nightly-b", cron_expr="0 0 * * *", dag_spec=spec)
+    await sm.cron_dag_scheduler.add(entry_a, FROZEN_TIME)
+    await sm.cron_dag_scheduler.add(entry_b, FROZEN_TIME)
+
+    await sm.reschedule_cron_entries_bulk([(entry_a, FROZEN_TIME), (entry_b, FROZEN_TIME)])
+
+    next_a = await sm.cron_dag_scheduler.get_next_run_at(entry_a.id)
+    next_b = await sm.cron_dag_scheduler.get_next_run_at(entry_b.id)
+    assert next_a is not None
+    assert next_a > FROZEN_TIME
+    assert next_b is not None
+    assert next_b > FROZEN_TIME
 
 
 @pytest.mark.asyncio

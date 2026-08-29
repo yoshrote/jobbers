@@ -127,6 +127,8 @@ button, .btn {
 .dag-status-complete        { background: #dcfce7; color: #166534; }
 .dag-status-partial_failure { background: #ffedd5; color: #9a3412; }
 .dag-status-failed          { background: #fee2e2; color: #991b1b; }
+.dag-status-cancelling      { background: #fde68a; color: #92400e; }
+.dag-status-cancelled       { background: #f3f4f6; color: #374151; }
 
 /* ── Misc ── */
 .error-msg { color: #dc3545; margin-top: .5rem; }

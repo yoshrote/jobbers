@@ -25,10 +25,10 @@ async function request(method, path, body, params) {
   return data
 }
 
-const get  = (path, params) => request('GET',    path, null, params)
-const post = (path, body)   => request('POST',   path, body)
-const put  = (path, body)   => request('PUT',    path, body)
-const del  = (path)         => request('DELETE', path)
+const get  = (path, params)         => request('GET',    path, null, params)
+const post = (path, body, params)   => request('POST',   path, body, params)
+const put  = (path, body)           => request('PUT',    path, body)
+const del  = (path)                 => request('DELETE', path)
 
 // ── Registered tasks ───────────────────────────────────────────────────────
 
@@ -256,3 +256,45 @@ export const listDags = (params) => get('/dags', params)
  * @returns {{ dag_run_id: string, name: string, status: string, submitted_at: string, task_ids: string[] }}
  */
 export const getDag = (dagRunId) => get(`/dags/${dagRunId}`)
+
+/**
+ * POST /dags/{dag_run_id}/cancel
+ *
+ * Cancels every non-terminal task in the run. SCHEDULED/SUBMITTED tasks are
+ * cancelled immediately; STARTED tasks are signalled via a single broadcast.
+ * @param {string} dagRunId
+ * @param {boolean} [verbose] Include a per-task breakdown in the response.
+ * @returns {{
+ *   dag_run_id: string,
+ *   already_terminal: number,
+ *   cancelled_immediately: number,
+ *   signalled_running: number,
+ *   tasks?: { task_id: string, status: string }[]
+ * }}
+ */
+export const cancelDag = (dagRunId, verbose) =>
+  post(`/dags/${dagRunId}/cancel`, null, verbose ? { verbose: true } : undefined)
+
+/**
+ * GET /dags/{dag_run_id}/resume-check
+ *
+ * Read-only check for whether a DAG run can currently be resumed. No side effects.
+ * @param {string} dagRunId
+ * @returns {{
+ *   dag_run_id: string,
+ *   resumable: boolean,
+ *   reason: 'dag_run_not_found_or_expired' | 'task_history_incomplete' | 'no_stuck_tasks' | 'fan_in_tracking_expired' | null,
+ *   stuck_task_ids: string[]
+ * }}
+ */
+export const getDagResumeCheck = (dagRunId) => get(`/dags/${dagRunId}/resume-check`)
+
+/**
+ * POST /dags/{dag_run_id}/resume
+ *
+ * Retries every FAILED/STALLED/CANCELLED/DROPPED task in the run from its stored
+ * parameters and lets the DAG continue from there.
+ * @param {string} dagRunId
+ * @returns {{ dag_run_id: string, resumed_task_ids: string[] }}
+ */
+export const resumeDag = (dagRunId) => post(`/dags/${dagRunId}/resume`)

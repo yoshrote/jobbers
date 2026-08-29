@@ -16,6 +16,7 @@ from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
+from jobbers.utils.asyncio_config import asyncio_debug_enabled, install_uvloop
 from jobbers.utils.otel import enable_otel, shutdown_otel
 
 if TYPE_CHECKING:
@@ -166,9 +167,12 @@ def run() -> None:
     logging.basicConfig(level=logging.INFO, handlers=handlers)
     logging.getLogger("jobbers").setLevel(logging.DEBUG)
 
+    if install_uvloop():
+        logger.info("uvloop installed as the event loop policy")
+
     _load_task_module(args.task_module)
 
     try:
-        asyncio.run(main(), debug=True)
+        asyncio.run(main(), debug=asyncio_debug_enabled())
     finally:
         shutdown_otel()

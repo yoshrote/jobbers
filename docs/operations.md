@@ -23,7 +23,7 @@ Run the migration tool before starting any process for the first time:
 jobbers_migrate
 ```
 
-This creates the SQL tables used for queue/role/task-state/DLQ/scheduler config (whichever backends are set to `sql`), and — when `ROUTING_BACKEND=redis_json` — creates the RediSearch routing indexes ahead of time instead of waiting for the first process to start.
+This creates the SQL tables for whichever of `ROUTING_BACKEND` / `TASK_BACKEND` / `DLQ_BACKEND` / `TASK_SCHEDULER_BACKEND` / `CRON_DAG_SCHEDULER_BACKEND` are actually set to `sql` (an all-non-SQL deployment creates nothing) — same selective logic every process already applies to itself at startup. When `ROUTING_BACKEND=redis_json`, it also creates the RediSearch routing indexes ahead of time instead of waiting for the first process to start.
 
 ### Frontend
 
@@ -132,7 +132,7 @@ Starts a worker process that pulls tasks from Redis queues and executes them. Li
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | SQLAlchemy URL for queue/role config |
 | `OTEL_*` | _(same as Manager)_ | OpenTelemetry endpoints |
 
-Scale horizontally by running more worker processes. Workers are fully independent — they coordinate only through Redis and SQL. Workers detect role and queue configuration changes automatically without restart.
+Scale horizontally by running more worker processes. Workers are fully independent — they coordinate only through Redis and SQL. Workers detect role and queue configuration changes automatically without restart. For guidance on sizing `WORKER_CONCURRENT_TASKS` and Redis connection/server settings, plus a reusable load-testing script, see [benchmarking-and-performance.md](benchmarking-and-performance.md).
 
 On `SIGTERM`, each in-flight task is handled according to its `on_shutdown` policy before the process exits.
 
@@ -222,7 +222,7 @@ Recommended cron setup:
 A long-running process that handles two scheduling concerns on each poll:
 
 1. **Retry delays** — re-enqueues tasks that are waiting out a backoff delay when their `run_at` arrives.
-2. **Cron DAGs** — fires recurring `CronDAGEntry` runs when their cron expression comes due; see [interacting-with-tasks.md — Cron DAGs](interacting-with-tasks.md#cron-dags).
+2. **Cron DAGs** — fires recurring `CronDAGEntry` runs when their cron expression comes due; see [interacting-with-dags.md — Cron DAGs](interacting-with-dags.md#2-cron-dags).
 
 Run exactly **one** Scheduler per Redis instance. A brief overlap of two instances (e.g. during a rolling restart) is tolerated for cron DAG dispatch when `CRON_DAG_SCHEDULER_BACKEND` is `redis` or `sql` — a short-TTL dispatch lock backed by that shared storage prevents both instances from submitting the same due run. This protection does **not** apply to `CRON_DAG_SCHEDULER_BACKEND=static`: its dispatch lock is private, in-process memory, so two static-backed Scheduler instances can both dispatch the same cron entry with no coordination at all. Do not run more than one Scheduler instance, even briefly, against the static cron backend.
 
@@ -305,6 +305,7 @@ All four processes emit OTLP metrics automatically. No instrumentation code is r
 | `task_execution_time` | Histogram (ms) | `queue`, `task`, `status` | Time from `started_at` to `completed_at` |
 | `task_end_to_end_latency` | Histogram (ms) | `queue`, `task`, `status` | Time from `submitted_at` to `completed_at` |
 | `tasks_retried` | Counter | `queue`, `task`, `version` | Retry events |
+| `tasks_dead_lettered` | Counter | `queue`, `task`, `version` | Tasks moved to DLQ on retry exhaustion (`fail_task`). Also incremented by the Cleaner when it moves a stalled task to the DLQ. |
 
 **Emitted by the Worker (task_generator):**
 
@@ -320,7 +321,6 @@ All four processes emit OTLP metrics automatically. No instrumentation code is r
 | Metric | Type | Labels | Description |
 | --- | --- | --- | --- |
 | `cancellations_requested` | Counter | `queue`, `task` | Cancel signals sent |
-| `tasks_dead_lettered` | Counter | `queue`, `task`, `version` | Tasks moved to DLQ |
 
 **Useful derived signals:**
 

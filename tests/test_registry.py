@@ -1,3 +1,6 @@
+import datetime as dt
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
 from jobbers.models.dag import DAGNode
@@ -7,8 +10,9 @@ from jobbers.registry import TaskWrapper, _task_function_map, get_task_config, r
 
 @pytest.fixture(autouse=True)
 def setup():
-    """Fixture to reset the tasks in the mocked Redis before each test."""
-    # Clear the internal task function map before each test to ensure isolation
+    """Reset the global task registry before and after each test for isolation."""
+    _task_function_map.clear()
+    yield
     _task_function_map.clear()
 
 
@@ -106,3 +110,55 @@ def test_get_task_config_not_found():
     """Test retrieving a non-existent task configuration."""
     task_config = get_task_config("non_existent_task", 1)
     assert task_config is None
+
+
+async def _test_function(**kwargs):  # pragma: no cover
+    return kwargs
+
+
+@pytest.mark.asyncio
+async def test_task_wrapper_submit_creates_and_submits_task():
+    """TaskWrapper.submit() builds a Task and hands it to StateManager.submit_task."""
+    wrapper = TaskWrapper(_test_function, "test_task", 1)
+    mock_sm = MagicMock()
+    mock_sm.submit_task = AsyncMock()
+
+    with patch("jobbers.registry.db.get_state_manager", return_value=mock_sm):
+        task = await wrapper.submit(queue="myqueue", x=1)
+
+    assert task.name == "test_task"
+    assert task.version == 1
+    assert task.queue == "myqueue"
+    assert task.parameters == {"x": 1}
+    mock_sm.submit_task.assert_called_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_task_wrapper_submit_defaults_to_default_queue():
+    """TaskWrapper.submit() without a queue argument targets the 'default' queue."""
+    wrapper = TaskWrapper(_test_function, "test_task", 1)
+    mock_sm = MagicMock()
+    mock_sm.submit_task = AsyncMock()
+
+    with patch("jobbers.registry.db.get_state_manager", return_value=mock_sm):
+        task = await wrapper.submit(x=1)
+
+    assert task.queue == "default"
+
+
+@pytest.mark.asyncio
+async def test_task_wrapper_schedule_creates_and_schedules_task():
+    """TaskWrapper.schedule() builds a Task and hands it to StateManager.schedule_new_task."""
+    wrapper = TaskWrapper(_test_function, "test_task", 1)
+    run_at = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
+    mock_sm = MagicMock()
+    mock_sm.schedule_new_task = AsyncMock()
+
+    with patch("jobbers.registry.db.get_state_manager", return_value=mock_sm):
+        task = await wrapper.schedule(run_at, queue="myqueue", x=1)
+
+    assert task.name == "test_task"
+    assert task.version == 1
+    assert task.queue == "myqueue"
+    assert task.parameters == {"x": 1}
+    mock_sm.schedule_new_task.assert_called_once_with(task, run_at)

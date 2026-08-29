@@ -53,6 +53,27 @@ _MARK_DAG_RUN_COMPLETE_SCRIPT = """
     return 1
 """
 
+# Mirror image of _RECORD_DAG_RUN_TERMINAL_SCRIPT's 'failed' branch: decrements 'failed'
+# by ARGV[1] (floored at 0) instead of incrementing either counter, and recomputes status
+# the same way. Used by reconcile_dag_run_task_retry to undo count stuck tasks' earlier
+# failure records before they're resubmitted, in one
+# round trip rather than one call per task. No-op (returns 0) if the run's meta hash is
+# missing.
+_RECONCILE_DAG_RUN_TASK_RETRY_SCRIPT = """
+    if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+    local failed = tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0
+    local count = tonumber(ARGV[1])
+    failed = math.max(0, failed - count)
+    redis.call('HSET', KEYS[1], 'failed', failed)
+    local completed = tonumber(redis.call('HGET', KEYS[1], 'completed')) or 0
+    local status = 'running'
+    if failed > 0 then
+        if completed > 0 then status = 'partial_failure' else status = 'failed' end
+    end
+    redis.call('HSET', KEYS[1], 'status', status)
+    return 1
+"""
+
 
 class RedisTaskState(SharedTaskAdapterMixin):
     """
@@ -71,6 +92,9 @@ class RedisTaskState(SharedTaskAdapterMixin):
         super().__init__(data_store)
         self._record_dag_run_terminal_script = data_store.register_script(_RECORD_DAG_RUN_TERMINAL_SCRIPT)
         self._mark_dag_run_complete_script = data_store.register_script(_MARK_DAG_RUN_COMPLETE_SCRIPT)
+        self._reconcile_dag_run_task_retry_script = data_store.register_script(
+            _RECONCILE_DAG_RUN_TASK_RETRY_SCRIPT
+        )
 
     # -- Storage primitives --------------------------------------------------
 
@@ -172,16 +196,25 @@ class RedisTaskState(SharedTaskAdapterMixin):
         )
         pipe = self.data_store.pipeline(transaction=False)
         for dag_id_bytes, _ in raw:
-            pipe.hmget(self.DAG_RUN_META(dag_run_id=ULID.from_bytes(dag_id_bytes)), "name", "status")
+            pipe.hmget(
+                self.DAG_RUN_META(dag_run_id=ULID.from_bytes(dag_id_bytes)), "name", "status", "cancelled_at"
+            )
         meta_rows = cast("list[list[bytes | None]]", await pipe.execute()) if raw else []
         summaries = [
             DAGRunSummary(
                 dag_run_id=ULID.from_bytes(dag_id_bytes),
                 name=name.decode() if name else "",
-                status=DagRunStatus(status.decode()) if status else DagRunStatus.RUNNING,
+                # Once cancellation is requested, the raw "status" field is superseded
+                # here -- see get_dag_run's docstring for why this list view can't
+                # afford to distinguish CANCELLING from CANCELLED cheaply.
+                status=(
+                    DagRunStatus.CANCELLING
+                    if cancelled_at
+                    else (DagRunStatus(status.decode()) if status else DagRunStatus.RUNNING)
+                ),
                 submitted_at=dt.datetime.fromtimestamp(score, dt.UTC),
             )
-            for (dag_id_bytes, score), (name, status) in zip(raw, meta_rows, strict=True)
+            for (dag_id_bytes, score), (name, status, cancelled_at) in zip(raw, meta_rows, strict=True)
         ]
         return summaries, total
 
@@ -201,16 +234,57 @@ class RedisTaskState(SharedTaskAdapterMixin):
         # time, so sorting restores the submission-order guarantee callers rely on
         # (e.g. the /dags/{dag_run_id} response) at no extra I/O cost.
         task_ids = sorted(ULID.from_bytes(b) for b in raw_ids)
-        name_raw, status_raw = cast(
+        name_raw, status_raw, cancelled_raw, completed_raw, failed_raw = cast(
             "list[bytes | None]",
-            await self.data_store.hmget(self.DAG_RUN_META(dag_run_id=dag_run_id), "name", "status"),
+            await self.data_store.hmget(
+                self.DAG_RUN_META(dag_run_id=dag_run_id),
+                "name",
+                "status",
+                "cancelled_at",
+                "completed",
+                "failed",
+            ),
         )
+        status = DagRunStatus(status_raw.decode()) if status_raw else DagRunStatus.RUNNING
+        if cancelled_raw:
+            # Once cancellation is requested, the raw "status" field (still being
+            # written by record_dag_run_task_terminal's running/partial_failure/failed
+            # recompute) is superseded here: a cancelled/cancelling run reports
+            # CANCELLED once every registered task has reached a terminal outcome,
+            # CANCELLING until then. Cancelled tasks never leave DAG_RUN_PENDING (see
+            # finalize_dag_run_task), so "pending count reaches 0" can't be used as the
+            # settled signal -- completed+failed reaching the full task count can.
+            completed = int(completed_raw or 0)
+            failed = int(failed_raw or 0)
+            status = (
+                DagRunStatus.CANCELLED if (completed + failed) >= len(task_ids) else DagRunStatus.CANCELLING
+            )
         return DAGRunDetail(
             dag_run_id=dag_run_id,
             name=name_raw.decode() if name_raw else "",
-            status=DagRunStatus(status_raw.decode()) if status_raw else DagRunStatus.RUNNING,
+            status=status,
             submitted_at=submitted_at,
             task_ids=task_ids,
+        )
+
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        """Idempotently record that cancellation was requested for this run (HSETNX)."""
+        now = dt.datetime.now(dt.UTC).timestamp()
+        await self.data_store.hsetnx(self.DAG_RUN_META(dag_run_id=dag_run_id), "cancelled_at", now)
+
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        """Cheap check: has cancellation been requested for this run."""
+        val = await self.data_store.hget(self.DAG_RUN_META(dag_run_id=dag_run_id), "cancelled_at")
+        return val is not None
+
+    async def clear_dag_run_cancellation(self, dag_run_id: ULID) -> None:
+        """Clear a previously-set cancellation marker (HDEL). No-op if it wasn't set."""
+        await self.data_store.hdel(self.DAG_RUN_META(dag_run_id=dag_run_id), "cancelled_at")
+
+    async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
+        """Undo ``count`` earlier 'failed' terminal-outcome records for tasks about to be retried."""
+        await self._reconcile_dag_run_task_retry_script(
+            keys=[self.DAG_RUN_META(dag_run_id=dag_run_id)], args=[count]
         )
 
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None:

@@ -21,6 +21,7 @@ from opentelemetry import metrics
 
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.utils.asyncio_config import asyncio_debug_enabled, install_uvloop
 from jobbers.utils.otel import enable_otel, shutdown_otel
 
 if TYPE_CHECKING:
@@ -111,7 +112,10 @@ def run() -> None:
     role = os.environ.get("SCHEDULER_ROLE", "default")
     config_interval = dt.timedelta(minutes=int(os.environ.get("SCHEDULER_CONFIG_REFRESH_INTERVAL", "3")))
 
+    if install_uvloop():
+        logger.info("uvloop installed as the event loop policy")
+
     try:
-        asyncio.run(main(poll_interval, config_interval, role, batch_size))
+        asyncio.run(main(poll_interval, config_interval, role, batch_size), debug=asyncio_debug_enabled())
     finally:
         shutdown_otel()

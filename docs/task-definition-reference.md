@@ -369,7 +369,33 @@ async def process_records(rows: Annotated[int, FromParent("rows")], **kwargs) ->
     return {"processed": rows}
 ```
 
-`rows` is never part of the submitted payload — the worker fetches it from the parent's results before calling the function, the same way `Depends()` params are never part of the payload.
+Unlike `Depends()` params, `rows` is not forbidden from the submitted payload — it's just overridden by the parent's result whenever there is one. If the task has a parent and that parent's results contain `"rows"`, the worker overwrites whatever was submitted with that value before calling the function. Only when there's no parent to pull from (see "Root nodes are exempt" below) does a submitted `rows` value actually take effect.
+
+| Task's situation | What `rows` resolves to |
+| --- | --- |
+| Has a parent, and the parent's results contain `"rows"` | The parent's value — a submitted `rows` (if any) is silently discarded |
+| Has a parent, but the parent's results don't contain `"rows"` | The submitted `rows` value, or the function's own Python default |
+| No parent at all (root node, or called/submitted directly) | The submitted `rows` value, or the function's own Python default |
+
+```python
+@register_task(name="process_records", version=1)
+async def process_records(rows: Annotated[int, FromParent("rows")] = 0, **kwargs) -> dict:
+    return {"processed": rows}
+
+# 1. Root node -- nothing to pull from a parent, so the submitted value wins.
+DAGNode("process_records", parameters={"rows": 5})             # rows == 5
+
+# 2. Chain position -- the parent's result has "rows", so it wins outright.
+extract = DAGNode("extract_rows")                               # returns {"rows": 100}
+process = DAGNode("process_records", parameters={"rows": 5})    # rows == 100, the 5 is discarded
+extract.then(process)
+
+# 3. Chain position, but the parent's result has no "rows" key --
+#    falls back to the submitted value (then the function's own default if nothing was submitted).
+extract2 = DAGNode("extract_row_count")                         # returns {"count": 100}, no "rows"
+process2 = DAGNode("process_records", parameters={"rows": 5})   # rows == 5
+extract2.then(process2)
+```
 
 ### Two modes
 

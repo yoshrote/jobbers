@@ -260,6 +260,45 @@ async def test_main_sigterm_respects_on_shutdown_policy():
     gen_instance.stop.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="loop.add_signal_handler is POSIX-only")
+async def test_main_sigterm_during_blocking_fetch_shuts_down_cleanly():
+    """
+    A SIGTERM that arrives while blocked on the next task fetch shuts down cleanly.
+
+    _request_shutdown cancels the in-flight fetch_task to interrupt a blocking queue
+    pop immediately, surfacing as asyncio.CancelledError -- caught by the "except
+    (StopAsyncIteration, asyncio.CancelledError)" clause. This relies on the redis
+    client being constructed with socket_timeout=None (db.py:get_client(),
+    https://github.com/redis/redis-py/issues/4091): with a finite socket_timeout,
+    redis-py's read_response wraps the blocking read in asyncio.timeout(), whose
+    __aexit__ converts *any* CancelledError into TimeoutError once its own deadline
+    has fired -- which used to turn this exact shutdown-triggered cancellation into
+    an unhandled redis.exceptions.TimeoutError instead of a clean shutdown.
+    """
+    state_manager = _make_state_manager()
+
+    async def fake_anext(_self: object = None) -> Task:
+        await asyncio.sleep(10000)  # simulate blocking on an empty queue
+        raise AssertionError("should have been cancelled by shutdown")  # pragma: no cover
+
+    gen_instance = MagicMock()
+    gen_instance.queues = AsyncMock(return_value={"default"})
+    gen_instance.stop = MagicMock()
+    gen_instance.__anext__ = fake_anext
+
+    with (
+        patch("jobbers.runners.worker_proc.db.init_state_manager", return_value=state_manager),
+        patch("jobbers.runners.worker_proc.TaskGenerator", return_value=gen_instance),
+    ):
+        main_task = asyncio.create_task(main())
+        await asyncio.sleep(0.1)  # let main() start blocking on the fetch
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(main_task, timeout=2)  # must not raise
+
+    gen_instance.stop.assert_called_once()
+
+
 # ── run() otel shutdown ───────────────────────────────────────────────────────
 
 

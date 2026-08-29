@@ -1846,6 +1846,142 @@
           }
         }
       }
+    },
+    "/dags/{dag_run_id}/cancel": {
+      "post": {
+        "summary": "Cancel Dag",
+        "description": "Cancel every non-terminal task in a DAG run.\n\nSCHEDULED/SUBMITTED tasks are cancelled immediately; STARTED tasks are signalled\nvia a single DAG-wide pub/sub broadcast rather than one message per task. Pass\n``?verbose=true`` for a per-task breakdown; the default response is a fixed-size\naggregate summary regardless of run size.",
+        "operationId": "cancel_dag_dags__dag_run_id__cancel_post",
+        "parameters": [
+          {
+            "name": "dag_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Dag Run Id"
+            }
+          },
+          {
+            "name": "verbose",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Verbose"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Cancel Dag Dags  Dag Run Id  Cancel Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dags/{dag_run_id}/resume-check": {
+      "get": {
+        "summary": "Check Dag Resumable",
+        "description": "Read-only check for whether a DAG run can currently be resumed.\n\nNo side effects -- safe to poll for driving a \"Resume\" button's enabled state.",
+        "operationId": "check_dag_resumable_dags__dag_run_id__resume_check_get",
+        "parameters": [
+          {
+            "name": "dag_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Dag Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Check Dag Resumable Dags  Dag Run Id  Resume Check Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dags/{dag_run_id}/resume": {
+      "post": {
+        "summary": "Resume Dag",
+        "description": "Retry every FAILED/STALLED/CANCELLED/DROPPED task in a DAG run from its stored parameters.\n\nRequires the run's task history, DAG run index, and (if the run uses fan-in)\nfan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in\nTTL expiry -- see GET /dags/{dag_run_id}/resume-check and\ndocs/dag-resume-design.md for what each unresumable reason means.",
+        "operationId": "resume_dag_dags__dag_run_id__resume_post",
+        "parameters": [
+          {
+            "name": "dag_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Dag Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Resume Dag Dags  Dag Run Id  Resume Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {

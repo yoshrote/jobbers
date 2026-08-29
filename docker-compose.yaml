@@ -42,6 +42,22 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: jobbers
+      POSTGRES_PASSWORD: jobbers
+      POSTGRES_DB: jobbers
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobbers"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
   manager:
     build: .
     environment:
@@ -80,8 +96,10 @@ services:
     volumes:
       - .:/usr/src/app
     depends_on:
-      - redis
-      - collector
+      redis:
+        condition: service_healthy
+      collector:
+        condition: service_started
   scheduler:
     build: .
     environment:
@@ -95,12 +113,14 @@ services:
       SCHEDULER_BATCH_SIZE: "10"
       SCHEDULER_POLL_INTERVAL: "1.0"
       SCHEDULER_ROLE: "default"
-    command: /opt/venv/bin/jobbers_scheduler /usr/src/app/end2end.py
+    command: /opt/venv/bin/jobbers_scheduler
     volumes:
       - .:/usr/src/app
     depends_on:
-      - redis
-      - collector
+      redis:
+        condition: service_healthy
+      collector:
+        condition: service_started
   frontend:
     build:
       context: ./frontend
@@ -120,4 +140,5 @@ services:
 volumes:
   frontend_nm:
   redis_data:
-  openobserve_data:  
+  postgres_data:
+  openobserve_data:

@@ -1185,6 +1185,171 @@ async def test_get_dag_not_found(state_manager):
     assert response.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_cancel_dag_not_found(state_manager):
+    """POST /dags/{dag_run_id}/cancel returns 404 when the run does not exist."""
+    state_manager.request_dag_cancellation = AsyncMock(return_value=None)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/cancel")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cancel_dag_default_response_omits_task_breakdown(state_manager):
+    """POST /dags/{dag_run_id}/cancel returns the aggregate summary without a per-task list by default."""
+    from jobbers.models.dag import DAGCancelResult, DAGCancelTaskResult
+
+    result = DAGCancelResult(
+        dag_run_id=DAG_RUN_ID,
+        already_terminal=1,
+        cancelled_immediately=2,
+        signalled_running=3,
+        tasks=[
+            DAGCancelTaskResult(task_id=ULID1, status="cancelled"),
+            DAGCancelTaskResult(task_id=ULID2, status="signalled"),
+        ],
+    )
+    state_manager.request_dag_cancellation = AsyncMock(return_value=result)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/cancel")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data == {
+        "dag_run_id": str(DAG_RUN_ID),
+        "already_terminal": 1,
+        "cancelled_immediately": 2,
+        "signalled_running": 3,
+    }
+    state_manager.request_dag_cancellation.assert_called_once_with(DAG_RUN_ID)
+
+
+@pytest.mark.asyncio
+async def test_cancel_dag_verbose_includes_task_breakdown(state_manager):
+    """POST /dags/{dag_run_id}/cancel?verbose=true includes the per-task breakdown."""
+    from jobbers.models.dag import DAGCancelResult, DAGCancelTaskResult
+
+    result = DAGCancelResult(
+        dag_run_id=DAG_RUN_ID,
+        already_terminal=0,
+        cancelled_immediately=1,
+        signalled_running=1,
+        tasks=[
+            DAGCancelTaskResult(task_id=ULID1, status="cancelled"),
+            DAGCancelTaskResult(task_id=ULID2, status="signalled"),
+        ],
+    )
+    state_manager.request_dag_cancellation = AsyncMock(return_value=result)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/cancel", params={"verbose": "true"})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["tasks"] == [
+        {"task_id": str(ULID1), "status": "cancelled"},
+        {"task_id": str(ULID2), "status": "signalled"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resume_check_dag_returns_precheck_result(state_manager):
+    """GET /dags/{dag_run_id}/resume-check returns the precheck's resumable/reason/stuck_task_ids."""
+    from jobbers.models.dag import DAGResumePrecheck
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(
+            dag_run_id=DAG_RUN_ID, resumable=True, reason=None, stuck_task_ids=[ULID1, ULID2]
+        )
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/dags/{DAG_RUN_ID}/resume-check")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "dag_run_id": str(DAG_RUN_ID),
+        "resumable": True,
+        "reason": None,
+        "stuck_task_ids": [str(ULID1), str(ULID2)],
+    }
+    state_manager.can_resume_dag_run.assert_called_once_with(DAG_RUN_ID)
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_not_found_returns_404(state_manager):
+    """POST /dags/{dag_run_id}/resume returns 404 when the run was never registered."""
+    from jobbers.models.dag import DAGResumePrecheck
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(
+            dag_run_id=DAG_RUN_ID, resumable=False, reason="dag_run_not_found_or_expired"
+        )
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_not_resumable_returns_409_with_reason(state_manager):
+    """POST /dags/{dag_run_id}/resume returns 409 with the precheck's reason for other non-resumable cases."""
+    from jobbers.models.dag import DAGResumePrecheck
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(dag_run_id=DAG_RUN_ID, resumable=False, reason="no_stuck_tasks")
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "no_stuck_tasks"
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_success_returns_resumed_task_ids(state_manager):
+    """POST /dags/{dag_run_id}/resume returns the resumed task IDs on success."""
+    from jobbers.models.dag import DAGResumePrecheck, DAGResumeResult
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(dag_run_id=DAG_RUN_ID, resumable=True, stuck_task_ids=[ULID1])
+    )
+    state_manager.resume_dag_run = AsyncMock(
+        return_value=DAGResumeResult(dag_run_id=DAG_RUN_ID, resumed_task_ids=[ULID1])
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
+
+    assert response.status_code == 200
+    assert response.json() == {"dag_run_id": str(DAG_RUN_ID), "resumed_task_ids": [str(ULID1)]}
+    state_manager.resume_dag_run.assert_called_once_with(DAG_RUN_ID)
+
+
+@pytest.mark.asyncio
+async def test_resume_dag_race_between_precheck_and_resume_returns_409(state_manager):
+    """A TaskException raised by resume_dag_run itself (post-precheck race) still surfaces as 409."""
+    from jobbers.models.dag import DAGResumePrecheck
+
+    state_manager.can_resume_dag_run = AsyncMock(
+        return_value=DAGResumePrecheck(dag_run_id=DAG_RUN_ID, resumable=True, stuck_task_ids=[ULID1])
+    )
+    state_manager.resume_dag_run = AsyncMock(
+        side_effect=TaskException("DAG run is not resumable: no_stuck_tasks")
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
+
+    assert response.status_code == 409
+
+
 # ── task routing endpoints ─────────────────────────────────────────────────────
 
 
@@ -1510,6 +1675,144 @@ async def test_submit_dag_defaults_name_to_dag_run_id():
     assert response.status_code == 200
     assert response.json()["dag_run_id"] == str(captured["dag_run_id"])
     assert captured["name"] == str(captured["dag_run_id"])
+
+
+# ── Cron DAG CRUD happy paths ─────────────────────────────────────────────────
+
+
+def _registered_cron_task_config() -> TaskConfig:
+    async def task_function(**kwargs: object) -> None: ...
+
+    return TaskConfig(name="my_task", version=1, function=task_function)
+
+
+@pytest.mark.asyncio
+async def test_create_cron_dag_success(state_manager):
+    """POST /cron-dags persists the entry and returns its full representation."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                "/cron-dags",
+                json={"name": "nightly", "cron_expr": "0 6 * * *", "diagram": diagram},
+            )
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["name"] == "nightly"
+    assert data["cron_expr"] == "0 6 * * *"
+    assert data["enabled"] is True
+    assert data["concurrency_policy"] == "always"
+    assert data["next_run_at"] is not None
+
+    stored = await state_manager.cron_dag_scheduler.get(ULID.from_str(data["id"]))
+    assert stored is not None
+    assert stored.name == "nightly"
+
+
+@pytest.mark.asyncio
+async def test_list_cron_dags_returns_created_entries(state_manager):
+    """GET /cron-dags lists previously created entries with a total count."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await client.post(
+                "/cron-dags", json={"name": "first", "cron_expr": "0 6 * * *", "diagram": diagram}
+            )
+            await client.post(
+                "/cron-dags", json={"name": "second", "cron_expr": "0 7 * * *", "diagram": diagram}
+            )
+            response = await client.get("/cron-dags")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert {e["name"] for e in data["cron_dags"]} == {"first", "second"}
+
+
+@pytest.mark.asyncio
+async def test_get_cron_dag_returns_entry(state_manager):
+    """GET /cron-dags/{id} returns 200 with the entry's full representation."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            create_response = await client.post(
+                "/cron-dags", json={"name": "nightly", "cron_expr": "0 6 * * *", "diagram": diagram}
+            )
+            cron_id = create_response.json()["id"]
+            response = await client.get(f"/cron-dags/{cron_id}")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == cron_id
+    assert response.json()["name"] == "nightly"
+
+
+@pytest.mark.asyncio
+async def test_get_cron_dag_not_found_returns_404(state_manager):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/cron-dags/{ULID1}")
+
+    assert response.status_code == 404
+    assert str(ULID1) in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_cron_dag_success(state_manager):
+    """PUT /cron-dags/{id} replaces the diagram/settings but preserves id and created_at."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            create_response = await client.post(
+                "/cron-dags", json={"name": "nightly", "cron_expr": "0 6 * * *", "diagram": diagram}
+            )
+            cron_id = create_response.json()["id"]
+            created_at = create_response.json()["created_at"]
+
+            response = await client.put(
+                f"/cron-dags/{cron_id}",
+                json={
+                    "name": "nightly-updated",
+                    "cron_expr": "0 7 * * *",
+                    "diagram": diagram,
+                    "enabled": False,
+                },
+            )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == cron_id
+    assert data["created_at"] == created_at
+    assert data["name"] == "nightly-updated"
+    assert data["cron_expr"] == "0 7 * * *"
+    assert data["enabled"] is False
+
+    stored = await state_manager.cron_dag_scheduler.get(ULID.from_str(cron_id))
+    assert stored is not None
+    assert stored.cron_expr == "0 7 * * *"
+
+
+@pytest.mark.asyncio
+async def test_delete_cron_dag_success(state_manager):
+    """DELETE /cron-dags/{id} removes the entry; a subsequent GET returns 404."""
+    diagram = 'flowchart TD\n  A["my_task@1"]'
+
+    with patch("jobbers.registry.get_task_config", return_value=_registered_cron_task_config()):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            create_response = await client.post(
+                "/cron-dags", json={"name": "nightly", "cron_expr": "0 6 * * *", "diagram": diagram}
+            )
+            cron_id = create_response.json()["id"]
+
+            delete_response = await client.delete(f"/cron-dags/{cron_id}")
+            get_response = await client.get(f"/cron-dags/{cron_id}")
+
+    assert delete_response.status_code == 200
+    assert cron_id in delete_response.json()["message"]
+    assert get_response.status_code == 404
 
 
 # ── PUT /cron-dags/{id} branches ─────────────────────────────────────────────

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import redis.asyncio as redis
 from sqlalchemy import event
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from jobbers.adapters import (
@@ -46,6 +47,31 @@ TASK_SCHEDULER_BACKEND = os.environ.get("TASK_SCHEDULER_BACKEND", "redis")
 CRON_DAG_SCHEDULER_BACKEND = os.environ.get("CRON_DAG_SCHEDULER_BACKEND", "redis")
 FORCE_SAGA_MODE = os.environ.get("FORCE_SAGA_MODE", "false").lower() == "true"
 
+# SQLAlchemy engine-construction kwargs recognized as SQL_PATH query params (popped off
+# the URL before it reaches the DBAPI driver -- see _get_or_create_sql).
+_SQL_POOL_URL_PARAMS: dict[str, type[int] | type[float]] = {
+    "pool_size": int,
+    "max_overflow": int,
+    "pool_timeout": float,
+}
+
+
+def needed_sql_features() -> set[str]:
+    """Return the SQL table groups actually required, based on which backends are currently set to "sql"."""
+    features: set[str] = set()
+    if os.environ.get("ROUTING_BACKEND", "sql") == "sql":
+        features.add("routing")
+    if TASK_BACKEND == "sql":
+        features.add("task_state")
+    if DLQ_BACKEND == "sql":
+        features.add("dead_letter")
+    if TASK_SCHEDULER_BACKEND == "sql":
+        features.add("task_schedule")
+    if CRON_DAG_SCHEDULER_BACKEND == "sql":
+        features.add("cron_dag")
+    return features
+
+
 _client: redis.Redis | None = None
 _state_manager: StateManager | None = None
 _engine: AsyncEngine | None = None
@@ -57,7 +83,14 @@ _pre_registered_routing_backend: RoutingBackendProtocol | None = None
 def get_client() -> redis.Redis:
     global _client
     if _client is None:
-        _client = redis.from_url(DEFAULT_REDIS_URL, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False)
+        # socket_timeout=None: redis-py 8.0 changed this default from None to 5
+        # seconds, which races the server-side timeout on blocking commands
+        # (e.g. TaskGenerator's BZPOPMIN with timeout=0, meaning "block
+        # forever") -- the client-side read would time out first. See
+        # https://github.com/redis/redis-py/issues/4091.
+        _client = redis.from_url(
+            DEFAULT_REDIS_URL, protocol=REDIS_PROTOCOL_VERSION, legacy_responses=False, socket_timeout=None
+        )
     return _client
 
 
@@ -141,7 +174,25 @@ async def _get_or_create_sql(features: set[str]) -> async_sessionmaker[AsyncSess
         return _session_factory
 
     db_path = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
-    _engine = create_async_engine(db_path)
+    # SQLAlchemy's async engine pool (AsyncAdaptedQueuePool) defaults to pool_size=5,
+    # max_overflow=10 -- a ceiling of 15 connections per process, far tighter than
+    # redis-py's 100-connection default. Unlike redis-py, SQLAlchemy doesn't natively
+    # support tuning these via a URL query param -- unrecognized query params are
+    # forwarded straight to the DBAPI driver's connect() call, which rejects them
+    # (asyncpg raises TypeError on an unknown `pool_size` kwarg). To keep the same
+    # `?pool_size=...&max_overflow=...&pool_timeout=...` convention SQL_PATH shares with
+    # REDIS_URL, pop the recognized params off the URL ourselves before constructing the
+    # engine, passing them as explicit kwargs instead. SQLite's pool (StaticPool) doesn't
+    # accept these kwargs at all, hence the guard.
+    engine_kwargs: dict[str, int | float] = {}
+    url = make_url(db_path)
+    if url.query and "sqlite" not in db_path:
+        remaining_query = dict(url.query)
+        for param, cast in _SQL_POOL_URL_PARAMS.items():
+            if param in remaining_query:
+                engine_kwargs[param] = cast(remaining_query.pop(param))  # type: ignore[arg-type]
+        url = url.set(query=remaining_query)
+    _engine = create_async_engine(url, **engine_kwargs)
 
     @event.listens_for(_engine.sync_engine, "connect")
     def set_sqlite_pragma(dbapi_conn: object, connection_record: object) -> None:
@@ -192,18 +243,7 @@ async def init_state_manager() -> StateManager:
     client = get_client()
 
     # Determine which SQL features are needed so we run only the required migrations.
-    needed_sql_features: set[str] = set()
-    routing_backend_type = os.environ.get("ROUTING_BACKEND", "sql")
-    if routing_backend_type == "sql":
-        needed_sql_features.add("routing")
-    if TASK_BACKEND == "sql":
-        needed_sql_features.add("task_state")
-    if DLQ_BACKEND == "sql":
-        needed_sql_features.add("dead_letter")
-    if TASK_SCHEDULER_BACKEND == "sql":
-        needed_sql_features.add("task_schedule")
-    if CRON_DAG_SCHEDULER_BACKEND == "sql":
-        needed_sql_features.add("cron_dag")
+    sql_features = needed_sql_features()
 
     routing_backend = await _create_routing_backend(client)
 
@@ -212,7 +252,7 @@ async def init_state_manager() -> StateManager:
     if TASK_BACKEND == "sql":
         from jobbers.adapters.sql import SQLTaskState, SQLTaskSubmit
 
-        sf = await _get_or_create_sql(needed_sql_features)
+        sf = await _get_or_create_sql(sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         _task_adapter = SQLTaskState(sf, dsn=dsn)
         task_submit = SQLTaskSubmit(sf, dsn=dsn)
@@ -224,7 +264,7 @@ async def init_state_manager() -> StateManager:
     if DLQ_BACKEND == "sql":
         from jobbers.adapters.sql import SQLDeadQueue
 
-        sf = await _get_or_create_sql(needed_sql_features)
+        sf = await _get_or_create_sql(sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         dead_queue: DeadQueueProtocol = SQLDeadQueue(sf, dsn=dsn)
     else:
@@ -234,7 +274,7 @@ async def init_state_manager() -> StateManager:
     if TASK_SCHEDULER_BACKEND == "sql":
         from jobbers.adapters.sql import SQLTaskScheduler
 
-        sf = await _get_or_create_sql(needed_sql_features)
+        sf = await _get_or_create_sql(sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         task_scheduler: RedisTaskScheduler | SQLTaskScheduler = SQLTaskScheduler(
             sf, routing_backend.get_all_queues, dsn=dsn
@@ -245,7 +285,7 @@ async def init_state_manager() -> StateManager:
     if CRON_DAG_SCHEDULER_BACKEND == "sql":
         from jobbers.adapters.sql import SQLCronDAGScheduler
 
-        sf = await _get_or_create_sql(needed_sql_features)
+        sf = await _get_or_create_sql(sql_features)
         dsn = os.environ.get("SQL_PATH", "sqlite+aiosqlite:///jobbers.db")
         cron_dag_scheduler: RedisCronDAGScheduler | SQLCronDAGScheduler | StaticCronDAGScheduler = (
             SQLCronDAGScheduler(sf, dsn=dsn)

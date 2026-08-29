@@ -27,7 +27,8 @@ Task storage / dead-letter queue (split-store protocols):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, runtime_checkable
+from enum import StrEnum
+from typing import TYPE_CHECKING, NamedTuple, runtime_checkable
 
 from typing_extensions import Protocol
 
@@ -119,11 +120,28 @@ class RoutingBackendProtocol(Protocol):
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
 
 
+class CancellationKind(StrEnum):
+    """Discriminator for a CancellationMessage: cancel a task, a whole DAG run, or abort a stale-marked task."""
+
+    TASK = "task"
+    DAG = "dag"
+    STALE = "stale"
+
+
+class CancellationMessage(NamedTuple):
+    """A parsed cancellation-bus message: cancel one task, cancel every task in a DAG run, or abort a task the Cleaner already marked STALLED."""
+
+    kind: CancellationKind
+    id: ULID
+
+
 class CancellationBusProtocol(Protocol):  # pragma: no cover
-    """Pub/sub channel for in-flight task cancellation signals."""
+    """Pub/sub channel for in-flight task, DAG-run, and stale-task cancellation signals."""
 
     async def publish_cancellation(self, task_id: ULID) -> None: ...
-    def listen_cancellations(self) -> AsyncIterator[ULID]: ...
+    async def publish_dag_cancellation(self, dag_run_id: ULID) -> None: ...
+    async def publish_stale_cancellation(self, task_id: ULID) -> None: ...
+    def listen_cancellations(self) -> AsyncIterator[CancellationMessage]: ...
 
 
 class RoutingNotificationProtocol(Protocol):  # pragma: no cover
@@ -250,6 +268,20 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
         """
         ...
 
+    async def save_task_if_status(self, task: Task, expected: TaskStatus) -> bool:
+        """
+        Persist ``task`` exactly as given only if the *stored* task's status equals ``expected``.
+
+        Unlike ``compare_and_set_status``, which re-reads the stored task and flips only
+        its status, this persists the caller-supplied ``task`` object in full. Returns
+        False -- the write is dropped -- if the stored status has already moved on (e.g.
+        the Cleaner marked it STALLED while this worker was still computing a result).
+
+        Redis: implemented via WATCH/MULTI on the task key.
+        SQL: implemented via ``UPDATE ... WHERE id = ? AND status = ?``.
+        """
+        ...
+
     # Heartbeat
     async def update_task_heartbeat(self, task: Task) -> None: ...
     async def remove_task_heartbeat(self, task: Task) -> None: ...
@@ -270,6 +302,14 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
         with ``propagate_fan_in=True``: the arm's ID is swapped for the
         grandcollector's ID so the outer fan-in waits for the grandcollector.
         """
+        ...
+
+    async def dag_run_fan_in_alive(self, dag_run_id: ULID) -> bool:
+        """Whether this run's fan-in tracking is still present (not expired/swept)."""
+        ...
+
+    async def refresh_dag_run_fan_in_ttl(self, dag_run_id: ULID, ttl: int = 86400) -> None:
+        """Extend (never shrink) this run's fan-in tracking TTL. No-op if it doesn't exist."""
         ...
 
     # DAG run index
@@ -294,6 +334,42 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
 
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
         """Set status='complete' iff failed_count == 0. No-op if the run's record is missing."""
+        ...
+
+    # DAG run cancellation — a persisted marker, since "cancelling" can't be derived
+    # from the completed/failed counters alone (a run can be cancelling with zero
+    # failures recorded yet).
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        """Idempotently record that cancellation was requested for this run."""
+        ...
+
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        """Cheap check: has cancellation been requested for this run? False if the run doesn't exist."""
+        ...
+
+    async def clear_dag_run_cancellation(self, dag_run_id: ULID) -> None:
+        """
+        Clear a previously-set cancellation marker (see "Resuming DAG runs" in docs/interacting-with-dags.md).
+
+        Required before resuming a cancelled run: TaskProcessor's is_dag_run_cancelling
+        gates in post_process/_handle_retry would otherwise keep suppressing the
+        resumed task's own descendants/retries. No-op if the run isn't cancelling.
+        """
+        ...
+
+    # DAG run resume support (see "Resuming DAG runs" in docs/interacting-with-dags.md)
+    async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
+        """
+        Undo ``count`` earlier 'failed' terminal-outcome records for tasks about to be retried.
+
+        record_dag_run_task_terminal's 'failed' counter is otherwise monotonic --
+        without this, a stuck task that's resumed
+        and succeeds would leave the run at partial_failure forever, since the
+        original failure's increment is never undone by a later success. Takes a
+        ``count`` rather than requiring one call per task so resuming N stuck tasks
+        in a run costs one round trip, not N. Floored at 0; no-op if the run's
+        record is missing.
+        """
         ...
 
     # Lifecycle
@@ -411,6 +487,24 @@ class AtomicTaskStateProtocol(TaskStateProtocol, Protocol):  # pragma: no cover
         additional staged operations before committing.
 
         Returns True if dispatched, False if the task was not found or already cancelled.
+        Locking strategy: WATCH/MULTI (Redis) or SELECT FOR UPDATE (SQL).
+        """
+        ...
+
+    async def atomic_save_if_status(
+        self,
+        task: Task,
+        expected: TaskStatus,
+        stage_extra: Callable[[TransactionHandle], None],
+    ) -> bool:
+        """
+        Apply the same guard as ``save_task_if_status``, plus a same-transaction extra staged op.
+
+        Reads the stored task's status under lock; if it matches ``expected``, stages
+        the caller-supplied ``task`` save and calls stage_extra(pipe) (e.g. a dead-letter
+        add) before committing both atomically. Returns False -- nothing staged or
+        committed -- if the stored status no longer matches.
+
         Locking strategy: WATCH/MULTI (Redis) or SELECT FOR UPDATE (SQL).
         """
         ...

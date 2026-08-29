@@ -3,7 +3,7 @@ import contextlib
 import datetime as dt
 import logging
 from typing import Annotated
-from unittest.mock import ANY, AsyncMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 from ulid import ULID
@@ -23,8 +23,15 @@ from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.registry import TaskConfig, clear_registry, register_task
-from jobbers.state_manager import StateManager, TaskRateLimitedError, UserCancellationError
+from jobbers.state_manager import (
+    CancelReason,
+    StaleTaskCancelledError,
+    StateManager,
+    TaskRateLimitedError,
+    UserCancellationError,
+)
 from jobbers.task_processor import TaskProcessor, _spec_to_dag_node
+from jobbers.utils.mermaid_dag import parse_mermaid_dag
 
 
 @pytest.fixture(autouse=True)
@@ -67,8 +74,9 @@ async def test_task_processor_success():
 
     assert result_task.status == TaskStatus.COMPLETED
     assert result_task.results == {"result": "success"}
-    # save_task called once when starting; complete_task called when done
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    # save_task called once when starting; the CAS-guarded save_task_if_status when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
 
 
 @pytest.mark.asyncio
@@ -478,8 +486,9 @@ async def test_task_processor_cancelled_with_continue_policy_uses_shield():
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
 
-    # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    # save_task called when starting; the CAS-guarded save_task_if_status when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
 
 
 @pytest.mark.asyncio
@@ -519,8 +528,9 @@ async def test_task_processor_cancelled_with_stop_policy_no_shield():
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
 
-    # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    # save_task called when starting; the CAS-guarded save_task_if_status when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
 
 
 @pytest.mark.asyncio
@@ -560,8 +570,9 @@ async def test_task_processor_cancelled_with_resubmit_policy_no_shield():
     # Task should complete successfully
     assert result_task.status == TaskStatus.COMPLETED
 
-    # save_task called when starting; complete_task called when done
-    state_manager.save_task.assert_has_calls([call(task), call(task)])
+    # save_task called when starting; the CAS-guarded save_task_if_status when done
+    state_manager.save_task.assert_called_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
 
 
 # ── scheduled-retry tests (TaskScheduler present + retry_delay configured) ───
@@ -572,6 +583,9 @@ def _make_state_manager():
     state_manager = AsyncMock(spec=StateManager)
     state_manager.task_scheduler = AsyncMock(spec=RedisTaskScheduler)
     state_manager.task_state = AsyncMock()
+    # Default to "not cancelling" so the post_process/_handle_retry DAG-cancellation
+    # gates don't short-circuit tests that aren't exercising that feature.
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=False)
 
     async def _schedule_retry_task(task: Task, run_at: dt.datetime) -> Task:
         return task
@@ -680,6 +694,125 @@ async def test_expected_exception_max_retries_fails_even_with_scheduler():
     assert result.retry_attempt == 3
     state_manager.fail_task.assert_called_once_with(task)
     state_manager.schedule_retry_task.assert_not_called()
+
+
+# ── _handle_retry: DAG-cancellation gate ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_cancelled_instead_of_scheduled_when_dag_run_cancelling():
+    """
+    A retryable failure that would normally be SCHEDULED is CANCELLED instead when the DAG is cancelling.
+
+    Cancellation wins over "retries remaining" -- see "Cancelling DAG runs" in docs/interacting-with-dags.md.
+    """
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+        dag_run_id=dag_run_id,
+    )
+    state_manager = _make_state_manager()
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=True)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config()  # has retry_delay=5 -> would normally schedule
+    task_config = task_config.model_copy(update={"function": task_function})
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.CANCELLED
+    state_manager.schedule_retry_task.assert_not_called()
+    state_manager.queue_retry_task.assert_not_called()
+    state_manager.fail_task.assert_not_called()
+    state_manager.finalize_dag_run_task.assert_awaited_once_with(task)
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_cancelled_instead_of_queued_when_dag_run_cancelling():
+    """A retryable failure that would normally be re-queued immediately is CANCELLED instead when cancelling."""
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+        dag_run_id=dag_run_id,
+    )
+    state_manager = _make_state_manager()
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=True)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    # No retry_delay -> would normally be an immediate requeue (queue_retry_task).
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        timeout=10,
+        max_retries=3,
+        expected_exceptions=(ValueError,),
+    )
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.CANCELLED
+    state_manager.queue_retry_task.assert_not_called()
+    state_manager.schedule_retry_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_retries_normally_when_dag_run_not_cancelling():
+    """Sanity check: an explicit is_dag_run_cancelling=False still retries normally (gate is a no-op)."""
+    dag_run_id = ULID()
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+        dag_run_id=dag_run_id,
+    )
+    state_manager = _make_state_manager()
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=False)
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config()
+    task_config = task_config.model_copy(update={"function": task_function})
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.SCHEDULED
+    state_manager.schedule_retry_task.assert_called_once_with(task, ANY)
+
+
+@pytest.mark.asyncio
+async def test_expected_exception_skips_cancelling_check_for_non_dag_task():
+    """A standalone (non-DAG) task's retry path never calls is_dag_run_cancelling."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        retry_attempt=0,
+    )
+    state_manager = _make_state_manager()
+    task_function = AsyncMock(side_effect=ValueError("boom"))
+    task_config = _retryable_config()
+    task_config = task_config.model_copy(update={"function": task_function})
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert result.status == TaskStatus.SCHEDULED
+    state_manager.is_dag_run_cancelling.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -829,8 +962,10 @@ async def test_task_processor_run_exits_early_on_cancel_signal():
         await processor.run(task)
 
     assert task.status == TaskStatus.CANCELLED
-    # State was saved at least twice: once when started, once when interrupted.
-    assert state_manager.save_task.call_count >= 2
+    # State was saved once when started (save_task), and once via the CAS-guarded
+    # save_task_if_status when the user cancellation was handled.
+    assert state_manager.save_task.call_count >= 1
+    assert state_manager.task_state.save_task_if_status.await_count >= 1
 
 
 @pytest.mark.asyncio
@@ -865,6 +1000,40 @@ async def test_process_does_not_overwrite_cancelled_status_on_system_cancel():
 
     mock_sys.assert_not_called()
     assert task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_process_skips_system_cancel_when_cancel_reason_is_stale():
+    """
+    process() skips handle_system_cancelled_task when the cancel reason is STALE.
+
+    The Cleaner's STALLED write is already authoritative -- nothing should be persisted
+    for a task aborted locally because it was marked stale.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    state_manager.cancel_reason = MagicMock(return_value=CancelReason.STALE)
+
+    async def cancel_immediately() -> dict[str, object]:
+        raise asyncio.CancelledError()
+
+    task_config = TaskConfig(name="test_task", version=1, function=cancel_immediately, timeout=60)
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        with patch.object(processor, "handle_system_cancelled_task", new_callable=AsyncMock) as mock_sys:
+            await processor.process(task)
+
+    mock_sys.assert_not_called()
+    # Nothing in the stale path touches local status: it stays whatever it was locally.
+    assert task.status == TaskStatus.STARTED
 
 
 # ── _handle_dynamic_fanout ────────────────────────────────────────────────────
@@ -1146,6 +1315,86 @@ async def test_handle_dynamic_fanout_arm_with_static_diamond_inits_both_fan_ins(
 
 
 @pytest.mark.asyncio
+async def test_handle_declarative_fanout_arm_with_internal_fan_in_inits_both_fan_ins():
+    """
+    A mermaid-parsed dispatcher whose arm itself contains a diamond wires up correctly end to end.
+
+    Round-trip regression: parse_mermaid_dag's arm-internal fan-in wiring
+    (mermaid_dag.py's arm_fan_in_collectors branch) only matters once the resulting
+    spec is rebuilt into a live DAGNode tree by _spec_to_dag_node when the arm
+    actually dispatches -- this is the only test exercising both halves together,
+    using a real parsed DynamicFanOutCallback rather than one built by hand.
+    """
+    text = """
+    flowchart TD
+        A["dispatch"]
+        B["arm_root"]
+        C["branch_1"]
+        D["branch_2"]
+        E["arm_merge"]
+        G["arm_terminal"]
+        F["collector"]
+        A -->> B
+        B --> C
+        B --> D
+        C --> E
+        D --> E
+        E --> G
+        G --o F
+    """
+    roots = parse_mermaid_dag(text)
+    fanout_cb = roots[0].to_spec().dag_callbacks[0]
+    assert isinstance(fanout_cb, DynamicFanOutCallback)
+
+    dag_run_id = ULID()
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="dispatch",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        results={"items": [{}]},
+    )
+
+    state_manager = _make_state_manager()
+    state_manager.init_fan_in = AsyncMock()
+    state_manager.save_task = AsyncMock()
+    state_manager.submit_tasks_batch = AsyncMock()
+    state_manager.get_queue_config = AsyncMock(return_value=None)
+
+    processor = TaskProcessor(state_manager)
+    await processor._handle_declarative_fanout(parent, fanout_cb)
+
+    # Two fan-in sets initialised: the arm-internal diamond (arm_merge) and the
+    # outer collector waiting on the arm's terminal (arm_terminal).
+    init_calls = {c[0][1]: c[0][2] for c in state_manager.init_fan_in.call_args_list}
+    assert all(c[0][0] == dag_run_id for c in state_manager.init_fan_in.call_args_list)
+    assert len(init_calls) == 2
+
+    submitted_arms = state_manager.submit_tasks_batch.call_args[0][0]
+    assert len(submitted_arms) == 1
+    arm_root_task = submitted_arms[0]
+
+    # _spec_to_dag_node must have rebuilt: arm_root -> SimpleCallback(branch_1, branch_2)
+    branch_cbs = {c.task.name: c for c in arm_root_task.dag_callbacks if isinstance(c, SimpleCallback)}
+    assert set(branch_cbs) == {"branch_1", "branch_2"}
+
+    # ...each branch -> FanInCallback sharing one key into arm_merge...
+    b1_fan_in = next(c for c in branch_cbs["branch_1"].task.dag_callbacks if isinstance(c, FanInCallback))
+    b2_fan_in = next(c for c in branch_cbs["branch_2"].task.dag_callbacks if isinstance(c, FanInCallback))
+    assert b1_fan_in.fan_in_key == b2_fan_in.fan_in_key
+    assert b1_fan_in.task.name == "arm_merge"
+    assert b1_fan_in.fan_in_key in init_calls
+
+    # ...and arm_merge -> arm_terminal, chaining onward to the fan-out boundary.
+    merge_spec = b1_fan_in.task
+    assert len(merge_spec.dag_callbacks) == 1
+    assert isinstance(merge_spec.dag_callbacks[0], SimpleCallback)
+    assert merge_spec.dag_callbacks[0].task.name == "arm_terminal"
+
+
+@pytest.mark.asyncio
 async def test_handle_dynamic_fanout_with_outer_fan_in_delegates_to_collector():
     """When the parent has outer FanInCallbacks the collector inherits them and delegate_fan_in is called."""
     dag_run_id = ULID()
@@ -1330,6 +1579,50 @@ async def test_handle_declarative_fanout_preserves_nested_dispatch_on_arm_task()
 
 
 @pytest.mark.asyncio
+async def test_process_injects_resolved_dependency_into_task_kwargs():
+    """
+    A Depends()-annotated task parameter receives the DependencyResolver's resolved value.
+
+    di.py's DependencyResolver is thoroughly unit-tested in isolation; this covers the
+    separate step of actually mapping a resolved dependency into the running task's
+    kwargs (the loop in process() that checks `isinstance(meta, _Depends)`), which no
+    existing task_processor test exercises.
+    """
+    from jobbers.utils.di import Depends, inspect_task_dependencies
+
+    def get_greeting() -> str:
+        return "hello"
+
+    captured: dict[str, object] = {}
+
+    async def task_function(greeting: Annotated[str, Depends(get_greeting)]) -> None:
+        captured["greeting"] = greeting
+
+    task_config = TaskConfig(
+        name="test_task",
+        version=1,
+        function=task_function,
+        dependency_graph=inspect_task_dependencies(task_function),
+        timeout=10,
+    )
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+
+    with patch("jobbers.task_processor.get_task_config", return_value=task_config):
+        processor = TaskProcessor(state_manager)
+        result = await processor.process(task)
+
+    assert captured["greeting"] == "hello"
+    assert result.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_task_processor_stores_task_result_on_success():
     """TaskProcessor stores results from a TaskResult return value."""
     task = Task(
@@ -1376,6 +1669,37 @@ async def test_monitor_task_cancellation_calls_handle_user_cancelled_task():
     mock_handle.assert_called_once_with(task)
 
 
+@pytest.mark.asyncio
+async def test_monitor_task_cancellation_reraises_stale_error_without_handling():
+    """
+    monitor_task_cancellation re-raises StaleTaskCancelledError without calling any handler.
+
+    Unlike UserCancellationError, there's nothing to persist -- the Cleaner's STALLED
+    write is already authoritative.
+    """
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        parameters={},
+        status=TaskStatus.SUBMITTED,
+        queue="test_queue",
+    )
+    state_manager = _make_state_manager()
+    state_manager.monitor_task_cancellation.side_effect = StaleTaskCancelledError("stale")
+
+    processor = TaskProcessor(state_manager)
+    with (
+        patch.object(processor, "handle_user_cancelled_task", new_callable=AsyncMock) as mock_user,
+        patch.object(processor, "handle_system_cancelled_task", new_callable=AsyncMock) as mock_sys,
+    ):
+        with pytest.raises((StaleTaskCancelledError, ExceptionGroup)):
+            await processor.monitor_task_cancellation(task)
+
+    mock_user.assert_not_called()
+    mock_sys.assert_not_called()
+
+
 # ── post_process with dag_callbacks ──────────────────────────────────────────
 
 
@@ -1407,6 +1731,50 @@ async def test_post_process_triggers_dag_callbacks():
     state_manager.submit_tasks_batch.assert_awaited_once()
     submitted = state_manager.submit_tasks_batch.call_args[0][0][0]
     assert submitted.name == child_spec.name
+
+
+@pytest.mark.asyncio
+async def test_post_process_skipped_when_dag_run_cancelling():
+    """post_process spawns no descendants when the task's DAG run is marked cancelling."""
+    dag_run_id = ULID()
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_run_id=dag_run_id,
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    state_manager = _make_state_manager()
+    state_manager.is_dag_run_cancelling = AsyncMock(return_value=True)
+
+    processor = TaskProcessor(state_manager)
+    await processor.post_process(parent)
+
+    state_manager.submit_tasks_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_process_skips_cancelling_check_for_non_dag_task():
+    """A standalone (non-DAG) task's post_process never calls is_dag_run_cancelling."""
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
+    parent = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.COMPLETED,
+        queue="default",
+        dag_callbacks=[SimpleCallback(task=child_spec)],
+    )
+    state_manager = _make_state_manager()
+
+    processor = TaskProcessor(state_manager)
+    await processor.post_process(parent)
+
+    state_manager.is_dag_run_cancelling.assert_not_awaited()
+    state_manager.submit_tasks_batch.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1646,6 +2014,41 @@ async def test_run_reraises_non_user_cancellation_error():
             await processor.run(task)
 
 
+@pytest.mark.asyncio
+async def test_run_treats_stale_task_cancelled_error_as_clean_exit():
+    """run() suppresses StaleTaskCancelledError from monitor_task_cancellation, same as UserCancellationError."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.SUBMITTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+
+    task_started = asyncio.Event()
+
+    async def slow_task():
+        task_started.set()
+        await asyncio.sleep(30)
+        return {}  # pragma: no cover
+
+    task_config = TaskConfig(name="test_task", version=1, function=slow_task, timeout=60)
+
+    async def stale_monitor(_task):
+        await task_started.wait()
+        raise StaleTaskCancelledError(str(_task.id))
+
+    with (
+        patch("jobbers.task_processor.get_task_config", return_value=task_config),
+        patch.object(TaskProcessor, "monitor_task_cancellation", side_effect=stale_monitor),
+    ):
+        processor = TaskProcessor(state_manager)
+        # No exception should propagate out of run() -- StaleTaskCancelledError is
+        # treated as a normal control-flow signal, same as UserCancellationError.
+        await processor.run(task)
+
+
 # ── post_process_error ────────────────────────────────────────────────────────
 
 
@@ -1813,8 +2216,8 @@ async def test_non_failed_terminal_statuses_do_not_trigger_error_callback(trigge
 
 
 @pytest.mark.asyncio
-async def test_handle_success_without_cron_id_calls_save_task():
-    """handle_success saves the task directly when cron_id is None."""
+async def test_handle_success_without_cron_id_calls_save_task_if_status():
+    """handle_success CAS-guards the save against the task's prior STARTED status when cron_id is None."""
     task = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -1827,8 +2230,30 @@ async def test_handle_success_without_cron_id_calls_save_task():
     processor = TaskProcessor(state_manager)
     await processor.handle_success(task)
 
-    state_manager.save_task.assert_awaited_once_with(task)
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
     assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_handle_success_drops_write_and_counts_when_task_marked_stale():
+    """When save_task_if_status's CAS fails (task marked STALLED meanwhile), the result is dropped and counted."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.STARTED,
+        queue="default",
+        cron_id=None,
+    )
+    state_manager = _make_state_manager()
+    state_manager.task_state.save_task_if_status.return_value = False
+    processor = TaskProcessor(state_manager)
+
+    with patch("jobbers.task_processor.tasks_completed_after_stale") as mock_counter:
+        await processor.handle_success(task)
+
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
+    mock_counter.add.assert_called_once_with(1, {"queue": task.queue, "task": task.name})
 
 
 @pytest.mark.asyncio
@@ -1851,6 +2276,49 @@ async def test_handle_success_with_cron_id_uses_complete_cron_task():
     state_manager.save_task.assert_not_awaited()
     state_manager.complete_cron_task.assert_awaited_once_with(task)
     assert task.status == TaskStatus.COMPLETED
+
+
+# ── handle_user_cancelled_task ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_user_cancelled_task_calls_save_task_if_status():
+    """handle_user_cancelled_task CAS-guards the save against the task's prior STARTED status."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.STARTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    processor = TaskProcessor(state_manager)
+
+    await processor.handle_user_cancelled_task(task)
+
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
+    assert task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_handle_user_cancelled_task_drops_write_and_counts_when_task_marked_stale():
+    """When save_task_if_status's CAS fails (task marked STALLED meanwhile), the cancellation is dropped and counted."""
+    task = Task(
+        id="01JQC31AJP7TSA9X8AEP64XG08",
+        name="test_task",
+        version=1,
+        status=TaskStatus.STARTED,
+        queue="default",
+    )
+    state_manager = _make_state_manager()
+    state_manager.task_state.save_task_if_status.return_value = False
+    processor = TaskProcessor(state_manager)
+
+    with patch("jobbers.task_processor.tasks_completed_after_stale") as mock_counter:
+        await processor.handle_user_cancelled_task(task)
+
+    state_manager.task_state.save_task_if_status.assert_awaited_once_with(task, TaskStatus.STARTED)
+    mock_counter.add.assert_called_once_with(1, {"queue": task.queue, "task": task.name})
 
 
 @pytest.mark.asyncio

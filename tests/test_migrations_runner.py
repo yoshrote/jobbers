@@ -1,6 +1,8 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy import inspect
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from jobbers.migrations import runner
 
@@ -8,6 +10,52 @@ from jobbers.migrations import runner
 @pytest.fixture(autouse=True)
 def _reset_sql_env(monkeypatch):
     monkeypatch.setenv("SQL_PATH", "sqlite+aiosqlite:///:memory:")
+
+
+@pytest.mark.asyncio
+async def test_run_migrations_empty_features_creates_no_tables():
+    """An explicitly empty (non-None) features set must create nothing, not fall back to 'all tables'."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        await runner.run_migrations(engine, features=set())
+        async with engine.connect() as conn:
+            table_names = await conn.run_sync(lambda c: inspect(c).get_table_names())
+        assert table_names == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_migrations_features_creates_only_requested_tables():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        await runner.run_migrations(engine, features={"dead_letter"})
+        async with engine.connect() as conn:
+            table_names = await conn.run_sync(lambda c: inspect(c).get_table_names())
+        assert table_names == ["dead_letter_queue"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_cli_only_migrates_backends_set_to_sql(monkeypatch):
+    """jobbers_migrate should only create tables for backends actually configured as sql."""
+    monkeypatch.setattr("jobbers.db.TASK_BACKEND", "sql")
+    monkeypatch.setattr("jobbers.db.DLQ_BACKEND", "redis")
+    monkeypatch.setattr("jobbers.db.TASK_SCHEDULER_BACKEND", "redis")
+    monkeypatch.setattr("jobbers.db.CRON_DAG_SCHEDULER_BACKEND", "redis")
+    monkeypatch.setenv("ROUTING_BACKEND", "redis")
+
+    captured = {}
+
+    async def fake_run_migrations(engine, features=None):
+        captured["features"] = features
+
+    monkeypatch.setattr(runner, "run_migrations", fake_run_migrations)
+
+    await runner.run_cli()
+
+    assert captured["features"] == {"task_state"}
 
 
 @pytest.mark.asyncio

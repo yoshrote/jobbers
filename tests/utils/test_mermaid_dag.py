@@ -676,6 +676,57 @@ def test_parse_fanout_multi_step_arm() -> None:
     assert arm_cb.task.name == "finish_processing"
 
 
+def test_parse_fanout_arm_with_internal_fan_in() -> None:
+    """
+    A-->>B; B-->C; B-->D; C-->E; D-->E; E-->G; G--oF: the arm itself contains a diamond.
+
+    Regression coverage for the arm-internal fan-in wiring (validate_fan_in_cardinality
+    + DAGNode.merge, mermaid_dag.py's arm_fan_in_collectors branch) and the
+    _find_arm_collector BFS's revisit guard, neither of which fires for a purely
+    linear multi-step arm (see test_parse_fanout_multi_step_arm above).
+    """
+    text = """
+    flowchart TD
+        A["dispatch"]
+        B["arm_root"]
+        C["branch_1"]
+        D["branch_2"]
+        E["arm_merge"]
+        G["arm_terminal"]
+        F["collector"]
+        A -->> B
+        B --> C
+        B --> D
+        C --> E
+        D --> E
+        E --> G
+        G --o F
+    """
+    roots = parse_mermaid_dag(text)
+    spec = roots[0].to_spec()
+    cb = spec.dag_callbacks[0]
+    assert isinstance(cb, DynamicFanOutCallback)
+    assert cb.arm_root.name == "arm_root"
+    assert cb.collector.name == "collector"
+
+    # arm_root -> SimpleCallback(branch_1), SimpleCallback(branch_2)
+    branch_cbs = {c.task.name: c for c in cb.arm_root.dag_callbacks if isinstance(c, SimpleCallback)}
+    assert set(branch_cbs) == {"branch_1", "branch_2"}
+
+    # Both branches converge on arm_merge via a FanInCallback sharing the same key.
+    b1_fan_in = next(c for c in branch_cbs["branch_1"].task.dag_callbacks if isinstance(c, FanInCallback))
+    b2_fan_in = next(c for c in branch_cbs["branch_2"].task.dag_callbacks if isinstance(c, FanInCallback))
+    assert b1_fan_in.fan_in_key == b2_fan_in.fan_in_key
+    assert b1_fan_in.task.id == b2_fan_in.task.id
+    assert b1_fan_in.task.name == "arm_merge"
+
+    # arm_merge -> arm_terminal (plain chain to the fan-out boundary).
+    merge_spec = b1_fan_in.task
+    assert len(merge_spec.dag_callbacks) == 1
+    assert isinstance(merge_spec.dag_callbacks[0], SimpleCallback)
+    assert merge_spec.dag_callbacks[0].task.name == "arm_terminal"
+
+
 def test_parse_fanout_dispatcher_not_root_when_preceded() -> None:
     """X --> A; A -->> B; B --o C: X is root, A is not."""
     text = """

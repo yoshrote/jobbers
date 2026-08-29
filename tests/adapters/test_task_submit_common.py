@@ -131,6 +131,47 @@ async def test_enqueue_registers_dag_run(task_adapter):
     assert ULID1 in run.task_ids
 
 
+@pytest.mark.asyncio
+async def test_submit_task_dag_run_shared_by_multiple_tasks(task_adapter):
+    """Two tasks submitted into the same dag_run_id both register as pending without conflict."""
+    state, submit = task_adapter
+    dag_run_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+    task_a = make_task(ULID1)
+    task_b = make_task(ULID2)
+    task_a.dag_run_id = dag_run_id
+    task_b.dag_run_id = dag_run_id
+
+    await submit.submit_task(task_a)
+    # Second task registers against the already-existing dag_runs row.
+    await submit.submit_task(task_b)
+
+    run = await state.get_dag_run(dag_run_id)
+    assert run is not None
+    assert set(run.task_ids) == {ULID1, ULID2}
+
+
+@pytest.mark.asyncio
+async def test_enqueue_dag_run_reregistration_is_idempotent(task_adapter):
+    """
+    Re-enqueuing the same task into the same dag_run_id (e.g. a retry re-dispatch) does not error.
+
+    Exercises the IntegrityError-guarded nested-transaction insert in _register_dag_run's
+    dag_run_pending upsert -- the same (dag_run_id, task_id) pair is registered twice.
+    """
+    state, submit = task_adapter
+    dag_run_id = ULID.from_str("01JQC31AJP7TSA9X8AEP64XG09")
+    task = make_task()
+    task.dag_run_id = dag_run_id
+    await state.save_task(task)
+
+    for _ in range(2):
+        await submit.enqueue(task)
+
+    run = await state.get_dag_run(dag_run_id)
+    assert run is not None
+    assert run.task_ids == [ULID1]
+
+
 # ── get_next_task ─────────────────────────────────────────────────────────────
 
 

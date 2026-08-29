@@ -298,6 +298,10 @@ DAGNode.merge(branch_a, branch_b, into=collector, on_error=err)
 
 Error callbacks fire only when a task reaches `FAILED` status (retries exhausted or an unexpected exception). Tasks that end in `CANCELLED`, `STALLED`, or `DROPPED` do **not** trigger error callbacks, and neither do tasks that are still being retried.
 
+**DAG run cancellation and resume** — a DAG run is trackable and recoverable as a unit, not just a set of independently-revoked task IDs. `POST /dags/{dag_run_id}/cancel` cancels every non-terminal task in a run with a single call: `SCHEDULED`/`SUBMITTED` tasks are cancelled immediately, and `STARTED` tasks are signalled via one DAG-wide pub/sub broadcast rather than one cancellation message per task. `GET /dags/{dag_run_id}/resume-check` and `POST /dags/{dag_run_id}/resume` let an operator resume a stuck run — any task left in `FAILED`, `STALLED`, `CANCELLED`, or `DROPPED` — by retrying those tasks from their stored `parameters`/`dag_callbacks`/`parent_ids`, with the run's aggregate counters reconciled so a resumed run that goes on to succeed reports `complete` rather than being stuck at `partial_failure` forever. Resume works regardless of `dead_letter_policy` and covers `CANCELLED` tasks, which the DLQ never sees. It's bounded by the same retention that bounds everything else in Jobbers: a stuck run becomes permanently unresumable once its task blobs or run index are pruned by the Cleaner's `--completed-task-age`, or once fan-in tracking for a stuck fan-in outlives its `fan_in_ttl` — the resume-check endpoint reports which of those applies before anything is retried.
+
+Celery has no equivalent at the canvas level: a `chord`'s state lives only in the result backend for as long as the backend's own TTL, there's no way to cancel a whole chain/chord as one unit beyond revoking each `AsyncResult` individually, and there's no built-in mechanism to resume a partially-failed chord from where it broke — a failed chord callback typically means re-submitting the whole canvas expression from scratch.
+
 **Key differences from Celery canvas:**
 
 | Dimension | Celery | Jobbers |
@@ -309,8 +313,10 @@ Error callbacks fire only when a task reaches `FAILED` status (retries exhausted
 | Runtime fan-out | `group(task.s(x) for x in items)` | `TaskResult(fanout=DynamicFanOut(...))` return value |
 | Error routing | `link_error` on any signature | `on_error=` on `then()` / `merge()` |
 | DAG introspection | No standard visual format | `dag_diagram` field in task status: render anywhere Mermaid is supported |
+| Run-level cancellation | Revoke each `AsyncResult` individually | `POST /dags/{id}/cancel` — one call, one broadcast for in-flight tasks |
+| Run-level recovery | Re-submit the whole canvas expression from scratch | `POST /dags/{id}/resume` retries only the stuck tasks, in place, time-bounded by Cleaner retention |
 
-**Verdict:** Jobbers edges ahead for DAG-heavy workloads. The Mermaid format makes DAG authoring, sharing, and debugging significantly more ergonomic — a graph can be pasted into a GitHub comment or a wiki page and rendered immediately. Both frameworks support call-site node construction (Celery via `.s()`, Jobbers via `.node()`); the real difference is that Celery's canvas is a single composable expression that defines and submits in one call, while Jobbers separates graph construction from `submit_dag`. Jobbers supports both explicit result fetching (`await get_current_task().parent_results()`) and automatic per-field injection (`Annotated[T, FromParent("key")]` on the task function), so the data-flow style is a matter of preference.
+**Verdict:** Jobbers edges ahead for DAG-heavy workloads. The Mermaid format makes DAG authoring, sharing, and debugging significantly more ergonomic — a graph can be pasted into a GitHub comment or a wiki page and rendered immediately. Both frameworks support call-site node construction (Celery via `.s()`, Jobbers via `.node()`); the real difference is that Celery's canvas is a single composable expression that defines and submits in one call, while Jobbers separates graph construction from `submit_dag`. Jobbers supports both explicit result fetching (`await get_current_task().parent_results()`) and automatic per-field injection (`Annotated[T, FromParent("key")]` on the task function), so the data-flow style is a matter of preference. The gap widens further once a run fails partway through: Jobbers treats the whole run as a recoverable unit (single-call cancel, in-place resume of just the stuck tasks); Celery's canvas has no notion of a run as a persisted, recoverable thing at all.
 
 ---
 
@@ -457,10 +463,13 @@ result.state               # PENDING / STARTED / SUCCESS / FAILURE
 | `GET /scheduled-tasks` | Tasks currently waiting in the scheduler (retry delays + future runs), with their scheduled time |
 | `POST /task/{id}/cancel` | Cancel a single task in any cancellable state |
 | `POST /tasks/cancel` | Bulk cancel by `task_ids` |
+| `GET /dags` / `GET /dags/{id}` | List/inspect DAG runs, including aggregate status (`running`, `partial_failure`, `complete`, `cancelling`, `cancelled`, ...) |
+| `POST /dags/{id}/cancel` | Cancel every non-terminal task in a DAG run with one call |
+| `GET /dags/{id}/resume-check` / `POST /dags/{id}/resume` | Check whether, then retry, a stuck run's `FAILED`/`STALLED`/`CANCELLED`/`DROPPED` tasks in place |
 
 Cancellation is cooperative: a running task checks for a cancellation signal at each `await` point (or heartbeat call). The worker does not need to be interrupted.
 
-**Verdict:** Jobbers wins. Per-task cancellation without process interruption and a queryable task history API are significant production advantages.
+**Verdict:** Jobbers wins. Per-task cancellation without process interruption and a queryable task history API are significant production advantages, and DAG runs get the same treatment as single tasks — cancel or resume the whole run with one call instead of tracking down every `AsyncResult` it produced.
 
 ---
 
@@ -485,6 +494,7 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 | **Dead letter queue** | Not built-in | First-class | Jobbers: queryable API + bulk resubmit, 3 backend options |
 | **Traffic management** | Restart required | Live, no restart | Jobbers: dynamic roles/queues, per-queue caps, refresh-tag + pub/sub propagation |
 | **Task composition** | Full canvas API | DAG API + Mermaid | Celery: canvas signatures. Jobbers: `DAGNode` + `DynamicFanOut` + `on_error` callbacks; DAGs defined and returned as Mermaid |
+| **DAG run recovery** | Re-submit the canvas from scratch | Single-call cancel + in-place resume | Jobbers treats a DAG run as a persisted, recoverable unit; Celery's chord state lives only in the result backend |
 | **Graceful restart safety** | Good | Good | Both handle SIGTERM correctly |
 | **Hard crash recovery** | `acks_late` required | Heartbeat + Cleaner | Detection window can be several minutes; atomic pipeline mode narrows cross-store inconsistency where supported |
 | **Broker durability** | RabbitMQ: strong | Redis-backed: AOF/RDB-dependent; SQL-backed: transactional | Celery + RabbitMQ offers stronger durability than Jobbers' Redis adapters; Jobbers' `sql` backends close most of the gap |
@@ -503,6 +513,7 @@ Cancellation is cooperative: a running task checks for a cancellation signal at 
 - You need multi-step DAG workflows (chain, fan-out, fan-in, runtime-determined fan-out, error callbacks) with either explicit result fetching or automatic parent result injection.
 - You want recurring scheduled jobs that integrate natively with the DAG model and a configurable concurrency policy, manageable via REST API without code deploys.
 - You want DAG workflows defined in a standard, portable format (Mermaid) that renders natively in GitHub, VS Code, and documentation tools.
+- You want a DAG run to be cancellable and resumable as a single unit — one call to stop or retry a whole run — rather than re-submitting a canvas expression from scratch after a partial failure.
 
 ### When to choose Celery
 

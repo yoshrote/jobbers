@@ -21,6 +21,7 @@ from jobbers.adapters.redis_json import RedisJSONTaskState, RedisJSONTaskSubmit
 from jobbers.adapters.sql import SQLRoutingBackend
 from jobbers.migrations.runner import run_migrations
 from jobbers.models.cron_dag import CronDAGEntry
+from jobbers.models.dag import DAGRunDetail, DagRunStatus
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_routing import RoutingConfig
@@ -76,6 +77,7 @@ class DummyTaskState:
     def __init__(self) -> None:
         self._store: dict[ULID, Task] = {}
         self._heartbeats: dict[ULID, float] = {}
+        self._cancelling: set[ULID] = set()
 
     # ── TaskStateProtocol: reads ──────────────────────────────────────────────
 
@@ -95,6 +97,13 @@ class DummyTaskState:
         task.set_status(new)  # type: ignore[arg-type]
         return True
 
+    async def save_task_if_status(self, task: Task, expected: object) -> bool:
+        current = self._store.get(task.id)
+        if current is None or current.status != expected:
+            return False
+        self._store[task.id] = task
+        return True
+
     async def get_active_tasks(self, queues: object) -> list[Task]:
         return [t for tid, t in self._store.items() if tid in self._heartbeats]
 
@@ -104,7 +113,11 @@ class DummyTaskState:
             if score < cutoff:
                 task = self._store.get(task_id)
                 if task is not None:
-                    yield task
+                    # Real backends always deserialize a fresh object per read, decoupled
+                    # from whatever the caller does to it afterward -- yield a copy here
+                    # too, so mutating the snapshot (e.g. clean()'s task.set_status(STALLED))
+                    # doesn't corrupt the "stored" object a later CAS check reads against.
+                    yield task.model_copy(deep=True)
 
     async def get_all_tasks(self, pagination: object) -> list[Task]:
         raise NotImplementedError("DummyTaskState.get_all_tasks")
@@ -130,8 +143,18 @@ class DummyTaskState:
     async def get_dag_runs(self, pagination: object) -> object:
         raise NotImplementedError("DummyTaskState.get_dag_runs")
 
-    async def get_dag_run(self, dag_run_id: ULID) -> object:
-        raise NotImplementedError("DummyTaskState.get_dag_run")
+    async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None:
+        """Derive run detail from _store rather than tracking a separate index."""
+        task_ids = [tid for tid, t in self._store.items() if t.dag_run_id == dag_run_id]
+        if not task_ids:
+            return None
+        return DAGRunDetail(
+            dag_run_id=dag_run_id,
+            name=str(dag_run_id),
+            status=DagRunStatus.RUNNING,
+            submitted_at=dt.datetime.now(dt.UTC),
+            task_ids=task_ids,
+        )
 
     async def clean_dag_runs(self, now: object, max_age: object) -> None:
         raise NotImplementedError("DummyTaskState.clean_dag_runs")
@@ -140,10 +163,28 @@ class DummyTaskState:
         raise NotImplementedError("DummyTaskState.close_dag_run_task")
 
     async def record_dag_run_task_terminal(self, dag_run_id: ULID, outcome: object) -> None:
-        raise NotImplementedError("DummyTaskState.record_dag_run_task_terminal")
+        """No-op: saga-mode tests exercising this only assert on the task-save sequence."""
 
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
         raise NotImplementedError("DummyTaskState.mark_dag_run_complete")
+
+    async def mark_dag_run_cancelling(self, dag_run_id: ULID) -> None:
+        self._cancelling.add(dag_run_id)
+
+    async def is_dag_run_cancelling(self, dag_run_id: ULID) -> bool:
+        return dag_run_id in self._cancelling
+
+    async def clear_dag_run_cancellation(self, dag_run_id: ULID) -> None:
+        self._cancelling.discard(dag_run_id)
+
+    async def reconcile_dag_run_task_retry(self, dag_run_id: ULID, count: int = 1) -> None:
+        """No-op: saga-mode tests exercising this only assert on the task-save/enqueue sequence."""
+
+    async def dag_run_fan_in_alive(self, dag_run_id: ULID) -> bool:
+        raise NotImplementedError("DummyTaskState.dag_run_fan_in_alive")
+
+    async def refresh_dag_run_fan_in_ttl(self, dag_run_id: ULID, ttl: int = 86400) -> None:
+        """No-op: saga-mode tests exercising this only assert on the task-save/enqueue sequence."""
 
     async def ensure_index(self) -> None:
         raise NotImplementedError("DummyTaskState.ensure_index")
@@ -225,6 +266,16 @@ class AtomicDummyTaskState(DummyTaskState):
         task.set_status(TaskStatus.SUBMITTED)
         pipe = self._data_store.pipeline(transaction=True)  # type: ignore[union-attr]
         self.stage_requeue(pipe, task)
+        stage_extra(pipe)  # type: ignore[operator]
+        await pipe.execute()
+        return True
+
+    async def atomic_save_if_status(self, task: Task, expected: object, stage_extra: object) -> bool:
+        current = self._store.get(task.id)
+        if current is None or current.status != expected:
+            return False
+        pipe = self._data_store.pipeline(transaction=True)  # type: ignore[union-attr]
+        self.stage_save(pipe, task)
         stage_extra(pipe)  # type: ignore[operator]
         await pipe.execute()
         return True
