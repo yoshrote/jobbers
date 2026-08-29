@@ -93,6 +93,7 @@ class SubworkerPool:
         request_id: str | None = None,
         on_heartbeat: Callable[[], None] | None = None,
         cancel_grace_period: float = 5.0,
+        cancel_poll_interval: float = 0.5,
     ) -> Any:
         """
         Run one task on a free handle and return its result.
@@ -107,8 +108,9 @@ class SubworkerPool:
         ``asyncio.timeout()``) does not just abandon the subworker to keep running
         unobserved: ``dispatch()`` catches its own cancellation, calls ``self.cancel()``
         (cooperative cancel, escalating to a hard kill after ``cancel_grace_period``
-        seconds) on the caller's behalf, and only then re-raises ``CancelledError`` --
-        cancelling a sync task actually stops the process behind it.
+        seconds, checking in every ``cancel_poll_interval`` seconds in the meantime) on
+        the caller's behalf, and only then re-raises ``CancelledError`` -- cancelling a
+        sync task actually stops the process behind it.
 
         ``request_id`` defaults to a fresh ULID; a caller that wants a stable identifier
         for logging/correlation (e.g. the originating task's own id) can supply its own —
@@ -142,7 +144,7 @@ class SubworkerPool:
             # already gone (future popped, nothing left to hand to self.cancel()).
             return await asyncio.shield(future)
         except asyncio.CancelledError:
-            await self.cancel(request_id, cancel_grace_period)
+            await self.cancel(request_id, cancel_grace_period, cancel_poll_interval)
             if future.done() and not future.cancelled():
                 # We're discarding the outcome in favor of re-raising CancelledError;
                 # retrieve it so a resolved-but-unretrieved exception doesn't get logged
@@ -155,7 +157,7 @@ class SubworkerPool:
             self._request_slot.pop(request_id, None)
             self._heartbeat_callbacks.pop(request_id, None)
 
-    async def cancel(self, request_id: str, grace_period: float) -> None:
+    async def cancel(self, request_id: str, grace_period: float, poll_interval: float = 0.5) -> None:
         """
         Best-effort cooperative cancel of an in-flight request, escalating to a hard kill.
 
@@ -164,11 +166,14 @@ class SubworkerPool:
         observes the cancellation as a ``SubworkerTaskFailure``/``SubworkerCrashedError``
         through its own return path once the reader loop processes the outcome.
 
-        A signal like ``SIGUSR2`` has no acknowledgment channel of its own, so if the
-        grace period elapses with no ``ResultMsg``, ``handle.current_request_id()`` (the
-        out-of-band status file — see ``jobbers.subworker.status_file``) is checked as a
-        tie-breaker before killing: if it shows the subworker already moved off this
-        request, the message is just delayed, not stuck, and the kill is skipped.
+        A signal like ``SIGUSR2`` has no acknowledgment channel of its own, so while
+        waiting up to ``grace_period`` for a ``ResultMsg``, this also polls
+        ``handle.current_request_id()`` (the out-of-band status file — see
+        ``jobbers.subworker.status_file``) every ``poll_interval`` seconds: the moment it
+        shows the subworker moved off this request, the message is just delayed, not
+        stuck, and the kill is skipped — without waiting out the rest of the grace
+        period. A subworker that's still genuinely stuck on this request past the full
+        grace period gets killed as before.
         """
         slot_id = self._request_slot.get(request_id)
         if slot_id is None:
@@ -178,15 +183,25 @@ class SubworkerPool:
         if handle is None or future is None:
             return
         await handle.cancel(request_id)
-        try:
-            await asyncio.wait_for(asyncio.shield(future), timeout=grace_period)
-        except TimeoutError:
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + grace_period
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout=min(poll_interval, remaining))
+                return
+            except TimeoutError:
+                pass
+            except Exception:
+                return
             with contextlib.suppress(Exception):
                 if await handle.current_request_id() != request_id:
                     return
-            await handle.kill(grace_period=0)
-        except Exception:
-            pass
+
+        await handle.kill(grace_period=0)
 
     async def shutdown(self, grace_period: float) -> None:
         """

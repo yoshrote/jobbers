@@ -299,6 +299,35 @@ async def test_cancel_skips_kill_when_status_file_confirms_moved_on():
 
 
 @pytest.mark.asyncio
+async def test_cancel_polls_status_file_and_returns_before_full_grace_period():
+    """
+    A long grace_period must not block for its full duration.
+
+    Once the status file confirms the subworker moved off the cancelled request,
+    cancel() should notice at the next poll instead of waiting out the whole grace period.
+    """
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    created[0].mark_idle_without_result()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await pool.cancel(request_id, grace_period=10, poll_interval=0.05)
+    elapsed = loop.time() - start
+
+    assert created[0].killed is False
+    assert elapsed < 1  # noticed at the first poll, not after the full 10s grace period
+
+    created[0].push_result(request_id, True, result="done-late")
+    assert await task == "done-late"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_cancellation_tells_handle_to_cancel():
     """
     Cancelling the awaiting dispatch() coroutine itself must still stop the subworker.
