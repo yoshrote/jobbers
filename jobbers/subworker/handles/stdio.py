@@ -16,9 +16,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import tempfile
 from typing import TYPE_CHECKING, Any
 
-from jobbers.subworker import wire
+from jobbers.subworker import status_file, wire
 from jobbers.subworker.protocols import (
     HeartbeatMsg,
     ResultMsg,
@@ -45,6 +47,9 @@ class StdioSubworkerHandle:
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._exited = False
+        fd, self._status_file = tempfile.mkstemp(prefix="jobbers-subworker-status-", suffix=".txt")
+        os.close(fd)
+        status_file.write_status(self._status_file, None)
 
     @property
     def pid(self) -> int | None:
@@ -53,15 +58,25 @@ class StdioSubworkerHandle:
         return self._proc.pid
 
     async def start(self) -> None:
+        # Materialize the full environment (rather than passing our base env dict as-is)
+        # so SUBWORKER_STATUS_FILE layers on top of "inherit everything" when the caller
+        # didn't supply a custom env, matching create_subprocess_exec's own env=None
+        # semantics instead of silently dropping the rest of the parent's environment.
+        env = dict(self._env) if self._env is not None else dict(os.environ)
+        env["SUBWORKER_STATUS_FILE"] = self._status_file
         self._proc = await asyncio.create_subprocess_exec(
             self._executable,
             *self._args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=self._env,
+            env=env,
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    async def current_request_id(self) -> str | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, status_file.read_status, self._status_file)
 
     async def _drain_stderr(self) -> None:
         proc = self._proc
@@ -110,6 +125,8 @@ class StdioSubworkerHandle:
             raise RuntimeError("no process to reap")
         self._exited = True
         exit_code = await proc.wait()
+        with contextlib.suppress(OSError):
+            os.remove(self._status_file)
         return SubworkerExited(exit_code=exit_code)
 
     async def cancel(self, request_id: str) -> None:
@@ -146,6 +163,8 @@ class StdioSubworkerHandle:
             stderr_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await stderr_task
+        with contextlib.suppress(OSError):
+            os.remove(self._status_file)
         return proc.returncode
 
 

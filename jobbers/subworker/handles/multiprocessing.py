@@ -20,10 +20,12 @@ import multiprocessing
 import multiprocessing.connection
 import os
 import signal
+import tempfile
 import traceback
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from jobbers.registry import get_task_config
+from jobbers.subworker import status_file
 from jobbers.subworker.context import _current_heartbeat_sender
 from jobbers.subworker.errors import TaskCancelledError
 from jobbers.subworker.protocols import (
@@ -74,6 +76,9 @@ class MultiprocessingSubworkerHandle:
         self._conn: Any = None
         self._process: BaseProcess | None = None
         self._reaped = False
+        fd, self._status_file = tempfile.mkstemp(prefix="jobbers-subworker-status-", suffix=".txt")
+        os.close(fd)
+        status_file.write_status(self._status_file, None)
 
     @property
     def pid(self) -> int | None:
@@ -83,11 +88,19 @@ class MultiprocessingSubworkerHandle:
 
     async def start(self) -> None:
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
-        process = self._ctx.Process(target=_bootstrap_main, args=(child_conn, self._task_module), daemon=True)
+        process = self._ctx.Process(
+            target=_bootstrap_main,
+            args=(child_conn, self._task_module, self._status_file),
+            daemon=True,
+        )
         process.start()
         child_conn.close()  # the child owns this end now; drop the parent's duplicate handle
         self._conn = parent_conn
         self._process = process
+
+    async def current_request_id(self) -> str | None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, status_file.read_status, self._status_file)
 
     async def dispatch(
         self, request_id: str, task_name: str, task_version: int, kwargs: dict[str, Any]
@@ -167,10 +180,12 @@ class MultiprocessingSubworkerHandle:
         if self._conn is not None:
             with contextlib.suppress(OSError):
                 self._conn.close()
+        with contextlib.suppress(OSError):
+            os.remove(self._status_file)
         return process.exitcode
 
 
-def _bootstrap_main(conn: Any, task_module: str) -> None:
+def _bootstrap_main(conn: Any, task_module: str, status_file_path: str) -> None:
     """Child process entry point (the ``spawn`` target) — must stay importable at module level."""
     state: dict[str, str | None] = {"current_request_id": None}
 
@@ -200,6 +215,8 @@ def _bootstrap_main(conn: Any, task_module: str) -> None:
             logger.warning("Ignoring unexpected message from parent: %r", msg)
             continue
         state["current_request_id"] = msg.request_id
+        status_file.write_status(status_file_path, msg.request_id)
+
         def _send_heartbeat(rid: str = msg.request_id) -> None:
             conn.send(HeartbeatMsg(rid))
 
@@ -229,6 +246,7 @@ def _bootstrap_main(conn: Any, task_module: str) -> None:
         finally:
             _current_heartbeat_sender.reset(heartbeat_token)
             state["current_request_id"] = None
+            status_file.write_status(status_file_path, None)
     conn.close()
 
 

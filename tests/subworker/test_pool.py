@@ -38,6 +38,7 @@ class FakeSubworkerHandle:
         self._pid = next(_pid_counter)
         self._exited = False
         self._inbox: asyncio.Queue[SubworkerMessage] = asyncio.Queue()
+        self._current_request_id: str | None = None  # mirrors the real status-file mechanism
 
     @property
     def pid(self) -> int | None:
@@ -50,6 +51,7 @@ class FakeSubworkerHandle:
         self, request_id: str, task_name: str, task_version: int, kwargs: dict[str, Any]
     ) -> None:
         self.dispatches.append((request_id, task_name, task_version, kwargs))
+        self._current_request_id = request_id
 
     async def recv(self) -> SubworkerMessage:
         msg = await self._inbox.get()
@@ -60,6 +62,9 @@ class FakeSubworkerHandle:
     async def cancel(self, request_id: str) -> None:
         self.cancels.append(request_id)
 
+    async def current_request_id(self) -> str | None:
+        return self._current_request_id
+
     async def retire(self) -> None:
         self.retired = True
         if not self._exited:
@@ -67,6 +72,7 @@ class FakeSubworkerHandle:
 
     async def kill(self, grace_period: float) -> int | None:
         self.killed = True
+        self._current_request_id = None
         if not self._exited:
             self._inbox.put_nowait(SubworkerExited(exit_code=137))
         return 137
@@ -75,13 +81,25 @@ class FakeSubworkerHandle:
     def push_result(
         self, request_id: str, ok: bool, result: Any = None, error: SubworkerTaskError | None = None
     ) -> None:
+        self._current_request_id = None
         self._inbox.put_nowait(ResultMsg(request_id, ok, result, error))
 
     def push_heartbeat(self, request_id: str) -> None:
         self._inbox.put_nowait(HeartbeatMsg(request_id))
 
     def crash(self, exit_code: int | None = 1) -> None:
+        self._current_request_id = None
         self._inbox.put_nowait(SubworkerExited(exit_code=exit_code))
+
+    def mark_idle_without_result(self) -> None:
+        """
+        Simulate the status file reporting idle before the matching ResultMsg is read.
+
+        Models the real gap this whole mechanism exists for: the child's status-file
+        write and its pipe/socket write aren't atomic together, so a pool's cancel-escalation
+        check can observe "moved on" slightly before recv() delivers the ResultMsg.
+        """
+        self._current_request_id = None
 
 
 def _factory(created: list[FakeSubworkerHandle]):
@@ -252,6 +270,84 @@ async def test_cancel_escalates_to_kill_on_timeout():
     assert created[0].killed is True
     with pytest.raises(SubworkerCrashedError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_cancel_skips_kill_when_status_file_confirms_moved_on():
+    """
+    The status-file tie-breaker: no ResultMsg yet, but current_request_id() says idle.
+
+    Confirms cancel() consults handle.current_request_id() before killing, rather than
+    killing unconditionally on every grace-period timeout -- the whole point of the
+    status file is to avoid tearing down a subworker that's about to report back cleanly.
+    """
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    created[0].mark_idle_without_result()
+    await pool.cancel(request_id, grace_period=0.01)
+    assert created[0].killed is False
+
+    # the ResultMsg arrives late; dispatch() still resolves normally off of it.
+    created[0].push_result(request_id, True, result="done-late")
+    assert await task == "done-late"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cancellation_tells_handle_to_cancel():
+    """
+    Cancelling the awaiting dispatch() coroutine itself must still stop the subworker.
+
+    Regression test: dispatch() used to just `await future` directly, so an external
+    cancellation (a caller's task.cancel(), or an enclosing asyncio.timeout()) cancelled
+    that future as a side effect of asyncio's own await-cancellation propagation -- which
+    ran dispatch()'s `finally` and popped the future from self._futures *before* anyone
+    had a chance to call self.cancel() on it, silently leaving the subworker running.
+    dispatch() now shields the future and cancels/kills the subworker itself.
+    """
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}, cancel_grace_period=1))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    task.cancel()
+    await asyncio.sleep(0)  # let dispatch()'s except-CancelledError branch run
+    assert created[0].cancels == [request_id]
+
+    error = SubworkerTaskError("TaskCancelledError", "cancelled by parent", "", True)
+    created[0].push_result(request_id, False, error=error)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert created[0].killed is False  # cooperative cancel succeeded before the grace period
+    assert pool.free_slots == 1  # the slot is usable again, not stuck "occupied"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cancellation_escalates_to_kill_on_timeout():
+    """If the subworker doesn't cooperate within cancel_grace_period, dispatch() kills it."""
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}, cancel_grace_period=0.01))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert created[0].cancels == [request_id]
+    assert created[0].killed is True
+    assert len(created) == 2  # the dead slot was replaced
 
 
 @pytest.mark.asyncio

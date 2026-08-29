@@ -33,6 +33,7 @@ class QueueConfig(BaseModel):
     # Admin-set hint: tasks routed to this queue may be sync-dispatched (execution_mode
     # sync_subworker). Read by TaskGenerator.filter_by_worker_queue_capacity to avoid
     # popping a sync task off a queue when the worker's SubworkerPool has no free slot --
+    # see sync-task-subworker-design.md §4.3.
     has_sync_tasks: bool = Field(default=False)
 
     def period_in_seconds(self) -> int | None:

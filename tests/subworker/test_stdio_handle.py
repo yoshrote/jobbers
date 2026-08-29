@@ -157,3 +157,45 @@ async def test_heartbeat_calls_are_delivered_before_the_result():
     finally:
         await handle.kill(grace_period=2)
 
+
+async def _wait_until_status(handle: StdioSubworkerHandle, expected: str | None) -> None:
+    """
+    Poll current_request_id() until it matches expected.
+
+    The status file and the ResultMsg are two independent writes from the child, sent
+    in sequence but not synchronized with the parent's read of either -- current_request_id()
+    is a best-effort, eventually-consistent signal, not something guaranteed to match
+    the instant recv() returns.
+    """
+    for _ in range(50):
+        if await handle.current_request_id() == expected:
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail(f"current_request_id() never became {expected!r}")
+
+
+@pytest.mark.asyncio
+async def test_current_request_id_reflects_busy_and_idle_state():
+    handle = _make_handle()
+    await handle.start()
+    try:
+        assert await handle.current_request_id() is None
+        request_id = str(uuid.uuid4())
+        await handle.dispatch(request_id, "subworker_sleep", 1, {"seconds": 3})
+        await _wait_until_status(handle, request_id)
+        msg = await handle.recv()
+        assert isinstance(msg, ResultMsg)
+        assert msg.ok is True
+        await _wait_until_status(handle, None)
+    finally:
+        await handle.kill(grace_period=2)
+
+
+@pytest.mark.asyncio
+async def test_kill_removes_the_status_file():
+    handle = _make_handle()
+    await handle.start()
+    status_path = handle._status_file
+    assert await asyncio.to_thread(os.path.exists, status_path)
+    await handle.kill(grace_period=2)
+    assert not await asyncio.to_thread(os.path.exists, status_path)

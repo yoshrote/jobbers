@@ -14,10 +14,17 @@ running synchronously on the main thread, so a background thread owns all reads;
 dispatches are handed to the main thread over a queue, and a ``cancel`` message for the
 in-flight request is translated into ``SIGUSR2`` (POSIX only, per that doc's §7 signal
 choice) to interrupt the blocked main thread — mirroring
-``MultiprocessingSubworkerHandle``'s own ``SIGUSR1`` mechanism. Heartbeats aren't wired to
-task authors yet (needs a ``Task`` proxy object from the eventual pool/``TaskProcessor``
-integration) — this reference bootstrap only demonstrates the dispatch/result/retire/exit
-lifecycle the handle protocol itself requires.
+``MultiprocessingSubworkerHandle``'s own ``SIGUSR1`` mechanism. A task calls
+``jobbers.subworker.context.heartbeat()`` to send a heartbeat; only the main thread ever
+writes to stdout (heartbeats included), so it's safe to send synchronously from within
+the task's own call stack without coordinating with the reader thread.
+
+If ``SUBWORKER_STATUS_FILE`` is set in the environment, the currently-processing request
+id (or ``"0"`` while idle) is also written there via ``jobbers.subworker.status_file`` --
+an out-of-band signal ``StdioSubworkerHandle.current_request_id()`` reads independently of
+stdout, so the parent can confirm a cancel actually took effect even if the ``ResultMsg``
+is delayed or never arrives. Optional: a non-Python subworker that skips this just means
+its parent always waits out the full grace period before killing it on cancel/timeout.
 """
 
 from __future__ import annotations
@@ -35,7 +42,8 @@ import traceback
 from typing import TYPE_CHECKING, Any, cast
 
 from jobbers.registry import get_task_config
-from jobbers.subworker import wire
+from jobbers.subworker import status_file, wire
+from jobbers.subworker.context import _current_heartbeat_sender
 from jobbers.subworker.errors import TaskCancelledError
 from jobbers.utils.module_loading import load_task_module
 
@@ -92,6 +100,8 @@ def main(task_module: str) -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     load_task_module(task_module)
 
+    status_file_path = os.environ.get("SUBWORKER_STATUS_FILE")
+
     state: dict[str, str | None] = {"current_request_id": None}
 
     def _on_cancel_signal(signum: int, frame: FrameType | None) -> None:
@@ -114,6 +124,13 @@ def main(task_module: str) -> None:
             break
         request_id = item["request_id"]
         state["current_request_id"] = request_id
+        if status_file_path is not None:
+            status_file.write_status(status_file_path, request_id)
+
+        def _send_heartbeat(rid: str = request_id) -> None:
+            wire.write_frame_sync(stdout, {"type": "heartbeat", "request_id": rid})
+
+        heartbeat_token = _current_heartbeat_sender.set(_send_heartbeat)
         try:
             result = _run_task(item["task_name"], item["task_version"], item.get("kwargs") or {})
         except TaskCancelledError as exc:
@@ -145,7 +162,10 @@ def main(task_module: str) -> None:
         else:
             _send_result(stdout, request_id, True, result, None)
         finally:
+            _current_heartbeat_sender.reset(heartbeat_token)
             state["current_request_id"] = None
+            if status_file_path is not None:
+                status_file.write_status(status_file_path, None)
 
 
 def run() -> None:

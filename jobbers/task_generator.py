@@ -108,6 +108,7 @@ class TaskGenerator:
         # capacity to run right now -- skip those queues this iteration instead of
         # popping the task and holding a WORKER_CONCURRENT_TASKS slot hostage waiting
         # on a subworker that isn't there.
+        # See sync-task-subworker-design.md §4.3.
         if self.subworker_pool is not None and self.subworker_pool.free_slots == 0:
             candidates -= {
                 q for q in candidates if queue_worker_limits.get(q, _UNKNOWN_QUEUE_LIMITS).has_sync_tasks

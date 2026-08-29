@@ -104,6 +104,19 @@ class SubworkerHandleProtocol(Protocol):
         """
         ...
 
+    async def current_request_id(self) -> str | None:
+        """
+        Best-effort, out-of-band read of which request the subworker is processing (None if idle).
+
+        Backed by a status file the child updates independently of the message
+        pipe/socket (see ``jobbers.subworker.status_file``), so it stays meaningful even
+        if the child is stuck and never gets a ``ResultMsg`` out. Used as a tie-breaker
+        by a pool's cancel-escalation logic: if this reports the subworker already moved
+        off the cancelled request, skip the hard kill even though no ``ResultMsg`` has
+        arrived yet.
+        """
+        ...
+
     async def retire(self) -> None:
         """
         Tell the child "don't expect another dispatch; exit once idle" without an abrupt kill.
