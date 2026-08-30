@@ -1,0 +1,438 @@
+"""
+Unit tests for SubworkerPool orchestration logic, against an in-memory fake handle.
+
+Fast and deterministic — exercises occupancy tracking, TTL recycling, heartbeat
+forwarding, crash-triggered respawn, and cancel/shutdown escalation without spawning
+real subprocesses. See test_pool_integration.py for end-to-end coverage against the two
+real SubworkerHandleProtocol implementations.
+"""
+
+import asyncio
+import itertools
+from typing import Any
+
+import pytest
+
+from jobbers.subworker.errors import SubworkerCrashedError, SubworkerTaskFailure
+from jobbers.subworker.pool import SubworkerPool
+from jobbers.subworker.protocols import (
+    HeartbeatMsg,
+    ResultMsg,
+    SubworkerExited,
+    SubworkerMessage,
+    SubworkerTaskError,
+)
+
+_pid_counter = itertools.count(1)
+
+
+class FakeSubworkerHandle:
+    """In-memory SubworkerHandleProtocol implementation for deterministic pool tests."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.retired = False
+        self.killed = False
+        self.dispatches: list[tuple[str, str, int, dict[str, Any]]] = []
+        self.cancels: list[str] = []
+        self._pid = next(_pid_counter)
+        self._exited = False
+        self._inbox: asyncio.Queue[SubworkerMessage] = asyncio.Queue()
+        self._current_request_id: str | None = None  # mirrors the real status-file mechanism
+
+    @property
+    def pid(self) -> int | None:
+        return None if self._exited else self._pid
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def dispatch(
+        self, request_id: str, task_name: str, task_version: int, kwargs: dict[str, Any]
+    ) -> None:
+        self.dispatches.append((request_id, task_name, task_version, kwargs))
+        self._current_request_id = request_id
+
+    async def recv(self) -> SubworkerMessage:
+        msg = await self._inbox.get()
+        if isinstance(msg, SubworkerExited):
+            self._exited = True
+        return msg
+
+    async def cancel(self, request_id: str) -> None:
+        self.cancels.append(request_id)
+
+    async def current_request_id(self) -> str | None:
+        return self._current_request_id
+
+    async def retire(self) -> None:
+        self.retired = True
+        if not self._exited:
+            self._inbox.put_nowait(SubworkerExited(exit_code=0))
+
+    async def kill(self, grace_period: float) -> int | None:
+        self.killed = True
+        self._current_request_id = None
+        if not self._exited:
+            self._inbox.put_nowait(SubworkerExited(exit_code=137))
+        return 137
+
+    # Test-only helpers driving recv() output; not part of the protocol.
+    def push_result(
+        self, request_id: str, ok: bool, result: Any = None, error: SubworkerTaskError | None = None
+    ) -> None:
+        self._current_request_id = None
+        self._inbox.put_nowait(ResultMsg(request_id, ok, result, error))
+
+    def push_heartbeat(self, request_id: str) -> None:
+        self._inbox.put_nowait(HeartbeatMsg(request_id))
+
+    def crash(self, exit_code: int | None = 1) -> None:
+        self._current_request_id = None
+        self._inbox.put_nowait(SubworkerExited(exit_code=exit_code))
+
+    def mark_idle_without_result(self) -> None:
+        """
+        Simulate the status file reporting idle before the matching ResultMsg is read.
+
+        Models the real gap this whole mechanism exists for: the child's status-file
+        write and its pipe/socket write aren't atomic together, so a pool's cancel-escalation
+        check can observe "moved on" slightly before recv() delivers the ResultMsg.
+        """
+        self._current_request_id = None
+
+
+def _factory(created: list[FakeSubworkerHandle]):
+    def make() -> FakeSubworkerHandle:
+        handle = FakeSubworkerHandle()
+        created.append(handle)
+        return handle
+
+    return make
+
+
+@pytest.mark.asyncio
+async def test_dispatch_returns_result():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("add", 1, {"a": 1, "b": 2}))
+    await asyncio.sleep(0)  # let dispatch() reach handle.dispatch()
+    request_id, task_name, task_version, kwargs = created[0].dispatches[0]
+    assert (task_name, task_version, kwargs) == ("add", 1, {"a": 1, "b": 2})
+
+    created[0].push_result(request_id, True, result=3)
+    assert await task == 3
+    assert pool.free_slots == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_error_raises_subworker_task_failure():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("fail", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+    error = SubworkerTaskError("ValueError", "boom", "traceback", None)
+    created[0].push_result(request_id, False, error=error)
+
+    with pytest.raises(SubworkerTaskFailure) as exc_info:
+        await task
+    assert exc_info.value.error == error
+
+
+@pytest.mark.asyncio
+async def test_second_dispatch_waits_for_free_slot():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    first = asyncio.create_task(pool.dispatch("a", 1, {}))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(pool.dispatch("b", 1, {}))
+    await asyncio.sleep(0)
+
+    # Only one handle was ever created (size=1), and it only has the first dispatch queued.
+    assert len(created) == 1
+    assert len(created[0].dispatches) == 1
+    assert pool.free_slots == 0
+
+    request_id_1 = created[0].dispatches[0][0]
+    created[0].push_result(request_id_1, True, result="first")
+    assert await first == "first"
+
+    await asyncio.sleep(0)  # let the freed slot get picked up by the second dispatch
+    assert len(created[0].dispatches) == 2
+    request_id_2 = created[0].dispatches[1][0]
+    created[0].push_result(request_id_2, True, result="second")
+    assert await second == "second"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_forwarded_and_keeps_task_in_flight():
+    created: list[FakeSubworkerHandle] = []
+    heartbeats: list[str] = []
+    pool = SubworkerPool(_factory(created), size=1, on_heartbeat=heartbeats.append)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    created[0].push_heartbeat(request_id)
+    created[0].push_heartbeat(request_id)
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert heartbeats == [request_id, request_id]
+
+    created[0].push_result(request_id, True, result="done")
+    assert await task == "done"
+
+
+@pytest.mark.asyncio
+async def test_crash_while_in_flight_raises_and_respawns():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    created[0].crash(exit_code=139)
+
+    with pytest.raises(SubworkerCrashedError) as exc_info:
+        await task
+    assert exc_info.value.exit_code == 139
+    assert len(created) == 2  # the dead slot was replaced
+    assert pool.free_slots == 1
+
+
+@pytest.mark.asyncio
+async def test_ttl_recycles_handle_after_n_dispatches():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1, ttl=2)
+    await pool.start()
+
+    for _ in range(2):
+        task = asyncio.create_task(pool.dispatch("a", 1, {}))
+        await asyncio.sleep(0)
+        request_id = created[0].dispatches[-1][0]
+        created[0].push_result(request_id, True, result="ok")
+        await task
+
+    assert created[0].retired is True
+    assert len(created) == 2  # recycled once the TTL was hit
+
+    task = asyncio.create_task(pool.dispatch("a", 1, {}))
+    await asyncio.sleep(0)
+    assert len(created[1].dispatches) == 1  # the new dispatch went to the replacement
+    request_id = created[1].dispatches[0][0]
+    created[1].push_result(request_id, True, result="ok2")
+    assert await task == "ok2"
+
+
+@pytest.mark.asyncio
+async def test_cancel_succeeds_cooperatively_within_grace_period():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    cancel_task = asyncio.create_task(pool.cancel(request_id, grace_period=1))
+    await asyncio.sleep(0)
+    assert created[0].cancels == [request_id]
+
+    error = SubworkerTaskError("TaskCancelledError", "cancelled by parent", "", True)
+    created[0].push_result(request_id, False, error=error)
+
+    await cancel_task
+    assert created[0].killed is False  # cooperative cancel succeeded; no escalation needed
+    with pytest.raises(SubworkerTaskFailure):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cancel_escalates_to_kill_on_timeout():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    await pool.cancel(request_id, grace_period=0.01)  # nothing ever replies; times out
+    assert created[0].killed is True
+    with pytest.raises(SubworkerCrashedError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cancel_skips_kill_when_status_file_confirms_moved_on():
+    """
+    The status-file tie-breaker: no ResultMsg yet, but current_request_id() says idle.
+
+    Confirms cancel() consults handle.current_request_id() before killing, rather than
+    killing unconditionally on every grace-period timeout -- the whole point of the
+    status file is to avoid tearing down a subworker that's about to report back cleanly.
+    """
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    created[0].mark_idle_without_result()
+    await pool.cancel(request_id, grace_period=0.01)
+    assert created[0].killed is False
+
+    # the ResultMsg arrives late; dispatch() still resolves normally off of it.
+    created[0].push_result(request_id, True, result="done-late")
+    assert await task == "done-late"
+
+
+@pytest.mark.asyncio
+async def test_cancel_polls_status_file_and_returns_before_full_grace_period():
+    """
+    A long grace_period must not block for its full duration.
+
+    Once the status file confirms the subworker moved off the cancelled request,
+    cancel() should notice at the next poll instead of waiting out the whole grace period.
+    """
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    created[0].mark_idle_without_result()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await pool.cancel(request_id, grace_period=10, poll_interval=0.05)
+    elapsed = loop.time() - start
+
+    assert created[0].killed is False
+    assert elapsed < 1  # noticed at the first poll, not after the full 10s grace period
+
+    created[0].push_result(request_id, True, result="done-late")
+    assert await task == "done-late"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cancellation_tells_handle_to_cancel():
+    """
+    Cancelling the awaiting dispatch() coroutine itself must still stop the subworker.
+
+    Regression test: dispatch() used to just `await future` directly, so an external
+    cancellation (a caller's task.cancel(), or an enclosing asyncio.timeout()) cancelled
+    that future as a side effect of asyncio's own await-cancellation propagation -- which
+    ran dispatch()'s `finally` and popped the future from self._futures *before* anyone
+    had a chance to call self.cancel() on it, silently leaving the subworker running.
+    dispatch() now shields the future and cancels/kills the subworker itself.
+    """
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}, cancel_grace_period=1))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    task.cancel()
+    await asyncio.sleep(0)  # let dispatch()'s except-CancelledError branch run
+    assert created[0].cancels == [request_id]
+
+    error = SubworkerTaskError("TaskCancelledError", "cancelled by parent", "", True)
+    created[0].push_result(request_id, False, error=error)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert created[0].killed is False  # cooperative cancel succeeded before the grace period
+    assert pool.free_slots == 1  # the slot is usable again, not stuck "occupied"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cancellation_escalates_to_kill_on_timeout():
+    """If the subworker doesn't cooperate within cancel_grace_period, dispatch() kills it."""
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}, cancel_grace_period=0.01))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert created[0].cancels == [request_id]
+    assert created[0].killed is True
+    assert len(created) == 2  # the dead slot was replaced
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_unknown_request_is_a_noop():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+    await pool.cancel("does-not-exist", grace_period=1)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retires_idle_handles():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=2)
+    await pool.start()
+
+    await pool.shutdown(grace_period=1)
+    assert all(h.retired for h in created)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_and_kills_busy_handles():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+
+    task = asyncio.create_task(pool.dispatch("slow", 1, {}))
+    await asyncio.sleep(0)
+    request_id = created[0].dispatches[0][0]
+
+    await pool.shutdown(grace_period=1)
+    assert created[0].cancels == [request_id]
+    assert created[0].killed is True
+    with pytest.raises(SubworkerCrashedError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_dispatch_after_shutdown_raises():
+    created: list[FakeSubworkerHandle] = []
+    pool = SubworkerPool(_factory(created), size=1)
+    await pool.start()
+    await pool.shutdown(grace_period=1)
+
+    with pytest.raises(RuntimeError):
+        await pool.dispatch("a", 1, {})
+
+
+@pytest.mark.asyncio
+async def test_start_twice_raises():
+    pool = SubworkerPool(_factory([]), size=1)
+    await pool.start()
+    with pytest.raises(RuntimeError):
+        await pool.start()
+
+
+def test_size_must_be_positive():
+    with pytest.raises(ValueError, match="size must be at least 1"):
+        SubworkerPool(_factory([]), size=0)

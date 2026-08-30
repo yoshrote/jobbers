@@ -1,6 +1,6 @@
 import datetime as dt
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Annotated, Any
 
@@ -9,8 +9,10 @@ from pydantic import BaseModel, Field, PlainSerializer, WithJsonSchema, field_va
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 
+# Callable[..., Any] rather than Callable[..., Awaitable[Any]] -- a task function may be
+# a plain synchronous function (TaskExecutionMode.SYNC_SUBWORKER), not just async def.
 SerializableCallable = Annotated[
-    Callable[..., Awaitable[Any]],
+    Callable[..., Any],
     WithJsonSchema({"type": "string", "readOnly": True}),
     PlainSerializer(
         lambda f: f"{f.__module__}.{f.__qualname__}",
@@ -18,6 +20,13 @@ SerializableCallable = Annotated[
         when_used="json",
     ),
 ]
+
+
+class TaskExecutionMode(StrEnum):
+    """How a registered task function is invoked."""
+
+    ASYNC = "async"  # awaited in-process, on the worker's own event loop
+    SYNC_SUBWORKER = "sync_subworker"  # a plain (non-async) function, run in a subworker process
 
 
 class BackoffStrategy(StrEnum):
@@ -50,6 +59,8 @@ class TaskConfig(BaseModel):
     on_shutdown: TaskShutdownPolicy = Field(default=TaskShutdownPolicy.STOP)
     dead_letter_policy: DeadLetterPolicy = Field(default=DeadLetterPolicy.NONE)
     cleanup_on: frozenset[TaskStatus] | None = Field(default=None)
+    # Auto-detected by @register_task from inspect.iscoroutinefunction() -- not user-set.
+    execution_mode: TaskExecutionMode = Field(default=TaskExecutionMode.ASYNC)
     max_heartbeat_interval: dt.timedelta | None = Field(
         default=None
     )  # Interval for sending heartbeats in seconds, if applicable

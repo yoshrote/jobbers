@@ -5,7 +5,7 @@ import os
 import signal
 import sys
 import tempfile
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from ulid import ULID
@@ -14,7 +14,31 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
-from jobbers.runners.worker_proc import _load_task_module, _run_cancel_listener_supervised, main, run
+from jobbers.registry import clear_registry, register_task
+from jobbers.runners.worker_proc import (
+    _has_sync_subworker_tasks,
+    _load_task_module,
+    _make_subworker_handle_factory,
+    _run_cancel_listener_supervised,
+    main,
+    run,
+)
+from jobbers.subworker.handles.multiprocessing import MultiprocessingSubworkerHandle
+from jobbers.subworker.handles.stdio import StdioSubworkerHandle
+
+
+@pytest.fixture(autouse=True)
+def _no_subworker_pool_by_default(monkeypatch):
+    """
+    Most tests in this file don't care about subworker pools -- default to "none registered".
+
+    Without this, whatever the global task registry happens to hold at test time (from
+    other test modules' registrations, since it's process-global) would nondeterministically
+    decide whether main() spawns real subprocesses here. Tests that actually exercise the
+    subworker wiring override this explicitly.
+    """
+    monkeypatch.setattr("jobbers.runners.worker_proc._has_sync_subworker_tasks", lambda: False)
+
 
 # ── _load_task_module ─────────────────────────────────────────────────────────
 
@@ -142,7 +166,7 @@ async def test_main_processes_tasks_until_exhausted():
         gen_instance.__anext__ = AsyncMock(side_effect=[task, StopAsyncIteration()])
         MockGen.return_value = gen_instance
 
-        await main()
+        await main("test.module")
 
     assert len(process_calls) == 1
     assert process_calls[0] is task
@@ -164,7 +188,7 @@ async def test_main_respects_worker_ttl_env_var(monkeypatch):
         gen_instance.__anext__ = AsyncMock(side_effect=StopAsyncIteration)
         MockGen.return_value = gen_instance
 
-        await main()
+        await main("test.module")
 
     _, kwargs = MockGen.call_args
     assert kwargs.get("max_tasks") == 7 or MockGen.call_args[0][2] == 7
@@ -185,7 +209,117 @@ async def test_main_cancels_active_tasks_on_stop():
         gen_instance.__anext__ = AsyncMock(side_effect=StopAsyncIteration)
         MockGen.return_value = gen_instance
 
-        await main()  # should not raise
+        await main("test.module")  # should not raise
+
+
+# ── _has_sync_subworker_tasks ───────────────────────────────────────────────
+
+
+def test_has_sync_subworker_tasks_false_when_only_async_registered():
+    @register_task(name="only_async", version=1)
+    async def _async_task(**kwargs):  # pragma: no cover
+        return kwargs
+
+    try:
+        assert _has_sync_subworker_tasks() is False
+    finally:
+        clear_registry()
+
+
+def test_has_sync_subworker_tasks_true_when_sync_registered():
+    @register_task(name="a_sync_task", version=1)
+    def _sync_task(**kwargs):  # pragma: no cover
+        return kwargs
+
+    try:
+        assert _has_sync_subworker_tasks() is True
+    finally:
+        clear_registry()
+
+
+def test_has_sync_subworker_tasks_false_for_empty_registry():
+    clear_registry()
+    assert _has_sync_subworker_tasks() is False
+
+
+# ── _make_subworker_handle_factory ──────────────────────────────────────────
+
+
+def test_make_subworker_handle_factory_defaults_to_multiprocessing(monkeypatch):
+    monkeypatch.delenv("SUBWORKER_BACKEND", raising=False)
+    factory = _make_subworker_handle_factory("some.module")
+    assert isinstance(factory(), MultiprocessingSubworkerHandle)
+
+
+def test_make_subworker_handle_factory_stdio_default_args(monkeypatch):
+    monkeypatch.setenv("SUBWORKER_BACKEND", "stdio")
+    monkeypatch.delenv("SUBWORKER_STDIO_EXECUTABLE", raising=False)
+    monkeypatch.delenv("SUBWORKER_STDIO_ARGS", raising=False)
+    factory = _make_subworker_handle_factory("some.module")
+    handle = factory()
+    assert isinstance(handle, StdioSubworkerHandle)
+    assert handle._executable == sys.executable
+    assert handle._args == ["-m", "jobbers.subworker.bootstrap.stdio_main", "some.module"]
+
+
+def test_make_subworker_handle_factory_stdio_custom_executable_and_args(monkeypatch):
+    monkeypatch.setenv("SUBWORKER_BACKEND", "stdio")
+    monkeypatch.setenv("SUBWORKER_STDIO_EXECUTABLE", "/usr/bin/ruby")
+    monkeypatch.setenv("SUBWORKER_STDIO_ARGS", "worker.rb --flag 'quoted value'")
+    factory = _make_subworker_handle_factory("some.module")
+    handle = factory()
+    assert handle._executable == "/usr/bin/ruby"
+    assert handle._args == ["worker.rb", "--flag", "quoted value"]
+
+
+def test_make_subworker_handle_factory_unknown_backend_raises(monkeypatch):
+    monkeypatch.setenv("SUBWORKER_BACKEND", "carrier-pigeon")
+    with pytest.raises(ValueError, match="Unknown SUBWORKER_BACKEND"):
+        _make_subworker_handle_factory("some.module")
+
+
+# ── main() subworker pool wiring ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_main_starts_and_shuts_down_subworker_pool_when_registered(monkeypatch):
+    """main() constructs, starts, hands off to TaskProcessor, and shuts down a SubworkerPool."""
+    monkeypatch.setattr("jobbers.runners.worker_proc._has_sync_subworker_tasks", lambda: True)
+    task = Task(id=ULID(), name="t", version=1, queue="default", status=TaskStatus.SUBMITTED)
+    state_manager = _make_state_manager()
+
+    mock_pool = MagicMock()
+    mock_pool.start = AsyncMock()
+    mock_pool.shutdown = AsyncMock()
+    MockPool = MagicMock(return_value=mock_pool)
+
+    process_calls: list[object] = []
+
+    async def fake_run(t: Task) -> None:
+        process_calls.append(t)
+
+    mock_processor = MagicMock()
+    mock_processor.run = fake_run
+
+    with (
+        patch("jobbers.runners.worker_proc.db.init_state_manager", return_value=state_manager),
+        patch("jobbers.runners.worker_proc.TaskGenerator") as MockGen,
+        patch("jobbers.runners.worker_proc.SubworkerPool", MockPool),
+        patch("jobbers.runners.worker_proc.TaskProcessor", return_value=mock_processor) as MockProcessor,
+    ):
+        gen_instance = MagicMock()
+        gen_instance.queues = AsyncMock(return_value={"default"})
+        gen_instance.stop = MagicMock()
+        gen_instance.__anext__ = AsyncMock(side_effect=[task, StopAsyncIteration()])
+        MockGen.return_value = gen_instance
+
+        await main("test.module")
+
+    MockPool.assert_called_once_with(ANY, size=ANY, ttl=ANY)
+    mock_pool.start.assert_awaited_once()
+    MockProcessor.assert_called_once_with(state_manager, mock_pool)
+    mock_pool.shutdown.assert_awaited_once()
+    assert process_calls == [task]
 
 
 @pytest.mark.asyncio
@@ -249,7 +383,7 @@ async def test_main_sigterm_respects_on_shutdown_policy():
         patch("jobbers.runners.worker_proc.TaskGenerator", return_value=gen_instance),
         patch("jobbers.runners.worker_proc.TaskProcessor", return_value=mock_processor),
     ):
-        main_task = asyncio.create_task(main())
+        main_task = asyncio.create_task(main("test.module"))
         await asyncio.wait_for(both_active.wait(), timeout=2)
         os.kill(os.getpid(), signal.SIGTERM)
         await asyncio.wait_for(main_task, timeout=2)
@@ -291,7 +425,7 @@ async def test_main_sigterm_during_blocking_fetch_shuts_down_cleanly():
         patch("jobbers.runners.worker_proc.db.init_state_manager", return_value=state_manager),
         patch("jobbers.runners.worker_proc.TaskGenerator", return_value=gen_instance),
     ):
-        main_task = asyncio.create_task(main())
+        main_task = asyncio.create_task(main("test.module"))
         await asyncio.sleep(0.1)  # let main() start blocking on the fetch
         os.kill(os.getpid(), signal.SIGTERM)
         await asyncio.wait_for(main_task, timeout=2)  # must not raise

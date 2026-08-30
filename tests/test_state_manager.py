@@ -24,6 +24,7 @@ from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
 from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
+from jobbers.protocols import QueueLimits
 from jobbers.state_manager import (
     CancelReason,
     StaleTaskCancelledError,
@@ -2214,6 +2215,34 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
     r2 = await sm.get_queue_config("q1")
     assert r2 is not None
     assert r2.max_concurrent == 5, "cache should serve the original value"
+
+
+@pytest.mark.asyncio
+async def test_get_queue_limits_surfaces_max_concurrent_and_has_sync_tasks(
+    redis, session_factory, dummy_task_adapter
+):
+    """get_queue_limits reuses get_queue_config's cache and reports QueueLimits per queue."""
+    routing_backend = SQLRoutingBackend(session_factory)
+    sm = StateManager(
+        routing_backend,
+        task_state=dummy_task_adapter,
+        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
+        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
+        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
+        cron_dag_scheduler=RedisCronDAGScheduler(redis),
+        cancellation_bus=RedisCancellationBus(redis),
+        routing_notifications=RedisRoutingNotifications(redis),
+    )
+    await sm.routing.save_queue_config(QueueConfig(name="sync_q", max_concurrent=5, has_sync_tasks=True))
+    await sm.routing.save_queue_config(QueueConfig(name="async_q", max_concurrent=3))
+
+    result = await sm.get_queue_limits({"sync_q", "async_q", "missing_q"})
+
+    assert result == {
+        "sync_q": QueueLimits(5, True),
+        "async_q": QueueLimits(3, False),
+        "missing_q": QueueLimits(None, False),
+    }
 
 
 @pytest.mark.asyncio

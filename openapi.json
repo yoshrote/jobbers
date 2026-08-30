@@ -1944,7 +1944,7 @@
     "/dags/{dag_run_id}/resume": {
       "post": {
         "summary": "Resume Dag",
-        "description": "Retry every FAILED/STALLED/CANCELLED/DROPPED task in a DAG run from its stored parameters.\n\nRequires the run's task history, DAG run index, and (if the run uses fan-in)\nfan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in\nTTL expiry -- see GET /dags/{dag_run_id}/resume-check and\ndocs/dag-resume-design.md for what each unresumable reason means.",
+        "description": "Retry every FAILED/STALLED/CANCELLED/DROPPED task in a DAG run from its stored parameters.\n\nRequires the run's task history, DAG run index, and (if the run uses fan-in)\nfan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in\nTTL expiry -- see GET /dags/{dag_run_id}/resume-check and\ndocs/interacting-with-dags.md for what each unresumable reason means.",
         "operationId": "resume_dag_dags__dag_run_id__resume_post",
         "parameters": [
           {
@@ -2388,6 +2388,11 @@
                 "type": "null"
               }
             ]
+          },
+          "has_sync_tasks": {
+            "type": "boolean",
+            "title": "Has Sync Tasks",
+            "default": false
           }
         },
         "type": "object",
@@ -2915,6 +2920,10 @@
             ],
             "title": "Cleanup On"
           },
+          "execution_mode": {
+            "$ref": "#/components/schemas/TaskExecutionMode",
+            "default": "async"
+          },
           "max_heartbeat_interval": {
             "anyOf": [
               {
@@ -2957,6 +2966,15 @@
         ],
         "title": "TaskConfig",
         "description": "Configuration for a task."
+      },
+      "TaskExecutionMode": {
+        "type": "string",
+        "enum": [
+          "async",
+          "sync_subworker"
+        ],
+        "title": "TaskExecutionMode",
+        "description": "How a registered task function is invoked."
       },
       "TaskShutdownPolicy": {
         "type": "string",

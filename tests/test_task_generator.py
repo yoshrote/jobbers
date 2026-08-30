@@ -7,6 +7,7 @@ from ulid import ULID
 
 from jobbers import task_generator as tg_module
 from jobbers.models.task import Task, TaskStatus
+from jobbers.protocols import QueueLimits
 from jobbers.state_manager import StateManager
 from jobbers.task_generator import _CAPACITY_BACKOFF_SECS, TaskGenerator
 
@@ -157,7 +158,9 @@ async def test_filter_by_worker_queue_capacity_no_limits():
     """Test that filter_by_worker_queue_capacity returns all queues when no limits are set."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {"queue1": 5, "queue2": 10}
-    state_manager.get_queue_limits = AsyncMock(return_value={"queue1": None, "queue2": None})
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={"queue1": QueueLimits(None, False), "queue2": QueueLimits(None, False)}
+    )
     task_generator = TaskGenerator(state_manager)
 
     queues = {"queue1", "queue2"}
@@ -172,7 +175,9 @@ async def test_filter_by_worker_queue_capacity_zero_limit():
     """Test that filter_by_worker_queue_capacity returns all queues when limit is 0 (no limit)."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {"queue1": 5, "queue2": 10}
-    state_manager.get_queue_limits = AsyncMock(return_value={"queue1": 0, "queue2": 0})
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={"queue1": QueueLimits(0, False), "queue2": QueueLimits(0, False)}
+    )
     task_generator = TaskGenerator(state_manager)
 
     queues = {"queue1", "queue2"}
@@ -187,7 +192,9 @@ async def test_filter_by_worker_queue_capacity_under_limit():
     """Test that filter_by_worker_queue_capacity includes queues under their limits."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {"queue1": 3, "queue2": 7}
-    state_manager.get_queue_limits = AsyncMock(return_value={"queue1": 5, "queue2": 10})
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={"queue1": QueueLimits(5, False), "queue2": QueueLimits(10, False)}
+    )
     task_generator = TaskGenerator(state_manager)
 
     queues = {"queue1", "queue2"}
@@ -202,7 +209,9 @@ async def test_filter_by_worker_queue_capacity_at_limit():
     """Test that filter_by_worker_queue_capacity excludes queues at their limits."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {"queue1": 5, "queue2": 10}
-    state_manager.get_queue_limits = AsyncMock(return_value={"queue1": 5, "queue2": 10})
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={"queue1": QueueLimits(5, False), "queue2": QueueLimits(10, False)}
+    )
     task_generator = TaskGenerator(state_manager)
 
     queues = {"queue1", "queue2"}
@@ -217,7 +226,9 @@ async def test_filter_by_worker_queue_capacity_over_limit():
     """Test that filter_by_worker_queue_capacity excludes queues over their limits."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {"queue1": 8, "queue2": 15}
-    state_manager.get_queue_limits = AsyncMock(return_value={"queue1": 5, "queue2": 10})
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={"queue1": QueueLimits(5, False), "queue2": QueueLimits(10, False)}
+    )
     task_generator = TaskGenerator(state_manager)
 
     queues = {"queue1", "queue2"}
@@ -254,11 +265,11 @@ async def test_filter_by_worker_queue_capacity_mixed_scenarios():
     }
     state_manager.get_queue_limits = AsyncMock(
         return_value={
-            "queue1": 5,
-            "queue2": 10,
-            "queue3": 12,
-            "queue4": 5,
-            "queue5": 0,
+            "queue1": QueueLimits(5, False),
+            "queue2": QueueLimits(10, False),
+            "queue3": QueueLimits(12, False),
+            "queue4": QueueLimits(5, False),
+            "queue5": QueueLimits(0, False),
         }
     )
     task_generator = TaskGenerator(state_manager)
@@ -275,7 +286,9 @@ async def test_filter_by_worker_queue_capacity_no_active_tasks():
     """Test that filter_by_worker_queue_capacity includes queues with no active tasks."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
-    state_manager.get_queue_limits = AsyncMock(return_value={"queue1": 5, "queue2": 3})
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={"queue1": QueueLimits(5, False), "queue2": QueueLimits(3, False)}
+    )
     task_generator = TaskGenerator(state_manager)
 
     queues = {"queue1", "queue2"}
@@ -290,7 +303,7 @@ async def test_filter_by_worker_queue_capacity_missing_queue_data():
     """Test that filter_by_worker_queue_capacity handles missing data gracefully."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {"queue1": 3}
-    state_manager.get_queue_limits = AsyncMock(return_value={"queue1": 5})
+    state_manager.get_queue_limits = AsyncMock(return_value={"queue1": QueueLimits(5, False)})
     task_generator = TaskGenerator(state_manager)
 
     queues = {"queue1", "queue2", "queue3"}
@@ -305,7 +318,9 @@ async def test_filter_by_worker_queue_capacity_regression_test():
     """Regression test for the bug where > was used instead of < in the comparison."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {"busy_queue": 8, "available_queue": 2}
-    state_manager.get_queue_limits = AsyncMock(return_value={"busy_queue": 5, "available_queue": 5})
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={"busy_queue": QueueLimits(5, False), "available_queue": QueueLimits(5, False)}
+    )
     task_generator = TaskGenerator(state_manager)
 
     queues = {"busy_queue", "available_queue"}
@@ -313,6 +328,72 @@ async def test_filter_by_worker_queue_capacity_regression_test():
 
     assert result == {"available_queue"}
     state_manager.get_queue_limits.assert_called_once_with(queues)
+
+
+# ── filter_by_worker_queue_capacity: sync_subworker capacity gate ─────────────
+
+
+@pytest.mark.asyncio
+async def test_filter_by_worker_queue_capacity_no_subworker_pool_ignores_has_sync_tasks():
+    """Without a subworker_pool configured, has_sync_tasks queues are never gated."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits = AsyncMock(return_value={"sync_queue": QueueLimits(None, True)})
+    task_generator = TaskGenerator(state_manager)
+
+    result = await task_generator.filter_by_worker_queue_capacity({"sync_queue"})
+
+    assert result == {"sync_queue"}
+
+
+@pytest.mark.asyncio
+async def test_filter_by_worker_queue_capacity_excludes_sync_queues_when_pool_full():
+    """A sync_subworker queue is excluded when the SubworkerPool has no free slots."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits = AsyncMock(
+        return_value={
+            "sync_queue": QueueLimits(None, True),
+            "async_queue": QueueLimits(None, False),
+        }
+    )
+    subworker_pool = Mock()
+    subworker_pool.free_slots = 0
+    task_generator = TaskGenerator(state_manager, subworker_pool=subworker_pool)
+
+    result = await task_generator.filter_by_worker_queue_capacity({"sync_queue", "async_queue"})
+
+    assert result == {"async_queue"}
+
+
+@pytest.mark.asyncio
+async def test_filter_by_worker_queue_capacity_includes_sync_queues_when_pool_has_free_slots():
+    """A sync_subworker queue stays eligible while the SubworkerPool still has free slots."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {}
+    state_manager.get_queue_limits = AsyncMock(return_value={"sync_queue": QueueLimits(None, True)})
+    subworker_pool = Mock()
+    subworker_pool.free_slots = 2
+    task_generator = TaskGenerator(state_manager, subworker_pool=subworker_pool)
+
+    result = await task_generator.filter_by_worker_queue_capacity({"sync_queue"})
+
+    assert result == {"sync_queue"}
+
+
+@pytest.mark.asyncio
+async def test_filter_by_worker_queue_capacity_sync_gate_combines_with_concurrency_limit():
+    """A queue already excluded by max_concurrent stays excluded regardless of has_sync_tasks."""
+    state_manager = Mock(spec=StateManager)
+    state_manager.active_tasks_per_queue = {"busy_sync_queue": 5}
+    state_manager.get_queue_limits = AsyncMock(return_value={"busy_sync_queue": QueueLimits(5, True)})
+    subworker_pool = Mock()
+    subworker_pool.free_slots = 3  # plenty of subworker capacity...
+    task_generator = TaskGenerator(state_manager, subworker_pool=subworker_pool)
+
+    result = await task_generator.filter_by_worker_queue_capacity({"busy_sync_queue"})
+
+    assert result == set()  # ...but max_concurrent already excludes it
 
 
 # ── stop() ────────────────────────────────────────────────────────────────────

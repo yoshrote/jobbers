@@ -30,6 +30,11 @@ class QueueConfig(BaseModel):
     rate_numerator: int | None = None  # Number of tasks to process from this queue
     rate_denominator: int | None = None  # Number of tasks to rate limit
     rate_period: RatePeriod | None = None  # Period for rate limiting
+    # Admin-set hint: tasks routed to this queue may be sync-dispatched (execution_mode
+    # sync_subworker). Read by TaskGenerator.filter_by_worker_queue_capacity to avoid
+    # popping a sync task off a queue when the worker's SubworkerPool has no free slot --
+    # see sync-task-subworker-design.md §4.3.
+    has_sync_tasks: bool = Field(default=False)
 
     def period_in_seconds(self) -> int | None:
         """Convert the rate period to seconds."""
@@ -47,12 +52,13 @@ class QueueConfig(BaseModel):
 
     @classmethod
     def from_row(cls, row: Any) -> Self:
-        """Construct from a row (name, max_concurrent, rate_numerator, rate_denominator, rate_period)."""
-        name, max_concurrent, rate_numerator, rate_denominator, rate_period = row
+        """Construct from a row (name, max_concurrent, rate_numerator, rate_denominator, rate_period, has_sync_tasks)."""
+        name, max_concurrent, rate_numerator, rate_denominator, rate_period, has_sync_tasks = row
         return cls(
             name=name,
             max_concurrent=max_concurrent,
             rate_numerator=rate_numerator,
             rate_denominator=rate_denominator,
             rate_period=RatePeriod(rate_period) if rate_period else None,
+            has_sync_tasks=bool(has_sync_tasks),
         )

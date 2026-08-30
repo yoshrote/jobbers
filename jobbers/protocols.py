@@ -3,6 +3,7 @@ Protocol definitions for all pluggable adapters.
 
 Routing:
 - `RoutingBackendReadOnlyError` — raised by read-only backends on write operations.
+- `QueueLimits` — per-queue max_concurrent/has_sync_tasks pair returned by get_queue_limits.
 - `QueueConfigProtocol` — interface for queue/role configuration and refresh-tag management.
 - `TaskRoutingConfigProtocol` — interface for task routing configuration.
 - `RoutingBackendProtocol` — interface all routing backends must implement.
@@ -63,6 +64,13 @@ class RoutingBackendReadOnlyError(Exception):
     """Raised when a write operation is attempted on a read-only routing backend."""
 
 
+class QueueLimits(NamedTuple):
+    """Per-queue values ``TaskGenerator`` needs for capacity gating, read off ``QueueConfig``."""
+
+    max_concurrent: int | None
+    has_sync_tasks: bool
+
+
 @runtime_checkable
 class QueueConfigProtocol(Protocol):
     """Interface for queue/role configuration."""
@@ -77,7 +85,7 @@ class QueueConfigProtocol(Protocol):
     async def create_role(self, role: str, queues_set: set[str]) -> bool: ...
     async def get_all_roles(self) -> list[str]: ...
     async def delete_role(self, role: str) -> None: ...
-    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]: ...
+    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, QueueLimits]: ...
     async def get_roles_for_queue(self, queue_name: str) -> list[str]: ...
 
 

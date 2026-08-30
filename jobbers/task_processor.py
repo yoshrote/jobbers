@@ -18,6 +18,7 @@ from jobbers.models.dag import (
     validate_fan_in_cardinality,
 )
 from jobbers.models.task import Task
+from jobbers.models.task_config import TaskExecutionMode
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
 from jobbers.registry import get_task_config
@@ -28,11 +29,19 @@ from jobbers.state_manager import (
     TaskRateLimitedError,
     UserCancellationError,
 )
+from jobbers.subworker.errors import SubworkerTaskFailure
+from jobbers.subworker.pool import SubworkerPool
 from jobbers.utils.di import DependencyResolver
 from jobbers.utils.di import Depends as _Depends
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
+
+# Passed as SubworkerPool.dispatch()'s cancel_grace_period: how long a cancelled/timed-out
+# sync_subworker task's subworker gets to unwind cooperatively before dispatch() escalates
+# to a hard kill on the caller's behalf. Not yet exposed as worker-level config (see
+# .claude/plans/sync-task-subworker-design.md §8) -- a fixed default until it is.
+_SUBWORKER_CANCEL_GRACE_PERIOD = 5.0
 
 
 logger = logging.getLogger(__name__)
@@ -115,6 +124,13 @@ tasks_completed_after_stale = meter.create_counter("tasks_completed_after_stale"
 _OMIT = object()  # sentinel: key legitimately absent — let the function's own Python default apply
 
 
+async def _missing_subworker_pool(task: Task) -> Any:
+    raise RuntimeError(
+        f"Task {task.name} v{task.version} has execution_mode=sync_subworker but this "
+        "worker has no subworker pool configured."
+    )
+
+
 def _resolve_from_parent(
     task: Task, param_name: str, spec: FromParent, parent_results_map: dict[ULID, dict[Any, Any]]
 ) -> Any:
@@ -155,8 +171,9 @@ def _resolve_from_parent(
 class TaskProcessor:
     """TaskProcessor to process tasks from a TaskGenerator."""
 
-    def __init__(self, state_manager: StateManager) -> None:
+    def __init__(self, state_manager: StateManager, subworker_pool: SubworkerPool | None = None) -> None:
         self.state_manager = state_manager
+        self.subworker_pool = subworker_pool
         self._current_promise: Awaitable[Any] | None = None
 
     async def run(self, task: Task) -> None:
@@ -229,7 +246,31 @@ class TaskProcessor:
                                 if isinstance(meta, _Depends) and meta.dependency in dep_cache:
                                     kwargs[param_name] = dep_cache[meta.dependency]
 
-                    self._current_promise = task.task_config.function(**kwargs)
+                    if task.task_config.execution_mode == TaskExecutionMode.SYNC_SUBWORKER:
+                        if self.subworker_pool is None:
+                            # Raised from *inside* the coroutine (rather than here,
+                            # directly) so it flows through the same try/except below as
+                            # any other task-execution error -- FAILED + retry/DLQ policy
+                            # -- instead of escaping process() as an unhandled exception.
+                            self._current_promise = _missing_subworker_pool(task)
+                        else:
+
+                            def _forward_heartbeat(t: Task = task) -> None:
+                                asyncio.ensure_future(self.state_manager.update_task_heartbeat(t))  # noqa: RUF006
+
+                            # dispatch() cancels/kills the subworker itself if this await
+                            # is cancelled (directly, or by the asyncio.timeout() below) --
+                            # no extra handling needed in the except clauses further down.
+                            self._current_promise = self.subworker_pool.dispatch(
+                                task.name,
+                                task.version,
+                                kwargs,
+                                request_id=str(task.id),
+                                on_heartbeat=_forward_heartbeat,
+                                cancel_grace_period=_SUBWORKER_CANCEL_GRACE_PERIOD,
+                            )
+                    else:
+                        self._current_promise = task.task_config.function(**kwargs)
                     if task.task_config.on_shutdown == TaskShutdownPolicy.CONTINUE:
                         self._current_promise = asyncio.shield(self._current_promise)
 
@@ -256,6 +297,21 @@ class TaskProcessor:
                         else:
                             ex = exc
                             await self.handle_system_cancelled_task(task)
+                    except SubworkerTaskFailure as exc:
+                        # No live exception type crosses the subworker boundary (see
+                        # SubworkerTaskError) -- match expected_exceptions by class name
+                        # against the marshalled error_type instead of isinstance().
+                        if (
+                            task.task_config
+                            and task.task_config.expected_exceptions
+                            and any(
+                                expected.__name__ == exc.error.error_type
+                                for expected in task.task_config.expected_exceptions
+                            )
+                        ):
+                            task = await self.handle_expected_exception(task, exc)
+                        else:
+                            await self.handle_unexpected_exception(task, exc)
                     except Exception as exc:
                         if (
                             task.task_config

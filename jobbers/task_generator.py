@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 from opentelemetry import metrics
 
 from jobbers.models.task import Task
+from jobbers.protocols import QueueLimits
 from jobbers.state_manager import StateManager
+from jobbers.subworker.pool import SubworkerPool
 
 if TYPE_CHECKING:
     from ulid import ULID
@@ -20,6 +22,7 @@ queue_config_refreshes = meter.create_counter("queue_config_refreshes", unit="1"
 refresh_lag_ms = meter.create_histogram("refresh_lag_ms", unit="ms")
 
 _CAPACITY_BACKOFF_SECS: float = 1.0
+_UNKNOWN_QUEUE_LIMITS = QueueLimits(None, False)
 
 
 class MaxTaskCounter:
@@ -67,6 +70,7 @@ class TaskGenerator:
         state_manager: StateManager,
         role: str = "default",
         max_tasks: int = 100,
+        subworker_pool: SubworkerPool | None = None,
     ) -> None:
         self.role: str = role
         self.state_manager: StateManager = state_manager
@@ -74,6 +78,7 @@ class TaskGenerator:
         self.task_queues: set[str] = set()
         self.refresh_tag: ULID | None = None
         self.routing_version: ULID | None = None
+        self.subworker_pool = subworker_pool
         self._run: bool = True
 
     async def find_queues(self) -> set[str]:
@@ -92,11 +97,24 @@ class TaskGenerator:
         logger.debug("Queues: %s; Active: %s; Limits: %s", queues, active_tasks, queue_worker_limits)
         # Deliberately truthy, not `is not None`: limit=0 means unlimited, same as a
         # missing/None entry -- see QueueConfig.max_concurrent's docstring.
-        return {
+        candidates = {
             q
             for q in queues
-            if not (limit := queue_worker_limits.get(q, 0)) or active_tasks.get(q, 0) < limit
+            if not (limit := queue_worker_limits.get(q, _UNKNOWN_QUEUE_LIMITS).max_concurrent)
+            or active_tasks.get(q, 0) < limit
         }
+
+        # Don't pop a sync_subworker task off a queue the worker has no subworker
+        # capacity to run right now -- skip those queues this iteration instead of
+        # popping the task and holding a WORKER_CONCURRENT_TASKS slot hostage waiting
+        # on a subworker that isn't there.
+        # See sync-task-subworker-design.md §4.3.
+        if self.subworker_pool is not None and self.subworker_pool.free_slots == 0:
+            candidates -= {
+                q for q in candidates if queue_worker_limits.get(q, _UNKNOWN_QUEUE_LIMITS).has_sync_tasks
+            }
+
+        return candidates
 
     async def queues(self) -> set[str]:
         # store the full set of tasks in self.task_queues, but emit the

@@ -1,6 +1,7 @@
 import datetime as dt
+import inspect
 import logging
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from ulid import ULID
@@ -8,9 +9,9 @@ from ulid import ULID
 from jobbers import db
 from jobbers.models.dag import DAGNode
 from jobbers.models.task import Task
-from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
+from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig, TaskExecutionMode
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
-from jobbers.utils.di import inspect_task_dependencies
+from jobbers.utils.di import get_injected_param_names, inspect_task_dependencies
 
 logger = logging.getLogger(__name__)
 _task_function_map: dict[tuple[str, int], TaskConfig] = {}
@@ -20,8 +21,8 @@ class TaskWrapper:
     """
     Wraps a registered task function with helpers for submission and DAG construction.
 
-    Instances are callable — calling them invokes the underlying async task function.
-    Three additional methods are provided:
+    Instances are callable — calling them invokes the underlying task function (async or,
+    for a ``sync_subworker`` task, plain sync). Three additional methods are provided:
 
     - ``submit(queue, **params)`` — create and submit a task to a queue.
     - ``schedule(run_at, queue, **params)`` — create and schedule a task for future execution.
@@ -29,12 +30,12 @@ class TaskWrapper:
       programmatic DAG construction.
     """
 
-    def __init__(self, func: Callable[..., Awaitable[Any]], name: str, version: int) -> None:
+    def __init__(self, func: Callable[..., Any], name: str, version: int) -> None:
         self._func = func
         self._name = name
         self._version = version
 
-    def __call__(self, **kwargs: Any) -> Awaitable[Any]:
+    def __call__(self, **kwargs: Any) -> Any:
         return self._func(**kwargs)
 
     async def submit(self, queue: str = "default", **params: Any) -> "Task":
@@ -78,6 +79,26 @@ def register_task(
         # Unwrap a TaskWrapper so double-decoration stores the raw function.
         raw_func: Callable[..., Any] = func._func if isinstance(func, TaskWrapper) else func
         dep_graph = inspect_task_dependencies(raw_func)
+        execution_mode = (
+            TaskExecutionMode.ASYNC
+            if inspect.iscoroutinefunction(raw_func)
+            else TaskExecutionMode.SYNC_SUBWORKER
+        )
+        if execution_mode == TaskExecutionMode.SYNC_SUBWORKER:
+            injected = get_injected_param_names(raw_func)
+            if injected:
+                logger.exception(
+                    "Task %s version %d is a synchronous function but declares Depends() params %s",
+                    name,
+                    version,
+                    sorted(injected),
+                )
+                raise ValueError(
+                    f"Task {name} version {version} is a synchronous function and cannot declare "
+                    f"Depends() parameters {sorted(injected)}: dependency-resolved objects are bound "
+                    "to this process's event loop/connections and cannot cross into a subworker "
+                    "process. Make the task async, or drop the Depends() parameters."
+                )
         if (name, version) in _task_function_map:
             if _task_function_map[(name, version)].function != raw_func:
                 logger.exception(
@@ -92,6 +113,7 @@ def register_task(
             version=version,
             function=raw_func,
             dependency_graph=dep_graph,
+            execution_mode=execution_mode,
             max_concurrent=max_concurrent,
             timeout=timeout,
             max_retries=max_retries,

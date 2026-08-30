@@ -1,11 +1,13 @@
 import datetime as dt
+from typing import Annotated
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from jobbers.models.dag import DAGNode
-from jobbers.models.task_config import TaskConfig
+from jobbers.models.task_config import TaskConfig, TaskExecutionMode
 from jobbers.registry import TaskWrapper, _task_function_map, get_task_config, register_task
+from jobbers.utils.di import Depends
 
 
 @pytest.fixture(autouse=True)
@@ -110,6 +112,61 @@ def test_get_task_config_not_found():
     """Test retrieving a non-existent task configuration."""
     task_config = get_task_config("non_existent_task", 1)
     assert task_config is None
+
+
+def test_register_task_sync_function_gets_sync_subworker_execution_mode():
+    """A plain (non-async) function is auto-detected as execution_mode=sync_subworker."""
+
+    @register_task(name="sync_task", version=1)
+    def sync_function():  # pragma: no cover
+        pass
+
+    task_config = get_task_config("sync_task", 1)
+    assert task_config is not None
+    assert task_config.execution_mode == TaskExecutionMode.SYNC_SUBWORKER
+
+
+def test_register_task_async_function_gets_async_execution_mode():
+    """An async def function is auto-detected as execution_mode=async."""
+
+    @register_task(name="async_task", version=1)
+    async def async_function(**kwargs):  # pragma: no cover
+        return kwargs
+
+    task_config = get_task_config("async_task", 1)
+    assert task_config is not None
+    assert task_config.execution_mode == TaskExecutionMode.ASYNC
+
+
+def test_register_task_sync_function_with_depends_raises():
+    """A sync function that declares a Depends() parameter is rejected at registration time."""
+
+    async def get_val() -> int:
+        return 1
+
+    with pytest.raises(ValueError, match="cannot declare Depends"):
+
+        @register_task(name="sync_di_task", version=1)
+        def sync_function(v: Annotated[int, Depends(get_val)]):  # pragma: no cover
+            pass
+
+    assert get_task_config("sync_di_task", 1) is None
+
+
+def test_register_task_async_function_with_depends_still_allowed():
+    """Depends() remains fine for async tasks; only sync_subworker tasks reject it."""
+
+    async def get_val() -> int:
+        return 1
+
+    @register_task(name="async_di_task", version=1)
+    async def async_function(v: Annotated[int, Depends(get_val)]):  # pragma: no cover
+        return v
+
+    task_config = get_task_config("async_di_task", 1)
+    assert task_config is not None
+    assert task_config.execution_mode == TaskExecutionMode.ASYNC
+    assert len(task_config.dependency_graph) == 1
 
 
 async def _test_function(**kwargs):  # pragma: no cover

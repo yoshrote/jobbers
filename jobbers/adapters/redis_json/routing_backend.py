@@ -24,6 +24,7 @@ from jobbers.adapters.redis_json._helpers import (
 )
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_routing import RoutingConfig
+from jobbers.protocols import QueueLimits
 
 if TYPE_CHECKING:
     from redis.asyncio.client import Redis
@@ -132,7 +133,7 @@ class RedisJSONQueueConfigAdapter:
         results = await self._client.ft(self.QUEUE_IDX).search(SearchQuery("*").no_content().paging(0, 10000))
         return sorted(doc.id.removeprefix("routing:queue:") for doc in results.docs)
 
-    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]:
+    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, QueueLimits]:
         if not queues_set:
             return {}
         ordered = list(queues_set)
@@ -140,12 +141,13 @@ class RedisJSONQueueConfigAdapter:
         for name in ordered:
             pipe.json().get(self.QUEUE_KEY(name=name))
         raws: list[dict[str, Any] | None] = await pipe.execute()
-        result: dict[str, int | None] = {}
+        result: dict[str, QueueLimits] = {}
         for name, raw in zip(ordered, raws):
             if raw is None:
-                result[name] = None
+                result[name] = QueueLimits(None, False)
             else:
-                result[name] = QueueConfig.model_validate(raw).max_concurrent
+                cfg = QueueConfig.model_validate(raw)
+                result[name] = QueueLimits(cfg.max_concurrent, cfg.has_sync_tasks)
         return result
 
     # ── Role CRUD ─────────────────────────────────────────────────────────────

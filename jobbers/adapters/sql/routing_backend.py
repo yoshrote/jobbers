@@ -22,6 +22,7 @@ from jobbers.migrations.schema import (
 )
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_routing import RoutingConfig
+from jobbers.protocols import QueueLimits
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -56,6 +57,7 @@ class SQLQueueConfigAdapter:
                     queues.c.rate_numerator,
                     queues.c.rate_denominator,
                     queues.c.rate_period,
+                    queues.c.has_sync_tasks,
                 ).where(queues.c.name == queue)
             )
             row = result.fetchone()
@@ -75,6 +77,7 @@ class SQLQueueConfigAdapter:
                         rate_numerator=queue_config.rate_numerator,
                         rate_denominator=queue_config.rate_denominator,
                         rate_period=queue_config.rate_period,
+                        has_sync_tasks=queue_config.has_sync_tasks,
                     )
                 )
             else:
@@ -85,6 +88,7 @@ class SQLQueueConfigAdapter:
                         rate_numerator=queue_config.rate_numerator,
                         rate_denominator=queue_config.rate_denominator,
                         rate_period=queue_config.rate_period,
+                        has_sync_tasks=queue_config.has_sync_tasks,
                     )
                 )
 
@@ -99,6 +103,7 @@ class SQLQueueConfigAdapter:
                         rate_numerator=queue_config.rate_numerator,
                         rate_denominator=queue_config.rate_denominator,
                         rate_period=queue_config.rate_period,
+                        has_sync_tasks=queue_config.has_sync_tasks,
                     )
                 )
         except IntegrityError:
@@ -120,16 +125,18 @@ class SQLQueueConfigAdapter:
             result = await session.execute(select(queues.c.name).order_by(queues.c.name))
             return [row[0] for row in result.fetchall()]
 
-    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, int | None]:
-        """Return a map of queue name → max_concurrent for the requested queues."""
+    async def get_queue_limits(self, queues_set: set[str]) -> dict[str, QueueLimits]:
+        """Return a map of queue name → QueueLimits for the requested queues."""
         if not queues_set:
             return {}
         async with self._session_factory() as session:
             result = await session.execute(
-                select(queues.c.name, queues.c.max_concurrent).where(queues.c.name.in_(list(queues_set)))
+                select(queues.c.name, queues.c.max_concurrent, queues.c.has_sync_tasks).where(
+                    queues.c.name.in_(list(queues_set))
+                )
             )
-            found = {row[0]: row[1] for row in result.fetchall()}
-        return {q: found.get(q) for q in queues_set}
+            found = {row[0]: QueueLimits(row[1], bool(row[2])) for row in result.fetchall()}
+        return {q: found.get(q, QueueLimits(None, False)) for q in queues_set}
 
     # ── Role CRUD ─────────────────────────────────────────────────────────────
 
