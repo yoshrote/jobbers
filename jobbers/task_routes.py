@@ -15,7 +15,15 @@ from ulid import ULID
 
 from jobbers import db, registry
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.dag import DAGResumeReason, DAGRunPagination, DAGTaskSpec, FanInCardinalityError
+from jobbers.models.dag import (
+    DAGResumeReason,
+    DAGRunPagination,
+    DAGTaskSpec,
+    DynamicFanOutCallback,
+    FanInCardinalityError,
+    RouterCallback,
+    RouterSpec,
+)
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
@@ -133,7 +141,7 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
         spec = DAGTaskSpec(
             id=task.id,
             name=task.name,
-            queue=task.queue,
+            lane=task.lane,
             version=task.version,
             parameters=task.parameters,
             dag_callbacks=task.dag_callbacks,
@@ -395,6 +403,53 @@ def _parse_ulid(raw: str, field_name: str = "id") -> ULID:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw!r}") from ex
 
 
+def _require_registered_task(name: str, version: int) -> None:
+    if not registry.get_task_config(name, version):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown task '{name}@{version}'. Register it with @register_task before submitting.",
+        )
+
+
+def _validate_spec_against_registry(spec: DAGTaskSpec) -> None:
+    """Validate a serialised spec subtree -- used for router candidates and fan-out arms."""
+    seen: set[str] = set()
+    worklist: list[DAGTaskSpec] = [spec]
+    while worklist:
+        current = worklist.pop()
+        if str(current.id) in seen:
+            continue
+        seen.add(str(current.id))
+        _require_registered_task(current.name, current.version)
+        for cb in current.dag_callbacks:
+            if isinstance(cb, RouterCallback):
+                _validate_router_against_registry(cb.router)
+                continue
+            if isinstance(cb, DynamicFanOutCallback):
+                if cb.arm_router is not None:
+                    _validate_router_against_registry(cb.arm_router)
+                elif cb.arm_root is not None:
+                    worklist.append(cb.arm_root)
+                worklist.append(cb.collector)
+            else:
+                worklist.append(cb.task)
+            if cb.error_callback is not None:
+                worklist.append(cb.error_callback)
+
+
+def _validate_router_against_registry(router: RouterSpec) -> None:
+    if not registry.get_router_config(router.router, router.version):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown router '{router.router}@{router.version}'. "
+                "Register it with @register_router before submitting."
+            ),
+        )
+    for candidate in router.candidates:
+        _validate_spec_against_registry(candidate)
+
+
 def _validate_dag_against_registry(roots: list[Any]) -> None:
     """Walk all reachable nodes (not just roots) and validate each against the registry."""
     visited: set[int] = set()
@@ -404,15 +459,25 @@ def _validate_dag_against_registry(roots: list[Any]) -> None:
         if id(node) in visited:
             continue
         visited.add(id(node))
-        if not registry.get_task_config(node._name, node._version):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown task '{node._name}@{node._version}'. Register it with @register_task before submitting.",
-            )
+        _require_registered_task(node._name, node._version)
         for successor, _, error_node in node._successors:
             worklist.append(successor)
             if error_node is not None:
                 worklist.append(error_node)
+        # Declarative fan-outs and routers hang off the builder as serialised
+        # specs rather than DAGNode successors, so walk them separately.
+        for fanout_cb in node._fanout_callbacks:
+            if fanout_cb.arm_router is not None:
+                _validate_router_against_registry(fanout_cb.arm_router)
+            elif fanout_cb.arm_root is not None:
+                _validate_spec_against_registry(fanout_cb.arm_root)
+            _validate_spec_against_registry(fanout_cb.collector)
+            if fanout_cb.error_callback is not None:
+                _validate_spec_against_registry(fanout_cb.error_callback)
+        for router_cb in node._router_callbacks:
+            _validate_router_against_registry(router_cb.router)
+            if router_cb.error_callback is not None:
+                _validate_spec_against_registry(router_cb.error_callback)
 
 
 async def _require_role(role_name: str, sm: StateManager) -> None:

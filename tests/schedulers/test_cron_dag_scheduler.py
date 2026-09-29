@@ -87,14 +87,14 @@ async def test_add_and_get_preserves_disabled(scheduler):
 
 @pytest.mark.asyncio
 async def test_add_and_get_preserves_dag_spec(scheduler):
-    spec = DAGTaskSpec(name="special_task", queue="myqueue", version=2)
+    spec = DAGTaskSpec(name="special_task", lane="myqueue", version=2)
     entry = make_entry()
     entry = CronDAGEntry(**{**entry.model_dump(), "dag_spec": spec})
     await add_entry(scheduler, entry, FUTURE)
     fetched = await scheduler.get(entry.id)
     assert fetched is not None
     assert fetched.dag_spec.name == "special_task"
-    assert fetched.dag_spec.queue == "myqueue"
+    assert fetched.dag_spec.lane == "myqueue"
     assert fetched.dag_spec.version == 2
 
 

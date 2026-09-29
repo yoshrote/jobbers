@@ -1944,7 +1944,7 @@
     "/dags/{dag_run_id}/resume": {
       "post": {
         "summary": "Resume Dag",
-        "description": "Retry every FAILED/STALLED/CANCELLED/DROPPED task in a DAG run from its stored parameters.\n\nRequires the run's task history, DAG run index, and (if the run uses fan-in)\nfan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in\nTTL expiry -- see GET /dags/{dag_run_id}/resume-check and\ndocs/dag-resume-design.md for what each unresumable reason means.",
+        "description": "Retry every FAILED/STALLED/CANCELLED/DROPPED task in a DAG run from its stored parameters.\n\nRequires the run's task history, DAG run index, and (if the run uses fan-in)\nfan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in\nTTL expiry -- see GET /dags/{dag_run_id}/resume-check and\ndocs/interacting-with-dags.md for what each unresumable reason means.",
         "operationId": "resume_dag_dags__dag_run_id__resume_post",
         "parameters": [
           {
@@ -2085,9 +2085,9 @@
             "type": "string",
             "title": "Name"
           },
-          "queue": {
+          "lane": {
             "type": "string",
-            "title": "Queue",
+            "title": "Lane",
             "default": "default"
           },
           "version": {
@@ -2112,6 +2112,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/DynamicFanOutCallback"
+                },
+                {
+                  "$ref": "#/components/schemas/RouterCallback"
                 }
               ],
               "discriminator": {
@@ -2119,6 +2122,7 @@
                 "mapping": {
                   "dynamic_fanout": "#/components/schemas/DynamicFanOutCallback",
                   "fan_in": "#/components/schemas/FanInCallback",
+                  "router": "#/components/schemas/RouterCallback",
                   "simple": "#/components/schemas/SimpleCallback"
                 }
               }
@@ -2243,7 +2247,24 @@
             "default": "dynamic_fanout"
           },
           "arm_root": {
-            "$ref": "#/components/schemas/DAGTaskSpec"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DAGTaskSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "arm_router": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RouterSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "collector": {
             "$ref": "#/components/schemas/DAGTaskSpec"
@@ -2276,7 +2297,6 @@
         },
         "type": "object",
         "required": [
-          "arm_root",
           "collector"
         ],
         "title": "DynamicFanOutCallback",
@@ -2466,6 +2486,85 @@
         "title": "RootResponse",
         "description": "Response model for the root endpoint."
       },
+      "RouterCallback": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "router",
+            "title": "Type",
+            "default": "router"
+          },
+          "router": {
+            "$ref": "#/components/schemas/RouterSpec"
+          },
+          "error_callback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DAGTaskSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "router"
+        ],
+        "title": "RouterCallback",
+        "description": "Run a router when the parent task completes and submit the candidate it picks.\n\nProduced by the mermaid parser for a ``parent --> R`` edge into a rhombus\nnode. The router runs synchronously during callback handling; see\n``TaskProcessor._handle_router``."
+      },
+      "RouterSpec": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 26,
+                "minLength": 26,
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+              },
+              {
+                "type": "string",
+                "maxLength": 16,
+                "minLength": 16,
+                "contentMediaType": "application/octet-stream"
+              }
+            ],
+            "title": "Id"
+          },
+          "router": {
+            "type": "string",
+            "title": "Router"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 0
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Parameters",
+            "default": {}
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/DAGTaskSpec"
+            },
+            "type": "array",
+            "title": "Candidates",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "router"
+        ],
+        "title": "RouterSpec",
+        "description": "Serialisable specification for a router node (a mermaid rhombus).\n\n``router``/``version`` name a ``@register_router`` function; ``parameters``\ncome from the node label. ``candidates`` are the task nodes the router's\noutgoing ``-->`` edges point at -- the router selects exactly one of them,\nor none.\n\n``id`` is pre-assigned so generated diagrams can give the router node a\nstable identifier alongside the task ULIDs."
+      },
       "RoutingConfig": {
         "properties": {
           "task_name": {
@@ -2477,6 +2576,34 @@
             "type": "integer",
             "title": "Task Version",
             "default": 0
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/RoutingRule"
+            },
+            "type": "array",
+            "title": "Rules"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rules"
+        ],
+        "title": "RoutingConfig",
+        "description": "Lane \u2192 queue routing configuration for a task type.\n\nA config is a list of rules. ``rule_for(lane)`` picks the rule scoped to\nthat lane, falling back to the wildcard rule. When neither exists the caller\napplies the identity default: the lane resolves to the queue of the same\nname (see ``docs/lanes-and-queues.md``)."
+      },
+      "RoutingRule": {
+        "properties": {
+          "from_lane": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Lane"
           },
           "strategy": {
             "$ref": "#/components/schemas/RoutingStrategy"
@@ -2508,8 +2635,8 @@
           "strategy",
           "queues"
         ],
-        "title": "RoutingConfig",
-        "description": "Queue routing configuration for a task type."
+        "title": "RoutingRule",
+        "description": "One lane \u2192 queue(s) mapping within a task type's routing config.\n\n``from_lane`` scopes the rule to work that *asked for* that lane. ``None``\nis the wildcard: it matches any lane, which is the blanket-override\nbehaviour routing configs had before lanes existed."
       },
       "RoutingStrategy": {
         "type": "string",
@@ -2618,6 +2745,11 @@
           "name": {
             "type": "string",
             "title": "Name"
+          },
+          "lane": {
+            "type": "string",
+            "title": "Lane",
+            "default": "default"
           },
           "queue": {
             "type": "string",
@@ -2739,6 +2871,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/DynamicFanOutCallback"
+                },
+                {
+                  "$ref": "#/components/schemas/RouterCallback"
                 }
               ],
               "discriminator": {
@@ -2746,6 +2881,7 @@
                 "mapping": {
                   "dynamic_fanout": "#/components/schemas/DynamicFanOutCallback",
                   "fan_in": "#/components/schemas/FanInCallback",
+                  "router": "#/components/schemas/RouterCallback",
                   "simple": "#/components/schemas/SimpleCallback"
                 }
               }

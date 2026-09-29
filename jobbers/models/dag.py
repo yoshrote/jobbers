@@ -60,9 +60,9 @@ from __future__ import annotations
 import datetime as dt  # noqa: TC003 -- resolved at runtime by Pydantic (DAGRunSummary.submitted_at)
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Annotated, Any, Literal, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, get_args, get_origin, get_type_hints
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, model_validator
 from ulid import ULID
 
 # ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ class DAGTaskSpec(BaseModel):
 
     id: ULID = Field(default_factory=ULID)
     name: str
-    queue: str = "default"
+    lane: str = "default"
     version: int = 0
     parameters: dict[str, Any] = {}
     dag_callbacks: list[DAGCallback] = []
@@ -126,12 +126,21 @@ class DAGTaskSpec(BaseModel):
                         error_callback=new_err,
                     )
                 )
+            elif isinstance(cb, RouterCallback):
+                new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
+                new_callbacks.append(
+                    RouterCallback(
+                        router=cb.router._remap(id_map),
+                        error_callback=new_err,
+                    )
+                )
             else:
-                # DynamicFanOutCallback: remap arm_root and collector specs
+                # DynamicFanOutCallback: remap the arm source and collector specs
                 new_err = cb.error_callback._remap(id_map) if cb.error_callback else None
                 new_callbacks.append(
                     DynamicFanOutCallback(
-                        arm_root=cb.arm_root._remap(id_map),
+                        arm_root=cb.arm_root._remap(id_map) if cb.arm_root is not None else None,
+                        arm_router=cb.arm_router._remap(id_map) if cb.arm_router is not None else None,
                         collector=cb.collector._remap(id_map),
                         items_key=cb.items_key,
                         fan_in_ttl=cb.fan_in_ttl,
@@ -142,7 +151,7 @@ class DAGTaskSpec(BaseModel):
         return DAGTaskSpec(
             id=new_id,
             name=self.name,
-            queue=self.queue,
+            lane=self.lane,
             version=self.version,
             parameters=self.parameters,
             dag_callbacks=new_callbacks,
@@ -197,18 +206,78 @@ class DynamicFanOutCallback(BaseModel):
     """
 
     type: Literal["dynamic_fanout"] = "dynamic_fanout"
-    arm_root: DAGTaskSpec
+    arm_root: DAGTaskSpec | None = None
+    # Set instead of ``arm_root`` when the arm root is chosen per item by a
+    # router (mermaid ``A -->> R``). Exactly one of the two is always set.
+    arm_router: RouterSpec | None = None
     collector: DAGTaskSpec
     items_key: str = "items"
     fan_in_ttl: int = 86400
     propagate_fan_in: bool = True
     error_callback: DAGTaskSpec | None = None
 
+    @model_validator(mode="after")
+    def _check_arm_source(self) -> Self:
+        if (self.arm_root is None) == (self.arm_router is None):
+            raise ValueError("DynamicFanOutCallback requires exactly one of arm_root or arm_router")
+        return self
+
+
+class RouterSpec(BaseModel):
+    """
+    Serialisable specification for a router node (a mermaid rhombus).
+
+    ``router``/``version`` name a ``@register_router`` function; ``parameters``
+    come from the node label. ``candidates`` are the task nodes the router's
+    outgoing ``-->`` edges point at -- the router selects exactly one of them,
+    or none.
+
+    ``id`` is pre-assigned so generated diagrams can give the router node a
+    stable identifier alongside the task ULIDs.
+    """
+
+    id: ULID = Field(default_factory=ULID)
+    router: str
+    version: int = 0
+    parameters: dict[str, Any] = {}
+    candidates: list[DAGTaskSpec] = []
+
+    @field_serializer("id", when_used="json")
+    def serialize_id(self, value: ULID) -> str:
+        return str(value)
+
+    def _remap(self, id_map: dict[ULID, ULID]) -> RouterSpec:
+        return RouterSpec(
+            id=id_map.setdefault(self.id, ULID()),
+            router=self.router,
+            version=self.version,
+            parameters=self.parameters,
+            candidates=[c._remap(id_map) for c in self.candidates],
+        )
+
+
+class RouterCallback(BaseModel):
+    """
+    Run a router when the parent task completes and submit the candidate it picks.
+
+    Produced by the mermaid parser for a ``parent --> R`` edge into a rhombus
+    node. The router runs synchronously during callback handling; see
+    ``TaskProcessor._handle_router``.
+    """
+
+    type: Literal["router"] = "router"
+    router: RouterSpec
+    error_callback: DAGTaskSpec | None = None  # Submit when the router raises or selects nothing
+
 
 # Pydantic discriminated union – serialises/deserialises by the ``type`` field.
-DAGCallback = Annotated[SimpleCallback | FanInCallback | DynamicFanOutCallback, Field(discriminator="type")]
+DAGCallback = Annotated[
+    SimpleCallback | FanInCallback | DynamicFanOutCallback | RouterCallback,
+    Field(discriminator="type"),
+]
 
-# Allow self-referential DAGTaskSpec.dag_callbacks.
+# Allow self-referential DAGTaskSpec.dag_callbacks and the forward ref to RouterSpec.
+DynamicFanOutCallback.model_rebuild()
 DAGTaskSpec.model_rebuild()
 
 
@@ -226,12 +295,18 @@ def collect_fan_in_keys(spec: DAGTaskSpec) -> dict[str, set[ULID]]:
             return
         visited.add(s.id)
         for cb in s.dag_callbacks:
+            if isinstance(cb, RouterCallback):
+                # Only one candidate is ever submitted, and which one is unknown
+                # until the router runs, so candidate subtrees' fan-in sets are
+                # initialised at routing time (TaskProcessor._handle_router)
+                # rather than pre-populated here for branches that may never run.
+                continue
             if isinstance(cb, DynamicFanOutCallback):
                 # Arm fan-in sets are initialised at runtime by the processor, so
-                # arm_root is intentionally not walked here. The collector, however,
-                # may itself feed into further static fan-ins (e.g. `collector --> D`
-                # in a mermaid diagram) — those need pre-populating like any other
-                # static edge, so walk into it.
+                # the arm source is intentionally not walked here. The collector,
+                # however, may itself feed into further static fan-ins (e.g.
+                # `collector --> D` in a mermaid diagram) — those need
+                # pre-populating like any other static edge, so walk into it.
                 _walk(cb.collector)
                 continue
             if isinstance(cb, FanInCallback):
@@ -262,20 +337,22 @@ class DAGNode:
         self,
         name: str,
         *,
-        queue: str = "default",
+        lane: str = "default",
         version: int = 0,
         parameters: dict[str, Any] | None = None,
         task_id: ULID | None = None,
     ) -> None:
         self._id: ULID = task_id or ULID()
         self._name = name
-        self._queue = queue
+        self._lane = lane
         self._version = version
         self._parameters: dict[str, Any] = parameters or {}
         # (successor_node, fan_in_key or None, error_node or None)
         self._successors: list[tuple[DAGNode, str | None, DAGNode | None]] = []
         # DynamicFanOutCallback entries declared via the mermaid parser (-->> / --o edges).
         self._fanout_callbacks: list[DynamicFanOutCallback] = []
+        # RouterCallback entries declared via the mermaid parser (--> into a rhombus node).
+        self._router_callbacks: list[RouterCallback] = []
 
     @property
     def id(self) -> ULID:
@@ -385,7 +462,7 @@ class DAGNode:
         return DAGTaskSpec(
             id=self._id,
             name=self._name,
-            queue=self._queue,
+            lane=self._lane,
             version=self._version,
             parameters=self._parameters,
             dag_callbacks=self._callbacks_recursive(),
@@ -394,6 +471,10 @@ class DAGNode:
     def add_fanout_callback(self, cb: DynamicFanOutCallback) -> None:
         """Attach a declarative ``DynamicFanOutCallback`` to this node (used by the mermaid parser)."""
         self._fanout_callbacks.append(cb)
+
+    def add_router_callback(self, cb: RouterCallback) -> None:
+        """Attach a declarative ``RouterCallback`` to this node (used by the mermaid parser)."""
+        self._router_callbacks.append(cb)
 
     def _callbacks_recursive(self) -> list[DAGCallback]:
         """Return the list of `DAGCallback` objects for this node's successors."""
@@ -417,6 +498,7 @@ class DAGNode:
                     )
                 )
         callbacks.extend(self._fanout_callbacks)
+        callbacks.extend(self._router_callbacks)
         return callbacks
 
     def to_task(
@@ -432,7 +514,7 @@ class DAGNode:
         return Task(
             id=self._id,
             name=self._name,
-            queue=self._queue,
+            lane=self._lane,
             version=self._version,
             parameters=self._parameters,
             dag_callbacks=self._callbacks_recursive(),
@@ -464,6 +546,9 @@ class DAGNode:
             for cb in node._fanout_callbacks:
                 for key, ids in collect_fan_in_keys(cb.collector).items():
                     result.setdefault(key, set()).update(ids)
+            # Router candidate subtrees are intentionally not walked: only one
+            # candidate ever runs, and which one is unknown until the router
+            # does. Their fan-in sets are initialised at routing time instead.
 
         _walk(self)
         return result

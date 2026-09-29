@@ -51,6 +51,15 @@ export default function TaskDetail() {
         <table style={{ width: 'auto' }}>
           <tbody>
             <tr><th>Name</th><td>{task.name}</td></tr>
+            <tr>
+              <th>Lane → queue</th>
+              <td>
+                {task.lane ?? '—'}
+                {task.queue && task.queue !== task.lane && (
+                  <> → <strong>{task.queue}</strong></>
+                )}
+              </td>
+            </tr>
             <tr><th>Status</th><td><StatusBadge status={task.status} /></td></tr>
             <tr><th>Retry attempt</th><td>{task.retry_attempt}</td></tr>
             <tr>
