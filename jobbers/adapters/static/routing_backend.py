@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
-from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+from jobbers.models.task_routing import RoutingConfig, RoutingRule, RoutingStrategy
 from jobbers.protocols import RoutingBackendReadOnlyError
 
 _DEFAULT_QUEUE = QueueConfig(name="default", max_concurrent=10)
@@ -44,13 +44,35 @@ def _parse_roles(raw: dict[str, list[str]]) -> dict[str, set[str]]:
 
 
 def _parse_routing(raw: list[dict[str, Any]]) -> list[RoutingConfig]:
+    """
+    Build routing configs from the static config file's ``routing`` list.
+
+    Each entry is one task type with a ``rules`` list of lane -> queue mappings::
+
+        {
+            "task_name": "fulfil_order",
+            "task_version": 1,
+            "rules": [
+                {"from_lane": "priority", "strategy": "single", "queues": ["priority-v2"]},
+                {"strategy": "single", "queues": ["bulk"]},
+            ],
+        }
+
+    A rule without ``from_lane`` is the wildcard: it matches any lane.
+    """
     return [
         RoutingConfig(
             task_name=r["task_name"],
             task_version=r["task_version"],
-            strategy=RoutingStrategy(r["strategy"]),
-            queues=r["queues"],
-            weights=r.get("weights"),
+            rules=[
+                RoutingRule(
+                    from_lane=rule.get("from_lane"),
+                    strategy=RoutingStrategy(rule["strategy"]),
+                    queues=rule["queues"],
+                    weights=rule.get("weights"),
+                )
+                for rule in r["rules"]
+            ],
         )
         for r in raw
     ]
@@ -100,7 +122,7 @@ class StaticRoutingBackend:
 
         routing_configs = _parse_routing(data.get("routing", []))
         for rc in routing_configs:
-            for q in rc.queues:
+            for q in rc.target_queues():
                 if q not in known_queues:
                     raise ValueError(
                         f"Routing config for '{rc.task_name}' v{rc.task_version} references unknown queue '{q}'"

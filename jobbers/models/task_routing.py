@@ -6,6 +6,11 @@ from typing import Any, Self
 
 from pydantic import BaseModel, model_validator
 
+# Sentinel stored in the ``from_lane`` column for the wildcard rule. SQL primary
+# keys can't contain NULL portably, so the empty string stands in for "any lane"
+# on the storage side only -- the model itself uses ``None``.
+WILDCARD_LANE = ""
+
 
 class RoutingStrategy(StrEnum):
     """Queue routing strategy for a task type."""
@@ -14,11 +19,16 @@ class RoutingStrategy(StrEnum):
     WEIGHTED = "weighted"
 
 
-class RoutingConfig(BaseModel):
-    """Queue routing configuration for a task type."""
+class RoutingRule(BaseModel):
+    """
+    One lane → queue(s) mapping within a task type's routing config.
 
-    task_name: str = ""
-    task_version: int = 0
+    ``from_lane`` scopes the rule to work that *asked for* that lane. ``None``
+    is the wildcard: it matches any lane, which is the blanket-override
+    behaviour routing configs had before lanes existed.
+    """
+
+    from_lane: str | None = None
     strategy: RoutingStrategy
     queues: list[str]
     weights: list[float] | None = None
@@ -37,14 +47,65 @@ class RoutingConfig(BaseModel):
                 raise ValueError("WEIGHTED routing requires weights with the same length as queues")
         return self
 
+
+class RoutingConfig(BaseModel):
+    """
+    Lane → queue routing configuration for a task type.
+
+    A config is a list of rules. ``rule_for(lane)`` picks the rule scoped to
+    that lane, falling back to the wildcard rule. When neither exists the caller
+    applies the identity default: the lane resolves to the queue of the same
+    name (see ``docs/lanes-and-queues.md``).
+    """
+
+    task_name: str = ""
+    task_version: int = 0
+    rules: list[RoutingRule]
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if not self.rules:
+            raise ValueError("A routing config requires at least one rule")
+        seen: set[str | None] = set()
+        for rule in self.rules:
+            if rule.from_lane in seen:
+                label = "wildcard" if rule.from_lane is None else repr(rule.from_lane)
+                raise ValueError(f"Duplicate routing rule for {label} lane")
+            seen.add(rule.from_lane)
+        return self
+
+    def rule_for(self, lane: str) -> RoutingRule | None:
+        """Return the rule matching *lane*, falling back to the wildcard rule, else None."""
+        wildcard: RoutingRule | None = None
+        for rule in self.rules:
+            if rule.from_lane == lane:
+                return rule
+            if rule.from_lane is None:
+                wildcard = rule
+        return wildcard
+
+    def target_queues(self) -> set[str]:
+        """Every physical queue any rule in this config can resolve to."""
+        return {queue for rule in self.rules for queue in rule.queues}
+
     @classmethod
-    def from_row(cls, row: Any) -> Self:
-        """Construct from a DB row (task_name, task_version, strategy, queues_json, weights_json)."""
-        task_name, task_version, strategy, queues_json, weights_json = row
+    def from_rows(cls, task_name: str, task_version: int, rows: list[Any]) -> Self:
+        """
+        Construct from ``task_routing_rules`` rows.
+
+        Each row is ``(from_lane, strategy, queues_json, weights_json)``, where
+        ``from_lane`` is ``WILDCARD_LANE`` for the wildcard rule.
+        """
         return cls(
             task_name=task_name,
             task_version=task_version,
-            strategy=RoutingStrategy(strategy),
-            queues=json.loads(queues_json),
-            weights=json.loads(weights_json) if weights_json is not None else None,
+            rules=[
+                RoutingRule(
+                    from_lane=None if from_lane == WILDCARD_LANE else from_lane,
+                    strategy=RoutingStrategy(strategy),
+                    queues=json.loads(queues_json),
+                    weights=json.loads(weights_json) if weights_json is not None else None,
+                )
+                for from_lane, strategy, queues_json, weights_json in rows
+            ],
         )

@@ -13,7 +13,7 @@ from jobbers.models.dag import DAGRunDetail, DAGRunPagination, DagRunStatus, DAG
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
-from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+from jobbers.models.task_routing import RoutingConfig, RoutingRule, RoutingStrategy
 from jobbers.state_manager import TaskException, TaskRateLimitedError
 from jobbers.task_routes import app
 
@@ -938,7 +938,7 @@ async def test_update_task_routing_bumps_routing_version(state_manager, redis):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(
             "/task-routing/my_task/1",
-            json={"strategy": "single", "queues": ["default"]},
+            json={"rules": [{"strategy": "single", "queues": ["default"]}]},
         )
 
     assert response.status_code == 200
@@ -952,7 +952,9 @@ async def test_delete_task_routing_bumps_routing_version(state_manager, redis):
     """DELETE /task-routing updates routing:version to a new ULID in Redis."""
     await state_manager.routing.save_routing_config(
         RoutingConfig(
-            task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["default"]
+            task_name="my_task",
+            task_version=1,
+            rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["default"])],
         )
     )
     version_before = await redis.get("routing:version")
@@ -1370,7 +1372,9 @@ async def test_get_task_routing_not_found():
 async def test_get_task_routing_found(state_manager):
     """GET /task-routing returns the routing config when it exists."""
     config = RoutingConfig(
-        task_name="echo_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"]
+        task_name="echo_task",
+        task_version=1,
+        rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["fast"])],
     )
     await state_manager.routing.save_routing_config(config)
 
@@ -1379,8 +1383,7 @@ async def test_get_task_routing_found(state_manager):
 
     assert response.status_code == 200
     data = response.json()["routing"]
-    assert data["strategy"] == "single"
-    assert data["queues"] == ["fast"]
+    assert data["rules"] == [{"from_lane": None, "strategy": "single", "queues": ["fast"], "weights": None}]
 
 
 @pytest.mark.asyncio
@@ -1389,16 +1392,16 @@ async def test_put_task_routing_creates(state_manager):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(
             "/task-routing/echo_task/1",
-            json={"strategy": "single", "queues": ["fast"]},
+            json={"rules": [{"strategy": "single", "queues": ["fast"]}]},
         )
 
     assert response.status_code == 200
-    assert response.json()["routing"]["strategy"] == "single"
+    assert response.json()["routing"]["rules"][0]["strategy"] == "single"
 
     saved = await state_manager.routing.get_routing_config("echo_task", 1)
     assert saved is not None
-    assert saved.strategy == RoutingStrategy.SINGLE
-    assert saved.queues == ["fast"]
+    assert saved.rules[0].strategy == RoutingStrategy.SINGLE
+    assert saved.rules[0].queues == ["fast"]
 
 
 @pytest.mark.asyncio
@@ -1407,7 +1410,11 @@ async def test_put_task_routing_path_overrides_body(state_manager):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(
             "/task-routing/real_name/3",
-            json={"task_name": "body_name", "task_version": 99, "strategy": "single", "queues": ["q"]},
+            json={
+                "task_name": "body_name",
+                "task_version": 99,
+                "rules": [{"strategy": "single", "queues": ["q"]}],
+            },
         )
 
     assert response.status_code == 200
@@ -1421,7 +1428,11 @@ async def test_put_task_routing_path_overrides_body(state_manager):
 async def test_delete_task_routing_removes_config(state_manager):
     """DELETE /task-routing removes the config and returns 200."""
     await state_manager.routing.save_routing_config(
-        RoutingConfig(task_name="echo_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"])
+        RoutingConfig(
+            task_name="echo_task",
+            task_version=1,
+            rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["fast"])],
+        )
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -1540,7 +1551,7 @@ async def test_get_task_status_dag_root_includes_diagram(state_manager):
     """GET /task-status/{id} includes dag_diagram when the task has dag_callbacks set."""
     from jobbers.models.dag import DAGTaskSpec, SimpleCallback
 
-    child_spec = DAGTaskSpec(name="child_task", queue="default")
+    child_spec = DAGTaskSpec(name="child_task", lane="default")
     task = Task(
         id=ULID1,
         name="root_task",
@@ -1907,3 +1918,107 @@ async def test_update_cron_dag_with_unregistered_task_returns_400():
 
     assert response.status_code == 400
     assert "totally_unregistered_xyz" in response.json()["detail"]
+
+
+# ── router node validation ────────────────────────────────────────────────────
+
+
+ROUTER_DIAGRAM = """
+flowchart TD
+    A["router_root"]
+    R{"pick_branch"}
+    B["branch_one"]
+    C["branch_two:heavy"]
+
+    A --> R
+    R --> B
+    R --> C
+"""
+
+
+@pytest.fixture
+def router_dag_registry():
+    """Register the tasks and router that ROUTER_DIAGRAM refers to."""
+    from jobbers.registry import clear_registry, register_router, register_task
+
+    clear_registry()
+    for name in ("router_root", "branch_one", "branch_two"):
+
+        @register_task(name=name, version=0)
+        async def _task(**kwargs):  # pragma: no cover - never executed
+            return {}
+
+    @register_router(name="pick_branch", version=0)
+    def _router(results):  # pragma: no cover - never executed
+        return "branch_one"
+
+    yield
+    clear_registry()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("router_dag_registry")
+async def test_submit_dag_with_unregistered_router_returns_400():
+    """A diagram naming a router that is not in the registry is rejected."""
+    from jobbers.registry import _router_function_map
+
+    _router_function_map.clear()  # tasks stay registered; only the router is missing
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/submit-dag", json={"diagram": ROUTER_DIAGRAM})
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "pick_branch" in detail
+    assert "@register_router" in detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("router_dag_registry")
+async def test_submit_dag_with_unregistered_router_candidate_returns_400():
+    """A candidate task missing from the registry is rejected even though the router exists."""
+    diagram = ROUTER_DIAGRAM.replace("branch_two:heavy", "totally_unregistered_xyz:heavy")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/submit-dag", json={"diagram": diagram})
+
+    assert response.status_code == 400
+    assert "totally_unregistered_xyz" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("router_dag_registry")
+async def test_submit_dag_with_router_succeeds(state_manager):
+    """A fully registered router diagram submits and returns its root task id."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/submit-dag", json={"diagram": ROUTER_DIAGRAM})
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert len(body["root_task_ids"]) == 1
+
+    # The root's stored spec carries the router, and GET renders it back as a rhombus.
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        detail = await client.get(f"/task-status/{body['root_task_ids'][0]}")
+    assert detail.status_code == 200
+    diagram = detail.json()["dag_diagram"]
+    assert '{"pick_branch"}:::router' in diagram
+    assert "branch_two:heavy" in diagram
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("router_dag_registry")
+async def test_create_cron_dag_with_unregistered_router_returns_400():
+    """POST /cron-dags applies the same router registry check as /submit-dag."""
+    from jobbers.registry import _router_function_map
+
+    _router_function_map.clear()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/cron-dags",
+            json={"name": "bad", "cron_expr": "0 * * * *", "diagram": ROUTER_DIAGRAM},
+        )
+
+    assert response.status_code == 400
+    assert "pick_branch" in response.json()["detail"]

@@ -61,6 +61,7 @@ meter = metrics.get_meter(__name__)
 tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
 stale_cancellations_published = meter.create_counter("stale_cancellations_published", unit="1")
 tasks_completed_after_stale = meter.create_counter("tasks_completed_after_stale", unit="1")
+lane_resolutions = meter.create_counter("lane_resolutions", unit="1")
 
 
 def _dag_run_uses_fan_in(tasks: list[Task]) -> bool:
@@ -633,13 +634,12 @@ class StateManager:
 
             fresh_spec, _ = entry.dag_spec.fresh_copy()
             fan_ins = collect_fan_in_keys(fresh_spec)
-            queue_config = await self.get_queue_config(fresh_spec.queue)
 
             dag_run_id = ULID()
             task = Task(
                 id=fresh_spec.id,
                 name=fresh_spec.name,
-                queue=fresh_spec.queue,
+                lane=fresh_spec.lane,
                 version=fresh_spec.version,
                 parameters=fresh_spec.parameters,
                 dag_callbacks=fresh_spec.dag_callbacks,
@@ -647,6 +647,10 @@ class StateManager:
                 dag_run_id=dag_run_id,
                 dag_run_name=f"{entry.name} @ {run_at.isoformat()}",
             )
+            # This path stages the submit itself rather than going through
+            # submit_task(), so the lane has to be resolved here.
+            task.queue = await self.resolve_queue(task)
+            queue_config = await self.get_queue_config(task.queue)
 
             is_rate_limited = bool(
                 queue_config
@@ -1178,23 +1182,34 @@ class StateManager:
         await self.routing.delete_role(role)
 
     async def resolve_queue(self, task: Task) -> str:
-        """Return the queue name to use for *task*, applying routing config if one is set."""
+        """
+        Resolve *task*'s lane to the physical queue it should run on.
+
+        Picks the routing rule scoped to ``task.lane``, falling back to the
+        config's wildcard rule. With no config, or no rule that applies, the
+        identity default holds: a lane resolves to the queue of the same name.
+        See ``docs/lanes-and-queues.md``.
+        """
         routing = await self.get_routing_config(task.name, task.version)
-        if routing is None:
-            return task.queue
-        match routing.strategy:
+        rule = routing.rule_for(task.lane) if routing is not None else None
+        if rule is None:
+            lane_resolutions.add(1, {"lane": task.lane, "queue": task.lane, "strategy": "identity"})
+            return task.lane
+        match rule.strategy:
             case RoutingStrategy.SINGLE:
-                final = routing.queues[0]
+                final = rule.queues[0]
             case RoutingStrategy.WEIGHTED:
-                final = random.choices(routing.queues, weights=routing.weights, k=1)[0]
-        if final != task.queue:
+                final = random.choices(rule.queues, weights=rule.weights, k=1)[0]
+        lane_resolutions.add(1, {"lane": task.lane, "queue": final, "strategy": rule.strategy})
+        if final != task.lane:
             logger.info(
-                "Routing override: task=%s v%d original=%s resolved=%s strategy=%s",
+                "Lane routed: task=%s v%d lane=%s queue=%s strategy=%s scope=%s",
                 task.name,
                 task.version,
-                task.queue,
+                task.lane,
                 final,
-                routing.strategy,
+                rule.strategy,
+                "wildcard" if rule.from_lane is None else rule.from_lane,
             )
         return final
 

@@ -55,6 +55,11 @@ class Task(BaseModel):
     id: ULID
     # task mapping fields
     name: str
+    # The logical destination the author/submitter/router asked for.
+    lane: str = "default"
+    # The physical queue this task actually runs on. Derived from `lane` by
+    # StateManager.resolve_queue at submit time and frozen from then on --
+    # retries and scheduler dispatch reuse it rather than re-resolving.
     queue: str = "default"
     version: int = 0
     parameters: dict[Any, Any] = {}
@@ -202,7 +207,7 @@ class Task(BaseModel):
         return self.__class__(
             id=spec.id,
             name=spec.name,
-            queue=spec.queue,
+            lane=spec.lane,
             version=spec.version,
             parameters=spec.parameters,
             dag_callbacks=spec.dag_callbacks,
@@ -296,7 +301,17 @@ class Task(BaseModel):
 
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(
-            mode="json", include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"}
+            mode="json",
+            include={
+                "id",
+                "name",
+                "lane",
+                "queue",
+                "parameters",
+                "status",
+                "retry_attempt",
+                "submitted_at",
+            },
         )
         if self.errors:
             summary["last_error"] = self.errors[-1]

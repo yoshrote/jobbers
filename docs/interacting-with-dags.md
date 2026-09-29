@@ -41,9 +41,9 @@ dag_run_id, submitted_roots = await get_state_manager().submit_dag(root)
 Using `@register_task` wrappers:
 
 ```python
-root = ingest_data.node(queue="etl")
-middle = transform_data.node(queue="etl")
-end = publish_results.node(queue="etl")
+root = ingest_data.node(lane="etl")
+middle = transform_data.node(lane="etl")
+end = publish_results.node(lane="etl")
 root.then(middle)
 middle.then(end)
 dag_run_id, _ = await get_state_manager().submit_dag(root)

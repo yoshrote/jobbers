@@ -35,10 +35,10 @@ def test_fresh_copy_leaf_gets_new_id():
 
 
 def test_fresh_copy_preserves_fields():
-    spec = make_spec(name="my_task", queue="my_queue", version=3, parameters={"k": "v"})
+    spec = make_spec(name="my_task", lane="my_lane", version=3, parameters={"k": "v"})
     fresh, _ = spec.fresh_copy()
     assert fresh.name == "my_task"
-    assert fresh.queue == "my_queue"
+    assert fresh.lane == "my_lane"
     assert fresh.version == 3
     assert fresh.parameters == {"k": "v"}
 
@@ -295,12 +295,12 @@ def test_task_result_with_fanout():
 
 def test_dag_node_to_task_no_parent():
     """to_task() with no parent creates a root task with empty parent_ids."""
-    node = DAGNode("fetch_data", queue="urgent", version=2, parameters={"k": "v"})
+    node = DAGNode("fetch_data", lane="urgent", version=2, parameters={"k": "v"})
     task = node.to_task()
 
     assert task.id == node.id
     assert task.name == "fetch_data"
-    assert task.queue == "urgent"
+    assert task.lane == "urgent"
     assert task.version == 2
     assert task.parameters == {"k": "v"}
     assert task.parent_ids == []

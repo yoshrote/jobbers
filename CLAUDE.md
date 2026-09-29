@@ -85,6 +85,7 @@ All four run as separate processes (separate Docker containers in production).
 ```mermaid
 UNSUBMITTED → SUBMITTED → STARTED → COMPLETED → [DAG callbacks / fan-out children]
            → SCHEDULED (task.schedule() / POST /schedule-task) → re-queued by scheduler → SUBMITTED
+                                  → [router node picks the next task, or none]
                                   → FAILED (no retries left) → [DLQ if policy=SAVE]
                                   → SCHEDULED (retry delay set) → re-queued by scheduler → SUBMITTED
                                   → UNSUBMITTED (immediate retry, no retry_delay) → SUBMITTED
@@ -94,6 +95,23 @@ UNSUBMITTED → SUBMITTED → STARTED → COMPLETED → [DAG callbacks / fan-out
 ```
 
 Workers apply the `on_shutdown` policy on SIGTERM: `STOP` (→ STALLED), `RESUBMIT` (→ UNSUBMITTED, re-enqueued), `CONTINUE` (shield to completion).
+
+## Router Registration
+
+A **router** is a registered pure function that picks which task handles a payload at runtime. It appears in a mermaid DAG as a rhombus node whose outgoing `-->` edges are its candidates.
+
+```python
+from jobbers.registry import register_router
+from jobbers.models.router import RouteTo
+
+@register_router(name="route_by_tier", version=1)
+def route_by_tier(results: dict, *, threshold: int = 100) -> str | RouteTo | None:
+    return RouteTo("fulfil_order", lane="priority" if results["vip"] else "standard")
+```
+
+Routers must be plain `def` (enforced at registration) — they run inline on the worker's event loop during callback handling, so they must be fast, pure and do no I/O. `RouteTo` is a *selector* over the router's declared candidates (matching on name, plus optional `lane`/`version`), not a free-form destination; it must match exactly one. Returning `None` ends that path. Routers are loaded by the same `task_module` import that loads tasks. Registry: `_router_function_map`, `get_router_config()`, `get_routers()`; `clear_registry()` clears tasks and routers.
+
+Serialised as `RouterCallback` (simple mode, `parent --> R`) or `DynamicFanOutCallback.arm_router` (per-item mode, `parent -->> R`), both in `jobbers/models/dag.py`. Driven by `TaskProcessor._handle_router` / `_handle_declarative_fanout`. See [docs/mermaid-dag-spec.md](docs/mermaid-dag-spec.md#router-nodes).
 
 ## Task Registration
 
@@ -115,6 +133,12 @@ async def my_task(**kwargs):
     return {"result": "value"}
 ```
 
+## Lanes & Queues
+
+A **lane** is the logical destination the author asks for (a DAG node's `:lane` segment, `submit(lane=...)`, a router's choice); a **queue** is the physical bucket workers pull from. `RoutingConfig` is the only thing spanning them: it maps `(task_name, task_version, lane) -> queue(s)`. **By default a lane resolves to the queue of the same name**, so a deployment with no routing rules never has to think about the distinction. `Task` carries both — `lane` (requested) and `queue` (resolved, frozen at first submit; retries do not re-resolve). Full treatment in [docs/lanes-and-queues.md](docs/lanes-and-queues.md).
+
+A routing config is a list of `RoutingRule`s, each optionally scoped by `from_lane`; a rule with `from_lane=None` is the wildcard and matches any lane. `StateManager.resolve_queue` picks the lane-scoped rule, else the wildcard, else the identity default.
+
 ## Queue & Role System
 
 - **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Storage backend depends on `ROUTING_BACKEND`.
@@ -135,6 +159,8 @@ All metrics use the OTLP exporter (configured in `jobbers/utils/otel.py`) and ar
 | `tasks_selected` | Counter | `1` | `task_generator.py` | Tasks pulled from a queue by a worker (tagged with `queue`, `role`, `task`) |
 | `queue_config_refreshes` | Counter | `1` | `task_generator.py` | Queue-list refreshes triggered on a worker (tagged with `role`); fires each time a worker reloads its queue assignment due to a `refresh_tag` change |
 | `refresh_lag_ms` | Histogram | `ms` | `task_generator.py` | Lag between when the `refresh_tag` was bumped (ULID timestamp) and when the worker picked up the change (tagged with `role`) |
+| `lane_resolutions` | Counter | `1` | `state_manager.py` | Every lane→queue resolution (tagged with `lane`, `queue`, `strategy`; `strategy=identity` when no rule applied) |
+| `router_decisions` | Counter | `1` | `task_processor.py` | Router selections (tagged with `router`, `target` as `name:lane` or `<none>`, `mode` as `simple`/`per_item`) |
 
 ## Adapter Architecture
 
@@ -227,7 +253,11 @@ Config file format (`routing.json`):
 {
   "queues": [{"name": "default", "max_concurrent": 10}],
   "roles": {"default": ["default"]},
-  "routing": []
+  "routing": [
+    {"task_name": "fulfil_order", "task_version": 1, "rules": [
+      {"from_lane": "priority", "strategy": "single", "queues": ["default"]}
+    ]}
+  ]
 }
 ```
 

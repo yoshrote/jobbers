@@ -13,7 +13,7 @@ import pytest_asyncio
 
 from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.models.queue_config import QueueConfig
-from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
+from jobbers.models.task_routing import RoutingConfig, RoutingRule, RoutingStrategy
 from jobbers.protocols import RoutingBackendReadOnlyError
 from jobbers.registry import clear_registry, register_task
 
@@ -27,7 +27,11 @@ async def backend():
         ],
         roles={"default": {"default"}, "fast-workers": {"fast", "default"}},
         routing_configs=[
-            RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"])
+            RoutingConfig(
+                task_name="t",
+                task_version=1,
+                rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["fast"])],
+            )
         ],
     )
 
@@ -89,7 +93,7 @@ async def test_get_roles_for_queue_returns_empty_for_unknown(backend):
 async def test_get_routing_config(backend):
     result = await backend.get_routing_config("t", 1)
     assert result is not None
-    assert result.queues == ["fast"]
+    assert result.rules[0].queues == ["fast"]
 
 
 @pytest.mark.asyncio
@@ -138,7 +142,11 @@ async def test_delete_role_raises(backend):
 async def test_save_routing_config_raises(backend):
     with pytest.raises(RoutingBackendReadOnlyError):
         await backend.save_routing_config(
-            RoutingConfig(task_name="x", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
+            RoutingConfig(
+                task_name="x",
+                task_version=1,
+                rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["q"])],
+            )
         )
 
 
@@ -159,7 +167,13 @@ async def test_from_file_json():
     data = {
         "queues": [{"name": "file_q", "max_concurrent": 4}],
         "roles": {"file_role": ["file_q"]},
-        "routing": [{"task_name": "ft", "task_version": 1, "strategy": "single", "queues": ["file_q"]}],
+        "routing": [
+            {
+                "task_name": "ft",
+                "task_version": 1,
+                "rules": [{"strategy": "single", "queues": ["file_q"]}],
+            }
+        ],
     }
     with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
         json.dump(data, f)
@@ -172,7 +186,7 @@ async def test_from_file_json():
         assert await b.get_queues("file_role") == {"file_q"}
         rc = await b.get_routing_config("ft", 1)
         assert rc is not None
-        assert rc.queues == ["file_q"]
+        assert rc.rules[0].queues == ["file_q"]
     finally:
         os.unlink(path)
         clear_registry()
@@ -197,7 +211,13 @@ def test_from_file_unknown_queue_in_routing(tmp_path):
     data = {
         "queues": [{"name": "q1", "max_concurrent": 2}],
         "roles": {},
-        "routing": [{"task_name": "rt", "task_version": 1, "strategy": "single", "queues": ["typo_q"]}],
+        "routing": [
+            {
+                "task_name": "rt",
+                "task_version": 1,
+                "rules": [{"strategy": "single", "queues": ["typo_q"]}],
+            }
+        ],
     }
     p = tmp_path / "config.json"
     p.write_text(json.dumps(data))
@@ -212,7 +232,13 @@ def test_from_file_unregistered_task_in_routing(tmp_path):
     data = {
         "queues": [{"name": "q1", "max_concurrent": 2}],
         "roles": {},
-        "routing": [{"task_name": "no_such_task", "task_version": 9, "strategy": "single", "queues": ["q1"]}],
+        "routing": [
+            {
+                "task_name": "no_such_task",
+                "task_version": 9,
+                "rules": [{"strategy": "single", "queues": ["q1"]}],
+            }
+        ],
     }
     p = tmp_path / "config.json"
     p.write_text(json.dumps(data))

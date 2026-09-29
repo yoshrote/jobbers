@@ -48,6 +48,7 @@ def _task_to_row(task: Task) -> dict[str, Any]:
     return {
         "id": str(task.id),
         "name": task.name,
+        "lane": task.lane,
         "queue": task.queue,
         "version": task.version,
         "status": task.status.value,
@@ -84,6 +85,7 @@ def _row_to_task(row: Any) -> Task:
     data: dict[str, Any] = {
         "id": row.id,
         "name": row.name,
+        "lane": row.lane,
         "queue": row.queue,
         "version": row.version,
         "status": row.status,

@@ -78,7 +78,7 @@ async def main(poll_interval: float, config_interval: dt.timedelta, role: str, b
                 for entry, run_at in enabled:
                     dispatch_latency.record(
                         (now - run_at).total_seconds(),
-                        {"queue": entry.dag_spec.queue, "task_name": entry.dag_spec.name},
+                        {"lane": entry.dag_spec.lane, "task_name": entry.dag_spec.name},
                     )
             # Disabled entries were already removed from cron-schedule by next_due_bulk;
             # reschedule them so they aren't lost.
