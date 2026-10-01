@@ -139,10 +139,10 @@ async def test_save_and_get_multiple_lane_scoped_rules(task_routing_config_adapt
             RoutingRule(
                 from_lane="standard",
                 strategy=RoutingStrategy.WEIGHTED,
-                queues=["bulk-a", "bulk-b"],
+                queues=["bulk_a", "bulk_b"],
                 weights=[2.0, 1.0],
             ),
-            RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["catch-all"]),
+            RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["catch_all"]),
         ],
     )
     await task_routing_config_adapter.save_routing_config(config)
@@ -150,10 +150,10 @@ async def test_save_and_get_multiple_lane_scoped_rules(task_routing_config_adapt
 
     assert result is not None
     assert result.rule_for("priority").queues == ["fast"]
-    assert result.rule_for("standard").queues == ["bulk-a", "bulk-b"]
+    assert result.rule_for("standard").queues == ["bulk_a", "bulk_b"]
     assert result.rule_for("standard").weights == [2.0, 1.0]
     # Any unlisted lane falls back to the wildcard rule.
-    assert result.rule_for("anything-else").queues == ["catch-all"]
+    assert result.rule_for("anything_else").queues == ["catch_all"]
 
 
 @pytest.mark.asyncio

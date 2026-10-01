@@ -7,7 +7,7 @@ from typing import Annotated, Any
 
 from croniter import croniter
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.params import Query
+from fastapi.params import Path, Query
 from fastapi.responses import JSONResponse
 from opentelemetry import metrics
 from pydantic import BaseModel, Field
@@ -24,7 +24,7 @@ from jobbers.models.dag import (
     RouterCallback,
     RouterSpec,
 )
-from jobbers.models.queue_config import QueueConfig
+from jobbers.models.queue_config import QUEUE_NAME_PATTERN, QueueConfig
 from jobbers.models.task import Task, TaskPagination
 from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
@@ -243,15 +243,24 @@ async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
 @app.get("/queues/{queue_name}/config")
 async def get_queue_config(queue_name: str) -> dict[str, Any]:
     """Retrieve the configuration for a specific queue."""
-    config = await db.get_state_manager().get_queue_config(queue_name)
+    sm = db.get_state_manager()
+    # Served from this process's cache, so poll (throttled) before answering: another
+    # Manager replica may have edited this queue since we last read it.
+    await sm.refresh_config_if_stale()
+    config = await sm.get_queue_config(queue_name)
     if config is None:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
     return {"queue": config.model_dump(mode="json")}
 
 
 @app.put("/queues/{queue_name}")
-async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, Any]:
+async def update_queue(
+    queue_name: Annotated[str, Path(pattern=QUEUE_NAME_PATTERN)],
+    queue_config: QueueConfig,
+) -> dict[str, Any]:
     """Create or update the configuration for a queue. The name in the body is ignored; the path name is used."""
+    # Assigning to .name bypasses QueueConfig's field validator (pydantic does not
+    # validate on assignment), so the path parameter carries the pattern itself.
     queue_config.name = queue_name
     await db.get_state_manager().save_queue_config(queue_config)
     return {"message": "Queue updated successfully", "queue": queue_config.model_dump(mode="json")}
@@ -562,7 +571,9 @@ async def refresh_role(role_name: str) -> dict[str, Any]:
 @app.get("/task-routing/{task_name}/{task_version}")
 async def get_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
     """Retrieve the routing configuration for a specific task type."""
-    config = await db.get_state_manager().get_routing_config(task_name, task_version)
+    sm = db.get_state_manager()
+    await sm.refresh_config_if_stale()
+    config = await sm.get_routing_config(task_name, task_version)
     if config is None:
         raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
     return {"routing": config.model_dump(mode="json")}

@@ -130,12 +130,12 @@ def test_target_queues_spans_every_rule():
             RoutingRule(
                 from_lane="standard",
                 strategy=RoutingStrategy.WEIGHTED,
-                queues=["bulk-a", "bulk-b"],
+                queues=["bulk_a", "bulk_b"],
                 weights=[1.0, 1.0],
             ),
         ]
     )
-    assert config.target_queues() == {"fast", "bulk-a", "bulk-b"}
+    assert config.target_queues() == {"fast", "bulk_a", "bulk_b"}
 
 
 # ---------------------------------------------------------------------------
@@ -170,4 +170,4 @@ def test_from_rows_lane_scoped():
     ]
     config = RoutingConfig.from_rows("my_task", 1, rows)
     assert config.rule_for("priority").queues == ["fast"]  # type: ignore[union-attr]
-    assert config.rule_for("anything-else").queues == ["bulk"]  # type: ignore[union-attr]
+    assert config.rule_for("anything_else").queues == ["bulk"]  # type: ignore[union-attr]

@@ -638,6 +638,7 @@ async def test_create_queue_conflict_returns_409():
 async def test_get_queue_config_found():
     """GET /queues/{name}/config returns the queue config."""
     mock_sm = MagicMock()
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="myqueue"))
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -652,6 +653,7 @@ async def test_get_queue_config_found():
 async def test_get_queue_config_not_found():
     """GET /queues/{name}/config returns 404 when queue doesn't exist."""
     mock_sm = MagicMock()
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_queue_config = AsyncMock(return_value=None)
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -671,6 +673,25 @@ async def test_update_queue(state_manager):
     saved = await state_manager.routing.get_queue_config("myqueue")
     assert saved is not None
     assert saved.max_concurrent == 7
+
+
+@pytest.mark.asyncio
+async def test_create_queue_with_invalid_name_returns_422():
+    """POST /queues rejects a name no mermaid edge label could address."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/queues", json={"name": "priority-shard-a"})
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_queue_with_invalid_name_returns_422(state_manager):
+    """The path parameter carries the pattern itself -- assigning to .name bypasses the field validator."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/queues/priority-shard-a", json={"name": "ignored", "max_concurrent": 7})
+
+    assert response.status_code == 422
+    assert await state_manager.routing.get_queue_config("priority-shard-a") is None
 
 
 @pytest.mark.asyncio
@@ -931,9 +952,9 @@ async def test_update_queue_bumps_refresh_tag_for_containing_roles(state_manager
 
 
 @pytest.mark.asyncio
-async def test_update_task_routing_bumps_routing_version(state_manager, redis):
-    """PUT /task-routing updates routing:version to a new ULID in Redis."""
-    version_before = await redis.get("routing:version")
+async def test_update_task_routing_bumps_config_version(state_manager, redis):
+    """PUT /task-routing updates config:version to a new ULID in Redis."""
+    version_before = await redis.get("config:version")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.put(
@@ -942,14 +963,14 @@ async def test_update_task_routing_bumps_routing_version(state_manager, redis):
         )
 
     assert response.status_code == 200
-    version_after = await redis.get("routing:version")
+    version_after = await redis.get("config:version")
     assert version_after is not None
     assert version_before != version_after
 
 
 @pytest.mark.asyncio
-async def test_delete_task_routing_bumps_routing_version(state_manager, redis):
-    """DELETE /task-routing updates routing:version to a new ULID in Redis."""
+async def test_delete_task_routing_bumps_config_version(state_manager, redis):
+    """DELETE /task-routing updates config:version to a new ULID in Redis."""
     await state_manager.routing.save_routing_config(
         RoutingConfig(
             task_name="my_task",
@@ -957,13 +978,13 @@ async def test_delete_task_routing_bumps_routing_version(state_manager, redis):
             rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["default"])],
         )
     )
-    version_before = await redis.get("routing:version")
+    version_before = await redis.get("config:version")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.delete("/task-routing/my_task/1")
 
     assert response.status_code == 200
-    version_after = await redis.get("routing:version")
+    version_after = await redis.get("config:version")
     assert version_after is not None
     assert version_before != version_after
 
@@ -975,6 +996,7 @@ async def test_delete_task_routing_bumps_routing_version(state_manager, redis):
 async def test_submit_task_raises_400_on_task_exception():
     """POST /submit-task returns 400 when the state manager raises TaskException."""
     mock_sm = MagicMock()
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_routing_config = AsyncMock(return_value=None)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
     mock_sm.submit_task = AsyncMock(side_effect=TaskException("bad params"))
@@ -1001,6 +1023,7 @@ async def test_submit_task_raises_400_on_task_exception():
 async def test_submit_task_raises_429_on_rate_limited_error():
     """POST /submit-task returns 429 when the state manager raises TaskRateLimitedError."""
     mock_sm = MagicMock()
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_routing_config = AsyncMock(return_value=None)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
     mock_sm.submit_task = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
@@ -1359,6 +1382,7 @@ async def test_resume_dag_race_between_precheck_and_resume_returns_409(state_man
 async def test_get_task_routing_not_found():
     """GET /task-routing returns 404 when no routing config exists."""
     mock_sm = MagicMock()
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_routing_config = AsyncMock(return_value=None)
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):

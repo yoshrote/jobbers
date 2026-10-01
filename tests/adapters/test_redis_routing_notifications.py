@@ -1,7 +1,7 @@
 """
 Tests for RedisRoutingNotifications.
 
-Covers get_routing_version(), bump_routing_version(), get_refresh_tag(),
+Covers get_config_version(), bump_config_version(), get_refresh_tag(),
 bump_refresh_tag(), and poll_refresh_signal() including the lazy subscription cache.
 """
 
@@ -20,27 +20,27 @@ async def notifications(redis):
 
 
 @pytest.mark.asyncio
-async def test_get_routing_version_returns_none_when_not_set(notifications):
-    """get_routing_version returns None before any version has been written."""
-    result = await notifications.get_routing_version()
+async def test_get_config_version_returns_none_when_not_set(notifications):
+    """get_config_version returns None before any version has been written."""
+    result = await notifications.get_config_version()
     assert result is None
 
 
 @pytest.mark.asyncio
-async def test_get_routing_version_returns_ulid_after_bump(notifications):
-    """get_routing_version returns a ULID after bump_routing_version is called."""
-    await notifications.bump_routing_version()
-    result = await notifications.get_routing_version()
+async def test_get_config_version_returns_ulid_after_bump(notifications):
+    """get_config_version returns a ULID after bump_config_version is called."""
+    await notifications.bump_config_version()
+    result = await notifications.get_config_version()
     assert result is not None
 
 
 @pytest.mark.asyncio
-async def test_bump_routing_version_changes_value(notifications):
-    """Calling bump_routing_version twice produces two different ULIDs."""
-    await notifications.bump_routing_version()
-    first = await notifications.get_routing_version()
-    await notifications.bump_routing_version()
-    second = await notifications.get_routing_version()
+async def test_bump_config_version_changes_value(notifications):
+    """Calling bump_config_version twice produces two different ULIDs."""
+    await notifications.bump_config_version()
+    first = await notifications.get_config_version()
+    await notifications.bump_config_version()
+    second = await notifications.get_config_version()
     assert first is not None
     assert second is not None
     assert first != second
