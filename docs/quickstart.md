@@ -44,7 +44,7 @@ Once the process that runs your code has initialised the state manager, submit w
 ```python
 from myapp.tasks import send_email
 
-task = await send_email.submit(lane="default", recipient="user@example.com", subject="Hello")
+task = await send_email.submit(queue="default", recipient="user@example.com", subject="Hello")
 print(task.id, task.status)  # SUBMITTED
 ```
 

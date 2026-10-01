@@ -33,7 +33,7 @@ Queues are the primary unit of traffic control. Each queue has two independent r
 ```python
 # POST /queues  or  PUT /queues/{name}
 {
-  "name": "heavy-jobs",
+  "name": "heavy_jobs",
   "max_concurrent": 3
 }
 ```
@@ -48,7 +48,7 @@ This is enforced in memory by `StateManager.current_tasks_by_queue` — a dict u
 
 ```python
 {
-  "name": "external-api-calls",
+  "name": "external_api_calls",
   "rate_numerator": 10,
   "rate_denominator": 1,
   "rate_period": "minute"    # "second" | "minute" | "hour" | "day"
@@ -71,6 +71,25 @@ On `sql`, `SQLTaskSubmit.submit_rate_limited_task` reproduces the same sliding w
 
 The Cleaner process periodically prunes stale entries from rate-limiter sorted sets (`redis`/`redis_json`) or the `rate_limit_entries` table (`sql`).
 
+### Propagating a Config Change
+
+Queue configs are cached per process, so a write has to be announced. Every write bumps one Redis key, `config:version`, and every process that reads queue config calls `StateManager.refresh_config_if_stale()`, which drops its cache when the version has moved.
+
+The check is throttled to `CONFIG_POLL_INTERVAL` seconds (default 5) so it can sit directly on the paths that read config:
+
+| Caller | Cadence |
+| --- | --- |
+| `StateManager.submit_task` | Throttled — the one place every submit reads queue config |
+| `validate_task` | Throttled — this is where a stale *negative* lookup would reject a valid queue |
+| `GET /queues/{name}/config` | Throttled — so the admin UI does not show another replica's stale view |
+| `TaskGenerator.queues()` | Every iteration (`min_interval=0`) |
+
+So the worst case for a config change to take effect anywhere is one `CONFIG_POLL_INTERVAL`, and the `config_refreshes` counter records each time a process drops its cache.
+
+The case this exists for: `get_queue_config` caches negative lookups, and the `in`-check makes them sticky. A process that probed a queue name before the queue was created would otherwise reject every submission to it until restart. Queue creation bumps the version, which clears the entry.
+
+Still, the ordering advice costs nothing: **create the queue before anything submits to it.**
+
 ### Queue CRUD API
 
 | Method | Endpoint | Effect |
@@ -80,6 +99,8 @@ The Cleaner process periodically prunes stale entries from rate-limiter sorted s
 | `PUT` | `/queues/{name}` | Create or update queue config (upsert) |
 | `GET` | `/queues/{name}/config` | Fetch current config |
 | `DELETE` | `/queues/{name}` | Delete queue; cascades to role mappings and bumps affected roles' refresh tags |
+
+**Queue names** must match `^[a-zA-Z_][a-zA-Z0-9_]*$` — letters, digits and underscores, not starting with a digit. **Hyphens are not allowed**: use `priority_shard_a`, not `priority-shard-a`. The rule is the same identifier rule used for task and router names, so that any queue can be named from a mermaid diagram label. It is enforced on create (the `QueueConfig.name` validator) and on update (the `PUT /queues/{name}` path pattern); role names are unconstrained, since a role is never named in a diagram.
 
 ---
 
@@ -125,9 +146,9 @@ Stop new submissions to a queue while in-flight tasks complete naturally:
 
 ```bash
 # Remove the queue from the role that processes it
-PUT /roles/default  { "queues": ["other-queue"] }
-# Workers stop polling "draining-queue" on their next fetch cycle
-# In-flight tasks on "draining-queue" finish normally (not cancelled)
+PUT /roles/default  { "queues": ["other_queue"] }
+# Workers stop polling "draining_queue" on their next fetch cycle
+# In-flight tasks on "draining_queue" finish normally (not cancelled)
 ```
 
 #### Shift capacity to a hot queue
@@ -142,8 +163,8 @@ PUT /roles/default  { "queues": ["normal", "urgent"] }
 
 ```bash
 # Create an isolated queue and role
-POST /queues  { "name": "heavy-ml", "max_concurrent": 2 }
-POST /roles   { "name": "ml-role", "queues": ["heavy-ml"] }
+POST /queues  { "name": "heavy_ml", "max_concurrent": 2 }
+POST /roles   { "name": "ml-role", "queues": ["heavy_ml"] }
 # Deploy workers with WORKER_ROLE=ml-role
 ```
 
@@ -151,7 +172,7 @@ POST /roles   { "name": "ml-role", "queues": ["heavy-ml"] }
 
 ```bash
 # Apply a concurrency cap without touching workers
-PUT /queues/external-api  { "name": "external-api", "max_concurrent": 5 }
+PUT /queues/external_api  { "name": "external_api", "max_concurrent": 5 }
 # Takes effect on next task-fetch cycle
 ```
 
@@ -159,8 +180,8 @@ PUT /queues/external-api  { "name": "external-api", "max_concurrent": 5 }
 
 ```bash
 # Add a rate limit to an overloaded downstream
-PUT /queues/payment-gateway  {
-  "name": "payment-gateway",
+PUT /queues/payment_gateway  {
+  "name": "payment_gateway",
   "rate_numerator": 100,
   "rate_denominator": 1,
   "rate_period": "minute"
