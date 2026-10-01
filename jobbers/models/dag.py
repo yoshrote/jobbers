@@ -80,7 +80,7 @@ class DAGTaskSpec(BaseModel):
 
     id: ULID = Field(default_factory=ULID)
     name: str
-    lane: str = "default"
+    queue: str = "default"
     version: int = 0
     parameters: dict[str, Any] = {}
     dag_callbacks: list[DAGCallback] = []
@@ -151,7 +151,7 @@ class DAGTaskSpec(BaseModel):
         return DAGTaskSpec(
             id=new_id,
             name=self.name,
-            lane=self.lane,
+            queue=self.queue,
             version=self.version,
             parameters=self.parameters,
             dag_callbacks=new_callbacks,
@@ -337,14 +337,14 @@ class DAGNode:
         self,
         name: str,
         *,
-        lane: str = "default",
+        queue: str = "default",
         version: int = 0,
         parameters: dict[str, Any] | None = None,
         task_id: ULID | None = None,
     ) -> None:
         self._id: ULID = task_id or ULID()
         self._name = name
-        self._lane = lane
+        self._queue = queue
         self._version = version
         self._parameters: dict[str, Any] = parameters or {}
         # (successor_node, fan_in_key or None, error_node or None)
@@ -462,7 +462,7 @@ class DAGNode:
         return DAGTaskSpec(
             id=self._id,
             name=self._name,
-            lane=self._lane,
+            queue=self._queue,
             version=self._version,
             parameters=self._parameters,
             dag_callbacks=self._callbacks_recursive(),
@@ -514,7 +514,7 @@ class DAGNode:
         return Task(
             id=self._id,
             name=self._name,
-            lane=self._lane,
+            queue=self._queue,
             version=self._version,
             parameters=self._parameters,
             dag_callbacks=self._callbacks_recursive(),

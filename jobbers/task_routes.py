@@ -26,7 +26,6 @@ from jobbers.models.dag import (
 )
 from jobbers.models.queue_config import QUEUE_NAME_PATTERN, QueueConfig
 from jobbers.models.task import Task, TaskPagination
-from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.protocols import RoutingBackendReadOnlyError
 from jobbers.state_manager import StateManager, TaskException, TaskRateLimitedError
@@ -141,7 +140,7 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
         spec = DAGTaskSpec(
             id=task.id,
             name=task.name,
-            lane=task.lane,
+            queue=task.queue,
             version=task.version,
             parameters=task.parameters,
             dag_callbacks=task.dag_callbacks,
@@ -563,40 +562,6 @@ async def refresh_role(role_name: str) -> dict[str, Any]:
     await _require_role(role_name, sm)
     new_tag = await sm.bump_refresh_tag(role_name)
     return {"role": role_name, "refresh_tag": new_tag}
-
-
-# ── Task routing ───────────────────────────────────────────────────────────────
-
-
-@app.get("/task-routing/{task_name}/{task_version}")
-async def get_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
-    """Retrieve the routing configuration for a specific task type."""
-    sm = db.get_state_manager()
-    await sm.refresh_config_if_stale()
-    config = await sm.get_routing_config(task_name, task_version)
-    if config is None:
-        raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
-    return {"routing": config.model_dump(mode="json")}
-
-
-@app.put("/task-routing/{task_name}/{task_version}")
-async def update_task_routing(
-    task_name: str, task_version: int, routing_config: RoutingConfig
-) -> dict[str, Any]:
-    """Create or update the routing configuration for a task type. Path parameters override body values."""
-    routing_config.task_name = task_name
-    routing_config.task_version = task_version
-    await db.get_state_manager().save_routing_config(routing_config)
-    return {"message": "Task routing updated successfully", "routing": routing_config.model_dump(mode="json")}
-
-
-@app.delete("/task-routing/{task_name}/{task_version}", status_code=200)
-async def delete_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
-    """Remove the routing configuration for a task type. Returns 404 if it does not exist."""
-    deleted = await db.get_state_manager().delete_routing_config(task_name, task_version)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
-    return {"message": f"Routing config for '{task_name}' v{task_version} deleted successfully."}
 
 
 # ── DAG submission ─────────────────────────────────────────────────────────────

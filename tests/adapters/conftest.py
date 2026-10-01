@@ -4,21 +4,18 @@ import pytest_asyncio
 from jobbers.adapters.redis import (
     RedisDeadQueue,
     RedisQueueConfigAdapter,
-    RedisTaskRoutingConfigAdapter,
     RedisTaskState,
     RedisTaskSubmit,
 )
 from jobbers.adapters.redis_json import (
     RedisJSONDeadQueue,
     RedisJSONQueueConfigAdapter,
-    RedisJSONTaskRoutingConfigAdapter,
     RedisJSONTaskState,
     RedisJSONTaskSubmit,
 )
 from jobbers.adapters.sql import (
     SQLDeadQueue,
     SQLQueueConfigAdapter,
-    SQLTaskRoutingConfigAdapter,
     SQLTaskState,
     SQLTaskSubmit,
 )
@@ -131,23 +128,6 @@ async def queue_config_adapter(request, session_factory, redis):
         adapter = RedisJSONQueueConfigAdapter(redis)
         await adapter.ensure_indexes()
         yield adapter
-
-
-@pytest_asyncio.fixture(params=["sql", "redis", "redis_json"], ids=["sql", "redis", "redis_json"])
-async def task_routing_config_adapter(request, session_factory, redis):
-    """
-    Parameterized fixture yielding a TaskRoutingConfigProtocol implementation for each backend.
-
-    - ``"sql"``: SQLTaskRoutingConfigAdapter backed by in-memory SQLite
-    - ``"redis"``: RedisTaskRoutingConfigAdapter backed by the shared real Redis connection
-    - ``"redis_json"``: RedisJSONTaskRoutingConfigAdapter backed by the shared real Redis connection
-    """
-    if request.param == "sql":
-        yield SQLTaskRoutingConfigAdapter(session_factory)
-    elif request.param == "redis":
-        yield RedisTaskRoutingConfigAdapter(redis)
-    else:
-        yield RedisJSONTaskRoutingConfigAdapter(redis)
 
 
 @pytest_asyncio.fixture(params=["redis", "redis_json", "sql"], ids=["redis", "redis_json", "sql"])

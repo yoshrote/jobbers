@@ -13,7 +13,7 @@ Jobbers uses a subset of the [Mermaid](https://mermaid.js.org/) `flowchart TD` d
 Every node uses a **quoted rectangular-bracket label**:
 
 ```text
-node_id["task_name[@version][:lane][(param=val, ...)]"]
+node_id["task_name[@version][:queue][(param=val, ...)]"]
 ```
 
 A **router node** uses a rhombus instead, naming a `@register_router` function:
@@ -26,7 +26,7 @@ node_id{"router_name[@version][(param=val, ...)]"}
 | --- | --- | --- |
 | `task_name` | yes | Registered task name — must match a `@register_task(name=...)` declaration |
 | `@version` | no | Integer task version; defaults to `0` when omitted |
-| `:lane` | no | Target lane; defaults to `"default"`. A lane runs on the queue of the same name unless a routing rule maps it elsewhere — see [lanes-and-queues.md](lanes-and-queues.md). |
+| `:queue` | no | Queue the task runs on; defaults to `"default"`. The queue must exist — see [resource-management.md](resource-management.md). |
 | `(key=val, …)` | no | Task parameters passed to the task function; values are type-coerced (see below) |
 | `{…}` | **reserved** | Output-only; appended by the generator for status / timestamps / metrics. **Stripped silently on parse** so UI-exported diagrams can be re-submitted without editing. |
 
@@ -151,7 +151,7 @@ flowchart TD
 
 What this describes:
 
-1. `A` (`fetch_data`, lane `heavy`, params `url` and `limit`) runs first.
+1. `A` (`fetch_data`, queue `heavy`, params `url` and `limit`) runs first.
 2. `A` fans out to `B` and `C` in parallel.
 3. `B` and `C` fan in to `D` — `D` runs only once both complete.
 4. `D` chains to `E` (`notify_slack`).
@@ -365,7 +365,7 @@ from jobbers.models.router import RouteTo
 def route_by_size(results: dict, *, threshold: int) -> str | RouteTo | None:
     if results["bytes"] < threshold:
         return "fast_path"
-    return RouteTo("slow_path", lane="heavy")
+    return RouteTo("slow_path", queue="heavy")
 ```
 
 - `results` is the parent task's result dict — or, in per-item mode, one **item** from it.
@@ -385,15 +385,15 @@ keeps the diagram a complete description of what can happen.
 | `None` | The path ends; nothing is submitted. |
 | `"fast_path"` | Shorthand for `RouteTo("fast_path")`. |
 | `RouteTo(task)` | Match by name. **Ambiguous** (and an error) when several candidates share that name. |
-| `RouteTo(task, lane="priority")` | Match by name *and* lane. |
-| `RouteTo(task, version=2)` | Match by name *and* version; combine with `lane` as needed. |
+| `RouteTo(task, queue="priority")` | Match by name *and* queue. |
+| `RouteTo(task, version=2)` | Match by name *and* version; combine with `queue` as needed. |
 
 A selection matching zero or more than one candidate is an error (see Failure handling below).
 
-### Same task, different lanes
+### Same task, different queues
 
-Candidates may share a task name as long as their lane or version differs — routing a subset of work
-to a higher-priority lane is the motivating case:
+Candidates may share a task name as long as their queue or version differs — routing a subset of work
+to a higher-priority queue is the motivating case:
 
 ```mermaid
 flowchart TD
@@ -413,10 +413,10 @@ flowchart TD
 ```python
 @register_router(name="route_by_tier", version=1)
 def route_by_tier(results) -> RouteTo:
-    return RouteTo("fulfil_order", lane="priority" if results["tier"] == "gold" else "standard")
+    return RouteTo("fulfil_order", queue="priority" if results["tier"] == "gold" else "standard")
 ```
 
-Where each lane physically runs stays the operator's call — see [lanes-and-queues.md](lanes-and-queues.md).
+Each queue's capacity and rate limits stay the operator's call — see [resource-management.md](resource-management.md).
 
 ### Converging branches are not a fan-in
 
@@ -432,7 +432,7 @@ An ordinary fan-in *inside* a single branch works normally — those predecessor
 ### Per-item routing
 
 A `-->>` edge into a router routes every item of the dispatcher's result list independently, so one
-fan-out can spread arms across several lanes:
+fan-out can spread arms across several queues:
 
 ```mermaid
 flowchart TD
@@ -452,7 +452,7 @@ flowchart TD
 ```python
 @register_router(name="route_by_region", version=1)
 def route_by_region(item) -> RouteTo | None:
-    return RouteTo("process_record", lane=item["region"])
+    return RouteTo("process_record", queue=item["region"])
 ```
 
 The router receives one item at a time. Returning `None` for an item drops it — that item contributes
@@ -473,10 +473,10 @@ than none.
 
 - A router needs at least one `-->` candidate and at least one incoming edge — it cannot be a DAG root.
 - Candidates must be tasks: router chaining (`R1 --> R2`) is not supported.
-- Candidates must be distinguishable — no two may share the same `(name, version, lane)`.
+- Candidates must be distinguishable — no two may share the same `(name, version, queue)`.
 - A router cannot be a dispatcher (`R -->>`), an arm terminal (`R --o`), a collector (`X --o R`), or the
   target of an error edge (`X -.-> R`).
-- `:lane` on a router label is a parse error; routers do not run on a lane.
+- `:queue` on a router label is a parse error; routers do not run on a queue.
 - A router selects at most one candidate. Conditional broadcast is not expressible.
 
 ---

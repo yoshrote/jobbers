@@ -2,7 +2,6 @@
 Redis Stack (RedisJSON + RediSearch) routing sub-adapters and routing backend.
 
 - `RedisJSONQueueConfigAdapter` — QueueConfigProtocol backed by RedisJSON + RediSearch.
-- `RedisJSONTaskRoutingConfigAdapter` — TaskRoutingConfigProtocol backed by RedisJSON.
 - `RedisJSONRoutingBackend` — RoutingBackendProtocol composing the two sub-adapters.
 """
 
@@ -23,7 +22,6 @@ from jobbers.adapters.redis_json._helpers import (
     _set_schema_version,
 )
 from jobbers.models.queue_config import QueueConfig
-from jobbers.models.task_routing import RoutingConfig
 
 if TYPE_CHECKING:
     from redis.asyncio.client import Redis
@@ -184,52 +182,15 @@ class RedisJSONQueueConfigAdapter:
 
 
 # ---------------------------------------------------------------------------
-# RedisJSONTaskRoutingConfigAdapter  (Redis Stack: RedisJSON)
-# ---------------------------------------------------------------------------
-
-
-class RedisJSONTaskRoutingConfigAdapter:
-    """TaskRoutingConfigProtocol backed by RedisJSON plain key-value docs."""
-
-    ROUTING_KEY = "routing:config:{task_name}:{task_version}".format
-
-    def __init__(self, client: Redis) -> None:
-        self._client = client
-
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        raw = cast(
-            "dict[str, Any] | None",
-            await self._client.json().get(self.ROUTING_KEY(task_name=task_name, task_version=task_version)),
-        )
-        if raw is None:
-            return None
-        return RoutingConfig.model_validate(raw)
-
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        await self._client.json().set(
-            self.ROUTING_KEY(task_name=routing_config.task_name, task_version=routing_config.task_version),
-            "$",
-            _pack(routing_config),
-        )
-
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
-        deleted: int = await self._client.delete(
-            self.ROUTING_KEY(task_name=task_name, task_version=task_version)
-        )
-        return deleted > 0
-
-
-# ---------------------------------------------------------------------------
 # RedisJSONRoutingBackend  (Redis Stack: RedisJSON + RediSearch)
 # ---------------------------------------------------------------------------
 
 
 class RedisJSONRoutingBackend:
-    """RoutingBackendProtocol backed by RedisJSON. Delegates to sub-adapters."""
+    """RoutingBackendProtocol backed by RedisJSON. Delegates to the queue-config sub-adapter."""
 
     def __init__(self, client: Redis) -> None:
         self._qca = RedisJSONQueueConfigAdapter(client)
-        self._rca = RedisJSONTaskRoutingConfigAdapter(client)
 
     async def ensure_indexes(self) -> None:
         await self._qca.ensure_indexes()
@@ -269,12 +230,3 @@ class RedisJSONRoutingBackend:
 
     async def get_roles_for_queue(self, queue_name: str) -> list[str]:
         return await self._qca.get_roles_for_queue(queue_name)
-
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        return await self._rca.get_routing_config(task_name, task_version)
-
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        await self._rca.save_routing_config(routing_config)
-
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
-        return await self._rca.delete_routing_config(task_name, task_version)

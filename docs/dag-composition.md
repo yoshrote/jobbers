@@ -193,7 +193,7 @@ from jobbers.models.router import RouteTo
 
 @register_router(name="route_by_tier", version=1)
 def route_by_tier(results) -> RouteTo:
-    return RouteTo("fulfil_order", lane="priority" if results["tier"] == "gold" else "standard")
+    return RouteTo("fulfil_order", queue="priority" if results["tier"] == "gold" else "standard")
 ```
 
 Only the selected branch is ever submitted. Because both predecessors of `confirm` are branches of the

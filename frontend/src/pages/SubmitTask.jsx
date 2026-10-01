@@ -14,7 +14,7 @@ export default function SubmitTask() {
   const [form, setForm] = useState({
     id: tempId(),
     name: '',
-    lane: 'default',
+    queue: 'default',
     version: 0,
     parameters: '{}',
   })
@@ -46,7 +46,7 @@ export default function SubmitTask() {
       const res = await submitTask({
         id: form.id,
         name: form.name,
-        lane: form.lane,
+        queue: form.queue,
         version: Number(form.version),
         parameters,
       })
@@ -93,9 +93,9 @@ export default function SubmitTask() {
           </div>
 
           <div className="form-row">
-            <label>Lane</label>
-            <input value={form.lane} onChange={set('lane')} required placeholder="default" />
-            <small>Runs on the queue of the same name unless a routing rule maps it elsewhere.</small>
+            <label>Queue</label>
+            <input value={form.queue} onChange={set('queue')} required placeholder="default" />
+            <small>Must be an existing queue. Letters, digits and underscores only.</small>
           </div>
 
           <input type="hidden" value={form.version} />

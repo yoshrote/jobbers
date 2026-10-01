@@ -22,7 +22,6 @@ from jobbers.models.dag import DAGNode, DagRunStatus, DAGTaskSpec, FanInCallback
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
-from jobbers.models.task_routing import RoutingConfig, RoutingRule, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import (
     CancelReason,
@@ -1335,7 +1334,7 @@ async def test_can_resume_dag_run_fan_in_tracking_expired(state_manager_real_ta)
     """A run that declares a fan-in edge but has no live tracking hash is not resumable."""
     dag_run_id = ULID()
     fan_in_callback = FanInCallback(
-        task=DAGTaskSpec(id=ULID2, name="collector_task", lane="default"), fan_in_key="fan-in:missing"
+        task=DAGTaskSpec(id=ULID2, name="collector_task", queue="default"), fan_in_key="fan-in:missing"
     )
     await _make_stuck_task(
         state_manager_real_ta, ULID1, dag_run_id, TaskStatus.FAILED, dag_callbacks=[fan_in_callback]
@@ -1352,7 +1351,7 @@ async def test_can_resume_dag_run_fan_in_tracking_alive(state_manager_real_ta):
     """A run whose declared fan-in tracking hash is still present is resumable."""
     dag_run_id = ULID()
     fan_in_callback = FanInCallback(
-        task=DAGTaskSpec(id=ULID2, name="collector_task", lane="default"), fan_in_key="fan-in:alive"
+        task=DAGTaskSpec(id=ULID2, name="collector_task", queue="default"), fan_in_key="fan-in:alive"
     )
     await state_manager_real_ta.task_state.init_fan_in(dag_run_id, "fan-in:alive", {ULID1})
     await _make_stuck_task(
@@ -1922,7 +1921,7 @@ async def test_submit_dag_fan_in_initialises_fan_in_sets(state_manager):
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_submits_task_and_reschedules(redis, state_manager):
     """dispatch_cron_dag submits the root task and reschedules the entry."""
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="daily_job",
         cron_expr="0 0 * * *",
@@ -1948,7 +1947,7 @@ async def test_dispatch_cron_dag_submits_task_and_reschedules(redis, state_manag
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_skip_if_running_skips_when_active(redis, state_manager):
     """dispatch_cron_dag skips dispatch but reschedules when concurrency_policy=SKIP_IF_RUNNING and previous run is active."""
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="guarded_job",
         cron_expr="0 0 * * *",
@@ -1983,7 +1982,7 @@ async def test_dispatch_cron_dag_skips_when_dispatch_lock_lost(redis, state_mana
     dispatch-lock guard against two dispatchers racing to fire the same due occurrence
     (e.g. during a scheduler restart), and applies regardless of concurrency_policy.
     """
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="unguarded_job",
         cron_expr="0 0 * * *",
@@ -2007,7 +2006,7 @@ async def test_dispatch_cron_dag_skips_when_dispatch_lock_lost(redis, state_mana
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_skip_if_running_records_active_task_when_not_skipping(redis, state_manager):
     """dispatch_cron_dag records the new root task when concurrency_policy=SKIP_IF_RUNNING and no prior run is active."""
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="guarded_job",
         cron_expr="0 0 * * *",
@@ -2059,7 +2058,7 @@ async def test_dispatch_cron_dag_fan_in_dag_initialises_sets(state_manager):
 @pytest.mark.asyncio
 async def test_dispatch_cron_dag_stages_submission_in_pipeline_for_non_rate_limited_queue(state_manager):
     """For non-rate-limited queues, submission is staged in the same pipeline (no separate submit_task call)."""
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="daily_job",
         cron_expr="0 0 * * *",
@@ -2086,7 +2085,7 @@ async def test_dispatch_cron_dag_falls_back_to_submit_task_for_rate_limited_queu
         QueueConfig(name="default", rate_numerator=5, rate_denominator=1, rate_period=RatePeriod.MINUTE)
     )
 
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="daily_job",
         cron_expr="0 0 * * *",
@@ -2111,7 +2110,7 @@ async def test_dispatch_cron_dag_swallows_rate_limit_rejection(state_manager, ca
         QueueConfig(name="default", rate_numerator=5, rate_denominator=1, rate_period=RatePeriod.MINUTE)
     )
 
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(
         name="daily_job",
         cron_expr="0 0 * * *",
@@ -2129,100 +2128,6 @@ async def test_dispatch_cron_dag_swallows_rate_limit_rejection(state_manager, ca
 
     mock_submit.assert_called_once()
     assert any("rejected by queue" in record.message for record in caplog.records)
-
-
-# ── resolve_queue ─────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_no_routing_uses_identity_default(state_manager):
-    """With no routing config, a lane resolves to the queue of the same name."""
-    task = Task(id=ULID1, name="my_task", version=1, lane="original")
-    result = await state_manager.resolve_queue(task)
-    assert result == "original"
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_single_strategy(state_manager):
-    """A wildcard SINGLE rule always returns the configured queue."""
-    config = RoutingConfig(
-        task_name="my_task",
-        task_version=1,
-        rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["target"])],
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    task = Task(id=ULID1, name="my_task", version=1, lane="ignored")
-    result = await state_manager.resolve_queue(task)
-    assert result == "target"
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_weighted_strategy_returns_one_of_configured_queues(state_manager):
-    """WEIGHTED routing returns one of the configured queues."""
-    config = RoutingConfig(
-        task_name="my_task",
-        task_version=1,
-        rules=[RoutingRule(strategy=RoutingStrategy.WEIGHTED, queues=["fast", "slow"], weights=[1.0, 1.0])],
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    task = Task(id=ULID1, name="my_task", version=1, lane="ignored")
-    results = {await state_manager.resolve_queue(task) for _ in range(20)}
-    assert results <= {"fast", "slow"}
-    assert len(results) > 0
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_lane_scoped_rule_wins_over_wildcard(state_manager):
-    """A rule scoped to the task's lane takes precedence over the wildcard rule."""
-    config = RoutingConfig(
-        task_name="my_task",
-        task_version=1,
-        rules=[
-            RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["bulk"]),
-            RoutingRule(from_lane="priority", strategy=RoutingStrategy.SINGLE, queues=["fast"]),
-        ],
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    priority = Task(id=ULID1, name="my_task", version=1, lane="priority")
-    standard = Task(id=ULID2, name="my_task", version=1, lane="standard")
-    assert await state_manager.resolve_queue(priority) == "fast"
-    assert await state_manager.resolve_queue(standard) == "bulk"
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_lanes_preserved_when_no_wildcard_rule(state_manager):
-    """Without a wildcard rule, an unmatched lane falls through to the identity default."""
-    config = RoutingConfig(
-        task_name="my_task",
-        task_version=1,
-        rules=[RoutingRule(from_lane="priority", strategy=RoutingStrategy.SINGLE, queues=["fast"])],
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    priority = Task(id=ULID1, name="my_task", version=1, lane="priority")
-    standard = Task(id=ULID2, name="my_task", version=1, lane="standard")
-    assert await state_manager.resolve_queue(priority) == "fast"
-    assert await state_manager.resolve_queue(standard) == "standard"
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_routing_is_version_specific(state_manager):
-    """Routing config is looked up by (name, version); a different version falls through."""
-    config = RoutingConfig(
-        task_name="my_task",
-        task_version=2,
-        rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["routed"])],
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    task_v1 = Task(id=ULID1, name="my_task", version=1, lane="original")
-    assert await state_manager.resolve_queue(task_v1) == "original"
-
-    task_v2 = Task(id=ULID2, name="my_task", version=2, lane="original")
-    assert await state_manager.resolve_queue(task_v2) == "routed"
 
 
 # ── cache behaviour ───────────────────────────────────────────────────────────
@@ -2251,40 +2156,6 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
     r2 = await sm.get_queue_config("q1")
     assert r2 is not None
     assert r2.max_concurrent == 5, "cache should serve the original value"
-
-
-@pytest.mark.asyncio
-async def test_get_routing_config_caches_result(redis, session_factory, dummy_task_adapter):
-    """get_routing_config returns a cached value on the second call."""
-    routing_backend = SQLRoutingBackend(session_factory)
-    sm = StateManager(
-        routing_backend,
-        task_state=dummy_task_adapter,
-        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
-        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
-        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
-        cron_dag_scheduler=RedisCronDAGScheduler(redis),
-        cancellation_bus=RedisCancellationBus(redis),
-        routing_notifications=RedisRoutingNotifications(redis),
-    )
-    config = RoutingConfig(
-        task_name="t", task_version=1, rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["routed"])]
-    )
-    await sm.routing.save_routing_config(config)
-    r1 = await sm.get_routing_config("t", 1)
-    assert r1 is not None
-    assert r1.rules[0].queues == ["routed"]
-
-    sm.routing.get_routing_config = AsyncMock(
-        return_value=RoutingConfig(
-            task_name="t",
-            task_version=1,
-            rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["other"])],
-        )
-    )
-    r2 = await sm.get_routing_config("t", 1)
-    assert r2 is not None, "cache should serve the original value"
-    assert r2.rules[0].queues == ["routed"], "cache should serve the original value"
 
 
 # ── explicit invalidation ─────────────────────────────────────────────────────
@@ -2327,117 +2198,6 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
     # refresh_tag should have been bumped for role_a (contains q1)
     tag_after = await sm.get_refresh_tag("role_a")
     assert tag_after != tag_before
-
-
-@pytest.mark.asyncio
-async def test_save_routing_config_invalidates_cache_and_bumps_version(
-    redis, session_factory, dummy_task_adapter
-):
-    """save_routing_config writes to SQL, clears the cache entry, and updates config:version to a new ULID."""
-    routing_backend = SQLRoutingBackend(session_factory)
-    sm = StateManager(
-        routing_backend,
-        task_state=dummy_task_adapter,
-        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
-        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
-        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
-        cron_dag_scheduler=RedisCronDAGScheduler(redis),
-        cancellation_bus=RedisCancellationBus(redis),
-        routing_notifications=RedisRoutingNotifications(redis),
-    )
-
-    config_v1 = RoutingConfig(
-        task_name="t", task_version=1, rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["q_old"])]
-    )
-    await sm.routing.save_routing_config(config_v1)
-
-    # Warm the cache
-    r1 = await sm.get_routing_config("t", 1)
-    assert r1 is not None
-    assert r1.rules[0].queues == ["q_old"]
-
-    version_before = await redis.get("config:version")
-
-    config_v2 = RoutingConfig(
-        task_name="t", task_version=1, rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["q_new"])]
-    )
-    await sm.save_routing_config(config_v2)
-
-    # Cache should be cleared — next call hits SQL and returns the new value
-    r2 = await sm.get_routing_config("t", 1)
-    assert r2 is not None
-    assert r2.rules[0].queues == ["q_new"]
-
-    version_after = await redis.get("config:version")
-    assert version_after is not None
-    assert version_before != version_after
-
-
-@pytest.mark.asyncio
-async def test_delete_routing_config_invalidates_cache_and_bumps_version(
-    redis, session_factory, dummy_task_adapter
-):
-    """delete_routing_config removes from SQL, clears the cache entry, and updates config:version to a new ULID."""
-    routing_backend = SQLRoutingBackend(session_factory)
-    sm = StateManager(
-        routing_backend,
-        task_state=dummy_task_adapter,
-        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
-        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
-        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
-        cron_dag_scheduler=RedisCronDAGScheduler(redis),
-        cancellation_bus=RedisCancellationBus(redis),
-        routing_notifications=RedisRoutingNotifications(redis),
-    )
-    config = RoutingConfig(
-        task_name="t", task_version=1, rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["q"])]
-    )
-    await sm.routing.save_routing_config(config)
-
-    # Warm the cache
-    await sm.get_routing_config("t", 1)
-
-    version_before = await redis.get("config:version")
-    deleted = await sm.delete_routing_config("t", 1)
-
-    assert deleted is True
-    # Cache entry cleared — returns None (SQL has no config now)
-    r = await sm.get_routing_config("t", 1)
-    assert r is None
-
-    version_after = await redis.get("config:version")
-    assert version_after is not None
-    assert version_before != version_after
-
-
-@pytest.mark.asyncio
-async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_factory, dummy_task_adapter):
-    """invalidate_all_routing_config clears all entries from the routing cache dict."""
-    routing_backend = SQLRoutingBackend(session_factory)
-    sm = StateManager(
-        routing_backend,
-        task_state=dummy_task_adapter,
-        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
-        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
-        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
-        cron_dag_scheduler=RedisCronDAGScheduler(redis),
-        cancellation_bus=RedisCancellationBus(redis),
-        routing_notifications=RedisRoutingNotifications(redis),
-    )
-    for i in range(3):
-        cfg = RoutingConfig(
-            task_name=f"t{i}",
-            task_version=1,
-            rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["q"])],
-        )
-        await sm.routing.save_routing_config(cfg)
-        await sm.get_routing_config(f"t{i}", 1)
-
-    assert len(sm._routing_config_cache) == 3
-
-    sm.invalidate_all_routing_config()
-
-    assert len(sm._routing_config_cache) == 0
 
 
 # ── saga-mode state-manager paths ────────────────────────────────────────────
@@ -2856,7 +2616,7 @@ async def test_dispatch_cron_dag_no_pipeline(cron_saga_state_manager):
 
     from jobbers.models.dag import DAGTaskSpec
 
-    spec = DAGTaskSpec(name="my_job", lane=spec_queue)
+    spec = DAGTaskSpec(name="my_job", queue=spec_queue)
     entry = CronDAGEntry(
         name="nightly",
         cron_expr="0 0 * * *",
@@ -2889,7 +2649,7 @@ async def test_complete_cron_task_same_backend_atomic_pipeline(state_manager_rea
 
     from jobbers.models.dag import DAGTaskSpec
 
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
     await sm.cron_dag_scheduler.add(entry, FROZEN_TIME)
     task_id = ULID()
@@ -2912,7 +2672,7 @@ async def test_reschedule_cron_entries_bulk_atomic_pipeline(state_manager_real_t
 
     from jobbers.models.dag import DAGTaskSpec
 
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry_a = CronDAGEntry(name="nightly-a", cron_expr="0 0 * * *", dag_spec=spec)
     entry_b = CronDAGEntry(name="nightly-b", cron_expr="0 0 * * *", dag_spec=spec)
     await sm.cron_dag_scheduler.add(entry_a, FROZEN_TIME)
@@ -2936,7 +2696,7 @@ async def test_complete_cron_task_atomic_state_separate_cron_backend(cron_saga_s
 
     from jobbers.models.dag import DAGTaskSpec
 
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
     await cron_sched.add(entry, FROZEN_TIME)
     task_id = ULID()
@@ -2957,7 +2717,7 @@ async def test_complete_cron_task_full_saga_mode(saga_state_manager):
     """complete_cron_task uses save_task + clear_active_run sequentially when state is also non-atomic."""
     from jobbers.models.dag import DAGTaskSpec
 
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
     cron_sched = saga_state_manager.cron_dag_scheduler
     await cron_sched.add(entry, FROZEN_TIME)
@@ -2979,7 +2739,7 @@ async def test_reschedule_cron_entries_bulk_no_pipeline(cron_saga_state_manager)
     """reschedule_cron_entries_bulk calls reschedule() sequentially when cron scheduler is non-atomic."""
     from jobbers.models.dag import DAGTaskSpec
 
-    spec = DAGTaskSpec(name="my_job", lane="default")
+    spec = DAGTaskSpec(name="my_job", queue="default")
     entry = CronDAGEntry(name="nightly", cron_expr="0 0 * * *", dag_spec=spec)
     cron_sched = cron_saga_state_manager.cron_dag_scheduler
     assert isinstance(cron_sched, DummyCronDAGScheduler)
@@ -3022,71 +2782,8 @@ def _sm_pair(redis, session_factory, dummy_task_adapter):
 
 
 @pytest.mark.asyncio
-async def test_repoint_reaches_a_second_process_without_restart(redis, session_factory, dummy_task_adapter):
-    """A lane repointed through one StateManager resolves the new queue in another."""
-    writer, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
-    await writer.save_queue_config(QueueConfig(name="old_q"))
-    await writer.save_queue_config(QueueConfig(name="new_q"))
-    await writer.save_routing_config(
-        RoutingConfig(
-            task_name="t",
-            task_version=1,
-            rules=[RoutingRule(from_lane="fast", strategy=RoutingStrategy.SINGLE, queues=["old_q"])],
-        )
-    )
-    task = Task(id=ULID(), name="t", version=1, lane="fast")
-
-    # The reader warms its cache against the pre-repoint config.
-    assert await reader.resolve_queue(task) == "old_q"
-
-    await writer.save_routing_config(
-        RoutingConfig(
-            task_name="t",
-            task_version=1,
-            rules=[RoutingRule(from_lane="fast", strategy=RoutingStrategy.SINGLE, queues=["new_q"])],
-        )
-    )
-
-    # Still stale inside the poll interval -- this is the documented staleness window.
-    assert await reader.resolve_queue(task) == "old_q"
-
-    assert await reader.refresh_config_if_stale(min_interval=0) is True
-    assert await reader.resolve_queue(task) == "new_q"
-
-
-@pytest.mark.asyncio
-async def test_resolve_queue_polls_for_config_changes(
-    redis, session_factory, dummy_task_adapter, monkeypatch
-):
-    """resolve_queue itself picks up a repoint -- no explicit refresh call needed."""
-    monkeypatch.setattr("jobbers.state_manager.CONFIG_POLL_INTERVAL", 0.0)
-    writer, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
-    await writer.save_queue_config(QueueConfig(name="old_q"))
-    await writer.save_queue_config(QueueConfig(name="new_q"))
-    await writer.save_routing_config(
-        RoutingConfig(
-            task_name="t",
-            task_version=1,
-            rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["old_q"])],
-        )
-    )
-    task = Task(id=ULID(), name="t", version=1, lane="fast")
-    assert await reader.resolve_queue(task) == "old_q"
-
-    await writer.save_routing_config(
-        RoutingConfig(
-            task_name="t",
-            task_version=1,
-            rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["new_q"])],
-        )
-    )
-
-    assert await reader.resolve_queue(task) == "new_q"
-
-
-@pytest.mark.asyncio
 async def test_creating_a_queue_expires_a_cached_negative_lookup(redis, session_factory, dummy_task_adapter):
-    """A queue created elsewhere clears a cached None -- validation stops rejecting the lane."""
+    """A queue created elsewhere clears a cached None -- validation stops rejecting it."""
     writer, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
 
     # The reader probes the target before it exists (what validate_task does) and caches None.

@@ -25,7 +25,7 @@ def make_cron_entry(*, enabled: bool = True, cron_expr: str = "0 * * * *") -> Cr
     return CronDAGEntry(
         name="test_cron",
         cron_expr=cron_expr,
-        dag_spec=DAGTaskSpec(name="test_task", lane="default"),
+        dag_spec=DAGTaskSpec(name="test_task", queue="default"),
         enabled=enabled,
     )
 

@@ -21,7 +21,7 @@ def _router_tree() -> DAGTaskSpec:
     """Build a root whose RouterCallback offers two candidates, one with a downstream chain."""
     tail = DAGTaskSpec(name="tail")
     fast = DAGTaskSpec(name="fast_path", dag_callbacks=[SimpleCallback(task=tail)])
-    slow = DAGTaskSpec(name="slow_path", lane="heavy")
+    slow = DAGTaskSpec(name="slow_path", queue="heavy")
     err = DAGTaskSpec(name="notify_bad_route")
     return DAGTaskSpec(
         name="root",
@@ -57,7 +57,7 @@ def test_fresh_copy_preserves_router_payload():
     cb = fresh.dag_callbacks[0]
     assert cb.router.router == "route"
     assert cb.router.parameters == {"threshold": 5}
-    assert [(c.name, c.lane) for c in cb.router.candidates] == [
+    assert [(c.name, c.queue) for c in cb.router.candidates] == [
         ("fast_path", "default"),
         ("slow_path", "heavy"),
     ]
@@ -181,14 +181,14 @@ def test_fanout_with_arm_router_round_trips_through_json():
         collector=collector,
         arm_router=RouterSpec(
             router="route_by_region",
-            candidates=[DAGTaskSpec(name="process", lane="us"), DAGTaskSpec(name="process", lane="eu")],
+            candidates=[DAGTaskSpec(name="process", queue="us"), DAGTaskSpec(name="process", queue="eu")],
         ),
     )
     restored = DynamicFanOutCallback.model_validate(cb.model_dump(mode="json"))
     assert restored.arm_root is None
     assert restored.arm_router is not None
     assert restored.arm_router.router == "route_by_region"
-    assert [(c.name, c.lane) for c in restored.arm_router.candidates] == [
+    assert [(c.name, c.queue) for c in restored.arm_router.candidates] == [
         ("process", "us"),
         ("process", "eu"),
     ]

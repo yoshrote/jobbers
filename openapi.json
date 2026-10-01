@@ -588,6 +588,7 @@
             "required": true,
             "schema": {
               "type": "string",
+              "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
               "title": "Queue Name"
             }
           }
@@ -1325,165 +1326,6 @@
         }
       }
     },
-    "/task-routing/{task_name}/{task_version}": {
-      "get": {
-        "summary": "Get Task Routing",
-        "description": "Retrieve the routing configuration for a specific task type.",
-        "operationId": "get_task_routing_task_routing__task_name___task_version__get",
-        "parameters": [
-          {
-            "name": "task_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Task Name"
-            }
-          },
-          {
-            "name": "task_version",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Task Version"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Task Routing Task Routing  Task Name   Task Version  Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "summary": "Update Task Routing",
-        "description": "Create or update the routing configuration for a task type. Path parameters override body values.",
-        "operationId": "update_task_routing_task_routing__task_name___task_version__put",
-        "parameters": [
-          {
-            "name": "task_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Task Name"
-            }
-          },
-          {
-            "name": "task_version",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Task Version"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RoutingConfig"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Update Task Routing Task Routing  Task Name   Task Version  Put"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "summary": "Delete Task Routing",
-        "description": "Remove the routing configuration for a task type. Returns 404 if it does not exist.",
-        "operationId": "delete_task_routing_task_routing__task_name___task_version__delete",
-        "parameters": [
-          {
-            "name": "task_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Task Name"
-            }
-          },
-          {
-            "name": "task_version",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Task Version"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Delete Task Routing Task Routing  Task Name   Task Version  Delete"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/submit-dag": {
       "post": {
         "summary": "Submit Dag",
@@ -2085,9 +1927,9 @@
             "type": "string",
             "title": "Name"
           },
-          "lane": {
+          "queue": {
             "type": "string",
-            "title": "Lane",
+            "title": "Queue",
             "default": "default"
           },
           "version": {
@@ -2362,6 +2204,7 @@
         "properties": {
           "name": {
             "type": "string",
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
             "title": "Name"
           },
           "max_concurrent": {
@@ -2565,88 +2408,6 @@
         "title": "RouterSpec",
         "description": "Serialisable specification for a router node (a mermaid rhombus).\n\n``router``/``version`` name a ``@register_router`` function; ``parameters``\ncome from the node label. ``candidates`` are the task nodes the router's\noutgoing ``-->`` edges point at -- the router selects exactly one of them,\nor none.\n\n``id`` is pre-assigned so generated diagrams can give the router node a\nstable identifier alongside the task ULIDs."
       },
-      "RoutingConfig": {
-        "properties": {
-          "task_name": {
-            "type": "string",
-            "title": "Task Name",
-            "default": ""
-          },
-          "task_version": {
-            "type": "integer",
-            "title": "Task Version",
-            "default": 0
-          },
-          "rules": {
-            "items": {
-              "$ref": "#/components/schemas/RoutingRule"
-            },
-            "type": "array",
-            "title": "Rules"
-          }
-        },
-        "type": "object",
-        "required": [
-          "rules"
-        ],
-        "title": "RoutingConfig",
-        "description": "Lane \u2192 queue routing configuration for a task type.\n\nA config is a list of rules. ``rule_for(lane)`` picks the rule scoped to\nthat lane, falling back to the wildcard rule. When neither exists the caller\napplies the identity default: the lane resolves to the queue of the same\nname (see ``docs/lanes-and-queues.md``)."
-      },
-      "RoutingRule": {
-        "properties": {
-          "from_lane": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "From Lane"
-          },
-          "strategy": {
-            "$ref": "#/components/schemas/RoutingStrategy"
-          },
-          "queues": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "title": "Queues"
-          },
-          "weights": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "number"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Weights"
-          }
-        },
-        "type": "object",
-        "required": [
-          "strategy",
-          "queues"
-        ],
-        "title": "RoutingRule",
-        "description": "One lane \u2192 queue(s) mapping within a task type's routing config.\n\n``from_lane`` scopes the rule to work that *asked for* that lane. ``None``\nis the wildcard: it matches any lane, which is the blanket-override\nbehaviour routing configs had before lanes existed."
-      },
-      "RoutingStrategy": {
-        "type": "string",
-        "enum": [
-          "single",
-          "weighted"
-        ],
-        "title": "RoutingStrategy",
-        "description": "Queue routing strategy for a task type."
-      },
       "ScheduleTaskRequest": {
         "properties": {
           "task": {
@@ -2745,11 +2506,6 @@
           "name": {
             "type": "string",
             "title": "Name"
-          },
-          "lane": {
-            "type": "string",
-            "title": "Lane",
-            "default": "default"
           },
           "queue": {
             "type": "string",

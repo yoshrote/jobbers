@@ -10,8 +10,7 @@ nodes it may select from.
 - ``RouterConfig`` — registry entry, mirroring ``TaskConfig``'s shape.
 
 See ``docs/mermaid-dag-spec.md`` for the diagram syntax and
-``docs/lanes-and-queues.md`` for how the selected candidate's lane becomes a
-physical queue.
+``docs/resource-management.md`` for the queue's capacity and rate controls.
 """
 
 from collections.abc import Callable
@@ -41,16 +40,16 @@ class RouteTo:
 
     ```python
     RouteTo("fulfil_order")  # by name alone
-    RouteTo("fulfil_order", lane="priority")  # name + lane
+    RouteTo("fulfil_order", queue="priority")  # name + queue
     RouteTo("fulfil_order", version=2)  # name + version
     ```
 
     Filtering by name alone is an error when the router has several candidates
-    with that name -- say which lane you mean.
+    with that name -- say which queue you mean.
     """
 
     task: str
-    lane: str | None = None
+    queue: str | None = None
     version: int | None = None
 
 

@@ -9,7 +9,7 @@ Node label grammar
 
 Every node uses a **quoted rectangular-bracket label**::
 
-    node_id["task_name[@version][:lane][(param=val, ...)]"]
+    node_id["task_name[@version][:queue][(param=val, ...)]"]
 
 .. list-table::
    :header-rows: 1
@@ -23,11 +23,10 @@ Every node uses a **quoted rectangular-bracket label**::
    * - ``@version``
      - no
      - Integer task version; defaults to ``0`` when omitted
-   * - ``:lane``
+   * - ``:queue``
      - no
-     - Target lane name; defaults to ``"default"``. A lane resolves to the
-       physical queue of the same name unless a routing rule says otherwise
-       (see ``docs/lanes-and-queues.md``).
+     - Queue the task runs on; defaults to ``"default"``. The queue must exist
+       (see ``docs/resource-management.md``).
    * - ``(key=val, …)``
      - no
      - Task parameters passed verbatim to the task function; values are
@@ -82,7 +81,7 @@ Reserved output annotations
 When the generator emits a diagram for a live DAG it appends a ``{STATUS}``
 section inside the label and emits ``:::classname`` / ``classDef`` blocks::
 
-    node_id["task_name:lane{COMPLETED|2026-03-30T10:00|43ms}"]:::completed
+    node_id["task_name:queue{COMPLETED|2026-03-30T10:00|43ms}"]:::completed
 
 These annotations are **read-only** — the parser strips them silently, so a
 diagram copied from the UI can be re-submitted without any editing.
@@ -159,7 +158,7 @@ class ParsedLabel(NamedTuple):
 
     name: str
     version: int
-    lane: str
+    queue: str
     params: dict[str, Any]
 
 
@@ -183,9 +182,9 @@ class FanInEdge(NamedTuple):
 # Strip trailing reserved {status_info} from a label before grammar parsing.
 _STATUS_SUFFIX_RE = re.compile(r"\{[^}]*\}\s*$")
 
-# Parses: task_name[@version][:lane][(params)]
+# Parses: task_name[@version][:queue][(params)]
 _LABEL_RE = re.compile(
-    r"^(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)(?:@(?P<version>\d+))?(?::(?P<lane>[a-zA-Z0-9_-]+))?(?:\((?P<params>[^)]*)\))?$"
+    r"^(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)(?:@(?P<version>\d+))?(?::(?P<queue>[a-zA-Z_][a-zA-Z0-9_]*))?(?:\((?P<params>[^)]*)\))?$"
 )
 
 # Node definition — no line anchor so finditer scans inline definitions.
@@ -325,14 +324,14 @@ def _parse_label(label: str) -> ParsedLabel:
     m = _LABEL_RE.match(label)
     if not m:
         raise MermaidParseError(
-            f"Invalid node label {label!r}. Expected: task_name[@version][:lane][(key=val, ...)]"
+            f"Invalid node label {label!r}. Expected: task_name[@version][:queue][(key=val, ...)]"
         )
     name = m.group("name")
     version = int(m.group("version")) if m.group("version") is not None else 0
-    lane = m.group("lane") or "default"
+    queue = m.group("queue") or "default"
     params_str = m.group("params") or ""
     params = _parse_params(params_str) if params_str.strip() else {}
-    return ParsedLabel(name, version, lane, params)
+    return ParsedLabel(name, version, queue, params)
 
 
 def _serialize_params(params: dict[str, Any]) -> str:
@@ -449,7 +448,7 @@ def _lex_mermaid(text: str) -> LexedDiagram:
         # Extract task node labels first, then strip their definitions before
         # scanning for routers. A task label may legitimately carry a reserved
         # {STATUS} suffix (fetch_data:heavy{COMPLETED}), which the router pattern
-        # would otherwise read as a rhombus node named after the lane.
+        # would otherwise read as a rhombus node named after the queue.
         for m in _NODE_RE.finditer(line):
             node_labels[m.group(1)] = (m.group(2) or m.group(3) or m.group(4) or "").strip()
         cleaned = _NODE_RE.sub(lambda m: m.group(1), line)
@@ -564,12 +563,12 @@ def _check_candidate_uniqueness(router_id: str, candidates: list[DAGNode]) -> No
     """Reject candidates a ``RouteTo`` selector could never tell apart."""
     seen: set[tuple[str, int, str]] = set()
     for node in candidates:
-        key = (node._name, node._version, node._lane)
+        key = (node._name, node._version, node._queue)
         if key in seen:
             raise MermaidParseError(
                 f"Router '{router_id}' has two candidates for "
                 f"'{key[0]}@{key[1]}:{key[2]}'; they would be indistinguishable to the "
-                "router's return value. Give them different lanes."
+                "router's return value. Give them different queues."
             )
         seen.add(key)
 
@@ -636,7 +635,7 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
                 node_labels[nid] = nid  # label defaults to the node identifier
                 all_ids.add(nid)
 
-    # Parse each label → ParsedLabel(name, version, lane, params).
+    # Parse each label → ParsedLabel(name, version, queue, params).
     parsed: dict[str, ParsedLabel] = {}
     for nid, label in node_labels.items():
         try:
@@ -644,38 +643,37 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
         except MermaidParseError as exc:
             raise MermaidParseError(f"Node '{nid}': {exc}") from exc
 
-    # Router labels share the task grammar minus the :lane segment -- a router
-    # doesn't execute anywhere, so naming a lane on one is meaningless.
+    # Router labels share the task grammar minus the :queue segment -- a router
+    # doesn't execute anywhere, so naming a queue on one is meaningless.
     parsed_routers: dict[str, ParsedLabel] = {}
     for rid, label in router_labels.items():
         try:
             pl = _parse_label(label)
         except MermaidParseError as exc:
             raise MermaidParseError(f"Router '{rid}': {exc}") from exc
-        if pl.lane != "default":
+        if pl.queue != "default":
             raise MermaidParseError(
-                f"Router '{rid}' declares a lane (':{pl.lane}'). Routers do not run on a "
-                "lane; the lane belongs to the candidate tasks it selects."
+                f"Router '{rid}' declares a queue (':{pl.queue}'). Routers do not run on a "
+                "queue; the queue belongs to the candidate tasks it selects."
             )
         parsed_routers[rid] = pl
 
-    # TODO: validate lane names against the database.
-    # All lane names referenced by this DAG are known at this point; collect them
-    # with a set comprehension and resolve in a single query rather than per-node:
+    # TODO: validate queue names against the database.
+    # Every queue this DAG references is known at this point; collect them with a set
+    # comprehension and resolve in a single query rather than per-node:
     #
-    #   lanes = {pl.lane for pl in parsed.values()}
-    #   unknown = lanes - await state_manager.get_known_lanes(lanes)
+    #   queues = {pl.queue for pl in parsed.values()}
+    #   unknown = queues - await state_manager.get_known_queues(queues)
     #   if unknown:
-    #       raise MermaidParseError(f"Unknown lanes: {', '.join(sorted(unknown))}")
+    #       raise MermaidParseError(f"Unknown queues: {', '.join(sorted(unknown))}")
     #
-    # parse_mermaid_dag would need to become async and accept a StateManager (or a
-    # callable) to do this.  Alternatively, validation can be deferred to the route
-    # handler, which already has a StateManager in scope, by exposing the lane set
-    # as a separate helper function.
+    # parse_mermaid_dag is synchronous and holds no StateManager, so this belongs in
+    # StateManager.submit_dag instead -- which also covers programmatic callers and
+    # POST /cron-dags, both of which bypass the route handler.
 
     # Build DAGNode objects with pre-assigned ULIDs.
     dag_nodes: dict[str, DAGNode] = {
-        nid: DAGNode(pl.name, version=pl.version, lane=pl.lane, parameters=pl.params, task_id=ULID())
+        nid: DAGNode(pl.name, version=pl.version, queue=pl.queue, parameters=pl.params, task_id=ULID())
         for nid, pl in parsed.items()
     }
 
@@ -953,8 +951,8 @@ def _spec_label(spec: DAGTaskSpec, status: TaskStatus | None) -> str:
     label = spec.name
     if spec.version != 0:
         label += f"@{spec.version}"
-    if spec.lane != "default":
-        label += f":{spec.lane}"
+    if spec.queue != "default":
+        label += f":{spec.queue}"
     params_str = _serialize_params(spec.parameters)
     if params_str:
         label += f"({params_str})"

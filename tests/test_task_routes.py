@@ -13,7 +13,6 @@ from jobbers.models.dag import DAGRunDetail, DAGRunPagination, DagRunStatus, DAG
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
-from jobbers.models.task_routing import RoutingConfig, RoutingRule, RoutingStrategy
 from jobbers.state_manager import TaskException, TaskRateLimitedError
 from jobbers.task_routes import app
 
@@ -24,7 +23,7 @@ FROZEN_TIME = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 
 @pytest_asyncio.fixture(autouse=True)
 async def setup(session_factory, state_manager):
-    """Seed the 'default' queue into both SQL (for task-routing CRUD tests) and the routing backend."""
+    """Seed the 'default' queue into both SQL and the routing backend."""
     await SQLQueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
     await state_manager.routing.save_queue_config(QueueConfig(name="default"))
     patches = [
@@ -952,15 +951,12 @@ async def test_update_queue_bumps_refresh_tag_for_containing_roles(state_manager
 
 
 @pytest.mark.asyncio
-async def test_update_task_routing_bumps_config_version(state_manager, redis):
-    """PUT /task-routing updates config:version to a new ULID in Redis."""
+async def test_update_queue_bumps_config_version(state_manager, redis):
+    """PUT /queues/{name} updates config:version so other processes drop their cache."""
     version_before = await redis.get("config:version")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.put(
-            "/task-routing/my_task/1",
-            json={"rules": [{"strategy": "single", "queues": ["default"]}]},
-        )
+        response = await client.put("/queues/default", json={"name": "default", "max_concurrent": 3})
 
     assert response.status_code == 200
     version_after = await redis.get("config:version")
@@ -969,19 +965,12 @@ async def test_update_task_routing_bumps_config_version(state_manager, redis):
 
 
 @pytest.mark.asyncio
-async def test_delete_task_routing_bumps_config_version(state_manager, redis):
-    """DELETE /task-routing updates config:version to a new ULID in Redis."""
-    await state_manager.routing.save_routing_config(
-        RoutingConfig(
-            task_name="my_task",
-            task_version=1,
-            rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["default"])],
-        )
-    )
+async def test_delete_queue_bumps_config_version(state_manager, redis):
+    """DELETE /queues/{name} updates config:version too."""
     version_before = await redis.get("config:version")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.delete("/task-routing/my_task/1")
+        response = await client.delete("/queues/default")
 
     assert response.status_code == 200
     version_after = await redis.get("config:version")
@@ -1375,110 +1364,6 @@ async def test_resume_dag_race_between_precheck_and_resume_returns_409(state_man
     assert response.status_code == 409
 
 
-# ── task routing endpoints ─────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_get_task_routing_not_found():
-    """GET /task-routing returns 404 when no routing config exists."""
-    mock_sm = MagicMock()
-    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
-    mock_sm.get_routing_config = AsyncMock(return_value=None)
-
-    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/task-routing/echo_task/1")
-
-    assert response.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_get_task_routing_found(state_manager):
-    """GET /task-routing returns the routing config when it exists."""
-    config = RoutingConfig(
-        task_name="echo_task",
-        task_version=1,
-        rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["fast"])],
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/task-routing/echo_task/1")
-
-    assert response.status_code == 200
-    data = response.json()["routing"]
-    assert data["rules"] == [{"from_lane": None, "strategy": "single", "queues": ["fast"], "weights": None}]
-
-
-@pytest.mark.asyncio
-async def test_put_task_routing_creates(state_manager):
-    """PUT /task-routing creates a new routing config."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.put(
-            "/task-routing/echo_task/1",
-            json={"rules": [{"strategy": "single", "queues": ["fast"]}]},
-        )
-
-    assert response.status_code == 200
-    assert response.json()["routing"]["rules"][0]["strategy"] == "single"
-
-    saved = await state_manager.routing.get_routing_config("echo_task", 1)
-    assert saved is not None
-    assert saved.rules[0].strategy == RoutingStrategy.SINGLE
-    assert saved.rules[0].queues == ["fast"]
-
-
-@pytest.mark.asyncio
-async def test_put_task_routing_path_overrides_body(state_manager):
-    """PUT uses path task_name/task_version even when body contains different values."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.put(
-            "/task-routing/real_name/3",
-            json={
-                "task_name": "body_name",
-                "task_version": 99,
-                "rules": [{"strategy": "single", "queues": ["q"]}],
-            },
-        )
-
-    assert response.status_code == 200
-    saved = await state_manager.routing.get_routing_config("real_name", 3)
-    assert saved is not None
-    assert saved.task_name == "real_name"
-    assert saved.task_version == 3
-
-
-@pytest.mark.asyncio
-async def test_delete_task_routing_removes_config(state_manager):
-    """DELETE /task-routing removes the config and returns 200."""
-    await state_manager.routing.save_routing_config(
-        RoutingConfig(
-            task_name="echo_task",
-            task_version=1,
-            rules=[RoutingRule(strategy=RoutingStrategy.SINGLE, queues=["fast"])],
-        )
-    )
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.delete("/task-routing/echo_task/1")
-
-    assert response.status_code == 200
-    assert await state_manager.routing.get_routing_config("echo_task", 1) is None
-
-
-@pytest.mark.asyncio
-async def test_delete_task_routing_not_found():
-    """DELETE /task-routing returns 404 when config does not exist."""
-    mock_sm = MagicMock()
-    mock_sm.delete_routing_config = AsyncMock(return_value=False)
-
-    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.delete("/task-routing/ghost/99")
-
-    assert response.status_code == 404
-
-
 # ── Queue existence validation ────────────────────────────────────────────────
 
 
@@ -1575,7 +1460,7 @@ async def test_get_task_status_dag_root_includes_diagram(state_manager):
     """GET /task-status/{id} includes dag_diagram when the task has dag_callbacks set."""
     from jobbers.models.dag import DAGTaskSpec, SimpleCallback
 
-    child_spec = DAGTaskSpec(name="child_task", lane="default")
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
     task = Task(
         id=ULID1,
         name="root_task",

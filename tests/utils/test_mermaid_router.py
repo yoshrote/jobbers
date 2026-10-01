@@ -85,7 +85,7 @@ def test_parse_router_node_and_candidates() -> None:
     assert cb.router.router == "route_by_size"
     assert cb.router.version == 0
     assert cb.router.parameters == {"threshold": 100}
-    assert [(c.name, c.lane) for c in cb.router.candidates] == [
+    assert [(c.name, c.queue) for c in cb.router.candidates] == [
         ("fast_path", "default"),
         ("slow_path", "heavy"),
     ]
@@ -108,7 +108,7 @@ def test_parse_router_error_edge_becomes_router_error_callback() -> None:
     assert cb.error_callback.name == "notify_bad_route"
 
 
-def test_parse_router_candidates_may_share_a_task_name_across_lanes() -> None:
+def test_parse_router_candidates_may_share_a_task_name_across_queues() -> None:
     cb = _router_cb("""
     flowchart TD
         A["classify_order"]
@@ -120,7 +120,7 @@ def test_parse_router_candidates_may_share_a_task_name_across_lanes() -> None:
         R --> P
         R --> S
     """)
-    assert [(c.name, c.lane) for c in cb.router.candidates] == [
+    assert [(c.name, c.queue) for c in cb.router.candidates] == [
         ("fulfil_order", "priority"),
         ("fulfil_order", "standard"),
     ]
@@ -226,7 +226,7 @@ def test_parse_router_as_fanout_arm_root() -> None:
     assert cb.arm_root is None
     assert cb.arm_router is not None
     assert cb.arm_router.router == "route_by_region"
-    assert [(c.name, c.lane) for c in cb.arm_router.candidates] == [
+    assert [(c.name, c.queue) for c in cb.arm_router.candidates] == [
         ("process_record", "us"),
         ("process_record", "eu"),
     ]
@@ -319,8 +319,8 @@ def test_router_fanout_arms_may_be_multi_step_chains() -> None:
         ),
         pytest.param(
             'flowchart TD\n A["t"] --> R{"route:heavy"}\n R --> B["b"]\n',
-            "Routers do not run on a lane",
-            id="router-with-lane",
+            "Routers do not run on a queue",
+            id="router-with-queue",
         ),
         pytest.param(
             'flowchart TD\n A["t"] --> R{"route"}\n R --> B["dup"]\n R --> C["dup"]\n',
@@ -366,8 +366,8 @@ def test_round_trip_simple_router_preserves_candidates() -> None:
     again = next(c for c in reparsed.dag_callbacks if isinstance(c, RouterCallback))
     assert again.router.router == original.router.router
     assert again.router.parameters == original.router.parameters
-    assert [(c.name, c.lane) for c in again.router.candidates] == [
-        (c.name, c.lane) for c in original.router.candidates
+    assert [(c.name, c.queue) for c in again.router.candidates] == [
+        (c.name, c.queue) for c in original.router.candidates
     ]
 
 
@@ -393,7 +393,7 @@ def test_round_trip_per_item_router_preserves_arm_router() -> None:
     cb = next(c for c in reparsed.dag_callbacks if isinstance(c, DynamicFanOutCallback))
     assert cb.arm_root is None
     assert cb.arm_router is not None
-    assert {(c.name, c.lane) for c in cb.arm_router.candidates} == {
+    assert {(c.name, c.queue) for c in cb.arm_router.candidates} == {
         ("process_record", "us"),
         ("process_record", "eu"),
     }

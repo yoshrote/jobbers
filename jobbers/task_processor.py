@@ -67,7 +67,7 @@ def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
             return
         all_specs[s.id] = s
         all_nodes[s.id] = DAGNode(
-            s.name, lane=s.lane, version=s.version, parameters=dict(s.parameters), task_id=s.id
+            s.name, queue=s.queue, version=s.version, parameters=dict(s.parameters), task_id=s.id
         )
         for cb in s.dag_callbacks:
             if isinstance(cb, (SimpleCallback, FanInCallback)):
@@ -415,16 +415,12 @@ class TaskProcessor:
             callbacks = await task.generate_callbacks(
                 self.state_manager.task_state, skip_fan_in_keys=skip_keys
             )
-            for callback in callbacks:
-                callback.queue = await self.state_manager.resolve_queue(callback)
             await self.state_manager.submit_tasks_batch(callbacks)
 
     async def post_process_error(self, task: Task) -> None:
         """Submit error callback tasks for a permanently-failed task."""
         error_callbacks = task.generate_error_callbacks()
         if error_callbacks:
-            for cb in error_callbacks:
-                cb.queue = await self.state_manager.resolve_queue(cb)
             await self.state_manager.submit_tasks_batch(error_callbacks)
 
     async def _handle_post_process_failure(self, task: Task, exc: Exception) -> None:
@@ -485,23 +481,23 @@ class TaskProcessor:
             c
             for c in router.candidates
             if c.name == selector.task
-            and (selector.lane is None or c.lane == selector.lane)
+            and (selector.queue is None or c.queue == selector.queue)
             and (selector.version is None or c.version == selector.version)
         ]
         if not matches:
             raise RouterError(
                 f"Router '{router.router}' selected {selector!r}, which matches none of its "
-                f"candidates: {[f'{c.name}@{c.version}:{c.lane}' for c in router.candidates]}"
+                f"candidates: {[f'{c.name}@{c.version}:{c.queue}' for c in router.candidates]}"
             )
         if len(matches) > 1:
             raise RouterError(
                 f"Router '{router.router}' selected {selector!r}, which is ambiguous across "
-                f"lanes {sorted(c.lane for c in matches)}. Return RouteTo(task, lane=...) "
+                f"queues {sorted(c.queue for c in matches)}. Return RouteTo(task, queue=...) "
                 "to say which one."
             )
         chosen = matches[0]
         router_decisions.add(
-            1, {"router": router.router, "target": f"{chosen.name}:{chosen.lane}", "mode": mode}
+            1, {"router": router.router, "target": f"{chosen.name}:{chosen.queue}", "mode": mode}
         )
         return chosen
 
@@ -531,7 +527,6 @@ class TaskProcessor:
             await asyncio.gather(
                 *(self.state_manager.init_fan_in(task.dag_run_id, key, ids) for key, ids in fan_ins.items())
             )
-        task.queue = await self.state_manager.resolve_queue(task)
         await self.state_manager.submit_tasks_batch([task])
 
     async def _handle_declarative_fanout(self, parent: Task, cb: DynamicFanOutCallback) -> None:
@@ -542,7 +537,7 @@ class TaskProcessor:
         arm instance per entry. With ``cb.arm_root`` set, every arm clones that
         one template. With ``cb.arm_router`` set instead (mermaid ``A -->> R``),
         each item is routed on its own, so different items can start different
-        tasks on different lanes. Either way the entry's params are
+        tasks on different queues. Either way the entry's params are
         shallow-merged into the chosen template (entry values win), and
         ``cb.collector`` is used as-is for the fan-in collector.
 
@@ -659,7 +654,6 @@ class TaskProcessor:
             # callbacks still need to be delegated to it, exactly as in the normal path
             # below, otherwise an outer fan-in waiting on *parent* never gets closed.
             solo = fanout.collector.to_task(dag_run_id=dag_run_id, dag_run_name=dag_run_name)
-            # submit_task() below resolves the lane itself.
             await self._delegate_outer_fan_in(
                 solo, dag_run_id, parent.id, fanout.collector.id, outer_fan_in_cbs
             )
@@ -700,14 +694,6 @@ class TaskProcessor:
         ]
         collector_task = fanout.collector.to_task(dag_run_id=dag_run_id, dag_run_name=dag_run_name)
         collector_task.parent_ids = list(terminal_ids)
-
-        # Arms and the collector are submitted/pre-saved directly rather than via
-        # submit_task(), so their lanes have to be resolved to physical queues here.
-        resolved = await asyncio.gather(
-            *(self.state_manager.resolve_queue(t) for t in (*arm_tasks, collector_task))
-        )
-        for t, queue in zip((*arm_tasks, collector_task), resolved):
-            t.queue = queue
 
         # 5. Delegation: transfer outer fan-in callbacks to the collector and
         #    atomically swap parent's ID → collector's ID in each outer fan-in set.
