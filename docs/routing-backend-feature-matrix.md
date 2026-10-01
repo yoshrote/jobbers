@@ -1,6 +1,6 @@
 # Routing Backend Comparison
 
-The routing backend controls where queue, role, and task-routing config is stored. Select via the `ROUTING_BACKEND` environment variable. The four options have meaningfully different infrastructure requirements, consistency guarantees, and operational tradeoffs.
+The routing backend controls where queue and role config is stored. Select via the `ROUTING_BACKEND` environment variable. The four options have meaningfully different infrastructure requirements, consistency guarantees, and operational tradeoffs.
 
 ## Feature matrix
 

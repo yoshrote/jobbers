@@ -350,7 +350,7 @@ async def fake_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def test_process_record():
     with dependency_overrides({get_db: fake_db}):
-        await process_record.submit(lane="default", record_id=1)
+        await process_record.submit(queue="default", record_id=1)
 ```
 
 ---
@@ -447,7 +447,7 @@ Zero parents is not a shape violation for either mode. A root node (or a task ca
 
 ```python
 DAGNode("process_records", parameters={"rows": 5})   # no parent needed
-await process_records.submit(lane="default", rows=5)  # same, via the task wrapper
+await process_records.submit(queue="default", rows=5)  # same, via the task wrapper
 ```
 
 — or rely on the function's own Python default. Only a *wrong* parent count (2+ parents on a singular slot) is a real structural bug and keeps raising unconditionally; 0 parents never is, because there's no data to lose by falling through.
@@ -484,7 +484,7 @@ from jobbers.models.router import RouteTo
 
 @register_router(name="route_by_size", version=1)
 def route_by_size(results: dict, *, threshold: int) -> str | RouteTo | None:
-    return "fast_path" if results["bytes"] < threshold else RouteTo("slow_path", lane="heavy")
+    return "fast_path" if results["bytes"] < threshold else RouteTo("slow_path", queue="heavy")
 ```
 
 | Parameter | Required | Meaning |
@@ -495,7 +495,7 @@ def route_by_size(results: dict, *, threshold: int) -> str | RouteTo | None:
 **Signature.** The first positional argument is the parent task's result dict — or, in per-item fan-out
 mode, a single item from it. Remaining keyword arguments come from the node label's `(key=val, ...)`.
 
-**Return value.** A task name, a `RouteTo(task, lane=..., version=...)` selector, or `None` to end that
+**Return value.** A task name, a `RouteTo(task, queue=..., version=...)` selector, or `None` to end that
 path. The selector must match exactly one of the router's declared candidates; zero or several matches
 is an error.
 

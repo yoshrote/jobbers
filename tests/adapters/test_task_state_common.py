@@ -1619,30 +1619,28 @@ async def test_clean_with_no_age_params_is_noop(task_adapter):
     assert len(remaining) == 1
 
 
-# ── lane / queue round-trip ───────────────────────────────────────────────────
+# ── queue round-trip ──────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_lane_and_queue_round_trip_independently(task_adapter):
-    """A task's lane survives persistence and stays distinct from its resolved queue."""
+async def test_queue_round_trips(task_adapter):
+    """A task's queue survives persistence."""
     state, submit = task_adapter
     task = make_task(queue="priority_shard_a")
-    task.lane = "priority"
     await submit.submit_task(task)
 
     fetched = await state.get_task(task.id)
     assert fetched is not None
-    assert fetched.lane == "priority"
     assert fetched.queue == "priority_shard_a"
 
 
 @pytest.mark.asyncio
-async def test_lane_defaults_when_never_set(task_adapter):
-    """A task submitted without an explicit lane round-trips the default."""
+async def test_queue_defaults_when_never_set(task_adapter):
+    """A task submitted without an explicit queue round-trips the default."""
     state, submit = task_adapter
     task = make_task()
     await submit.submit_task(task)
 
     fetched = await state.get_task(task.id)
     assert fetched is not None
-    assert fetched.lane == "default"
+    assert fetched.queue == "default"

@@ -1158,7 +1158,7 @@ async def test_handle_dynamic_fanout_no_children_with_outer_fan_in_still_delegat
     dag_run_id = ULID()
     outer_fan_in_key = "dag:fan-in:outer-collector"
     outer_fan_in_cb = FanInCallback(
-        task=DAGTaskSpec(name="outer_collect", lane="default"),
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
         fan_in_key=outer_fan_in_key,
     )
     parent = Task(
@@ -1400,7 +1400,7 @@ async def test_handle_dynamic_fanout_with_outer_fan_in_delegates_to_collector():
     dag_run_id = ULID()
     outer_fan_in_key = "dag:fan-in:outer-collector"
     outer_fan_in_cb = FanInCallback(
-        task=DAGTaskSpec(name="outer_collect", lane="default"),
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
         fan_in_key=outer_fan_in_key,
     )
     parent = Task(
@@ -1443,7 +1443,7 @@ async def test_handle_dynamic_fanout_propagate_fan_in_false_skips_delegation():
     dag_run_id = ULID()
     outer_fan_in_key = "dag:fan-in:outer-collector"
     outer_fan_in_cb = FanInCallback(
-        task=DAGTaskSpec(name="outer_collect", lane="default"),
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
         fan_in_key=outer_fan_in_key,
     )
     parent = Task(
@@ -1492,14 +1492,14 @@ def test_spec_to_dag_node_preserves_nested_dynamic_fanout_callback():
     no longer contained the inner DynamicFanOutCallback, so the nested fan-out never
     fired when that arm task actually executed.
     """
-    arm_spec = DAGTaskSpec(id=ULID(), name="inner_arm", lane="default", version=1, parameters={})
-    collector_spec = DAGTaskSpec(id=ULID(), name="inner_collector", lane="default", version=1, parameters={})
+    arm_spec = DAGTaskSpec(id=ULID(), name="inner_arm", queue="default", version=1, parameters={})
+    collector_spec = DAGTaskSpec(id=ULID(), name="inner_collector", queue="default", version=1, parameters={})
     inner_fanout_cb = DynamicFanOutCallback(arm_root=arm_spec, collector=collector_spec, items_key="items")
 
     dispatcher_spec = DAGTaskSpec(
         id=ULID(),
         name="dispatcher",
-        lane="default",
+        queue="default",
         version=1,
         parameters={},
         dag_callbacks=[inner_fanout_cb],
@@ -1536,9 +1536,9 @@ async def test_handle_declarative_fanout_preserves_nested_dispatch_on_arm_task()
         results={"items": [{}]},
     )
 
-    inner_arm_spec = DAGTaskSpec(id=ULID(), name="inner_worker", lane="default", version=1, parameters={})
+    inner_arm_spec = DAGTaskSpec(id=ULID(), name="inner_worker", queue="default", version=1, parameters={})
     inner_collector_spec = DAGTaskSpec(
-        id=ULID(), name="inner_collector", lane="default", version=1, parameters={}
+        id=ULID(), name="inner_collector", queue="default", version=1, parameters={}
     )
     inner_fanout_cb = DynamicFanOutCallback(
         arm_root=inner_arm_spec, collector=inner_collector_spec, items_key="items"
@@ -1548,13 +1548,13 @@ async def test_handle_declarative_fanout_preserves_nested_dispatch_on_arm_task()
     outer_arm_root = DAGTaskSpec(
         id=ULID(),
         name="process_batch",
-        lane="default",
+        queue="default",
         version=1,
         parameters={},
         dag_callbacks=[inner_fanout_cb],
     )
     outer_collector_spec = DAGTaskSpec(
-        id=ULID(), name="aggregate_all", lane="default", version=1, parameters={}
+        id=ULID(), name="aggregate_all", queue="default", version=1, parameters={}
     )
     outer_cb = DynamicFanOutCallback(
         arm_root=outer_arm_root, collector=outer_collector_spec, items_key="items"
@@ -1707,7 +1707,7 @@ async def test_monitor_task_cancellation_reraises_stale_error_without_handling()
 async def test_post_process_triggers_dag_callbacks():
     """post_process submits callbacks produced by generate_callbacks when has_callbacks() is True."""
     # Build a parent task with a SimpleCallback so has_callbacks() → True
-    child_spec = DAGTaskSpec(name="child_task", lane="default")
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -1737,7 +1737,7 @@ async def test_post_process_triggers_dag_callbacks():
 async def test_post_process_skipped_when_dag_run_cancelling():
     """post_process spawns no descendants when the task's DAG run is marked cancelling."""
     dag_run_id = ULID()
-    child_spec = DAGTaskSpec(name="child_task", lane="default")
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -1759,7 +1759,7 @@ async def test_post_process_skipped_when_dag_run_cancelling():
 @pytest.mark.asyncio
 async def test_post_process_skips_cancelling_check_for_non_dag_task():
     """A standalone (non-DAG) task's post_process never calls is_dag_run_cancelling."""
-    child_spec = DAGTaskSpec(name="child_task", lane="default")
+    child_spec = DAGTaskSpec(name="child_task", queue="default")
     parent = Task(
         id="01JQC31AJP7TSA9X8AEP64XG08",
         name="test_task",
@@ -1842,12 +1842,12 @@ async def test_post_process_declarative_fanout_skips_delegated_outer_fan_in():
     dag_run_id = ULID()
     outer_fan_in_key = "dag:fan-in:outer-collector"
     outer_fan_in_cb = FanInCallback(
-        task=DAGTaskSpec(name="outer_collect", lane="default"),
+        task=DAGTaskSpec(name="outer_collect", queue="default"),
         fan_in_key=outer_fan_in_key,
     )
     inner_fanout_cb = DynamicFanOutCallback(
-        arm_root=DAGTaskSpec(name="inner_worker", lane="default"),
-        collector=DAGTaskSpec(name="inner_collector", lane="default"),
+        arm_root=DAGTaskSpec(name="inner_worker", queue="default"),
+        collector=DAGTaskSpec(name="inner_collector", queue="default"),
         items_key="items",
     )
     parent = Task(

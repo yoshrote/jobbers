@@ -11,7 +11,7 @@ jobbers/
 │   ├── adapters/              # Pluggable adapters: task storage, dead-letter, routing, task/cron schedulers
 │   │   ├── _shared.py         # SharedTaskAdapterMixin + _SharedRedisTaskSubmitBase (used by redis/ and redis_json/)
 │   │   ├── redis/             # Plain-Redis adapter implementations
-│   │   │   ├── routing_backend.py    # RedisQueueConfigAdapter, RedisTaskRoutingConfigAdapter, RedisRoutingBackend
+│   │   │   ├── routing_backend.py    # RedisQueueConfigAdapter, RedisRoutingBackend
 │   │   │   ├── task_state.py         # RedisTaskState
 │   │   │   ├── task_submit.py        # RedisTaskSubmit
 │   │   │   ├── dead_queue.py         # RedisDeadQueue
@@ -20,12 +20,12 @@ jobbers/
 │   │   │   ├── cancellation_bus.py   # RedisCancellationBus
 │   │   │   └── routing_notifications.py # RedisRoutingNotifications
 │   │   ├── redis_json/        # Redis Stack (RedisJSON + RediSearch) adapter implementations
-│   │   │   ├── routing_backend.py    # RedisJSONQueueConfigAdapter, RedisJSONTaskRoutingConfigAdapter, RedisJSONRoutingBackend
+│   │   │   ├── routing_backend.py    # RedisJSONQueueConfigAdapter, RedisJSONRoutingBackend
 │   │   │   ├── task_state.py         # RedisJSONTaskState
 │   │   │   ├── task_submit.py        # RedisJSONTaskSubmit
 │   │   │   └── dead_queue.py         # RedisJSONDeadQueue
 │   │   ├── sql/               # SQLAlchemy adapter implementations
-│   │   │   ├── routing_backend.py    # SQLQueueConfigAdapter, SQLTaskRoutingConfigAdapter, SQLRoutingBackend
+│   │   │   ├── routing_backend.py    # SQLQueueConfigAdapter, SQLRoutingBackend
 │   │   │   ├── task_state.py         # SQLTaskState (+ shared helpers imported by task_submit)
 │   │   │   ├── task_submit.py        # SQLTaskSubmit
 │   │   │   ├── dead_queue.py         # SQLDeadQueue
@@ -106,10 +106,10 @@ from jobbers.models.router import RouteTo
 
 @register_router(name="route_by_tier", version=1)
 def route_by_tier(results: dict, *, threshold: int = 100) -> str | RouteTo | None:
-    return RouteTo("fulfil_order", lane="priority" if results["vip"] else "standard")
+    return RouteTo("fulfil_order", queue="priority" if results["vip"] else "standard")
 ```
 
-Routers must be plain `def` (enforced at registration) — they run inline on the worker's event loop during callback handling, so they must be fast, pure and do no I/O. `RouteTo` is a *selector* over the router's declared candidates (matching on name, plus optional `lane`/`version`), not a free-form destination; it must match exactly one. Returning `None` ends that path. Routers are loaded by the same `task_module` import that loads tasks. Registry: `_router_function_map`, `get_router_config()`, `get_routers()`; `clear_registry()` clears tasks and routers.
+Routers must be plain `def` (enforced at registration) — they run inline on the worker's event loop during callback handling, so they must be fast, pure and do no I/O. `RouteTo` is a *selector* over the router's declared candidates (matching on name, plus optional `queue`/`version`), not a free-form destination; it must match exactly one. Returning `None` ends that path. Routers are loaded by the same `task_module` import that loads tasks. Registry: `_router_function_map`, `get_router_config()`, `get_routers()`; `clear_registry()` clears tasks and routers.
 
 Serialised as `RouterCallback` (simple mode, `parent --> R`) or `DynamicFanOutCallback.arm_router` (per-item mode, `parent -->> R`), both in `jobbers/models/dag.py`. Driven by `TaskProcessor._handle_router` / `_handle_declarative_fanout`. See [docs/mermaid-dag-spec.md](docs/mermaid-dag-spec.md#router-nodes).
 
@@ -133,17 +133,20 @@ async def my_task(**kwargs):
     return {"result": "value"}
 ```
 
-## Lanes & Queues
+## Queues
 
-A **lane** is the logical destination the author asks for (a DAG node's `:lane` segment, `submit(lane=...)`, a router's choice); a **queue** is the physical bucket workers pull from. `RoutingConfig` is the only thing spanning them: it maps `(task_name, task_version, lane) -> queue(s)`. **By default a lane resolves to the queue of the same name**, so a deployment with no routing rules never has to think about the distinction. `Task` carries both — `lane` (requested) and `queue` (resolved, frozen at first submit; retries do not re-resolve). Full treatment in [docs/lanes-and-queues.md](docs/lanes-and-queues.md).
+**A queue is named directly, and there is no resolution step.** A DAG node's `:queue` label segment, `submit(queue=...)` and a router's choice all name the queue the task runs on; `Task.queue` holds it, frozen at first submit, and retries and scheduler dispatch reuse it. The queue must already exist — `validate_task` rejects an unknown name rather than falling back to anything.
 
-A routing config is a list of `RoutingRule`s, each optionally scoped by `from_lane`; a rule with `from_lane=None` is the wildcard and matches any lane. `StateManager.resolve_queue` picks the lane-scoped rule, else the wildcard, else the identity default.
+There is deliberately no logical-destination layer above the queue. The indirection that used to exist (`RoutingConfig`/`RoutingRule` mapping `(task_name, task_version, lane) -> queue(s)`) was removed: its one capability was repointing a name at a different queue at runtime, which cost a precedence chain, a cache, a CRUD surface and three adapter implementations. Work is redirected instead by changing role membership, and spread across queues by a router node. See [.claude/plans/lane-as-primitive.md](.claude/plans/lane-as-primitive.md) for the reasoning and what it gave up.
+
+Queue names must match the identifier rule described under Queue & Role System, so that any queue can be named from a mermaid label.
 
 ## Queue & Role System
 
-- **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Storage backend depends on `ROUTING_BACKEND`.
+- **Queues**: named buckets with per-queue concurrency limit and optional rate limiting. Storage backend depends on `ROUTING_BACKEND`. Queue names must match `^[a-zA-Z_][a-zA-Z0-9_]*$` (`QUEUE_NAME_PATTERN` in `jobbers/models/queue_config.py`) so a queue is nameable from a mermaid label — **no hyphens**; use underscores. Enforced by a `QueueConfig.name` validator and by the `PUT /queues/{queue_name}` path pattern.
 - **Roles**: named sets of queues assigned to workers. Workers consume all queues in their role. Storage backend depends on `ROUTING_BACKEND`.
-- Workers detect role/queue config changes via a `refresh_tag` stored per-role by the routing backend. `TaskGenerator.queues()` polls on every iteration; it also subscribes to the Redis pub/sub channel `queue-config-refresh:{role}` for immediate notification when a tag changes.
+- Workers detect role/queue *membership* changes via a `refresh_tag` stored per-role by the routing backend. `TaskGenerator.queues()` polls on every iteration; it also subscribes to the Redis pub/sub channel `queue-config-refresh:{role}` for immediate notification when a tag changes.
+- Cached queue-config documents are invalidated through a single Redis key, `config:version`, bumped by every queue-config write. Each process calls `StateManager.refresh_config_if_stale()` and drops its cache when the version moved. The call is throttled to `CONFIG_POLL_INTERVAL` seconds and sits on the paths that read config — `submit_task`, `validate_task`, `GET /queues/{name}/config` — plus an unthrottled call per `TaskGenerator` iteration. Without it a write only invalidated the cache of the process that served it. The sharp case: `get_queue_config` caches negative lookups, so a process that probed a queue name before the queue existed would reject every submission to it until restart.
 - The refresh tag is bumped automatically on `POST /queues/{role}` (set queues), `PUT /roles/{role_name}` (update role), `POST /roles` (create role), `PUT /queues/{queue_name}` (update queue config), and `DELETE /queues/{queue_name}` (delete queue). It can also be triggered manually via `POST /roles/{role_name}/refresh`.
 - `POST /queues/{role}`, `PUT /roles/{role_name}`, and `POST /roles` validate that all requested queue names exist before saving; unknown queues return 400.
 
@@ -159,8 +162,8 @@ All metrics use the OTLP exporter (configured in `jobbers/utils/otel.py`) and ar
 | `tasks_selected` | Counter | `1` | `task_generator.py` | Tasks pulled from a queue by a worker (tagged with `queue`, `role`, `task`) |
 | `queue_config_refreshes` | Counter | `1` | `task_generator.py` | Queue-list refreshes triggered on a worker (tagged with `role`); fires each time a worker reloads its queue assignment due to a `refresh_tag` change |
 | `refresh_lag_ms` | Histogram | `ms` | `task_generator.py` | Lag between when the `refresh_tag` was bumped (ULID timestamp) and when the worker picked up the change (tagged with `role`) |
-| `lane_resolutions` | Counter | `1` | `state_manager.py` | Every lane→queue resolution (tagged with `lane`, `queue`, `strategy`; `strategy=identity` when no rule applied) |
-| `router_decisions` | Counter | `1` | `task_processor.py` | Router selections (tagged with `router`, `target` as `name:lane` or `<none>`, `mode` as `simple`/`per_item`) |
+| `config_refreshes` | Counter | `1` | `state_manager.py` | Times a process dropped its cached queue/routing config because `config:version` moved |
+| `router_decisions` | Counter | `1` | `task_processor.py` | Router selections (tagged with `router`, `target` as `name:queue` or `<none>`, `mode` as `simple`/`per_item`) |
 
 ## Adapter Architecture
 
@@ -171,7 +174,7 @@ All pluggable storage is expressed as `@runtime_checkable Protocol` classes in `
 All concrete adapter classes follow the `{Backend}{Protocol}` pattern:
 
 - **Backend** prefix: `Redis` (plain Redis), `RedisJSON` (Redis Stack), `SQL` (SQLAlchemy), `Static` (in-process read-only)
-- **Protocol** suffix: the protocol name without the `Protocol` suffix (e.g., `TaskAdapter`, `DeadQueue`, `TaskScheduler`, `CronDAGScheduler`, `RoutingBackend`, `QueueConfigAdapter`, `TaskRoutingConfigAdapter`)
+- **Protocol** suffix: the protocol name without the `Protocol` suffix (e.g., `TaskAdapter`, `DeadQueue`, `TaskScheduler`, `CronDAGScheduler`, `RoutingBackend`, `QueueConfigAdapter`)
 
 Examples: `RedisTaskState`, `RedisTaskSubmit`, `RedisJSONDeadQueue`, `SQLCronDAGScheduler`, `StaticRoutingBackend`.
 
@@ -181,7 +184,7 @@ No aliases — always use the full `{Backend}{Protocol}` name.
 
 Each backend is a package under `adapters/`. Each file holds one protocol class (or a group of sub-protocol classes that compose up to the same parent protocol). The pattern is `adapters/<backend>/<protocol>.py`:
 
-- Sub-protocols that compose into a single parent protocol are colocated in one file. For example, `RedisQueueConfigAdapter` and `RedisTaskRoutingConfigAdapter` (sub-protocols of `RoutingBackendProtocol`) live together with `RedisRoutingBackend` in `redis/routing_backend.py`.
+- Sub-protocols that compose into a single parent protocol are colocated in one file. For example, `RedisQueueConfigAdapter` (a sub-protocol of `RoutingBackendProtocol`) lives with `RedisRoutingBackend` in `redis/routing_backend.py`.
 - Each backend `__init__.py` re-exports all public classes, so existing `from jobbers.adapters.redis import X` imports continue to work unchanged.
 - Private helpers shared within a backend live in `<backend>/_helpers.py` (e.g. `redis/_helpers.py` for the msgpack `_pack` helper).
 
@@ -190,10 +193,9 @@ Each backend is a package under `adapters/`. Each file holds one protocol class 
 | Protocol | sql | redis | redis_json | static |
 | --- | --- | --- | --- | --- |
 | `QueueConfigProtocol` | `SQLQueueConfigAdapter` | `RedisQueueConfigAdapter` | `RedisJSONQueueConfigAdapter` | — |
-| `TaskRoutingConfigProtocol` | `SQLTaskRoutingConfigAdapter` | `RedisTaskRoutingConfigAdapter` | `RedisJSONTaskRoutingConfigAdapter` | — |
 | `RoutingBackendProtocol` | `SQLRoutingBackend` | `RedisRoutingBackend` | `RedisJSONRoutingBackend` | `StaticRoutingBackend` |
 
-`RoutingBackendProtocol` is a composite of `QueueConfigProtocol` + `TaskRoutingConfigProtocol` (minus `get_queue_limits`). The `sql`, `redis`, and `redis_json` routing backends are thin delegation wrappers that compose a `_qca` (`QueueConfigProtocol`) and `_rca` (`TaskRoutingConfigProtocol`) sub-adapter internally. `StaticRoutingBackend` is a monolith (no sub-adapters) and raises `RoutingBackendReadOnlyError` on all write operations.
+`RoutingBackendProtocol` is `QueueConfigProtocol` minus `get_queue_limits`. The `sql`, `redis`, and `redis_json` routing backends are thin delegation wrappers around a `_qca` (`QueueConfigProtocol`) sub-adapter. `StaticRoutingBackend` is a monolith (no sub-adapter) and raises `RoutingBackendReadOnlyError` on all write operations.
 
 `get_queue_limits` exists on `QueueConfigProtocol` and all three dynamic implementations but is absent from `StaticRoutingBackend` (which is not expected to implement `QueueConfigProtocol`).
 
@@ -229,7 +231,7 @@ Each protocol has an **Atomic sub-protocol** that extends it with pipeline-stagi
 
 ## Routing Backends
 
-The routing backend controls where queue/role/task-routing config is stored. Select via `ROUTING_BACKEND`:
+The routing backend controls where queue and role config is stored. Select via `ROUTING_BACKEND`:
 
 | Value | Storage | SQL needed? | Dynamic CRUD? |
 | ------- | --------- | ------------- | --------------- |
@@ -252,12 +254,7 @@ Config file format (`routing.json`):
 ```json
 {
   "queues": [{"name": "default", "max_concurrent": 10}],
-  "roles": {"default": ["default"]},
-  "routing": [
-    {"task_name": "fulfil_order", "task_version": 1, "rules": [
-      {"from_lane": "priority", "strategy": "single", "queues": ["default"]}
-    ]}
-  ]
+  "roles": {"default": ["default"]}
 }
 ```
 
@@ -278,6 +275,7 @@ Config file format (`routing.json`):
 | `REDIS_URL` | `redis://localhost:6379` | All (accepts redis-py query-string params too, e.g. `?max_connections=300&socket_timeout=5`) |
 | `SQL_PATH` | `sqlite+aiosqlite:///jobbers.db` | All (used when any backend is `"sql"`; use PostgreSQL for multi-worker deployments). Accepts `?pool_size=...&max_overflow=...&pool_timeout=...` query params (non-SQLite DSNs only — SQLite's pool class rejects these kwargs). SQLAlchemy doesn't support this natively; `db.py` pops these params off the URL itself before constructing the engine, so the DBAPI driver never sees them. Combined connection ceiling is `pool_size + max_overflow` (defaults 5 + 10 = 15), well below redis-py's 100-connection default for `REDIS_URL`. |
 | `STATIC_CONFIG_FILE` | — | All (path to JSON/YAML routing config; requires `ROUTING_BACKEND=static`) |
+| `CONFIG_POLL_INTERVAL` | `5.0` | All (`jobbers/state_manager.py`); seconds between checks of the shared `config:version` key before a process trusts its cached queue config. Bounds how long a queue-config edit can be served stale by a process that did not make the change. Workers bypass the throttle and check once per loop iteration. |
 | `ASYNCIO_DEBUG` | `"false"` | Worker, Scheduler, Cleaner (`jobbers/utils/asyncio_config.py`); enables asyncio debug mode (slow-callback logging, extra coroutine-origin tracking). Adds real overhead — leave off outside local debugging. |
 
 ## Testing
@@ -285,7 +283,6 @@ Config file format (`routing.json`):
 - Uses `fakeredis` (in-memory, supports Lua + JSON modules) — no real Redis needed for most tests
 - `task_adapter` fixture is parametrized over `["redis", "redis_json", "sql"]` — `(RedisTaskState, RedisTaskSubmit)` via FakeRedis, `(RedisJSONTaskState, RedisJSONTaskSubmit)` via real Redis Stack (skipped if unavailable), `(SQLTaskState, SQLTaskSubmit)` via in-memory SQLite
 - `queue_config_adapter` fixture is parametrized over `["sql", "redis", "redis_json"]`
-- `task_routing_config_adapter` fixture is parametrized over `["sql", "redis", "redis_json"]`
 - Key test files: `test_state_manager.py`, `test_task_processor.py`, `test_task_routes.py`, `test_task_generator.py`
 - Run with: `pytest` (coverage configured in `pyproject.toml`, excludes `otel.py`)
 
@@ -337,7 +334,7 @@ The test suite follows a layered approach designed for speed and systematic prot
 
 | Tier | Where | Fixture | Purpose |
 | ------ | ------- | --------- | --------- |
-| **Protocol contract** | `tests/adapters/test_task_adapter_common.py`, `test_dead_queue_common.py`, `test_queue_config_common.py`, `test_task_routing_config_common.py` | `task_adapter` / `dead_queue` / `queue_config_adapter` / `task_routing_config_adapter` (each parametrized over all implementations) | Verify every implementation satisfies the protocol. Adding a new adapter means adding a fixture variant — all contract tests run automatically. |
+| **Protocol contract** | `tests/adapters/test_task_adapter_common.py`, `test_dead_queue_common.py`, `test_queue_config_common.py` | `task_adapter` / `dead_queue` / `queue_config_adapter` (each parametrized over all implementations) | Verify every implementation satisfies the protocol. Adding a new adapter means adding a fixture variant — all contract tests run automatically. |
 | **Implementation edge cases** | `tests/adapters/test_msgpack_adapter.py`, `test_json_adapter.py` | `msgpack_adapter` / `json_adapter` | Cover implementation-specific behaviour that is not a protocol requirement (e.g., `RedisTaskState` sorting limitations, null JSON blobs in `RedisJSONTaskState`). |
 | **Orchestration** | `test_state_manager.py`, `test_task_processor.py`, `test_task_routes.py`, `test_task_generator.py` | `DummyTaskAdapter` or `Mock(spec=StateManager)` | Test coordination logic without touching real adapters; fast, no Redis Stack required. |
 
@@ -350,7 +347,6 @@ The test suite follows a layered approach designed for speed and systematic prot
   - `task_adapter` (parametrized `["redis", "redis_json", "sql"]`) — yields `(state, submit)` pairs: `(RedisTaskState, RedisTaskSubmit)` via FakeRedis + `(RedisJSONTaskState, RedisJSONTaskSubmit)` via real Redis Stack (skipped if unavailable) + `(SQLTaskState, SQLTaskSubmit)` via in-memory SQLite.
   - `dead_queue` (parametrized `["redis", "redis_json", "sql"]`) — same pattern, yields `(dq, task_state_adapter)`.
   - `queue_config_adapter` (parametrized `["sql", "redis", "redis_json"]`) — SQL via in-memory SQLite, Redis via FakeRedis, Redis JSON via real Redis Stack (skipped if unavailable).
-  - `task_routing_config_adapter` (parametrized `["sql", "redis", "redis_json"]`) — same pattern.
   - `scheduler` (parametrized `["redis", "sql"]`) — `RedisTaskScheduler` via FakeRedis + `SQLTaskScheduler` via in-memory SQLite; in `tests/schedulers/`.
   - `cron_dag_scheduler` (parametrized `["redis", "sql", "static"]`) — all three cron DAG scheduler backends; in `tests/schedulers/`.
   - `mutable_cron_dag_scheduler` (parametrized `["redis", "sql"]`) — mutable backends only (static raises on add/remove); in `tests/schedulers/`.

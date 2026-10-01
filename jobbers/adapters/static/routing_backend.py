@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from jobbers.models.queue_config import QueueConfig, RatePeriod
-from jobbers.models.task_routing import RoutingConfig, RoutingRule, RoutingStrategy
 from jobbers.protocols import RoutingBackendReadOnlyError
 
 _DEFAULT_QUEUE = QueueConfig(name="default", max_concurrent=10)
@@ -43,41 +42,6 @@ def _parse_roles(raw: dict[str, list[str]]) -> dict[str, set[str]]:
     return {role: set(queues) for role, queues in raw.items()}
 
 
-def _parse_routing(raw: list[dict[str, Any]]) -> list[RoutingConfig]:
-    """
-    Build routing configs from the static config file's ``routing`` list.
-
-    Each entry is one task type with a ``rules`` list of lane -> queue mappings::
-
-        {
-            "task_name": "fulfil_order",
-            "task_version": 1,
-            "rules": [
-                {"from_lane": "priority", "strategy": "single", "queues": ["priority-v2"]},
-                {"strategy": "single", "queues": ["bulk"]},
-            ],
-        }
-
-    A rule without ``from_lane`` is the wildcard: it matches any lane.
-    """
-    return [
-        RoutingConfig(
-            task_name=r["task_name"],
-            task_version=r["task_version"],
-            rules=[
-                RoutingRule(
-                    from_lane=rule.get("from_lane"),
-                    strategy=RoutingStrategy(rule["strategy"]),
-                    queues=rule["queues"],
-                    weights=rule.get("weights"),
-                )
-                for rule in r["rules"]
-            ],
-        )
-        for r in raw
-    ]
-
-
 class StaticRoutingBackend:
     """
     RoutingBackendProtocol backed by in-process memory; config fixed at startup.
@@ -95,20 +59,14 @@ class StaticRoutingBackend:
         self,
         queues: list[QueueConfig] | None = None,
         roles: dict[str, set[str]] | None = None,
-        routing_configs: list[RoutingConfig] | None = None,
     ) -> None:
         self._queues: dict[str, QueueConfig] = {q.name: q for q in (queues or [_DEFAULT_QUEUE])}
         self._roles: dict[str, set[str]] = roles if roles is not None else dict(_DEFAULT_ROLES)
-        self._routing: dict[tuple[str, int], RoutingConfig] = {
-            (rc.task_name, rc.task_version): rc for rc in (routing_configs or [])
-        }
 
     # ── Factory methods ───────────────────────────────────────────────────────
 
     @classmethod
     def from_file(cls, path: str) -> StaticRoutingBackend:
-        from jobbers.registry import get_task_config
-
         data = _load_file(path)
         roles = _parse_roles(data.get("roles", {})) or None
         queues = _parse_queues(data.get("queues", [])) or None
@@ -120,23 +78,7 @@ class StaticRoutingBackend:
                     if q not in known_queues:
                         raise ValueError(f"Role '{role_name}' references unknown queue '{q}'")
 
-        routing_configs = _parse_routing(data.get("routing", []))
-        for rc in routing_configs:
-            for q in rc.target_queues():
-                if q not in known_queues:
-                    raise ValueError(
-                        f"Routing config for '{rc.task_name}' v{rc.task_version} references unknown queue '{q}'"
-                    )
-            if get_task_config(rc.task_name, rc.task_version) is None:
-                raise ValueError(
-                    f"Routing config references unregistered task '{rc.task_name}' v{rc.task_version}"
-                )
-
-        return cls(
-            queues=queues,
-            roles=roles,
-            routing_configs=routing_configs,
-        )
+        return cls(queues=queues, roles=roles)
 
     async def drop_stale_indexes(self) -> list[str]:
         """No-op: in-process backend holds no search index."""
@@ -162,11 +104,6 @@ class StaticRoutingBackend:
 
     async def get_roles_for_queue(self, queue_name: str) -> list[str]:
         return [role for role, queues in self._roles.items() if queue_name in queues]
-
-    # ── Routing config reads ──────────────────────────────────────────────────
-
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        return self._routing.get((task_name, task_version))
 
     # ── Write operations (not supported) ─────────────────────────────────────
 
@@ -196,16 +133,6 @@ class StaticRoutingBackend:
         )
 
     async def delete_role(self, role: str) -> None:
-        raise RoutingBackendReadOnlyError(
-            "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
-        )
-
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        raise RoutingBackendReadOnlyError(
-            "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
-        )
-
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
         raise RoutingBackendReadOnlyError(
             "Static routing backend is read-only. Use ROUTING_BACKEND=sql or ROUTING_BACKEND=redis for dynamic config."
         )

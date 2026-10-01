@@ -53,7 +53,7 @@ def test_valid_queue_names_are_accepted(name):
 @pytest.mark.parametrize(
     "name",
     [
-        "priority-shard-a",  # hyphens: the common mistake, since lane labels once allowed them
+        "priority-shard-a",  # hyphens: the common mistake, since queue names once allowed them
         "1_shard",  # leading digit
         "my.queue",  # dot
         "queue 1",  # space
@@ -68,6 +68,6 @@ def test_invalid_queue_names_are_rejected(name):
 
 
 def test_queue_name_error_names_the_hyphen_fix():
-    """The message has to teach the fix: hyphens were legal in lane labels."""
+    """The message has to teach the fix: hyphens used to be legal in queue names."""
     with pytest.raises(ValidationError, match="underscores"):
         QueueConfig(name="priority-shard-a")

@@ -26,7 +26,7 @@ Use the `TaskWrapper` returned by `@register_task`:
 ```python
 from myapp.tasks import process_order  # a @register_task-decorated function
 
-task = await process_order.submit(lane="orders", order_id=42)
+task = await process_order.submit(queue="orders", order_id=42)
 print(task.id, task.status)  # SUBMITTED
 ```
 
@@ -37,7 +37,7 @@ from ulid import ULID
 from jobbers.models.task import Task
 from jobbers.db import get_state_manager
 
-task = Task(id=ULID(), name="process_order", version=1, lane="orders", parameters={"order_id": 42})
+task = Task(id=ULID(), name="process_order", version=1, queue="orders", parameters={"order_id": 42})
 await get_state_manager().submit_task(task)
 ```
 
@@ -51,7 +51,7 @@ Content-Type: application/json
   "id": "01HZ...",
   "name": "process_order",
   "version": 1,
-  "lane": "orders",
+  "queue": "orders",
   "parameters": {"order_id": 42}
 }
 ```
@@ -71,7 +71,7 @@ import datetime as dt
 from myapp.tasks import send_reminder
 
 run_at = dt.datetime(2026, 6, 13, 9, 0, tzinfo=dt.UTC)
-task = await send_reminder.schedule(run_at, lane="notifications", user_id=99)
+task = await send_reminder.schedule(run_at, queue="notifications", user_id=99)
 ```
 
 Or using `StateManager.schedule_new_task` directly:
@@ -82,7 +82,7 @@ from jobbers.models.task import Task
 from jobbers.db import get_state_manager
 import datetime as dt
 
-task = Task(id=ULID(), name="send_reminder", version=1, lane="notifications", parameters={"user_id": 99})
+task = Task(id=ULID(), name="send_reminder", version=1, queue="notifications", parameters={"user_id": 99})
 run_at = dt.datetime(2026, 6, 13, 9, 0, tzinfo=dt.UTC)
 await get_state_manager().schedule_new_task(task, run_at)
 ```
@@ -98,7 +98,7 @@ Content-Type: application/json
     "id": "01HZ...",
     "name": "send_reminder",
     "version": 1,
-    "lane": "notifications",
+    "queue": "notifications",
     "parameters": {"user_id": 99}
   },
   "run_at": "2026-06-13T09:00:00Z"

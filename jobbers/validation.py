@@ -20,20 +20,8 @@ async def validate_task(task: Task, state_manager: StateManager) -> None:
     if not task.valid_task_params():
         raise ValidationError(f"Invalid parameters for {task.name} v{task.version}")
 
-    # A lane is valid if a routing rule maps it somewhere, or -- by the identity
-    # default -- a queue of the same name exists. See docs/lanes-and-queues.md.
-    # Poll first (throttled): both lookups below are cached, including negative results,
-    # so a stale cache here rejects a lane that another process has already made valid.
+    # The queue must exist. Poll first (throttled): get_queue_config caches negative
+    # results, so a stale cache here rejects a queue another process has already created.
     await state_manager.refresh_config_if_stale()
-    routing = await state_manager.get_routing_config(task.name, task.version)
-    rule = routing.rule_for(task.lane) if routing is not None else None
-    if rule is None:
-        queue_config = await state_manager.get_queue_config(task.lane)
-        if queue_config is None:
-            raise ValidationError(
-                f"Unknown lane {task.lane}: no routing rule matches it and no queue named {task.lane} exists"
-            )
-    else:
-        for queue in rule.queues:
-            if await state_manager.get_queue_config(queue) is None:
-                raise ValidationError(f"Routing rule for lane {task.lane} targets unknown queue {queue}")
+    if await state_manager.get_queue_config(task.queue) is None:
+        raise ValidationError(f"Unknown queue {task.queue}: no queue with that name exists")

@@ -26,9 +26,9 @@ class TaskWrapper:
     Instances are callable — calling them invokes the underlying async task function.
     Three additional methods are provided:
 
-    - ``submit(lane, **params)`` — create and submit a task to a lane.
-    - ``schedule(run_at, lane, **params)`` — create and schedule a task for future execution.
-    - ``node(lane, **params)`` — return a :class:`~jobbers.models.dag.DAGNode` for
+    - ``submit(queue, **params)`` — create and submit a task to a queue.
+    - ``schedule(run_at, queue, **params)`` — create and schedule a task for future execution.
+    - ``node(queue, **params)`` — return a :class:`~jobbers.models.dag.DAGNode` for
       programmatic DAG construction.
     """
 
@@ -40,21 +40,21 @@ class TaskWrapper:
     def __call__(self, **kwargs: Any) -> Awaitable[Any]:
         return self._func(**kwargs)
 
-    async def submit(self, lane: str = "default", **params: Any) -> "Task":
-        """Create a Task and submit it to *lane*. Raises TaskRateLimitedError if the queue is at capacity."""
-        task = Task(id=ULID(), name=self._name, version=self._version, lane=lane, parameters=params)
+    async def submit(self, queue: str = "default", **params: Any) -> "Task":
+        """Create a Task and submit it to *queue*. Raises TaskRateLimitedError if the queue is at capacity."""
+        task = Task(id=ULID(), name=self._name, version=self._version, queue=queue, parameters=params)
         await db.get_state_manager().submit_task(task)
         return task
 
-    async def schedule(self, run_at: dt.datetime, lane: str = "default", **params: Any) -> "Task":
+    async def schedule(self, run_at: dt.datetime, queue: str = "default", **params: Any) -> "Task":
         """Create a Task and schedule it to run at *run_at*."""
-        task = Task(id=ULID(), name=self._name, version=self._version, lane=lane, parameters=params)
+        task = Task(id=ULID(), name=self._name, version=self._version, queue=queue, parameters=params)
         await db.get_state_manager().schedule_new_task(task, run_at)
         return task
 
-    def node(self, lane: str = "default", **params: Any) -> "DAGNode":
+    def node(self, queue: str = "default", **params: Any) -> "DAGNode":
         """Return a :class:`~jobbers.models.dag.DAGNode` for this task."""
-        return DAGNode(self._name, lane=lane, version=self._version, parameters=params)
+        return DAGNode(self._name, queue=queue, version=self._version, parameters=params)
 
 
 def register_task(
@@ -122,7 +122,7 @@ def register_router(name: str, version: int) -> Callable[..., Any]:
     ```python
     @register_router(name="route_by_tier", version=1)
     def route_by_tier(results, *, threshold=100) -> str | RouteTo | None:
-        return RouteTo("fulfil_order", lane="priority" if results["vip"] else "standard")
+        return RouteTo("fulfil_order", queue="priority" if results["vip"] else "standard")
     ```
 
     It receives the parent task's result dict (or, in per-item fan-out mode, one

@@ -75,11 +75,11 @@ def test_task_wrapper_node():
     async def test_function(**kwargs):  # pragma: no cover
         return kwargs
 
-    node = test_function.node(lane="myqueue", x=1)
+    node = test_function.node(queue="myqueue", x=1)
     assert isinstance(node, DAGNode)
     assert node._name == "test_task"
     assert node._version == 2
-    assert node._lane == "myqueue"
+    assert node._queue == "myqueue"
     assert node._parameters == {"x": 1}
 
 
@@ -137,18 +137,18 @@ async def test_task_wrapper_submit_creates_and_submits_task():
     mock_sm.submit_task = AsyncMock()
 
     with patch("jobbers.registry.db.get_state_manager", return_value=mock_sm):
-        task = await wrapper.submit(lane="myqueue", x=1)
+        task = await wrapper.submit(queue="myqueue", x=1)
 
     assert task.name == "test_task"
     assert task.version == 1
-    assert task.lane == "myqueue"
+    assert task.queue == "myqueue"
     assert task.parameters == {"x": 1}
     mock_sm.submit_task.assert_called_once_with(task)
 
 
 @pytest.mark.asyncio
 async def test_task_wrapper_submit_defaults_to_default_queue():
-    """TaskWrapper.submit() without a lane argument targets the 'default' lane."""
+    """TaskWrapper.submit() without a queue argument targets the 'default' queue."""
     wrapper = TaskWrapper(_test_function, "test_task", 1)
     mock_sm = MagicMock()
     mock_sm.submit_task = AsyncMock()
@@ -156,7 +156,7 @@ async def test_task_wrapper_submit_defaults_to_default_queue():
     with patch("jobbers.registry.db.get_state_manager", return_value=mock_sm):
         task = await wrapper.submit(x=1)
 
-    assert task.lane == "default"
+    assert task.queue == "default"
 
 
 @pytest.mark.asyncio
@@ -168,11 +168,11 @@ async def test_task_wrapper_schedule_creates_and_schedules_task():
     mock_sm.schedule_new_task = AsyncMock()
 
     with patch("jobbers.registry.db.get_state_manager", return_value=mock_sm):
-        task = await wrapper.schedule(run_at, lane="myqueue", x=1)
+        task = await wrapper.schedule(run_at, queue="myqueue", x=1)
 
     assert task.name == "test_task"
     assert task.version == 1
-    assert task.lane == "myqueue"
+    assert task.queue == "myqueue"
     assert task.parameters == {"x": 1}
     mock_sm.schedule_new_task.assert_called_once_with(task, run_at)
 

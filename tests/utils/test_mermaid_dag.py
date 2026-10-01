@@ -362,14 +362,14 @@ def test_parse_queue_and_params() -> None:
     assert len(roots) == 1
     root = roots[0]
     assert root._name == "fetch_data"
-    assert root._lane == "heavy_queue"
+    assert root._queue == "heavy_queue"
     assert root._parameters == {"limit": 50, "dry_run": False}
 
 
 def test_parse_default_queue() -> None:
     text = 'flowchart TD\n    A["my_task"]'
     roots = parse_mermaid_dag(text)
-    assert roots[0]._lane == "default"  # type: ignore[attr-defined]
+    assert roots[0]._queue == "default"  # type: ignore[attr-defined]
 
 
 def test_parse_version() -> None:
@@ -389,7 +389,7 @@ def test_parse_version_with_queue_and_params() -> None:
     roots = parse_mermaid_dag(text)
     root = roots[0]
     assert root._version == 2  # type: ignore[attr-defined]
-    assert root._lane == "heavy"  # type: ignore[attr-defined]
+    assert root._queue == "heavy"  # type: ignore[attr-defined]
     assert root._parameters == {"limit": 10}  # type: ignore[attr-defined]
 
 
@@ -407,7 +407,7 @@ def test_parse_strips_status_suffix() -> None:
     roots = parse_mermaid_dag(text)
     assert len(roots) == 1
     assert roots[0]._name == "fetch_data"  # type: ignore[attr-defined]
-    assert roots[0]._lane == "heavy"  # type: ignore[attr-defined]
+    assert roots[0]._queue == "heavy"  # type: ignore[attr-defined]
 
 
 # ── parse_mermaid_dag — error handling ───────────────────────────────────────
@@ -427,7 +427,7 @@ def test_parse_invalid_label_raises() -> None:
 
 
 def _simple_spec(name: str, queue: str = "default") -> DAGTaskSpec:
-    return DAGTaskSpec(id=ULID(), name=name, lane=queue)
+    return DAGTaskSpec(id=ULID(), name=name, queue=queue)
 
 
 def test_generator_single_node() -> None:
@@ -469,7 +469,7 @@ def test_generator_linear_chain() -> None:
     a_with_cb = DAGTaskSpec(
         id=a.id,
         name=a.name,
-        lane=a.lane,
+        queue=a.queue,
         dag_callbacks=[SimpleCallback(task=b)],
     )
     diagram = dag_spec_to_mermaid(a_with_cb)
@@ -566,7 +566,7 @@ def test_round_trip_linear() -> None:
     assert len(roots2) == 1
     root2 = roots2[0]
     assert root2._name == "fetch_data"  # type: ignore[attr-defined]
-    assert root2._lane == "heavy"  # type: ignore[attr-defined]
+    assert root2._queue == "heavy"  # type: ignore[attr-defined]
     assert root2._parameters == {"limit": 10}  # type: ignore[attr-defined]
     # Three nodes: A → B → C
     assert len(root2._successors) == 1  # type: ignore[attr-defined]

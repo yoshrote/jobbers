@@ -155,23 +155,23 @@ async def test_router_submits_the_selected_candidate(state_manager_real_ta):
 
 
 @pytest.mark.asyncio
-async def test_router_selects_by_lane_when_candidates_share_a_task_name(state_manager_real_ta):
+async def test_router_selects_by_queue_when_candidates_share_a_task_name(state_manager_real_ta):
     _register_tasks("classify_order", "fulfil_order")
 
     @register_router(name="route_by_tier", version=0)
     def route_by_tier(results):
-        return RouteTo("fulfil_order", lane="priority" if results["vip"] else "standard")
+        return RouteTo("fulfil_order", queue="priority" if results["vip"] else "standard")
 
     task = _root_task(TIERED_ROUTER, results={"vip": True})
     await TaskProcessor(state_manager_real_ta).post_process(task)
 
     cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
-    priority = next(c for c in cb.router.candidates if c.lane == "priority")
-    standard = next(c for c in cb.router.candidates if c.lane == "standard")
+    priority = next(c for c in cb.router.candidates if c.queue == "priority")
+    standard = next(c for c in cb.router.candidates if c.queue == "standard")
 
     submitted = await state_manager_real_ta.task_state.get_task(priority.id)
     assert submitted is not None
-    assert submitted.lane == "priority"
+    assert submitted.queue == "priority"
     # With no routing rule, the identity default puts it on the same-named queue.
     assert submitted.queue == "priority"
     assert await state_manager_real_ta.task_state.get_task(standard.id) is None
@@ -244,8 +244,8 @@ async def test_unregistered_router_raises_router_error(state_manager_real_ta):
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_bare_name_selection_names_the_lanes(state_manager_real_ta):
-    """A bare task name is ambiguous when candidates differ only by lane."""
+async def test_ambiguous_bare_name_selection_names_the_queues(state_manager_real_ta):
+    """A bare task name is ambiguous when candidates differ only by queue."""
     _register_tasks("classify_order", "fulfil_order")
 
     @register_router(name="route_by_tier", version=0)
@@ -254,7 +254,7 @@ async def test_ambiguous_bare_name_selection_names_the_lanes(state_manager_real_
 
     task = _root_task(TIERED_ROUTER, results={})
     cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
-    with pytest.raises(RouterError, match="ambiguous across lanes"):
+    with pytest.raises(RouterError, match="ambiguous across queues"):
         await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
 
 
@@ -322,9 +322,9 @@ async def test_converging_branches_submit_the_collector_exactly_once(state_manag
 
 
 @pytest.mark.asyncio
-async def test_per_item_routing_spreads_arms_across_lanes(state_manager_real_ta):
+async def test_per_item_routing_spreads_arms_across_queues(state_manager_real_ta):
     """
-    Each item routes independently, so one fan-out can span several lanes.
+    Each item routes independently, so one fan-out can span several queues.
 
     Real-backend test: the collector's fan-in set is sized at routing time from
     the arms actually spawned, which only real fan-in semantics can verify.
@@ -333,7 +333,7 @@ async def test_per_item_routing_spreads_arms_across_lanes(state_manager_real_ta)
 
     @register_router(name="route_by_region", version=0)
     def route_by_region(item):
-        return RouteTo("process_record", lane=item["region"])
+        return RouteTo("process_record", queue=item["region"])
 
     dag_run_id = ULID()
     task = _root_task(
@@ -347,7 +347,7 @@ async def test_per_item_routing_spreads_arms_across_lanes(state_manager_real_ta)
     grouped = await _run_tasks_by_name(state_manager_real_ta, dag_run_id)
     arms = grouped["process_record"]
     assert len(arms) == 3
-    assert sorted(a.lane for a in arms) == ["eu", "us", "us"]
+    assert sorted(a.queue for a in arms) == ["eu", "us", "us"]
     assert sorted(a.parameters["n"] for a in arms) == [1, 2, 3]
 
     collector = await _collector_of(state_manager_real_ta, arms[0])
@@ -372,7 +372,7 @@ async def test_per_item_router_declining_an_item_drops_that_arm(state_manager_re
 
     @register_router(name="route_by_region", version=0)
     def route_by_region(item):
-        return None if item["region"] == "skip" else RouteTo("process_record", lane=item["region"])
+        return None if item["region"] == "skip" else RouteTo("process_record", queue=item["region"])
 
     dag_run_id = ULID()
     task = _root_task(
@@ -385,7 +385,7 @@ async def test_per_item_router_declining_an_item_drops_that_arm(state_manager_re
     grouped = await _run_tasks_by_name(state_manager_real_ta, dag_run_id)
     arms = grouped["process_record"]
     assert len(arms) == 2
-    assert sorted(a.lane for a in arms) == ["eu", "us"]
+    assert sorted(a.queue for a in arms) == ["eu", "us"]
 
     # The declined item contributes no arm, so the fan-in is sized to 2.
     collector = await _collector_of(state_manager_real_ta, arms[0])
@@ -400,7 +400,7 @@ async def test_per_item_router_gets_the_item_not_the_whole_result(state_manager_
     @register_router(name="route_by_region", version=0)
     def route_by_region(item):
         seen.append(item)
-        return RouteTo("process_record", lane=item["region"])
+        return RouteTo("process_record", queue=item["region"])
 
     task = _root_task(PER_ITEM, results={"items": [{"region": "us"}, {"region": "eu"}]})
     await TaskProcessor(state_manager_real_ta).post_process(task)

@@ -24,7 +24,6 @@ from jobbers.models.cron_dag import CronDAGEntry
 from jobbers.models.dag import DAGRunDetail, DagRunStatus
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
-from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import StateManager
 from tests._redis_helpers import real_redis_connection
@@ -541,7 +540,6 @@ def _make_state_manager(
         routing_notifications=RedisRoutingNotifications(redis),
     )
     sm.get_queue_config = sm.routing.get_queue_config
-    sm.get_routing_config = sm.routing.get_routing_config
     sm.get_queues = sm.routing.get_queues
     sm.get_all_queues = sm.routing.get_all_queues
     return sm
@@ -585,7 +583,6 @@ async def state_manager_real_ta(redis, dummy_routing_backend):
         routing_notifications=RedisRoutingNotifications(redis),
     )
     sm.get_queue_config = sm.routing.get_queue_config
-    sm.get_routing_config = sm.routing.get_routing_config
     sm.get_queues = sm.routing.get_queues
     sm.get_all_queues = sm.routing.get_all_queues
     return sm
@@ -650,7 +647,6 @@ class DummyRoutingBackend:
     def __init__(self) -> None:
         self._queues: dict[str, QueueConfig] = {}
         self._roles: dict[str, set[str]] = {}
-        self._routing: dict[tuple[str, int], RoutingConfig] = {}
 
     async def drop_stale_indexes(self) -> list[str]:
         return []
@@ -705,17 +701,6 @@ class DummyRoutingBackend:
 
     async def get_roles_for_queue(self, queue_name: str) -> list[str]:
         return [role for role, queues in self._roles.items() if queue_name in queues]
-
-    # ── Task routing config ───────────────────────────────────────────────────
-
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        return self._routing.get((task_name, task_version))
-
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        self._routing[(routing_config.task_name, routing_config.task_version)] = routing_config
-
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
-        return self._routing.pop((task_name, task_version), None) is not None
 
 
 @pytest.fixture

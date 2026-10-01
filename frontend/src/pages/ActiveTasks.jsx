@@ -86,7 +86,6 @@ export default function ActiveTasks() {
                 </th>
                 <th>ID</th>
                 <th>Name</th>
-                <th>Lane</th>
                 <th>Queue</th>
                 <th>Status</th>
                 <th>Retry</th>
@@ -107,7 +106,6 @@ export default function ActiveTasks() {
                     <Link to={`/tasks/${t.id}`} className="task-id-link">{t.id}</Link>
                   </td>
                   <td>{t.name}</td>
-                  <td>{t.lane ?? '—'}</td>
                   <td>{t.queue ?? '—'}</td>
                   <td><StatusBadge status={t.status} /></td>
                   <td>{t.retry_attempt}</td>
