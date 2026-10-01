@@ -17,8 +17,8 @@ if TYPE_CHECKING:
 class RedisRoutingNotifications:
     """RoutingNotificationProtocol backed by Redis keys and pub/sub channels."""
 
-    # One version for every cached config document (queue configs and routing configs
-    # alike): a reader only needs to know that *something* it may have cached changed.
+    # One version for every cached config document: a reader only needs to know that
+    # *something* it may have cached changed.
     CONFIG_VERSION_KEY = "config:version"
     REFRESH_CHANNEL = "queue-config-refresh:{role}".format
     ROLE_REFRESH_TAG_KEY = "config:role:{name}:refresh_tag".format

@@ -2,11 +2,13 @@
 
 The routing backend controls where queue and role config is stored. Select via the `ROUTING_BACKEND` environment variable. The four options have meaningfully different infrastructure requirements, consistency guarantees, and operational tradeoffs.
 
+(The name is historical: this backend no longer stores any task-routing rules — a task names its queue directly. See [resource-management.md](resource-management.md).)
+
 ## Feature matrix
 
 | Capability | `static` | `sql` | `redis` | `redis_json` |
 | --- | --- | --- | --- | --- |
-| Queue / role / routing CRUD | Read-only (HTTP 405) | Full | Full | Full |
+| Queue / role CRUD | Read-only (HTTP 405) | Full | Full | Full |
 | SQL dependency | None | Required | None | None |
 | Redis Stack required | No | No | No | Yes |
 | Config durability | In-process memory (reloaded from file/env) | SQL database | Redis persistence | Redis persistence |
@@ -23,13 +25,13 @@ The routing backend controls where queue and role config is stored. Select via t
 
 ### Strengths
 
-- Zero database dependencies. Only Redis is needed (for task queuing); routing config lives in process memory.
+- Zero database dependencies. Only Redis is needed (for task queuing); queue and role config lives in process memory.
 - Config is loaded once from a JSON/YAML file (`STATIC_CONFIG_FILE`). Nothing to manage at runtime.
 - Cheapest possible read path: in-process dictionary lookup with no network round-trips.
 
 ### Gaps and quirks
 
-- All write operations on queues, roles, and routing configs raise `RoutingBackendReadOnlyError`, surfaced as HTTP 405, so nothing in the normal CRUD flow ever bumps a refresh tag.
+- All write operations on queues and roles raise `RoutingBackendReadOnlyError`, surfaced as HTTP 405, so nothing in the normal CRUD flow ever bumps a refresh tag.
 - `POST /roles/{role_name}/refresh` still works regardless of `ROUTING_BACKEND` — it only touches the Redis-backed refresh-tag/pub-sub mechanism, not the routing backend's queue/role storage — so it's not blocked for `static`. It's just pointless here: the underlying config never changes, so a triggered refresh hands workers back the same data they already had.
 
 ---
@@ -40,7 +42,7 @@ The routing backend controls where queue and role config is stored. Select via t
 
 ### Strengths
 
-- Full ACID transactions for all writes. Every queue, role, and routing config change is atomic.
+- Full ACID transactions for all writes. Every queue and role change is atomic.
 - Persistent by default.
 - Schema migrations run automatically at startup; schema drift is tracked.
 - `delete_queue`'s row deletion is a single transaction that cascades to `role_queues` via a foreign key.
@@ -61,14 +63,14 @@ The routing backend controls where queue and role config is stored. Select via t
 ### Strengths
 
 - No SQL dependency, no Redis Stack modules required — works with any standard Redis instance.
-- Full CRUD for queues, roles, and routing configs.
+- Full CRUD for queues and roles.
 - Transactional pipelines for most writes.
 
 ### Gaps
 
 - **`bump_refresh_tags_for_queue` is O(N roles):** all N membership checks are issued in a single pipelined round trip, but the work is still proportional to role count. Fine for ≤50 roles; a concern at scale (where `redis_json`'s indexed query has the advantage).
 - **`delete_queue` is two-phase but uses safe ordering:** role cleanup (SREM from every role set + refresh tag bumps) runs first in a pipeline, then the queue config key is deleted. A crash between phases leaves an orphaned-but-valid queue config rather than roles referencing a deleted queue. The role-cleanup phase itself is all-or-nothing: all `SREM` calls are issued in a single pipeline, then tag bumps follow in a single MULTI/EXEC.
-- **Config durability depends on Redis persistence:** without AOF or RDB configured, a Redis restart wipes all routing config. Config must be re-created via the API after every restart.
+- **Config durability depends on Redis persistence:** without AOF or RDB configured, a Redis restart wipes all queue and role config. Config must be re-created via the API after every restart.
 - No migration mechanism — a key naming change requires manual cleanup. (`redis_json`'s `SCHEMA_VERSION` + `drop_stale_indexes()` only versions RediSearch index *names*, not this backend's plain-key config scheme.)
 
 ---
@@ -96,8 +98,8 @@ The routing backend controls where queue and role config is stored. Select via t
 
 ## Cross-cutting gaps
 
-**No cross-backend data migration.** Switching from `sql` to `redis` (or any other combination) requires re-creating all queues, roles, and routing configs via the API. There is no migration tool.
+**No cross-backend data migration.** Switching from `sql` to `redis` (or any other combination) requires re-creating all queues and roles via the API. There is no migration tool.
 
-**Redis keyspace sharing.** Both `redis` and `redis_json` store routing config (`config:*` / `routing:*` keys) on the same Redis instance as task data (`task:*`, `task-queues:*`, etc.). An aggressive Redis eviction policy (e.g., `allkeys-lru`) can evict routing config under memory pressure, which silently breaks queue and role reads.
+**Redis keyspace sharing.** Both `redis` and `redis_json` store queue and role config (`config:*` / `routing:*` keys) on the same Redis instance as task data (`task:*`, `task-queues:*`, etc.). An aggressive Redis eviction policy (e.g., `allkeys-lru`) can evict that config under memory pressure, which silently breaks queue and role reads.
 
 **Pub/sub refresh is backend-agnostic.** The Redis pub/sub notification (`queue-config-refresh:{role}`) that triggers immediate worker refresh is published inside `RedisRoutingNotifications.bump_refresh_tag` itself — a component every `ROUTING_BACKEND` value shares, since routing notifications are always Redis-backed regardless of where queue/role config lives. `task_routes.py` never publishes directly; it just calls `StateManager.bump_refresh_tag(role)`. All four backends benefit equally from it on write operations — except `static`, whose CRUD writes raise errors before ever reaching a bump call (the manual `POST /roles/{role}/refresh` endpoint is the one exception — see above).

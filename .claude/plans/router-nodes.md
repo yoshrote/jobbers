@@ -1,7 +1,16 @@
 # Router Nodes & the Lane / Queue Split — Design Plan
 
-Status: **implemented** (2026-09-19). Both parts landed; 1893 tests pass, `ruff`/`mypy`
-clean. Deviations from the plan as approved are noted inline below with **[impl]**.
+Status: **Part 1 reverted; Part 2 implemented.** Both parts originally landed
+(2026-09-19). Deviations from the plan as approved are noted inline below with
+**[impl]**.
+
+**Part 1 (the lane / queue split) has since been undone** by
+[lane-as-primitive.md](lane-as-primitive.md): a task names its queue directly and
+there is no logical-destination layer, so `Task.lane`, `RoutingConfig` and
+`resolve_queue` no longer exist. Read §2–§5 as history.
+
+**Part 2 (router nodes) is live**, with one change: `RouteTo`'s selector field is
+`queue`, not `lane`, and candidates are distinguished by `(name, version, queue)`.
 
 - **Part 1** (§2–§5) — split the conflated "queue" concept into **lane**
   (requested, logical) and **queue** (physical). Foundational; independently
