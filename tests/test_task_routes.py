@@ -986,7 +986,6 @@ async def test_submit_task_raises_400_on_task_exception():
     """POST /submit-task returns 400 when the state manager raises TaskException."""
     mock_sm = MagicMock()
     mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
-    mock_sm.get_routing_config = AsyncMock(return_value=None)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
     mock_sm.submit_task = AsyncMock(side_effect=TaskException("bad params"))
 
@@ -1013,7 +1012,6 @@ async def test_submit_task_raises_429_on_rate_limited_error():
     """POST /submit-task returns 429 when the state manager raises TaskRateLimitedError."""
     mock_sm = MagicMock()
     mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
-    mock_sm.get_routing_config = AsyncMock(return_value=None)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
     mock_sm.submit_task = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
 
