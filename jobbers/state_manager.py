@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import os
 import random
+import time
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -62,6 +64,13 @@ tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
 stale_cancellations_published = meter.create_counter("stale_cancellations_published", unit="1")
 tasks_completed_after_stale = meter.create_counter("tasks_completed_after_stale", unit="1")
 lane_resolutions = meter.create_counter("lane_resolutions", unit="1")
+config_refreshes = meter.create_counter("config_refreshes", unit="1")
+
+# How often a process re-checks the shared config version before trusting its cached
+# queue/routing config. Every process that resolves a lane polls on this interval, so a
+# config change made through one Manager reaches the other Managers and the Scheduler
+# without a restart.
+CONFIG_POLL_INTERVAL = float(os.environ.get("CONFIG_POLL_INTERVAL", "5.0"))
 
 
 def _dag_run_uses_fan_in(tasks: list[Task]) -> bool:
@@ -161,6 +170,11 @@ class StateManager:
         self.task_submit: TaskSubmitProtocol = task_submit
         self._queue_config_cache: dict[str, QueueConfig | None] = {}
         self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
+        # Shared-config staleness tracking for refresh_config_if_stale(). _config_version is
+        # the version these caches were populated against; _config_checked_at is a monotonic
+        # clock reading of the last check, used to throttle the poll.
+        self._config_version: ULID | None = None
+        self._config_checked_at: float | None = None
         self.submission_limiter = SubmissionRateLimiter(self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self._cancel_events: dict[ULID, _CancelHandle] = {}
@@ -1105,11 +1119,48 @@ class StateManager:
     def invalidate_all_routing_config(self) -> None:
         self._routing_config_cache.clear()
 
-    async def get_routing_version(self) -> ULID | None:
-        return await self.routing_notifications.get_routing_version()
+    def invalidate_all_queue_config(self) -> None:
+        self._queue_config_cache.clear()
 
-    async def bump_routing_version(self) -> None:
-        await self.routing_notifications.bump_routing_version()
+    async def get_config_version(self) -> ULID | None:
+        return await self.routing_notifications.get_config_version()
+
+    async def bump_config_version(self) -> None:
+        await self.routing_notifications.bump_config_version()
+
+    async def refresh_config_if_stale(self, min_interval: float | None = None) -> bool:
+        """
+        Drop cached queue/routing config when another process has changed it.
+
+        Every process that resolves a lane caches queue and routing config documents
+        indefinitely, and a write only invalidates the cache of the process that served it.
+        Without this poll a config change reaches workers (which call this once per
+        iteration) but never a second Manager replica or the Scheduler, both of which
+        resolve lanes of their own -- so the change appears to need a restart.
+
+        The check is throttled to *min_interval* seconds (default ``CONFIG_POLL_INTERVAL``)
+        so it can sit on the submit path: at most one extra read per interval per process.
+        Pass ``0`` to force a check, as ``TaskGenerator`` does.
+
+        Returns True when the caches were dropped.
+        """
+        interval = CONFIG_POLL_INTERVAL if min_interval is None else min_interval
+        now = time.monotonic()
+        if interval and self._config_checked_at is not None and now - self._config_checked_at < interval:
+            return False
+        self._config_checked_at = now
+        version = await self.get_config_version()
+        if version == self._config_version:
+            return False
+        # Both caches are dropped together: one version covers every config document, and
+        # clearing the queue-config cache is also what expires a negative (None) entry
+        # cached for a queue that has since been created.
+        self._config_version = version
+        self.invalidate_all_routing_config()
+        self.invalidate_all_queue_config()
+        config_refreshes.add(1)
+        logger.info("Config caches invalidated at version %s", version)
+        return True
 
     async def bump_refresh_tag(self, role: str) -> str:
         return await self.routing_notifications.bump_refresh_tag(role)
@@ -1120,9 +1171,10 @@ class StateManager:
             await self.routing_notifications.bump_refresh_tag(role)
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
-        """Save queue config, invalidate local cache, and bump refresh_tags for affected roles."""
+        """Save queue config, invalidate local cache, and signal every other process."""
         await self.routing.save_queue_config(queue_config)
         self.invalidate_queue_config(queue_config.name)
+        await self.bump_config_version()
         await self.bump_refresh_tags_for_queue(queue_config.name)
 
     async def create_queue_config(self, queue_config: QueueConfig) -> bool:
@@ -1130,19 +1182,23 @@ class StateManager:
         created = await self.routing.create_queue_config(queue_config)
         if created:
             self.invalidate_queue_config(queue_config.name)
+            # A new queue bumps the version because other processes may hold a negative
+            # lookup for this name -- e.g. a routing rule was pointed at the queue before
+            # it existed, so validation probed it and cached None.
+            await self.bump_config_version()
         return created
 
     async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        """Save routing config, invalidate local cache entry, and bump routing version."""
+        """Save routing config, invalidate local cache entry, and bump the config version."""
         await self.routing.save_routing_config(routing_config)
         self.invalidate_routing_config(routing_config.task_name, routing_config.task_version)
-        await self.bump_routing_version()
+        await self.bump_config_version()
 
     async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
-        """Delete routing config, invalidate local cache entry, and bump routing version."""
+        """Delete routing config, invalidate local cache entry, and bump the config version."""
         deleted = await self.routing.delete_routing_config(task_name, task_version)
         self.invalidate_routing_config(task_name, task_version)
-        await self.bump_routing_version()
+        await self.bump_config_version()
         return deleted
 
     async def get_queues(self, role: str) -> set[str]:
@@ -1175,6 +1231,7 @@ class StateManager:
     async def delete_queue(self, queue_name: str) -> None:
         self.invalidate_queue_config(queue_name)
         affected_roles = await self.routing.delete_queue(queue_name)
+        await self.bump_config_version()
         for role in affected_roles:
             await self.routing_notifications.bump_refresh_tag(role)
 
@@ -1190,6 +1247,10 @@ class StateManager:
         identity default holds: a lane resolves to the queue of the same name.
         See ``docs/lanes-and-queues.md``.
         """
+        # Resolution is the one place every process reads routing config, so it is where the
+        # (throttled) staleness check belongs -- a repointed lane must not wait for a restart
+        # to take effect on a Manager replica or on the Scheduler cron-dispatch path.
+        await self.refresh_config_if_stale()
         routing = await self.get_routing_config(task.name, task.version)
         rule = routing.rule_for(task.lane) if routing is not None else None
         if rule is None:

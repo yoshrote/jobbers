@@ -95,14 +95,14 @@ async def test_validate_task_lane_valid_via_routing_rule():
     routing = RoutingConfig(
         task_name="Test Task",
         task_version=0,
-        rules=[RoutingRule(from_lane="gold", strategy=RoutingStrategy.SINGLE, queues=["shard-a"])],
+        rules=[RoutingRule(from_lane="gold", strategy=RoutingStrategy.SINGLE, queues=["shard_a"])],
     )
     task = Task(id=ULID1, name="Test Task", lane="gold", parameters={"foo": 42})
-    sm = _mock_sm(routing=routing, queue_config=QueueConfig(name="shard-a"))
+    sm = _mock_sm(routing=routing, queue_config=QueueConfig(name="shard_a"))
     with patch("jobbers.registry.get_task_config", return_value=_task_config()):
         await validate_task(task, sm)
     # The rule's *target* queue is what gets checked, not the lane name.
-    sm.get_queue_config.assert_awaited_once_with("shard-a")
+    sm.get_queue_config.assert_awaited_once_with("shard_a")
 
 
 @pytest.mark.asyncio
@@ -125,10 +125,32 @@ async def test_validate_task_unmatched_lane_falls_back_to_queue_check():
     routing = RoutingConfig(
         task_name="Test Task",
         task_version=0,
-        rules=[RoutingRule(from_lane="gold", strategy=RoutingStrategy.SINGLE, queues=["shard-a"])],
+        rules=[RoutingRule(from_lane="gold", strategy=RoutingStrategy.SINGLE, queues=["shard_a"])],
     )
     task = Task(id=ULID1, name="Test Task", lane="silver", parameters={"foo": 42})
     sm = _mock_sm(routing=routing, queue_config=QueueConfig(name="silver"))
     with patch("jobbers.registry.get_task_config", return_value=_task_config()):
         await validate_task(task, sm)
     sm.get_queue_config.assert_awaited_once_with("silver")
+
+
+@pytest.mark.asyncio
+async def test_validate_task_polls_for_config_changes():
+    """
+    validate_task refreshes stale config before checking the lane.
+
+    Both lookups below are cached per process, negative results included, so without
+    the poll this process can keep rejecting a lane that another Manager replica has
+    already made valid by creating the queue.
+    """
+
+    async def task_function(foo: int) -> None: ...
+
+    task_config = TaskConfig(name="Test Task", function=task_function)
+    task = Task(id=ULID1, name="Test Task", lane="default", parameters={"foo": 42})
+    sm = _mock_sm(queue_config=QueueConfig(name="default"))
+
+    with patch("jobbers.registry.get_task_config", return_value=task_config):
+        await validate_task(task, sm)
+
+    sm.refresh_config_if_stale.assert_awaited_once()

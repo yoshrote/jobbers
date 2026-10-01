@@ -38,3 +38,36 @@ def test_max_concurrent_zero_is_accepted():
 def test_max_concurrent_negative_is_rejected():
     with pytest.raises(ValidationError):
         QueueConfig(name="test_queue", max_concurrent=-1)
+
+
+# ---------------------------------------------------------------------------
+# name
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["default", "heavy_jobs", "_internal", "shard_1", "A"])
+def test_valid_queue_names_are_accepted(name):
+    assert QueueConfig(name=name).name == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "priority-shard-a",  # hyphens: the common mistake, since lane labels once allowed them
+        "1_shard",  # leading digit
+        "my.queue",  # dot
+        "queue 1",  # space
+        "",  # empty
+        "qüeue",  # non-ascii
+    ],
+)
+def test_invalid_queue_names_are_rejected(name):
+    """A queue name must be nameable from a mermaid edge label -- see QUEUE_NAME_PATTERN."""
+    with pytest.raises(ValidationError):
+        QueueConfig(name=name)
+
+
+def test_queue_name_error_names_the_hyphen_fix():
+    """The message has to teach the fix: hyphens were legal in lane labels."""
+    with pytest.raises(ValidationError, match="underscores"):
+        QueueConfig(name="priority-shard-a")
