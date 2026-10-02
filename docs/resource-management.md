@@ -120,6 +120,8 @@ See [task-definition-reference.md](task-definition-reference.md) for the full pa
 
 ## 4. Live Traffic Direction: Dynamic Roles and Queue Remapping
 
+> For the step-by-step playbooks — creating, draining, retiring and replacing a queue on a running system, and what to check before deleting one — see [queue-operations.md](queue-operations.md). This section covers the mechanism; that one covers the procedure.
+
 Roles are named sets of queues. A worker consumes exactly the queues belonging to its role, determined by `WORKER_ROLE`. Roles and their queue memberships can be changed **without restarting workers**.
 
 ### Role CRUD API
@@ -142,7 +144,7 @@ See [operations.md — Queue configuration refresh](operations.md#queue-configur
 
 #### Drain a queue gradually
 
-Stop new submissions to a queue while in-flight tasks complete naturally:
+Stop *consuming* a queue while in-flight tasks complete naturally:
 
 ```bash
 # Remove the queue from the role that processes it
@@ -150,6 +152,8 @@ PUT /roles/default  { "queues": ["other_queue"] }
 # Workers stop polling "draining_queue" on their next fetch cycle
 # In-flight tasks on "draining_queue" finish normally (not cancelled)
 ```
+
+This does **not** stop submissions — the queue still exists, so `validate_task` accepts it and new work piles up unconsumed. There is no way to pause a queue. Draining is one half of retiring one: see [queue-operations.md § 5](queue-operations.md#5-destructive-changes) for the full sequence and the four places work hides before it is safe to delete.
 
 #### Shift capacity to a hot queue
 
@@ -176,6 +180,8 @@ PUT /queues/external_api  { "name": "external_api", "max_concurrent": 5 }
 # Takes effect on next task-fetch cycle
 ```
 
+Remember this cap is **per worker process** — the global ceiling is `max_concurrent × worker count`.
+
 #### Emergency rate limit
 
 ```bash
@@ -188,6 +194,8 @@ PUT /queues/payment_gateway  {
 }
 # New submissions are rejected at the rate limit boundary immediately
 ```
+
+This gates *first submissions*, not throughput: retries, requeues, DLQ resubmits and fan-out arm batches bypass the limiter.
 
 ---
 
