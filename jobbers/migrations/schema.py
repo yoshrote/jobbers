@@ -45,16 +45,6 @@ role_queues = Table(
     ),
 )
 
-task_routing = Table(
-    "task_routing",
-    metadata,
-    Column("task_name", String, primary_key=True),
-    Column("task_version", Integer, primary_key=True),
-    Column("strategy", String, nullable=False),
-    Column("queues", String, nullable=False),  # JSON array of queue names
-    Column("weights", String, nullable=True),  # JSON array of floats, NULL unless WEIGHTED
-)
-
 Index("idx_role_queues_role_queue", role_queues.c.role, role_queues.c.queue)
 
 # ---------------------------------------------------------------------------
@@ -270,7 +260,7 @@ cron_dispatch_locks = Table(
 # ---------------------------------------------------------------------------
 
 TABLE_GROUPS: dict[str, list[Table]] = {
-    "routing": [roles, queues, role_queues, task_routing],
+    "routing": [roles, queues, role_queues],
     "task_state": [
         tasks,
         task_queue,

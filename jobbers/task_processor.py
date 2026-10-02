@@ -13,14 +13,18 @@ from jobbers.models.dag import (
     DynamicFanOutCallback,
     FanInCallback,
     FromParent,
+    RouterCallback,
+    RouterSpec,
     SimpleCallback,
     TaskResult,
+    collect_fan_in_keys,
     validate_fan_in_cardinality,
 )
+from jobbers.models.router import RouteTo
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
-from jobbers.registry import get_task_config
+from jobbers.registry import get_router_config, get_task_config
 from jobbers.state_manager import (
     CancelReason,
     StaleTaskCancelledError,
@@ -104,12 +108,17 @@ def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
     return all_nodes[root.id]
 
 
+class RouterError(Exception):
+    """A router was unregistered, raised, or made a selection that matched no single candidate."""
+
+
 meter = metrics.get_meter(__name__)
 tasks_processed = meter.create_counter("tasks_processed", unit="1")
 tasks_retried = meter.create_counter("tasks_retried", unit="1")
 execution_time = meter.create_histogram("task_execution_time", unit="ms")
 end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms")
 post_process_failures = meter.create_counter("post_process_failures", unit="1")
+router_decisions = meter.create_counter("router_decisions", unit="1")
 tasks_completed_after_stale = meter.create_counter("tasks_completed_after_stale", unit="1")
 
 _OMIT = object()  # sentinel: key legitimately absent — let the function's own Python default apply
@@ -396,21 +405,22 @@ class TaskProcessor:
                         outer_fan_in_cbs_by_key[fc.fan_in_key] = fc
             await self._handle_dynamic_fanout(task, dynamic_fanout, list(outer_fan_in_cbs_by_key.values()))
 
+        # Router callbacks: run the router and submit whichever candidate it picks.
+        for cb in task.dag_callbacks:
+            if isinstance(cb, RouterCallback):
+                await self._handle_router(task, cb)
+
         if task.has_callbacks():
             skip_keys = frozenset(outer_fan_in_cbs_by_key)
             callbacks = await task.generate_callbacks(
                 self.state_manager.task_state, skip_fan_in_keys=skip_keys
             )
-            for callback in callbacks:
-                callback.queue = await self.state_manager.resolve_queue(callback)
             await self.state_manager.submit_tasks_batch(callbacks)
 
     async def post_process_error(self, task: Task) -> None:
         """Submit error callback tasks for a permanently-failed task."""
         error_callbacks = task.generate_error_callbacks()
         if error_callbacks:
-            for cb in error_callbacks:
-                cb.queue = await self.state_manager.resolve_queue(cb)
             await self.state_manager.submit_tasks_batch(error_callbacks)
 
     async def _handle_post_process_failure(self, task: Task, exc: Exception) -> None:
@@ -429,13 +439,106 @@ class TaskProcessor:
         post_process_failures.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
         await self.state_manager.save_task(task)
 
+    def _select_candidate(
+        self,
+        router: RouterSpec,
+        results: dict[Any, Any],
+        parent: Task,
+        mode: str,
+    ) -> DAGTaskSpec | None:
+        """
+        Run *router* over *results* and return the candidate spec it selects.
+
+        Returns ``None`` when the router declines to route (returns ``None``).
+        Raises ``RouterError`` when the router is unregistered, raises, or names
+        a selection that does not resolve to exactly one candidate -- callers let
+        that propagate into ``_handle_post_process_failure``.
+        """
+        config = get_router_config(router.router, router.version)
+        if config is None:
+            raise RouterError(
+                f"Unknown router '{router.router}@{router.version}'. "
+                "Register it with @register_router before submitting."
+            )
+        try:
+            choice = config.function(results, **router.parameters)
+        except Exception as exc:
+            raise RouterError(f"Router '{router.router}' raised: {exc}") from exc
+
+        if choice is None:
+            router_decisions.add(1, {"router": router.router, "target": "<none>", "mode": mode})
+            logger.debug("Router %s on task %s selected nothing.", router.router, parent.id)
+            return None
+
+        selector = RouteTo(choice) if isinstance(choice, str) else choice
+        if not isinstance(selector, RouteTo):
+            raise RouterError(
+                f"Router '{router.router}' returned {type(choice).__name__}; "
+                "expected a task name, a RouteTo, or None"
+            )
+
+        matches = [
+            c
+            for c in router.candidates
+            if c.name == selector.task
+            and (selector.queue is None or c.queue == selector.queue)
+            and (selector.version is None or c.version == selector.version)
+        ]
+        if not matches:
+            raise RouterError(
+                f"Router '{router.router}' selected {selector!r}, which matches none of its "
+                f"candidates: {[f'{c.name}@{c.version}:{c.queue}' for c in router.candidates]}"
+            )
+        if len(matches) > 1:
+            raise RouterError(
+                f"Router '{router.router}' selected {selector!r}, which is ambiguous across "
+                f"queues {sorted(c.queue for c in matches)}. Return RouteTo(task, queue=...) "
+                "to say which one."
+            )
+        chosen = matches[0]
+        router_decisions.add(
+            1, {"router": router.router, "target": f"{chosen.name}:{chosen.queue}", "mode": mode}
+        )
+        return chosen
+
+    async def _handle_router(self, parent: Task, cb: RouterCallback) -> None:
+        """
+        Run a router declared in a ``RouterCallback`` and submit the task it picks.
+
+        The selected candidate spec is used as-is, keeping its pre-assigned ULID
+        so the live diagram lines up with the submitted task -- a simple-mode
+        router fires at most once, so there is nothing to disambiguate.
+        """
+        chosen = self._select_candidate(cb.router, parent.results, parent, mode="simple")
+        if chosen is None:
+            return
+
+        task = parent._build_callback_task(chosen, [parent.id])
+        # Fan-in sets inside the chosen branch are initialised now rather than at
+        # submit time: the unchosen branches never run, so pre-populating their
+        # sets would leave collectors waiting forever.
+        fan_ins = collect_fan_in_keys(chosen)
+        if fan_ins:
+            if task.dag_run_id is None:
+                raise RouterError(
+                    f"Router '{cb.router.router}' selected a branch containing a fan-in but "
+                    f"task {parent.id} has no dag_run_id. Submit via submit_dag()."
+                )
+            await asyncio.gather(
+                *(self.state_manager.init_fan_in(task.dag_run_id, key, ids) for key, ids in fan_ins.items())
+            )
+        await self.state_manager.submit_tasks_batch([task])
+
     async def _handle_declarative_fanout(self, parent: Task, cb: DynamicFanOutCallback) -> None:
         """
         Drive a declarative fan-out declared in a ``DynamicFanOutCallback``.
 
         Reads ``parent.results[cb.items_key]`` (a list of dicts) and spawns one
-        arm instance per entry by cloning ``cb.arm_root`` with the entry's params
-        shallow-merged in (entry values override the template's static params).
+        arm instance per entry. With ``cb.arm_root`` set, every arm clones that
+        one template. With ``cb.arm_router`` set instead (mermaid ``A -->> R``),
+        each item is routed on its own, so different items can start different
+        tasks on different queues. Either way the entry's params are
+        shallow-merged into the chosen template (entry values win), and
         ``cb.collector`` is used as-is for the fan-in collector.
 
         Delegates to ``_handle_dynamic_fanout`` so that all fan-in wiring,
@@ -452,15 +555,19 @@ class TaskProcessor:
             )
             items = []
 
-        # Build arm DAGNodes from the template, merging per-item params.
+        # Build arm DAGNodes, merging per-item params into the arm template.
         arm_nodes: list[DAGNode] = []
-        fresh_root, _ = cb.arm_root.fresh_copy()
         for item_params in items:
-            cloned, _ = cb.arm_root.fresh_copy()
-            merged_params = {
-                **fresh_root.parameters,
-                **(item_params if isinstance(item_params, dict) else {}),
-            }
+            merge_from = item_params if isinstance(item_params, dict) else {}
+            if cb.arm_router is not None:
+                template = self._select_candidate(cb.arm_router, merge_from, parent, mode="per_item")
+                if template is None:
+                    continue  # router declined this item; it contributes no arm
+            else:
+                template = cb.arm_root
+            assert template is not None  # noqa: S101 -- guaranteed by the model validator
+            cloned, _ = template.fresh_copy()
+            merged_params = {**template.parameters, **merge_from}
             cloned = cloned.model_copy(update={"parameters": merged_params})
             # Rebuild a DAGNode from the spec so _handle_dynamic_fanout can walk it.
             arm_nodes.append(_spec_to_dag_node(cloned))
@@ -498,7 +605,8 @@ class TaskProcessor:
         if not outer_fan_in_cbs:
             return
         collector_task.dag_callbacks = list(collector_task.dag_callbacks) + cast(
-            "list[SimpleCallback | FanInCallback | DynamicFanOutCallback]", outer_fan_in_cbs
+            "list[SimpleCallback | FanInCallback | DynamicFanOutCallback | RouterCallback]",
+            outer_fan_in_cbs,
         )
         await asyncio.gather(
             *(

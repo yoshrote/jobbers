@@ -22,7 +22,6 @@ from jobbers.models.dag import DAGNode, DagRunStatus, DAGTaskSpec, FanInCallback
 from jobbers.models.queue_config import QueueConfig, RatePeriod
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy, TaskConfig
-from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.models.task_status import TaskStatus
 from jobbers.state_manager import (
     CancelReason,
@@ -2131,63 +2130,6 @@ async def test_dispatch_cron_dag_swallows_rate_limit_rejection(state_manager, ca
     assert any("rejected by queue" in record.message for record in caplog.records)
 
 
-# ── resolve_queue ─────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_no_routing_returns_task_queue(state_manager):
-    """When no routing config exists, resolve_queue returns the task's own queue."""
-    task = Task(id=ULID1, name="my_task", version=1, queue="original")
-    result = await state_manager.resolve_queue(task)
-    assert result == "original"
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_single_strategy(state_manager):
-    """SINGLE routing always returns the configured queue."""
-    config = RoutingConfig(
-        task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["target"]
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    task = Task(id=ULID1, name="my_task", version=1, queue="ignored")
-    result = await state_manager.resolve_queue(task)
-    assert result == "target"
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_weighted_strategy_returns_one_of_configured_queues(state_manager):
-    """WEIGHTED routing returns one of the configured queues."""
-    config = RoutingConfig(
-        task_name="my_task",
-        task_version=1,
-        strategy=RoutingStrategy.WEIGHTED,
-        queues=["fast", "slow"],
-        weights=[1.0, 1.0],
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    task = Task(id=ULID1, name="my_task", version=1, queue="ignored")
-    results = {await state_manager.resolve_queue(task) for _ in range(20)}
-    assert results <= {"fast", "slow"}
-    assert len(results) > 0
-
-
-@pytest.mark.asyncio
-async def testresolve_queue_routing_is_version_specific(state_manager):
-    """Routing config is looked up by (name, version); a different version falls through."""
-    config = RoutingConfig(
-        task_name="my_task", task_version=2, strategy=RoutingStrategy.SINGLE, queues=["routed"]
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    task_v1 = Task(id=ULID1, name="my_task", version=1, queue="original")
-    assert await state_manager.resolve_queue(task_v1) == "original"
-
-    task_v2 = Task(id=ULID2, name="my_task", version=2, queue="original")
-    assert await state_manager.resolve_queue(task_v2) == "routed"
-
-
 # ── cache behaviour ───────────────────────────────────────────────────────────
 
 
@@ -2214,36 +2156,6 @@ async def test_get_queue_config_caches_result(redis, session_factory, dummy_task
     r2 = await sm.get_queue_config("q1")
     assert r2 is not None
     assert r2.max_concurrent == 5, "cache should serve the original value"
-
-
-@pytest.mark.asyncio
-async def test_get_routing_config_caches_result(redis, session_factory, dummy_task_adapter):
-    """get_routing_config returns a cached value on the second call."""
-    routing_backend = SQLRoutingBackend(session_factory)
-    sm = StateManager(
-        routing_backend,
-        task_state=dummy_task_adapter,
-        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
-        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
-        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
-        cron_dag_scheduler=RedisCronDAGScheduler(redis),
-        cancellation_bus=RedisCancellationBus(redis),
-        routing_notifications=RedisRoutingNotifications(redis),
-    )
-    config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["routed"])
-    await sm.routing.save_routing_config(config)
-    r1 = await sm.get_routing_config("t", 1)
-    assert r1 is not None
-    assert r1.queues == ["routed"]
-
-    sm.routing.get_routing_config = AsyncMock(
-        return_value=RoutingConfig(
-            task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["other"]
-        )
-    )
-    r2 = await sm.get_routing_config("t", 1)
-    assert r2 is not None, "cache should serve the original value"
-    assert r2.queues == ["routed"], "cache should serve the original value"
 
 
 # ── explicit invalidation ─────────────────────────────────────────────────────
@@ -2286,111 +2198,6 @@ async def test_save_queue_config_invalidates_cache_and_bumps_refresh_tag(
     # refresh_tag should have been bumped for role_a (contains q1)
     tag_after = await sm.get_refresh_tag("role_a")
     assert tag_after != tag_before
-
-
-@pytest.mark.asyncio
-async def test_save_routing_config_invalidates_cache_and_bumps_version(
-    redis, session_factory, dummy_task_adapter
-):
-    """save_routing_config writes to SQL, clears the cache entry, and updates routing:version to a new ULID."""
-    routing_backend = SQLRoutingBackend(session_factory)
-    sm = StateManager(
-        routing_backend,
-        task_state=dummy_task_adapter,
-        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
-        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
-        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
-        cron_dag_scheduler=RedisCronDAGScheduler(redis),
-        cancellation_bus=RedisCancellationBus(redis),
-        routing_notifications=RedisRoutingNotifications(redis),
-    )
-
-    config_v1 = RoutingConfig(
-        task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q_old"]
-    )
-    await sm.routing.save_routing_config(config_v1)
-
-    # Warm the cache
-    r1 = await sm.get_routing_config("t", 1)
-    assert r1 is not None
-    assert r1.queues == ["q_old"]
-
-    version_before = await redis.get("routing:version")
-
-    config_v2 = RoutingConfig(
-        task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q_new"]
-    )
-    await sm.save_routing_config(config_v2)
-
-    # Cache should be cleared — next call hits SQL and returns the new value
-    r2 = await sm.get_routing_config("t", 1)
-    assert r2 is not None
-    assert r2.queues == ["q_new"]
-
-    version_after = await redis.get("routing:version")
-    assert version_after is not None
-    assert version_before != version_after
-
-
-@pytest.mark.asyncio
-async def test_delete_routing_config_invalidates_cache_and_bumps_version(
-    redis, session_factory, dummy_task_adapter
-):
-    """delete_routing_config removes from SQL, clears the cache entry, and updates routing:version to a new ULID."""
-    routing_backend = SQLRoutingBackend(session_factory)
-    sm = StateManager(
-        routing_backend,
-        task_state=dummy_task_adapter,
-        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
-        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
-        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
-        cron_dag_scheduler=RedisCronDAGScheduler(redis),
-        cancellation_bus=RedisCancellationBus(redis),
-        routing_notifications=RedisRoutingNotifications(redis),
-    )
-    config = RoutingConfig(task_name="t", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
-    await sm.routing.save_routing_config(config)
-
-    # Warm the cache
-    await sm.get_routing_config("t", 1)
-
-    version_before = await redis.get("routing:version")
-    deleted = await sm.delete_routing_config("t", 1)
-
-    assert deleted is True
-    # Cache entry cleared — returns None (SQL has no config now)
-    r = await sm.get_routing_config("t", 1)
-    assert r is None
-
-    version_after = await redis.get("routing:version")
-    assert version_after is not None
-    assert version_before != version_after
-
-
-@pytest.mark.asyncio
-async def test_invalidate_all_routing_config_clears_entire_cache(redis, session_factory, dummy_task_adapter):
-    """invalidate_all_routing_config clears all entries from the routing cache dict."""
-    routing_backend = SQLRoutingBackend(session_factory)
-    sm = StateManager(
-        routing_backend,
-        task_state=dummy_task_adapter,
-        task_submit=DummyTaskSubmit(dummy_task_adapter._store),
-        dead_queue=RedisDeadQueue(redis, dummy_task_adapter),
-        task_scheduler=RedisTaskScheduler(redis, dummy_task_adapter, routing_backend.get_all_queues),
-        cron_dag_scheduler=RedisCronDAGScheduler(redis),
-        cancellation_bus=RedisCancellationBus(redis),
-        routing_notifications=RedisRoutingNotifications(redis),
-    )
-    for i in range(3):
-        cfg = RoutingConfig(task_name=f"t{i}", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["q"])
-        await sm.routing.save_routing_config(cfg)
-        await sm.get_routing_config(f"t{i}", 1)
-
-    assert len(sm._routing_config_cache) == 3
-
-    sm.invalidate_all_routing_config()
-
-    assert len(sm._routing_config_cache) == 0
 
 
 # ── saga-mode state-manager paths ────────────────────────────────────────────
@@ -2944,3 +2751,149 @@ async def test_reschedule_cron_entries_bulk_no_pipeline(cron_saga_state_manager)
     next_run_at = await cron_sched.get_next_run_at(entry.id)
     assert next_run_at is not None
     assert next_run_at > run_at
+
+
+# ── cross-process config propagation (refresh_config_if_stale) ────────────────
+#
+# Every process caches queue/routing config documents forever, and a write only
+# invalidates the cache of the process that served it. These tests use two
+# StateManagers over one shared backend to stand in for two Manager replicas (or a
+# Manager and the Scheduler): one writes, the other must pick the change up without
+# a restart.
+
+
+def _sm_pair(redis, session_factory, dummy_task_adapter):
+    """Two StateManagers over one shared routing backend, as two processes would be."""
+    routing_backend = SQLRoutingBackend(session_factory)
+
+    def build(adapter):
+        return StateManager(
+            SQLRoutingBackend(session_factory),
+            task_state=adapter,
+            task_submit=DummyTaskSubmit(adapter._store),
+            dead_queue=RedisDeadQueue(redis, adapter),
+            task_scheduler=RedisTaskScheduler(redis, adapter, routing_backend.get_all_queues),
+            cron_dag_scheduler=RedisCronDAGScheduler(redis),
+            cancellation_bus=RedisCancellationBus(redis),
+            routing_notifications=RedisRoutingNotifications(redis),
+        )
+
+    return build(dummy_task_adapter), build(dummy_task_adapter)
+
+
+@pytest.mark.asyncio
+async def test_creating_a_queue_expires_a_cached_negative_lookup(redis, session_factory, dummy_task_adapter):
+    """A queue created elsewhere clears a cached None -- validation stops rejecting it."""
+    writer, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
+
+    # The reader probes the target before it exists (what validate_task does) and caches None.
+    assert await reader.get_queue_config("late_q") is None
+
+    assert await writer.create_queue_config(QueueConfig(name="late_q", max_concurrent=3)) is True
+
+    assert await reader.refresh_config_if_stale(min_interval=0) is True
+    config = await reader.get_queue_config("late_q")
+    assert config is not None, "a cached negative lookup must not outlive the queue creation"
+    assert config.max_concurrent == 3
+
+
+@pytest.mark.asyncio
+async def test_refresh_config_if_stale_is_throttled(redis, session_factory, dummy_task_adapter):
+    """Within min_interval the version is read once; min_interval=0 always reads."""
+    _, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
+    reader.routing_notifications.get_config_version = AsyncMock(return_value=None)
+
+    assert await reader.refresh_config_if_stale(min_interval=60) is False
+    assert await reader.refresh_config_if_stale(min_interval=60) is False
+    assert reader.routing_notifications.get_config_version.await_count == 1
+
+    assert await reader.refresh_config_if_stale(min_interval=0) is False
+    assert reader.routing_notifications.get_config_version.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_config_if_stale_noop_without_a_version(redis, session_factory, dummy_task_adapter):
+    """With no version written (e.g. the read-only static backend) the caches are kept."""
+    _, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
+    await reader.routing.save_queue_config(QueueConfig(name="q1", max_concurrent=7))
+    assert await reader.get_queue_config("q1") is not None
+
+    assert await reader.refresh_config_if_stale(min_interval=0) is False
+    assert "q1" in reader._queue_config_cache, "nothing changed, so nothing should be dropped"
+
+
+@pytest.mark.asyncio
+async def test_submit_task_polls_for_config_changes(redis, session_factory, dummy_task_adapter, monkeypatch):
+    """
+    submit_task itself picks up a queue-config change -- no explicit refresh call needed.
+
+    This pins the throttled poll to the submit path. submit_task is the one place every
+    submission reads queue config (for the rate limit), so if the call is removed a
+    capacity or rate-limit edit made through one Manager is served stale by every other
+    replica until it restarts, with nothing failing to say so.
+    """
+    monkeypatch.setattr("jobbers.state_manager.CONFIG_POLL_INTERVAL", 0.0)
+    writer, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
+    await writer.save_queue_config(QueueConfig(name="default", max_concurrent=1))
+
+    # The reader warms its cache against the pre-change config.
+    cached = await reader.get_queue_config("default")
+    assert cached is not None
+    assert cached.max_concurrent == 1
+
+    await writer.save_queue_config(QueueConfig(name="default", max_concurrent=50))
+
+    # No explicit refresh_config_if_stale() here: submitting is what must notice.
+    await reader.submit_task(Task(id=ULID(), name="t", version=1, queue="default"))
+
+    updated = await reader.get_queue_config("default")
+    assert updated is not None
+    assert updated.max_concurrent == 50, "submit_task must drop a stale queue-config cache"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_polls_for_config_changes(redis, state_manager, monkeypatch):
+    """
+    The cron dispatch path stages its own submit, so it carries its own staleness poll.
+
+    It bypasses submit_task, so the call added there does not cover it. The propagation
+    semantics themselves are covered by test_submit_task_polls_for_config_changes; this
+    pins the call site so the cron path cannot silently lose it.
+    """
+    monkeypatch.setattr("jobbers.state_manager.CONFIG_POLL_INTERVAL", 0.0)
+    calls = 0
+    real = state_manager.refresh_config_if_stale
+
+    async def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(state_manager, "refresh_config_if_stale", counting)
+
+    entry = CronDAGEntry(
+        name="nightly",
+        cron_expr="0 0 * * *",
+        dag_spec=DAGTaskSpec(name="my_job", queue="default"),
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+    await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    assert calls >= 1, "cron dispatch must poll for config changes before reading queue config"
+
+
+@pytest.mark.asyncio
+async def test_queue_config_change_reaches_a_second_process(redis, session_factory, dummy_task_adapter):
+    """An edited queue config (e.g. a new rate limit) is not served stale forever."""
+    writer, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
+    await writer.save_queue_config(QueueConfig(name="q1", max_concurrent=1))
+    cached = await reader.get_queue_config("q1")
+    assert cached is not None
+    assert cached.max_concurrent == 1
+
+    await writer.save_queue_config(QueueConfig(name="q1", max_concurrent=50))
+
+    assert await reader.refresh_config_if_stale(min_interval=0) is True
+    updated = await reader.get_queue_config("q1")
+    assert updated is not None
+    assert updated.max_concurrent == 50

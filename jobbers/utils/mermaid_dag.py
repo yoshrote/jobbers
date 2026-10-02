@@ -25,7 +25,8 @@ Every node uses a **quoted rectangular-bracket label**::
      - Integer task version; defaults to ``0`` when omitted
    * - ``:queue``
      - no
-     - Target queue name; defaults to ``"default"``
+     - Queue the task runs on; defaults to ``"default"``. The queue must exist
+       (see ``docs/resource-management.md``).
    * - ``(key=val, …)``
      - no
      - Task parameters passed verbatim to the task function; values are
@@ -133,6 +134,8 @@ from jobbers.models.dag import (
     DAGTaskSpec,
     DynamicFanOutCallback,
     FanInCallback,
+    RouterCallback,
+    RouterSpec,
     SimpleCallback,
     validate_fan_in_cardinality,
 )
@@ -181,12 +184,17 @@ _STATUS_SUFFIX_RE = re.compile(r"\{[^}]*\}\s*$")
 
 # Parses: task_name[@version][:queue][(params)]
 _LABEL_RE = re.compile(
-    r"^(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)(?:@(?P<version>\d+))?(?::(?P<queue>[a-zA-Z0-9_-]+))?(?:\((?P<params>[^)]*)\))?$"
+    r"^(?P<name>[a-zA-Z_][a-zA-Z0-9_]*)(?:@(?P<version>\d+))?(?::(?P<queue>[a-zA-Z_][a-zA-Z0-9_]*))?(?:\((?P<params>[^)]*)\))?$"
 )
 
 # Node definition — no line anchor so finditer scans inline definitions.
 # Handles: id["label"]  id['label']  id[label]  id["label"]:::class
 _NODE_RE = re.compile(r'(\w+)\[(?:"([^"]*)"|\'([^\']*)\'|([^\[\]"\']+))\](?:::[\w]+)?')
+
+# Router node definition (mermaid rhombus). Quoted forms are matched first so a
+# label carrying a reserved {status} suffix -- R{"route{small}"} -- lexes correctly;
+# the bare form deliberately excludes braces so it can't swallow one.
+_ROUTER_NODE_RE = re.compile("(\\w+)\\{(?:\"([^\"]*)\"|\\'([^\\']*)\\'|([^{}\"\\']+))\\}(?:::[\\w]+)?")
 
 # Strip :::classname suffixes that remain after node-label removal.
 _CLASS_SUFFIX_RE = re.compile(r":::\w+")
@@ -224,7 +232,8 @@ _CLASS_DEFS = (
     "    classDef pending   fill:#F0F0F0,stroke:#999,color:#000\n"
     "    classDef failed    fill:#FFB3B3,stroke:#CC0000,color:#000\n"
     "    classDef cancelled fill:#E0E0E0,stroke:#666,color:#000\n"
-    "    classDef stalled   fill:#FFD580,stroke:#CC8800,color:#000"
+    "    classDef stalled   fill:#FFD580,stroke:#CC8800,color:#000\n"
+    "    classDef router    fill:#E6D7FF,stroke:#7A4FBF,color:#000"
 )
 
 
@@ -406,21 +415,27 @@ def _extract_edges_from_line(
             fanin_edges.append(FanInEdge(src, dst))
 
 
-def _lex_mermaid(
-    text: str,
-) -> tuple[dict[str, str], list[Edge], list[Edge], list[FanOutEdge], list[FanInEdge]]:
+class LexedDiagram(NamedTuple):
+    """Everything ``_lex_mermaid`` extracts from a diagram, before any validation."""
+
+    node_labels: dict[str, str]  # task node id → raw label
+    router_labels: dict[str, str]  # router node id → raw label
+    success_edges: list[Edge]  # -->
+    error_edges: list[Edge]  # -.->
+    fanout_edges: list[FanOutEdge]  # -->> / --"key">>
+    fanin_edges: list[FanInEdge]  # --o
+
+
+def _lex_mermaid(text: str) -> LexedDiagram:
     """
-    Extract node definitions and edges from mermaid flowchart text.
+    Extract node definitions (rectangular and rhombus) and edges from mermaid text.
 
-    Returns ``(node_labels, success_edges, error_edges, fanout_edges, fanin_edges)`` where:
-
-    - ``node_labels`` maps node identifier → raw label string
-    - ``success_edges`` is a list of ``Edge(src, dst)`` for ``-->`` edges
-    - ``error_edges`` is a list of ``Edge(src, dst)`` for ``-.->`` edges
-    - ``fanout_edges`` is a list of ``FanOutEdge(src, dst, items_key)`` for ``-->>`` edges
-    - ``fanin_edges`` is a list of ``FanInEdge(src, dst)`` for ``--o`` edges
+    Router node definitions are stripped from each line *before* edge extraction
+    for the same reason task nodes are: their braces would otherwise be parsed
+    as edge text.
     """
     node_labels: dict[str, str] = {}
+    router_labels: dict[str, str] = {}
     success_edges: list[Edge] = []
     error_edges: list[Edge] = []
     fanout_edges: list[FanOutEdge] = []
@@ -430,15 +445,132 @@ def _lex_mermaid(
         line = raw_line.strip()
         if not line or any(line.startswith(p) for p in _SKIP_PREFIXES):
             continue
-        # Extract node label definitions anywhere on the line.
+        # Extract task node labels first, then strip their definitions before
+        # scanning for routers. A task label may legitimately carry a reserved
+        # {STATUS} suffix (fetch_data:heavy{COMPLETED}), which the router pattern
+        # would otherwise read as a rhombus node named after the queue.
         for m in _NODE_RE.finditer(line):
             node_labels[m.group(1)] = (m.group(2) or m.group(3) or m.group(4) or "").strip()
-        # Strip node definitions and class suffixes, then extract edges.
         cleaned = _NODE_RE.sub(lambda m: m.group(1), line)
+        for m in _ROUTER_NODE_RE.finditer(cleaned):
+            router_labels[m.group(1)] = (m.group(2) or m.group(3) or m.group(4) or "").strip()
+        # Strip router definitions and class suffixes, then extract edges.
+        cleaned = _ROUTER_NODE_RE.sub(lambda m: m.group(1), cleaned)
         cleaned = _CLASS_SUFFIX_RE.sub("", cleaned)
         _extract_edges_from_line(cleaned, success_edges, error_edges, fanout_edges, fanin_edges)
 
-    return node_labels, success_edges, error_edges, fanout_edges, fanin_edges
+    return LexedDiagram(node_labels, router_labels, success_edges, error_edges, fanout_edges, fanin_edges)
+
+
+# ── Router helpers ────────────────────────────────────────────────────────────
+
+
+def _validate_router_edges(
+    router_ids: set[str],
+    success_edges: list[Edge],
+    error_edges: list[Edge],
+    fanout_edges: list[FanOutEdge],
+    fanin_edges: list[FanInEdge],
+) -> None:
+    """
+    Reject edge shapes a router node cannot take part in.
+
+    A router is not a task: it cannot be an error target, a fan-out arm terminal,
+    a dispatcher, or another router's candidate. It also cannot be a DAG root --
+    something has to produce the results it routes on.
+    """
+    if not router_ids:
+        return
+
+    for edge in error_edges:
+        if edge.dst in router_ids:
+            raise MermaidParseError(
+                f"Error edge '-.->' points at router '{edge.dst}'. Error callbacks must target a task node."
+            )
+    for fo in fanout_edges:
+        if fo.src in router_ids:
+            raise MermaidParseError(
+                f"Router '{fo.src}' has a '-->>' fan-out edge. A router selects a "
+                "candidate; it cannot be a dispatcher."
+            )
+    for fi in fanin_edges:
+        if fi.src in router_ids:
+            raise MermaidParseError(
+                f"Router '{fi.src}' has a '--o' fan-in edge. A router cannot be an arm terminal."
+            )
+        if fi.dst in router_ids:
+            raise MermaidParseError(
+                f"'--o' fan-in edge points at router '{fi.dst}'. A collector must be a task node."
+            )
+
+    incoming = {e.dst for e in success_edges} | {fo.dst for fo in fanout_edges}
+    for rid in sorted(router_ids):
+        candidates = [e.dst for e in success_edges if e.src == rid]
+        if not candidates:
+            raise MermaidParseError(
+                f"Router '{rid}' has no candidates. Add at least one '-->' edge from it to a task node."
+            )
+        chained = sorted(c for c in candidates if c in router_ids)
+        if chained:
+            raise MermaidParseError(
+                f"Router '{rid}' points at router(s) {chained}. Router chaining is not "
+                "supported; candidates must be task nodes."
+            )
+        if rid not in incoming:
+            raise MermaidParseError(
+                f"Router '{rid}' has no incoming edge. A router cannot be a DAG root -- "
+                "it routes on a task's results."
+            )
+
+
+def _classify_predecessors(srcs: list[str], branch_tags: dict[str, set[tuple[str, str]]]) -> str:
+    """
+    Decide how a node with 2+ incoming '-->' edges should be wired.
+
+    Returns one of:
+
+    - ``"fan_in"`` -- every predecessor runs, so promote to a FanInCallback. This
+      covers both ordinary edges and a fan-in wholly inside a single router
+      branch (all predecessors tagged with the same branch).
+    - ``"alternatives"`` -- the predecessors are distinct branches of one router
+      and so mutually exclusive; exactly one runs, so wire plain callbacks.
+    - ``"mixed"`` -- conditional and unconditional predecessors, or branches of
+      different routers. A fan-in set cannot be sized for these, so the caller
+      rejects the diagram.
+    """
+    tagged = [src for src in srcs if src in branch_tags]
+    if not tagged:
+        return "fan_in"
+    if len(tagged) != len(srcs):
+        return "mixed"
+    # Every predecessor sits in at least one branch. Ambiguous membership (a node
+    # reachable from two branches) can't be reasoned about, so treat it as mixed.
+    if any(len(branch_tags[src]) != 1 for src in srcs):
+        return "mixed"
+    pairs = [next(iter(branch_tags[src])) for src in srcs]
+    routers = {rid for rid, _ in pairs}
+    branches = {cid for _, cid in pairs}
+    if len(routers) != 1:
+        return "mixed"
+    if len(branches) == len(srcs):
+        return "alternatives"  # one predecessor per branch: mutually exclusive
+    if len(branches) == 1:
+        return "fan_in"  # all on the same branch: they all run together
+    return "mixed"
+
+
+def _check_candidate_uniqueness(router_id: str, candidates: list[DAGNode]) -> None:
+    """Reject candidates a ``RouteTo`` selector could never tell apart."""
+    seen: set[tuple[str, int, str]] = set()
+    for node in candidates:
+        key = (node._name, node._version, node._queue)
+        if key in seen:
+            raise MermaidParseError(
+                f"Router '{router_id}' has two candidates for "
+                f"'{key[0]}@{key[1]}:{key[2]}'; they would be indistinguishable to the "
+                "router's return value. Give them different queues."
+            )
+        seen.add(key)
 
 
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -456,11 +588,20 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
     :raises MermaidParseError: If the text contains invalid node labels, multiple
         error callbacks on the same source, or no reachable root nodes.
     """
-    node_labels, success_edges, error_edges, fanout_edges, fanin_edges = _lex_mermaid(text)
+    lexed = _lex_mermaid(text)
+    node_labels = lexed.node_labels
+    router_labels = lexed.router_labels
+    success_edges = lexed.success_edges
+    error_edges = lexed.error_edges
+    fanout_edges = lexed.fanout_edges
+    fanin_edges = lexed.fanin_edges
 
     all_edge_count = len(success_edges) + len(fanout_edges) + len(fanin_edges)
-    if not node_labels and not all_edge_count:
+    if not node_labels and not router_labels and not all_edge_count:
         raise MermaidParseError("No nodes found in the mermaid text.")
+
+    router_ids = set(router_labels)
+    _validate_router_edges(router_ids, success_edges, error_edges, fanout_edges, fanin_edges)
 
     # Validate fanout/fanin pairings up-front.
     # Each dispatcher may have at most one -->> edge; each --o target identifies one collector.
@@ -481,6 +622,7 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
         fanin_map[fi.src] = fi
 
     # Auto-register nodes that appear only in edges (no explicit label definition).
+    # Router ids are excluded: a bare identifier in an edge is a task node.
     all_ids: set[str] = set(node_labels)
     for edge in (
         list(success_edges)
@@ -489,7 +631,7 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
         + [Edge(fi.src, fi.dst) for fi in fanin_edges]
     ):
         for nid in (edge.src, edge.dst):
-            if nid not in all_ids:
+            if nid not in all_ids and nid not in router_ids:
                 node_labels[nid] = nid  # label defaults to the node identifier
                 all_ids.add(nid)
 
@@ -501,19 +643,33 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
         except MermaidParseError as exc:
             raise MermaidParseError(f"Node '{nid}': {exc}") from exc
 
+    # Router labels share the task grammar minus the :queue segment -- a router
+    # doesn't execute anywhere, so naming a queue on one is meaningless.
+    parsed_routers: dict[str, ParsedLabel] = {}
+    for rid, label in router_labels.items():
+        try:
+            pl = _parse_label(label)
+        except MermaidParseError as exc:
+            raise MermaidParseError(f"Router '{rid}': {exc}") from exc
+        if pl.queue != "default":
+            raise MermaidParseError(
+                f"Router '{rid}' declares a queue (':{pl.queue}'). Routers do not run on a "
+                "queue; the queue belongs to the candidate tasks it selects."
+            )
+        parsed_routers[rid] = pl
+
     # TODO: validate queue names against the database.
-    # All queue names referenced by this DAG are known at this point; collect them
-    # with a set comprehension and resolve in a single query rather than per-node:
+    # Every queue this DAG references is known at this point; collect them with a set
+    # comprehension and resolve in a single query rather than per-node:
     #
-    #   queue_names = {pl.queue for pl in parsed.values()}
-    #   unknown = queue_names - await state_manager.get_known_queue_names(queue_names)
+    #   queues = {pl.queue for pl in parsed.values()}
+    #   unknown = queues - await state_manager.get_known_queues(queues)
     #   if unknown:
     #       raise MermaidParseError(f"Unknown queues: {', '.join(sorted(unknown))}")
     #
-    # parse_mermaid_dag would need to become async and accept a StateManager (or a
-    # callable) to do this.  Alternatively, validation can be deferred to the route
-    # handler, which already has a StateManager in scope, by exposing the queue set
-    # as a separate helper function.
+    # parse_mermaid_dag is synchronous and holds no StateManager, so this belongs in
+    # StateManager.submit_dag instead -- which also covers programmatic callers and
+    # POST /cron-dags, both of which bypass the route handler.
 
     # Build DAGNode objects with pre-assigned ULIDs.
     dag_nodes: dict[str, DAGNode] = {
@@ -521,9 +677,46 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
         for nid, pl in parsed.items()
     }
 
+    # ── Router nodes ──────────────────────────────────────────────────────────
+    # A router's outgoing '-->' edges name its candidates. They are selection
+    # edges, not chain edges, so they are kept out of the ordinary wiring below.
+    router_candidates: dict[str, list[str]] = {rid: [] for rid in router_ids}
+    for edge in success_edges:
+        if edge.src in router_ids:
+            router_candidates[edge.src].append(edge.dst)
+    for rid, cand_ids in router_candidates.items():
+        _check_candidate_uniqueness(rid, [dag_nodes[c] for c in cand_ids])
+
+    router_edges: set[tuple[str, str]] = {
+        (e.src, e.dst) for e in success_edges if e.src in router_ids or e.dst in router_ids
+    }
+
+    # Tag every node reachable from a candidate with the (router, candidate)
+    # branch it belongs to. Two nodes tagged with different candidates of the
+    # same router are mutually exclusive -- only one of them ever runs -- which
+    # is what lets converging branches skip fan-in promotion below.
+    branch_tags: dict[str, set[tuple[str, str]]] = {}
+    for rid, cand_ids in router_candidates.items():
+        for cid in cand_ids:
+            seen: set[str] = set()
+            frontier = [cid]
+            while frontier:
+                nid = frontier.pop()
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                branch_tags.setdefault(nid, set()).add((rid, cid))
+                frontier.extend(e.dst for e in success_edges if e.src == nid and e.src not in router_ids)
+
     # Nodes that are part of a fanout arm subgraph: arm roots and any nodes reachable
     # from them via --> edges up to (but not including) the collector.
-    arm_root_ids: set[str] = {fo.dst for fo in fanout_edges}
+    # A '-->>' edge into a router makes that router's candidates the arm roots.
+    arm_root_ids: set[str] = set()
+    for fo in fanout_edges:
+        if fo.dst in router_ids:
+            arm_root_ids.update(router_candidates[fo.dst])
+        else:
+            arm_root_ids.add(fo.dst)
     collector_ids: set[str] = {fi.dst for fi in fanin_edges}
 
     # Identify arm-internal edges: --> edges whose source is an arm root or
@@ -540,8 +733,12 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
                     changed = True
 
     # Compute in-degrees for fan-in detection among non-arm, non-fanout edges.
+    # Router selection edges are excluded: a candidate's predecessor is the
+    # router, which is not a task and never decrements a fan-in set.
     predecessors: dict[str, list[str]] = {nid: [] for nid in all_ids}
     for edge in success_edges:
+        if (edge.src, edge.dst) in router_edges:
+            continue
         if edge.src not in arm_node_ids and edge.dst not in arm_node_ids:
             predecessors[edge.dst].append(edge.src)
 
@@ -554,8 +751,26 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
             )
         error_map[edge.src] = edge.dst
 
-    # Fan-in collectors: destinations with ≥ 2 incoming non-arm success edges.
-    fan_in_collectors: set[str] = {dst for dst, srcs in predecessors.items() if len(srcs) >= 2}
+    # Fan-in collectors: destinations with ≥ 2 incoming non-arm success edges --
+    # except where every predecessor is a distinct branch of the same router.
+    # Those are mutually exclusive: exactly one runs, so promoting them to a
+    # fan-in would leave the collector waiting on branches that never execute.
+    fan_in_collectors: set[str] = set()
+    for dst, srcs in predecessors.items():
+        if len(srcs) < 2:
+            continue
+        verdict = _classify_predecessors(srcs, branch_tags)
+        if verdict == "alternatives":
+            continue
+        if verdict == "mixed":
+            conditional = sorted(src for src in srcs if src in branch_tags)
+            other = sorted(set(srcs) - set(conditional))
+            raise MermaidParseError(
+                f"Node '{dst}' mixes router branch predecessor(s) {conditional} with "
+                f"{other or 'other router branches'}. A fan-in set cannot be sized when "
+                "its predecessors are not all guaranteed to run."
+            )
+        fan_in_collectors.add(dst)
 
     # DAGNode.merge() is called once per predecessor below (to allow each predecessor
     # its own on_error node), so it never sees the full group and can't run its own
@@ -566,6 +781,8 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
 
     # Wire non-arm success edges.
     for edge in success_edges:
+        if (edge.src, edge.dst) in router_edges:
+            continue  # selection edges become RouterCallbacks below
         if edge.src in arm_node_ids or edge.dst in arm_node_ids:
             continue  # arm-internal edges are wired into the arm spec below
         error_nid = error_map.get(edge.src)
@@ -578,6 +795,8 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
     # Wire arm-internal success edges.
     arm_predecessors: dict[str, list[str]] = {nid: [] for nid in arm_node_ids}
     for edge in success_edges:
+        if (edge.src, edge.dst) in router_edges:
+            continue
         if edge.src in arm_node_ids and edge.dst in arm_node_ids:
             arm_predecessors[edge.dst].append(edge.src)
 
@@ -585,6 +804,8 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
     for dst in arm_fan_in_collectors:
         validate_fan_in_cardinality(tuple(dag_nodes[src] for src in arm_predecessors[dst]), dag_nodes[dst])
     for edge in success_edges:
+        if (edge.src, edge.dst) in router_edges:
+            continue
         if edge.src not in arm_node_ids or edge.dst not in arm_node_ids:
             continue
         error_nid = error_map.get(edge.src)
@@ -650,30 +871,67 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
             _visit(did)
         return result
 
+    def _router_spec(rid: str) -> RouterSpec:
+        """Serialise a router node and its candidate subtrees."""
+        pl = parsed_routers[rid]
+        return RouterSpec(
+            router=pl.name,
+            version=pl.version,
+            parameters=pl.params,
+            candidates=[dag_nodes[cid].to_spec() for cid in router_candidates[rid]],
+        )
+
     for dispatcher_id in _topo_dispatchers():
         fo = fanout_dispatchers[dispatcher_id]
-        arm_root_node = dag_nodes[fo.dst]
-        collector_id = _find_arm_collector(fo.dst)
+        # A '-->>' into a router routes each item individually; the candidates
+        # are the possible arm roots. Collector discovery starts from whichever
+        # of them is present, since all candidates must reach the same collector.
+        arm_search_id = router_candidates[fo.dst][0] if fo.dst in router_ids else fo.dst
+        collector_id = _find_arm_collector(arm_search_id)
         if collector_id is None:
             raise MermaidParseError(
                 f"Fan-out from '{dispatcher_id}' has no '--o'' fan-in boundary edge. "
                 "Add a '--o' edge from the arm terminal to a collector node."
             )
+        if fo.dst in router_ids:
+            for cid in router_candidates[fo.dst]:
+                if _find_arm_collector(cid) != collector_id:
+                    raise MermaidParseError(
+                        f"Router '{fo.dst}' routes a fan-out whose candidates reach different "
+                        "collectors. Every candidate's arm must end at the same '--o' collector."
+                    )
         collector_node = dag_nodes[collector_id]
         error_nid = error_map.get(dispatcher_id)
         on_error_spec = dag_nodes[error_nid].to_spec() if error_nid else None
         cb = DynamicFanOutCallback(
-            arm_root=arm_root_node.to_spec(),
+            arm_root=None if fo.dst in router_ids else dag_nodes[fo.dst].to_spec(),
+            arm_router=_router_spec(fo.dst) if fo.dst in router_ids else None,
             collector=collector_node.to_spec(),
             items_key=fo.items_key,
             error_callback=on_error_spec,
         )
         dag_nodes[dispatcher_id].add_fanout_callback(cb)
 
+    # Simple-mode routers: a plain '-->' into a rhombus node. (Routers reached by
+    # '-->>' are handled as arm routers above.)
+    fanout_router_ids = {fo.dst for fo in fanout_edges if fo.dst in router_ids}
+    for edge in success_edges:
+        if edge.dst not in router_ids or edge.dst in fanout_router_ids:
+            continue
+        error_nid = error_map.get(edge.dst)
+        dag_nodes[edge.src].add_router_callback(
+            RouterCallback(
+                router=_router_spec(edge.dst),
+                error_callback=dag_nodes[error_nid].to_spec() if error_nid else None,
+            )
+        )
+
     # Roots: dispatcher nodes and top-level nodes with no incoming non-arm success edges
-    # that are not error targets and not arm nodes and not collectors.
+    # that are not error targets and not arm nodes and not collectors. Router nodes and
+    # everything inside a router branch are excluded -- a branch is submitted by the
+    # router at runtime, never as a DAG root.
     error_targets: set[str] = set(error_map.values())
-    excluded = arm_node_ids | collector_ids | error_targets
+    excluded = arm_node_ids | collector_ids | error_targets | router_ids | set(branch_tags)
     roots = [dag_nodes[nid] for nid in all_ids if not predecessors.get(nid) and nid not in excluded]
 
     if not roots:
@@ -785,15 +1043,19 @@ def dag_spec_to_mermaid(
             _walk_arm(arm_cb.task, collector)
 
         for dag_cb in nested_fanouts:
-            inner_arm_id = str(dag_cb.arm_root.id)
-            _add_edge(sid, inner_arm_id, "-->>")
+            if dag_cb.arm_router is not None:
+                _emit_router(sid, dag_cb.arm_router, "-->>")
+                for candidate in dag_cb.arm_router.candidates:
+                    _walk_arm(candidate, dag_cb.collector)
+            else:
+                assert dag_cb.arm_root is not None  # noqa: S101 -- model validator guarantees it
+                _add_edge(sid, str(dag_cb.arm_root.id), "-->>")
+                _walk_arm(dag_cb.arm_root, dag_cb.collector)
             if dag_cb.error_callback is not None:
                 _add_edge(sid, str(dag_cb.error_callback.id), "-.->")
                 _walk(dag_cb.error_callback)
-            _walk_arm(dag_cb.arm_root, dag_cb.collector)
             # The inner collector continues this (outer) arm's chain rather than being
             # walked as a plain node -- see the docstring note above.
-            _walk_arm(dag_cb.collector, collector)
             _walk_arm(dag_cb.collector, collector)
 
     def _walk_compact_arm(s: DAGTaskSpec) -> None:
@@ -811,14 +1073,37 @@ def dag_spec_to_mermaid(
         node_lines[sid] = _node_line(s)
         for cb in s.dag_callbacks:
             if isinstance(cb, DynamicFanOutCallback):
-                inner_arm_id = str(cb.arm_root.id)
-                _add_edge(sid, inner_arm_id, "-->>")
+                col_id = str(cb.collector.id)
+                inner_roots = cb.arm_router.candidates if cb.arm_router is not None else [cb.arm_root]
+                if cb.arm_router is not None:
+                    _emit_router(sid, cb.arm_router, "-->>")
                 if cb.error_callback is not None:
                     _add_edge(sid, str(cb.error_callback.id), "-.->")
                     _walk(cb.error_callback)
-                _walk_compact_arm(cb.arm_root)
-                _add_edge(inner_arm_id, str(cb.collector.id), "--o")
+                for inner in inner_roots:
+                    assert inner is not None  # noqa: S101 -- model validator guarantees it
+                    if cb.arm_router is None:
+                        _add_edge(sid, str(inner.id), "-->>")
+                    _walk_compact_arm(inner)
+                    _add_edge(str(inner.id), col_id, "--o")
                 _walk(cb.collector)
+
+    def _router_line(r: RouterSpec) -> str:
+        label = r.router
+        if r.version != 0:
+            label += f"@{r.version}"
+        params_str = _serialize_params(r.parameters)
+        if params_str:
+            label += f"({params_str})"
+        return f'    {r.id}{{"{label}"}}:::router'
+
+    def _emit_router(src_id: str, r: RouterSpec, arrow: str) -> None:
+        """Emit the router node, the edge into it, and one selection edge per candidate."""
+        rid = str(r.id)
+        node_lines[rid] = _router_line(r)
+        _add_edge(src_id, rid, arrow)
+        for candidate in r.candidates:
+            _add_edge(rid, str(candidate.id), "-->")
 
     def _walk(s: DAGTaskSpec) -> None:
         sid = str(s.id)
@@ -828,9 +1113,33 @@ def dag_spec_to_mermaid(
         node_lines[sid] = _node_line(s)
 
         for cb in s.dag_callbacks:
+            if isinstance(cb, RouterCallback):
+                _emit_router(sid, cb.router, "-->")
+                if cb.error_callback is not None:
+                    _add_edge(str(cb.router.id), str(cb.error_callback.id), "-.->")
+                    _walk(cb.error_callback)
+                for candidate in cb.router.candidates:
+                    _walk(candidate)
+                continue
+
             if isinstance(cb, DynamicFanOutCallback):
-                arm_id = str(cb.arm_root.id)
                 col_id = str(cb.collector.id)
+                if cb.arm_router is not None:
+                    # Per-item routing: the rhombus sits between dispatcher and arms.
+                    _emit_router(sid, cb.arm_router, "-->>")
+                    if cb.error_callback is not None:
+                        _add_edge(sid, str(cb.error_callback.id), "-.->")
+                        _walk(cb.error_callback)
+                    for candidate in cb.arm_router.candidates:
+                        if expand_fanouts:
+                            _walk_arm(candidate, cb.collector)
+                        else:
+                            _walk_compact_arm(candidate)
+                            _add_edge(str(candidate.id), col_id, "--o")
+                    _walk(cb.collector)
+                    continue
+                assert cb.arm_root is not None  # noqa: S101 -- model validator guarantees it
+                arm_id = str(cb.arm_root.id)
                 _add_edge(sid, arm_id, "-->>")
                 if cb.error_callback is not None:
                     _add_edge(sid, str(cb.error_callback.id), "-.->")

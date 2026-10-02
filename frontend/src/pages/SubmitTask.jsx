@@ -95,6 +95,7 @@ export default function SubmitTask() {
           <div className="form-row">
             <label>Queue</label>
             <input value={form.queue} onChange={set('queue')} required placeholder="default" />
+            <small>Must be an existing queue. Letters, digits and underscores only.</small>
           </div>
 
           <input type="hidden" value={form.version} />

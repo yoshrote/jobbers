@@ -4,10 +4,9 @@ Protocol definitions for all pluggable adapters.
 Routing:
 - `RoutingBackendReadOnlyError` — raised by read-only backends on write operations.
 - `QueueConfigProtocol` — interface for queue/role configuration and refresh-tag management.
-- `TaskRoutingConfigProtocol` — interface for task routing configuration.
 - `RoutingBackendProtocol` — interface all routing backends must implement.
 - `CancellationBusProtocol` — pub/sub channel for in-flight task cancellation signals.
-- `RoutingNotificationProtocol` — routing version key and per-role queue-config refresh signals.
+- `RoutingNotificationProtocol` — config version key and per-role queue-config refresh signals.
 
 Task storage / dead-letter queue (split-store protocols):
 - `TaskStateProtocol` — task blob persistence, heartbeats, fan-in sets, DAG run index.
@@ -43,7 +42,6 @@ if TYPE_CHECKING:
     from jobbers.models.dag import DAGRunDetail, DagRunOutcome, DAGRunPagination, DAGRunSummary
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
-    from jobbers.models.task_routing import RoutingConfig
     from jobbers.models.task_status import TaskStatus
 
 
@@ -82,15 +80,6 @@ class QueueConfigProtocol(Protocol):
 
 
 @runtime_checkable
-class TaskRoutingConfigProtocol(Protocol):
-    """Interface for task routing configuration."""
-
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None: ...
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None: ...
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
-
-
-@runtime_checkable
 class RoutingBackendProtocol(Protocol):
     """Interface all routing backends must implement."""
 
@@ -113,11 +102,6 @@ class RoutingBackendProtocol(Protocol):
 
     # Lifecycle
     async def drop_stale_indexes(self) -> list[str]: ...
-
-    # Task routing config CRUD
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None: ...
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None: ...
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
 
 
 class CancellationKind(StrEnum):
@@ -145,10 +129,10 @@ class CancellationBusProtocol(Protocol):  # pragma: no cover
 
 
 class RoutingNotificationProtocol(Protocol):  # pragma: no cover
-    """Routing version key, per-role refresh tags, and pub/sub change signals."""
+    """Config version key, per-role refresh tags, and pub/sub change signals."""
 
-    async def get_routing_version(self) -> ULID | None: ...
-    async def bump_routing_version(self) -> None: ...
+    async def get_config_version(self) -> ULID | None: ...
+    async def bump_config_version(self) -> None: ...
     async def get_refresh_tag(self, role: str) -> ULID: ...
     async def bump_refresh_tag(self, role: str) -> str: ...
     async def poll_refresh_signal(self, role: str) -> ULID: ...

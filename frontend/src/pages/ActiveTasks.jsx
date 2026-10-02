@@ -95,7 +95,7 @@ export default function ActiveTasks() {
             </thead>
             <tbody>
               {tasks.length === 0 && (
-                <tr><td colSpan={8} className="empty-msg" style={{ padding: '1rem' }}>No active tasks.</td></tr>
+                <tr><td colSpan={9} className="empty-msg" style={{ padding: '1rem' }}>No active tasks.</td></tr>
               )}
               {tasks.map((t) => (
                 <tr key={t.id}>

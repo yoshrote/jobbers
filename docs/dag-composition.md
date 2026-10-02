@@ -166,6 +166,49 @@ graph TD
 
 ---
 
+### Router Nodes
+
+Every pattern above has a shape fixed at submission time. A **router node** decides which task runs
+based on what the previous one produced. Routers are declared in a mermaid diagram as a rhombus
+(`R{"..."}`), not through the `DAGNode` builder:
+
+```mermaid
+flowchart TD
+    A["classify_order"]
+    R{"route_by_tier"}
+    P["fulfil_order:priority"]
+    S["fulfil_order:standard"]
+    C["confirm"]
+
+    A --> R
+    R --> P
+    R --> S
+    P --> C
+    S --> C
+```
+
+```python
+from jobbers.registry import register_router
+from jobbers.models.router import RouteTo
+
+@register_router(name="route_by_tier", version=1)
+def route_by_tier(results) -> RouteTo:
+    return RouteTo("fulfil_order", queue="priority" if results["tier"] == "gold" else "standard")
+```
+
+Only the selected branch is ever submitted. Because both predecessors of `confirm` are branches of the
+same router, `confirm` is *not* promoted to a fan-in — exactly one runs, so it fires as soon as that
+branch completes.
+
+A router must be a plain `def`: it runs synchronously during callback handling and must do no I/O.
+`RouteTo` selects among the candidates the diagram declares rather than naming an arbitrary task, so
+the diagram stays a complete description of what can happen.
+
+See [mermaid-dag-spec.md](mermaid-dag-spec.md#router-nodes) for per-item routing, failure handling, and
+the full constraint list.
+
+---
+
 ## Options
 
 ### `FromParent`
@@ -432,7 +475,7 @@ Deep/wide nesting can put thousands of tasks in a single DAG run. See [dag-run-c
 
 ### Static DAG Shape
 
-For non-dynamic DAGs, the graph shape (which tasks exist and how they connect) is fixed at submission time. You cannot add new nodes to an in-flight DAG after it has started. For variable-length pipelines, use dynamic fan-out.
+For non-dynamic DAGs, the graph shape (which tasks exist and how they connect) is fixed at submission time. You cannot add new nodes to an in-flight DAG after it has started. For variable-length pipelines, use dynamic fan-out; to choose between shapes the diagram already declares, use a [router node](#router-nodes).
 
 ### Fan-In Result Access
 

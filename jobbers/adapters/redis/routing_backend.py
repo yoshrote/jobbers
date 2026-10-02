@@ -2,8 +2,7 @@
 Plain Redis routing sub-adapters and routing backend.
 
 - `RedisQueueConfigAdapter` — QueueConfigProtocol backed by plain Redis keys/sets.
-- `RedisTaskRoutingConfigAdapter` — TaskRoutingConfigProtocol backed by plain Redis keys.
-- `RedisRoutingBackend` — RoutingBackendProtocol composing the two sub-adapters.
+- `RedisRoutingBackend` — RoutingBackendProtocol wrapping it.
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ from typing import TYPE_CHECKING, cast
 
 from jobbers.adapters.redis._helpers import _pack
 from jobbers.models.queue_config import QueueConfig
-from jobbers.models.task_routing import RoutingConfig
 from jobbers.utils.serialization import deserialize
 
 if TYPE_CHECKING:
@@ -160,57 +158,15 @@ class RedisQueueConfigAdapter:
 
 
 # ---------------------------------------------------------------------------
-# RedisTaskRoutingConfigAdapter  (plain Redis: string values)
-# ---------------------------------------------------------------------------
-
-
-class RedisTaskRoutingConfigAdapter:
-    """
-    TaskRoutingConfigProtocol backed by plain Redis keys. No SQL required.
-
-    Key scheme:
-      config:routing:{task_name}:{task_version}   — msgpack bytes (RoutingConfig fields)
-    """
-
-    ROUTING_KEY = "config:routing:{task_name}:{task_version}".format
-
-    def __init__(self, client: Redis) -> None:
-        self._client = client
-
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        raw = cast(
-            "bytes | None",
-            await self._client.get(self.ROUTING_KEY(task_name=task_name, task_version=task_version)),
-        )
-        if raw is None:
-            return None
-        return RoutingConfig.model_validate(deserialize(raw))
-
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        payload = _pack(routing_config)
-        await self._client.set(
-            self.ROUTING_KEY(task_name=routing_config.task_name, task_version=routing_config.task_version),
-            payload,
-        )
-
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
-        deleted: int = await self._client.delete(
-            self.ROUTING_KEY(task_name=task_name, task_version=task_version)
-        )
-        return deleted > 0
-
-
-# ---------------------------------------------------------------------------
-# RedisRoutingBackend  (composes the two sub-adapters above)
+# RedisRoutingBackend
 # ---------------------------------------------------------------------------
 
 
 class RedisRoutingBackend:
-    """RoutingBackendProtocol backed by Redis. Delegates to sub-adapters."""
+    """RoutingBackendProtocol backed by Redis. Delegates to the queue-config sub-adapter."""
 
     def __init__(self, client: Redis) -> None:
         self._qca = RedisQueueConfigAdapter(client)
-        self._rca = RedisTaskRoutingConfigAdapter(client)
 
     async def drop_stale_indexes(self) -> list[str]:
         """No-op: plain-Redis routing backend uses simple key patterns, not a search index."""
@@ -248,12 +204,3 @@ class RedisRoutingBackend:
 
     async def get_roles_for_queue(self, queue_name: str) -> list[str]:
         return await self._qca.get_roles_for_queue(queue_name)
-
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        return await self._rca.get_routing_config(task_name, task_version)
-
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        await self._rca.save_routing_config(routing_config)
-
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
-        return await self._rca.delete_routing_config(task_name, task_version)

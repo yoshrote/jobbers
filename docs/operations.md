@@ -138,6 +138,8 @@ On `SIGTERM`, each in-flight task is handled according to its `on_shutdown` poli
 
 #### Queue configuration refresh
 
+> Changing queue config or role membership on a running system: see [queue-operations.md](queue-operations.md).
+
 Workers do not require a restart to pick up changes to their role's queue list or to individual queue configurations (concurrency limits, rate limits). The mechanism works as follows:
 
 **Refresh tag.** Each role has a `refresh_tag` (a ULID) stored in the routing backend. `TaskGenerator.queues()` compares the stored tag against its locally cached value on every iteration. A mismatch means the role's queue assignment has changed: the worker reloads its queue list from the routing backend and invalidates its per-queue configuration cache.

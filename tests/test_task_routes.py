@@ -13,7 +13,6 @@ from jobbers.models.dag import DAGRunDetail, DAGRunPagination, DagRunStatus, DAG
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
-from jobbers.models.task_routing import RoutingConfig, RoutingStrategy
 from jobbers.state_manager import TaskException, TaskRateLimitedError
 from jobbers.task_routes import app
 
@@ -24,7 +23,7 @@ FROZEN_TIME = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
 
 @pytest_asyncio.fixture(autouse=True)
 async def setup(session_factory, state_manager):
-    """Seed the 'default' queue into both SQL (for task-routing CRUD tests) and the routing backend."""
+    """Seed the 'default' queue into both SQL and the routing backend."""
     await SQLQueueConfigAdapter(session_factory).save_queue_config(QueueConfig(name="default"))
     await state_manager.routing.save_queue_config(QueueConfig(name="default"))
     patches = [
@@ -638,6 +637,7 @@ async def test_create_queue_conflict_returns_409():
 async def test_get_queue_config_found():
     """GET /queues/{name}/config returns the queue config."""
     mock_sm = MagicMock()
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="myqueue"))
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -652,6 +652,7 @@ async def test_get_queue_config_found():
 async def test_get_queue_config_not_found():
     """GET /queues/{name}/config returns 404 when queue doesn't exist."""
     mock_sm = MagicMock()
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_queue_config = AsyncMock(return_value=None)
 
     with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
@@ -671,6 +672,25 @@ async def test_update_queue(state_manager):
     saved = await state_manager.routing.get_queue_config("myqueue")
     assert saved is not None
     assert saved.max_concurrent == 7
+
+
+@pytest.mark.asyncio
+async def test_create_queue_with_invalid_name_returns_422():
+    """POST /queues rejects a name no mermaid edge label could address."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/queues", json={"name": "priority-shard-a"})
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_queue_with_invalid_name_returns_422(state_manager):
+    """The path parameter carries the pattern itself -- assigning to .name bypasses the field validator."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.put("/queues/priority-shard-a", json={"name": "ignored", "max_concurrent": 7})
+
+    assert response.status_code == 422
+    assert await state_manager.routing.get_queue_config("priority-shard-a") is None
 
 
 @pytest.mark.asyncio
@@ -931,37 +951,29 @@ async def test_update_queue_bumps_refresh_tag_for_containing_roles(state_manager
 
 
 @pytest.mark.asyncio
-async def test_update_task_routing_bumps_routing_version(state_manager, redis):
-    """PUT /task-routing updates routing:version to a new ULID in Redis."""
-    version_before = await redis.get("routing:version")
+async def test_update_queue_bumps_config_version(state_manager, redis):
+    """PUT /queues/{name} updates config:version so other processes drop their cache."""
+    version_before = await redis.get("config:version")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.put(
-            "/task-routing/my_task/1",
-            json={"strategy": "single", "queues": ["default"]},
-        )
+        response = await client.put("/queues/default", json={"name": "default", "max_concurrent": 3})
 
     assert response.status_code == 200
-    version_after = await redis.get("routing:version")
+    version_after = await redis.get("config:version")
     assert version_after is not None
     assert version_before != version_after
 
 
 @pytest.mark.asyncio
-async def test_delete_task_routing_bumps_routing_version(state_manager, redis):
-    """DELETE /task-routing updates routing:version to a new ULID in Redis."""
-    await state_manager.routing.save_routing_config(
-        RoutingConfig(
-            task_name="my_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["default"]
-        )
-    )
-    version_before = await redis.get("routing:version")
+async def test_delete_queue_bumps_config_version(state_manager, redis):
+    """DELETE /queues/{name} updates config:version too."""
+    version_before = await redis.get("config:version")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.delete("/task-routing/my_task/1")
+        response = await client.delete("/queues/default")
 
     assert response.status_code == 200
-    version_after = await redis.get("routing:version")
+    version_after = await redis.get("config:version")
     assert version_after is not None
     assert version_before != version_after
 
@@ -973,7 +985,7 @@ async def test_delete_task_routing_bumps_routing_version(state_manager, redis):
 async def test_submit_task_raises_400_on_task_exception():
     """POST /submit-task returns 400 when the state manager raises TaskException."""
     mock_sm = MagicMock()
-    mock_sm.get_routing_config = AsyncMock(return_value=None)
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
     mock_sm.submit_task = AsyncMock(side_effect=TaskException("bad params"))
 
@@ -999,7 +1011,7 @@ async def test_submit_task_raises_400_on_task_exception():
 async def test_submit_task_raises_429_on_rate_limited_error():
     """POST /submit-task returns 429 when the state manager raises TaskRateLimitedError."""
     mock_sm = MagicMock()
-    mock_sm.get_routing_config = AsyncMock(return_value=None)
+    mock_sm.refresh_config_if_stale = AsyncMock(return_value=False)
     mock_sm.get_queue_config = AsyncMock(return_value=QueueConfig(name="default"))
     mock_sm.submit_task = AsyncMock(side_effect=TaskRateLimitedError("queue is full"))
 
@@ -1348,100 +1360,6 @@ async def test_resume_dag_race_between_precheck_and_resume_returns_409(state_man
         response = await client.post(f"/dags/{DAG_RUN_ID}/resume")
 
     assert response.status_code == 409
-
-
-# ── task routing endpoints ─────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_get_task_routing_not_found():
-    """GET /task-routing returns 404 when no routing config exists."""
-    mock_sm = MagicMock()
-    mock_sm.get_routing_config = AsyncMock(return_value=None)
-
-    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/task-routing/echo_task/1")
-
-    assert response.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_get_task_routing_found(state_manager):
-    """GET /task-routing returns the routing config when it exists."""
-    config = RoutingConfig(
-        task_name="echo_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"]
-    )
-    await state_manager.routing.save_routing_config(config)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/task-routing/echo_task/1")
-
-    assert response.status_code == 200
-    data = response.json()["routing"]
-    assert data["strategy"] == "single"
-    assert data["queues"] == ["fast"]
-
-
-@pytest.mark.asyncio
-async def test_put_task_routing_creates(state_manager):
-    """PUT /task-routing creates a new routing config."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.put(
-            "/task-routing/echo_task/1",
-            json={"strategy": "single", "queues": ["fast"]},
-        )
-
-    assert response.status_code == 200
-    assert response.json()["routing"]["strategy"] == "single"
-
-    saved = await state_manager.routing.get_routing_config("echo_task", 1)
-    assert saved is not None
-    assert saved.strategy == RoutingStrategy.SINGLE
-    assert saved.queues == ["fast"]
-
-
-@pytest.mark.asyncio
-async def test_put_task_routing_path_overrides_body(state_manager):
-    """PUT uses path task_name/task_version even when body contains different values."""
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.put(
-            "/task-routing/real_name/3",
-            json={"task_name": "body_name", "task_version": 99, "strategy": "single", "queues": ["q"]},
-        )
-
-    assert response.status_code == 200
-    saved = await state_manager.routing.get_routing_config("real_name", 3)
-    assert saved is not None
-    assert saved.task_name == "real_name"
-    assert saved.task_version == 3
-
-
-@pytest.mark.asyncio
-async def test_delete_task_routing_removes_config(state_manager):
-    """DELETE /task-routing removes the config and returns 200."""
-    await state_manager.routing.save_routing_config(
-        RoutingConfig(task_name="echo_task", task_version=1, strategy=RoutingStrategy.SINGLE, queues=["fast"])
-    )
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.delete("/task-routing/echo_task/1")
-
-    assert response.status_code == 200
-    assert await state_manager.routing.get_routing_config("echo_task", 1) is None
-
-
-@pytest.mark.asyncio
-async def test_delete_task_routing_not_found():
-    """DELETE /task-routing returns 404 when config does not exist."""
-    mock_sm = MagicMock()
-    mock_sm.delete_routing_config = AsyncMock(return_value=False)
-
-    with patch("jobbers.task_routes.db.get_state_manager", return_value=mock_sm):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.delete("/task-routing/ghost/99")
-
-    assert response.status_code == 404
 
 
 # ── Queue existence validation ────────────────────────────────────────────────
@@ -1907,3 +1825,107 @@ async def test_update_cron_dag_with_unregistered_task_returns_400():
 
     assert response.status_code == 400
     assert "totally_unregistered_xyz" in response.json()["detail"]
+
+
+# ── router node validation ────────────────────────────────────────────────────
+
+
+ROUTER_DIAGRAM = """
+flowchart TD
+    A["router_root"]
+    R{"pick_branch"}
+    B["branch_one"]
+    C["branch_two:heavy"]
+
+    A --> R
+    R --> B
+    R --> C
+"""
+
+
+@pytest.fixture
+def router_dag_registry():
+    """Register the tasks and router that ROUTER_DIAGRAM refers to."""
+    from jobbers.registry import clear_registry, register_router, register_task
+
+    clear_registry()
+    for name in ("router_root", "branch_one", "branch_two"):
+
+        @register_task(name=name, version=0)
+        async def _task(**kwargs):  # pragma: no cover - never executed
+            return {}
+
+    @register_router(name="pick_branch", version=0)
+    def _router(results):  # pragma: no cover - never executed
+        return "branch_one"
+
+    yield
+    clear_registry()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("router_dag_registry")
+async def test_submit_dag_with_unregistered_router_returns_400():
+    """A diagram naming a router that is not in the registry is rejected."""
+    from jobbers.registry import _router_function_map
+
+    _router_function_map.clear()  # tasks stay registered; only the router is missing
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/submit-dag", json={"diagram": ROUTER_DIAGRAM})
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "pick_branch" in detail
+    assert "@register_router" in detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("router_dag_registry")
+async def test_submit_dag_with_unregistered_router_candidate_returns_400():
+    """A candidate task missing from the registry is rejected even though the router exists."""
+    diagram = ROUTER_DIAGRAM.replace("branch_two:heavy", "totally_unregistered_xyz:heavy")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/submit-dag", json={"diagram": diagram})
+
+    assert response.status_code == 400
+    assert "totally_unregistered_xyz" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("router_dag_registry")
+async def test_submit_dag_with_router_succeeds(state_manager):
+    """A fully registered router diagram submits and returns its root task id."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/submit-dag", json={"diagram": ROUTER_DIAGRAM})
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert len(body["root_task_ids"]) == 1
+
+    # The root's stored spec carries the router, and GET renders it back as a rhombus.
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        detail = await client.get(f"/task-status/{body['root_task_ids'][0]}")
+    assert detail.status_code == 200
+    diagram = detail.json()["dag_diagram"]
+    assert '{"pick_branch"}:::router' in diagram
+    assert "branch_two:heavy" in diagram
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("router_dag_registry")
+async def test_create_cron_dag_with_unregistered_router_returns_400():
+    """POST /cron-dags applies the same router registry check as /submit-dag."""
+    from jobbers.registry import _router_function_map
+
+    _router_function_map.clear()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/cron-dags",
+            json={"name": "bad", "cron_expr": "0 * * * *", "diagram": ROUTER_DIAGRAM},
+        )
+
+    assert response.status_code == 400
+    assert "pick_branch" in response.json()["detail"]

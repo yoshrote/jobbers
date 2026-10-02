@@ -588,6 +588,7 @@
             "required": true,
             "schema": {
               "type": "string",
+              "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
               "title": "Queue Name"
             }
           }
@@ -1325,165 +1326,6 @@
         }
       }
     },
-    "/task-routing/{task_name}/{task_version}": {
-      "get": {
-        "summary": "Get Task Routing",
-        "description": "Retrieve the routing configuration for a specific task type.",
-        "operationId": "get_task_routing_task_routing__task_name___task_version__get",
-        "parameters": [
-          {
-            "name": "task_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Task Name"
-            }
-          },
-          {
-            "name": "task_version",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Task Version"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Task Routing Task Routing  Task Name   Task Version  Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "summary": "Update Task Routing",
-        "description": "Create or update the routing configuration for a task type. Path parameters override body values.",
-        "operationId": "update_task_routing_task_routing__task_name___task_version__put",
-        "parameters": [
-          {
-            "name": "task_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Task Name"
-            }
-          },
-          {
-            "name": "task_version",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Task Version"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RoutingConfig"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Update Task Routing Task Routing  Task Name   Task Version  Put"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "summary": "Delete Task Routing",
-        "description": "Remove the routing configuration for a task type. Returns 404 if it does not exist.",
-        "operationId": "delete_task_routing_task_routing__task_name___task_version__delete",
-        "parameters": [
-          {
-            "name": "task_name",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Task Name"
-            }
-          },
-          {
-            "name": "task_version",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Task Version"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Delete Task Routing Task Routing  Task Name   Task Version  Delete"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/submit-dag": {
       "post": {
         "summary": "Submit Dag",
@@ -1944,7 +1786,7 @@
     "/dags/{dag_run_id}/resume": {
       "post": {
         "summary": "Resume Dag",
-        "description": "Retry every FAILED/STALLED/CANCELLED/DROPPED task in a DAG run from its stored parameters.\n\nRequires the run's task history, DAG run index, and (if the run uses fan-in)\nfan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in\nTTL expiry -- see GET /dags/{dag_run_id}/resume-check and\ndocs/dag-resume-design.md for what each unresumable reason means.",
+        "description": "Retry every FAILED/STALLED/CANCELLED/DROPPED task in a DAG run from its stored parameters.\n\nRequires the run's task history, DAG run index, and (if the run uses fan-in)\nfan-in tracking to not have been expunged by Cleaner age-based cleanup or fan-in\nTTL expiry -- see GET /dags/{dag_run_id}/resume-check and\ndocs/interacting-with-dags.md for what each unresumable reason means.",
         "operationId": "resume_dag_dags__dag_run_id__resume_post",
         "parameters": [
           {
@@ -2112,6 +1954,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/DynamicFanOutCallback"
+                },
+                {
+                  "$ref": "#/components/schemas/RouterCallback"
                 }
               ],
               "discriminator": {
@@ -2119,6 +1964,7 @@
                 "mapping": {
                   "dynamic_fanout": "#/components/schemas/DynamicFanOutCallback",
                   "fan_in": "#/components/schemas/FanInCallback",
+                  "router": "#/components/schemas/RouterCallback",
                   "simple": "#/components/schemas/SimpleCallback"
                 }
               }
@@ -2243,7 +2089,24 @@
             "default": "dynamic_fanout"
           },
           "arm_root": {
-            "$ref": "#/components/schemas/DAGTaskSpec"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DAGTaskSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "arm_router": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RouterSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "collector": {
             "$ref": "#/components/schemas/DAGTaskSpec"
@@ -2276,7 +2139,6 @@
         },
         "type": "object",
         "required": [
-          "arm_root",
           "collector"
         ],
         "title": "DynamicFanOutCallback",
@@ -2342,6 +2204,7 @@
         "properties": {
           "name": {
             "type": "string",
+            "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
             "title": "Name"
           },
           "max_concurrent": {
@@ -2466,59 +2329,84 @@
         "title": "RootResponse",
         "description": "Response model for the root endpoint."
       },
-      "RoutingConfig": {
+      "RouterCallback": {
         "properties": {
-          "task_name": {
+          "type": {
             "type": "string",
-            "title": "Task Name",
-            "default": ""
+            "const": "router",
+            "title": "Type",
+            "default": "router"
           },
-          "task_version": {
-            "type": "integer",
-            "title": "Task Version",
-            "default": 0
+          "router": {
+            "$ref": "#/components/schemas/RouterSpec"
           },
-          "strategy": {
-            "$ref": "#/components/schemas/RoutingStrategy"
-          },
-          "queues": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "title": "Queues"
-          },
-          "weights": {
+          "error_callback": {
             "anyOf": [
               {
-                "items": {
-                  "type": "number"
-                },
-                "type": "array"
+                "$ref": "#/components/schemas/DAGTaskSpec"
               },
               {
                 "type": "null"
               }
-            ],
-            "title": "Weights"
+            ]
           }
         },
         "type": "object",
         "required": [
-          "strategy",
-          "queues"
+          "router"
         ],
-        "title": "RoutingConfig",
-        "description": "Queue routing configuration for a task type."
+        "title": "RouterCallback",
+        "description": "Run a router when the parent task completes and submit the candidate it picks.\n\nProduced by the mermaid parser for a ``parent --> R`` edge into a rhombus\nnode. The router runs synchronously during callback handling; see\n``TaskProcessor._handle_router``."
       },
-      "RoutingStrategy": {
-        "type": "string",
-        "enum": [
-          "single",
-          "weighted"
+      "RouterSpec": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 26,
+                "minLength": 26,
+                "pattern": "[0-7][0123456789ABCDEFGHJKMNPQRSTVWXYZ]{25}"
+              },
+              {
+                "type": "string",
+                "maxLength": 16,
+                "minLength": 16,
+                "contentMediaType": "application/octet-stream"
+              }
+            ],
+            "title": "Id"
+          },
+          "router": {
+            "type": "string",
+            "title": "Router"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version",
+            "default": 0
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Parameters",
+            "default": {}
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/DAGTaskSpec"
+            },
+            "type": "array",
+            "title": "Candidates",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "router"
         ],
-        "title": "RoutingStrategy",
-        "description": "Queue routing strategy for a task type."
+        "title": "RouterSpec",
+        "description": "Serialisable specification for a router node (a mermaid rhombus).\n\n``router``/``version`` name a ``@register_router`` function; ``parameters``\ncome from the node label. ``candidates`` are the task nodes the router's\noutgoing ``-->`` edges point at -- the router selects exactly one of them,\nor none.\n\n``id`` is pre-assigned so generated diagrams can give the router node a\nstable identifier alongside the task ULIDs."
       },
       "ScheduleTaskRequest": {
         "properties": {
@@ -2739,6 +2627,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/DynamicFanOutCallback"
+                },
+                {
+                  "$ref": "#/components/schemas/RouterCallback"
                 }
               ],
               "discriminator": {
@@ -2746,6 +2637,7 @@
                 "mapping": {
                   "dynamic_fanout": "#/components/schemas/DynamicFanOutCallback",
                   "fan_in": "#/components/schemas/FanInCallback",
+                  "router": "#/components/schemas/RouterCallback",
                   "simple": "#/components/schemas/SimpleCallback"
                 }
               }

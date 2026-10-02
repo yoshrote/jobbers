@@ -470,3 +470,41 @@ Calling a registered task function directly — in a test, or from a script, via
 ### Manual access
 
 For anything `FromParent` can't express — needing a producer's task ID rather than just its results, or deciding at runtime which keys to read — call `await task.parent_results()` directly; see [dag-composition.md](dag-composition.md#fetching-parent-results-manually). For an `on_error` callback that needs to know *why* its predecessor failed, use `await task.parent_errors()` instead — `parent_results()` returns `{}` for a permanently-failed parent (its function raised before returning anything); `parent_errors()` returns that parent's `errors` list.
+
+---
+
+## `@register_router`
+
+Registers a **router** — a pure, synchronous function that picks which task handles a payload at
+runtime. Routers are not tasks: they have no retries, no queue, and no status record.
+
+```python
+from jobbers.registry import register_router
+from jobbers.models.router import RouteTo
+
+@register_router(name="route_by_size", version=1)
+def route_by_size(results: dict, *, threshold: int) -> str | RouteTo | None:
+    return "fast_path" if results["bytes"] < threshold else RouteTo("slow_path", queue="heavy")
+```
+
+| Parameter | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | Router name, referenced by a rhombus node in a mermaid diagram |
+| `version` | yes | Integer version; `(name, version)` is the router's identity |
+
+**Signature.** The first positional argument is the parent task's result dict — or, in per-item fan-out
+mode, a single item from it. Remaining keyword arguments come from the node label's `(key=val, ...)`.
+
+**Return value.** A task name, a `RouteTo(task, queue=..., version=...)` selector, or `None` to end that
+path. The selector must match exactly one of the router's declared candidates; zero or several matches
+is an error.
+
+**Constraints.** `async def` is rejected at registration — routers run inline on the worker's event
+loop during callback handling, so they must be fast, pure, and do no I/O. Re-registering the same
+function under the same `(name, version)` warns; registering a *different* one raises, matching
+`@register_task`.
+
+**Loading.** Routers are picked up by the same `task_module` import that loads tasks; define them
+alongside your `@register_task` functions.
+
+See [mermaid-dag-spec.md](mermaid-dag-spec.md#router-nodes) for the diagram syntax.

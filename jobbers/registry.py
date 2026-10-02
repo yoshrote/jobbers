@@ -1,4 +1,5 @@
 import datetime as dt
+import inspect
 import logging
 from collections.abc import Awaitable, Callable, Iterator
 from typing import Any
@@ -7,6 +8,7 @@ from ulid import ULID
 
 from jobbers import db
 from jobbers.models.dag import DAGNode
+from jobbers.models.router import RouterConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import BackoffStrategy, DeadLetterPolicy, TaskConfig
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
@@ -14,6 +16,7 @@ from jobbers.utils.di import inspect_task_dependencies
 
 logger = logging.getLogger(__name__)
 _task_function_map: dict[tuple[str, int], TaskConfig] = {}
+_router_function_map: dict[tuple[str, int], RouterConfig] = {}
 
 
 class TaskWrapper:
@@ -109,15 +112,67 @@ def register_task(
     return decorator
 
 
+def register_router(name: str, version: int) -> Callable[..., Any]:
+    """
+    Register a router function under *name* and *version*.
+
+    A router is a **pure, synchronous** function that decides which of a router
+    node's candidate tasks should handle a payload:
+
+    ```python
+    @register_router(name="route_by_tier", version=1)
+    def route_by_tier(results, *, threshold=100) -> str | RouteTo | None:
+        return RouteTo("fulfil_order", queue="priority" if results["vip"] else "standard")
+    ```
+
+    It receives the parent task's result dict (or, in per-item fan-out mode, one
+    item from it) plus any parameters from the node label, and returns a task
+    name, a :class:`~jobbers.models.router.RouteTo` selector, or ``None`` to end
+    that path.
+
+    Routers run inline on the worker's event loop during callback handling, so
+    ``async def`` is rejected at registration and the function must do no I/O.
+    Routers are picked up by the same ``task_module`` import that loads tasks --
+    define them alongside your ``@register_task`` functions.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        if not callable(func):
+            raise ValueError("Router function must be callable")
+        if inspect.iscoroutinefunction(func):
+            raise ValueError(
+                f"Router {name} must be a plain 'def' -- routers run synchronously "
+                "during callback handling and must not perform I/O"
+            )
+        if (name, version) in _router_function_map:
+            if _router_function_map[(name, version)].function != func:
+                raise ValueError(f"Router {name} version {version} is already registered to another function")
+            logger.warning("Re-registering router %s version %d to the same function", name, version)
+        _router_function_map[(name, version)] = RouterConfig(name=name, version=version, function=func)
+        return func
+
+    return decorator
+
+
 def get_task_config(name: str, version: int) -> TaskConfig | None:
     """Retrieve a task function given its name."""
     return _task_function_map.get((name, version))
+
+
+def get_router_config(name: str, version: int) -> RouterConfig | None:
+    """Retrieve a registered router by name and version."""
+    return _router_function_map.get((name, version))
 
 
 def get_tasks() -> Iterator[tuple[str, int]]:
     return iter(_task_function_map.keys())
 
 
+def get_routers() -> Iterator[tuple[str, int]]:
+    return iter(_router_function_map.keys())
+
+
 def clear_registry() -> None:
-    """Clear all registered tasks (for testing purposes)."""
+    """Clear all registered tasks and routers (for testing purposes)."""
     _task_function_map.clear()
+    _router_function_map.clear()
