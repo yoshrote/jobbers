@@ -2823,6 +2823,66 @@ async def test_refresh_config_if_stale_noop_without_a_version(redis, session_fac
 
 
 @pytest.mark.asyncio
+async def test_submit_task_polls_for_config_changes(redis, session_factory, dummy_task_adapter, monkeypatch):
+    """
+    submit_task itself picks up a queue-config change -- no explicit refresh call needed.
+
+    This pins the throttled poll to the submit path. submit_task is the one place every
+    submission reads queue config (for the rate limit), so if the call is removed a
+    capacity or rate-limit edit made through one Manager is served stale by every other
+    replica until it restarts, with nothing failing to say so.
+    """
+    monkeypatch.setattr("jobbers.state_manager.CONFIG_POLL_INTERVAL", 0.0)
+    writer, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
+    await writer.save_queue_config(QueueConfig(name="default", max_concurrent=1))
+
+    # The reader warms its cache against the pre-change config.
+    cached = await reader.get_queue_config("default")
+    assert cached is not None
+    assert cached.max_concurrent == 1
+
+    await writer.save_queue_config(QueueConfig(name="default", max_concurrent=50))
+
+    # No explicit refresh_config_if_stale() here: submitting is what must notice.
+    await reader.submit_task(Task(id=ULID(), name="t", version=1, queue="default"))
+
+    updated = await reader.get_queue_config("default")
+    assert updated is not None
+    assert updated.max_concurrent == 50, "submit_task must drop a stale queue-config cache"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cron_dag_polls_for_config_changes(redis, state_manager, monkeypatch):
+    """
+    The cron dispatch path stages its own submit, so it carries its own staleness poll.
+
+    It bypasses submit_task, so the call added there does not cover it. The propagation
+    semantics themselves are covered by test_submit_task_polls_for_config_changes; this
+    pins the call site so the cron path cannot silently lose it.
+    """
+    monkeypatch.setattr("jobbers.state_manager.CONFIG_POLL_INTERVAL", 0.0)
+    calls = 0
+    real = state_manager.refresh_config_if_stale
+
+    async def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(state_manager, "refresh_config_if_stale", counting)
+
+    entry = CronDAGEntry(
+        name="nightly",
+        cron_expr="0 0 * * *",
+        dag_spec=DAGTaskSpec(name="my_job", queue="default"),
+        concurrency_policy=ConcurrencyPolicy.ALWAYS,
+    )
+    await state_manager.dispatch_cron_dag(entry, FROZEN_TIME)
+
+    assert calls >= 1, "cron dispatch must poll for config changes before reading queue config"
+
+
+@pytest.mark.asyncio
 async def test_queue_config_change_reaches_a_second_process(redis, session_factory, dummy_task_adapter):
     """An edited queue config (e.g. a new rate limit) is not served stale forever."""
     writer, reader = _sm_pair(redis, session_factory, dummy_task_adapter)
