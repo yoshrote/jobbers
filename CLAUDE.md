@@ -139,7 +139,7 @@ async def my_task(**kwargs):
 
 There is deliberately no logical-destination layer above the queue. The indirection that used to exist (`RoutingConfig`/`RoutingRule` mapping `(task_name, task_version, lane) -> queue(s)`) was removed: its one capability was repointing a name at a different queue at runtime, which cost a precedence chain, a cache, a CRUD surface and three adapter implementations. Work is redirected instead by changing role membership, and spread across queues by a router node. See [.claude/plans/lane-as-primitive.md](.claude/plans/lane-as-primitive.md) for the reasoning and what it gave up.
 
-Queue names must match the identifier rule described under Queue & Role System, so that any queue can be named from a mermaid label.
+Queue names must match the identifier rule described under Queue & Role System, so that any queue can be named from a mermaid label. Operational procedures for changing queue config on a running system — draining, retiring, replacing a queue, and what to check before deleting one — are in [docs/queue-operations.md](docs/queue-operations.md).
 
 ## Queue & Role System
 
