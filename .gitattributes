@@ -1,0 +1,8 @@
+# LF is the canonical line ending in this repository, in the index and in the
+# working tree. Every tracked file is text; the code runs in Linux containers.
+#
+# Without this, a checkout's line endings depend on each machine's core.autocrlf,
+# and any tool that writes LF into a CRLF working tree turns the whole file into a
+# diff with no content change. jobbers/runners/scheduler_proc.py was committed that
+# way once already (121 lines "changed", none of them different).
+* text=auto eol=lf
