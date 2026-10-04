@@ -1107,7 +1107,19 @@ class StateManager:
         return await self.routing_notifications.get_config_version()
 
     async def bump_config_version(self) -> None:
-        await self.routing_notifications.bump_config_version()
+        """
+        Publish a local config change, and adopt the version it wrote.
+
+        Checking for staleness first is not redundant with the caller's own targeted
+        invalidation: a concurrent writer may have changed a *different* document that
+        this process still has cached, and adopting our own version below would hide it.
+
+        Recording the version we wrote is what stops a writer from clearing its whole
+        cache on its next poll -- and counting a `config_refreshes` -- purely because it
+        was the process that moved the key.
+        """
+        await self.refresh_config_if_stale(0)
+        self._config_version = await self.routing_notifications.bump_config_version()
 
     async def refresh_config_if_stale(self, min_interval: float | None = None) -> bool:
         """

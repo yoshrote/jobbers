@@ -327,6 +327,31 @@ def test_router_fanout_arms_may_be_multi_step_chains() -> None:
             "indistinguishable",
             id="duplicate-candidates",
         ),
+        pytest.param(
+            'flowchart TD\n A["a"] --> R{"route"}\n B["b"] --> R\n R --> Z["z"]\n',
+            "has 2 incoming edges",
+            id="router-with-two-parents",
+        ),
+        pytest.param(
+            'flowchart TD\n A["a"] --> R{"route"}\n A -->> R\n R --> Z["z"]\n Z --o C["c"]\n',
+            "has 2 incoming edges",
+            id="router-reached-by-both-arrow-kinds",
+        ),
+        pytest.param(
+            'flowchart TD\n A["a"] --> R{"route"}\n A --> Z["z"]\n R --> B["b"]\n Z --> B\n',
+            "besides router",
+            id="candidate-with-unconditional-parent",
+        ),
+        pytest.param(
+            'flowchart TD\n A["a"] --> R{"route"}\n R --> B["b"]\n A -.-> B\n',
+            "besides router",
+            id="candidate-as-error-target",
+        ),
+        pytest.param(
+            'flowchart TD\n A["a"] --> R1{"r1"}\n A2["a2"] --> R2{"r2"}\n R1 --> B["b"]\n R2 --> B\n',
+            "besides router",
+            id="candidate-shared-by-two-routers",
+        ),
     ],
 )
 def test_router_rejected_shapes(diagram: str, match: str) -> None:

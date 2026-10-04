@@ -477,7 +477,12 @@ def _validate_router_edges(
 
     A router is not a task: it cannot be an error target, a fan-out arm terminal,
     a dispatcher, or another router's candidate. It also cannot be a DAG root --
-    something has to produce the results it routes on.
+    something has to produce the results it routes on -- and it takes exactly one
+    incoming edge, which is what fixes whether it routes in simple or per-item mode.
+
+    Candidate ULIDs are pre-assigned at parse time, so any second path into a router
+    or into one of its candidates would submit the same task id twice; both shapes are
+    rejected here rather than left to produce a duplicate submit at runtime.
     """
     if not router_ids:
         return
@@ -503,7 +508,15 @@ def _validate_router_edges(
                 f"'--o' fan-in edge points at router '{fi.dst}'. A collector must be a task node."
             )
 
-    incoming = {e.dst for e in success_edges} | {fo.dst for fo in fanout_edges}
+    # Every edge as (src, dst, arrow) so incoming edges can be counted and reported
+    # regardless of kind.
+    all_edges: list[tuple[str, str, str]] = (
+        [(e.src, e.dst, "-->") for e in success_edges]
+        + [(e.src, e.dst, "-.->") for e in error_edges]
+        + [(fo.src, fo.dst, "-->>") for fo in fanout_edges]
+        + [(fi.src, fi.dst, "--o") for fi in fanin_edges]
+    )
+
     for rid in sorted(router_ids):
         candidates = [e.dst for e in success_edges if e.src == rid]
         if not candidates:
@@ -516,11 +529,37 @@ def _validate_router_edges(
                 f"Router '{rid}' points at router(s) {chained}. Router chaining is not "
                 "supported; candidates must be task nodes."
             )
-        if rid not in incoming:
+        # A router routes exactly one task's results. Two incoming edges would emit one
+        # callback per edge, each carrying the same pre-assigned candidate ULIDs, so both
+        # parents would submit the same task ids. It is also what makes the simple/per-item
+        # distinction well defined: a router reached by both '-->' and '-->>' has no mode.
+        parents = [f"'{src}' ({arrow})" for src, dst, arrow in all_edges if dst == rid]
+        if not parents:
             raise MermaidParseError(
                 f"Router '{rid}' has no incoming edge. A router cannot be a DAG root -- "
                 "it routes on a task's results."
             )
+        if len(parents) > 1:
+            raise MermaidParseError(
+                f"Router '{rid}' has {len(parents)} incoming edges ({', '.join(sorted(parents))}); "
+                "exactly one is allowed. A router routes one task's results -- give each "
+                "parent its own router node."
+            )
+        # Likewise a candidate is submitted only by its router, under an id the router
+        # pre-assigns. Any other path into it would submit that same id a second time.
+        for cid in candidates:
+            others = sorted(
+                f"'{src}' ({arrow})"
+                for src, dst, arrow in all_edges
+                if dst == cid and not (src == rid and arrow == "-->")
+            )
+            if others:
+                raise MermaidParseError(
+                    f"Router candidate '{cid}' also has incoming edge(s) from "
+                    f"{', '.join(others)} besides router '{rid}'. A candidate is submitted "
+                    "only when its router selects it; another path into it would submit the "
+                    "same task twice."
+                )
 
 
 def _classify_predecessors(srcs: list[str], branch_tags: dict[str, set[tuple[str, str]]]) -> str:
@@ -912,11 +951,11 @@ def parse_mermaid_dag(text: str) -> list[DAGNode]:
         )
         dag_nodes[dispatcher_id].add_fanout_callback(cb)
 
-    # Simple-mode routers: a plain '-->' into a rhombus node. (Routers reached by
-    # '-->>' are handled as arm routers above.)
-    fanout_router_ids = {fo.dst for fo in fanout_edges if fo.dst in router_ids}
+    # Simple-mode routers: a plain '-->' into a rhombus node. A router takes exactly one
+    # incoming edge (_validate_router_edges), so a '-->' into one is unambiguously simple
+    # mode -- a per-item router is reached by '-->>' and handled as an arm router above.
     for edge in success_edges:
-        if edge.dst not in router_ids or edge.dst in fanout_router_ids:
+        if edge.dst not in router_ids:
             continue
         error_nid = error_map.get(edge.dst)
         dag_nodes[edge.src].add_router_callback(

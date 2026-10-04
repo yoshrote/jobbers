@@ -32,8 +32,11 @@ class RedisRoutingNotifications:
         raw = cast("bytes | None", await self._client.get(self.CONFIG_VERSION_KEY))
         return ULID.from_str(raw.decode()) if raw else None
 
-    async def bump_config_version(self) -> None:
-        await self._client.set(self.CONFIG_VERSION_KEY, str(ULID()))
+    async def bump_config_version(self) -> ULID:
+        """Set the version key to a fresh ULID and return it."""
+        version = ULID()
+        await self._client.set(self.CONFIG_VERSION_KEY, str(version))
+        return version
 
     async def get_refresh_tag(self, role: str) -> ULID:
         if role in self._tag_cache:

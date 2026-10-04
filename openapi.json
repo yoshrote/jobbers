@@ -579,7 +579,7 @@
     "/queues/{queue_name}": {
       "put": {
         "summary": "Update Queue",
-        "description": "Create or update the configuration for a queue. The name in the body is ignored; the path name is used.",
+        "description": "Create or update the configuration for a queue.\n\nThe path name is the one that is saved, but the body's ``name`` is still validated\nagainst QUEUE_NAME_PATTERN by ``QueueConfig`` -- an unparseable name in the body is a\n422 even though the value is then discarded.",
         "operationId": "update_queue_queues__queue_name__put",
         "parameters": [
           {

@@ -2798,6 +2798,34 @@ async def test_creating_a_queue_expires_a_cached_negative_lookup(redis, session_
 
 
 @pytest.mark.asyncio
+async def test_writer_does_not_drop_its_own_cache_on_the_next_poll(
+    redis, session_factory, dummy_task_adapter
+):
+    """A process that bumped the version adopts it, so its own write is not a cache clear."""
+    writer, _ = _sm_pair(redis, session_factory, dummy_task_adapter)
+    await writer.save_queue_config(QueueConfig(name="q1", max_concurrent=4))
+    await writer.save_queue_config(QueueConfig(name="q2", max_concurrent=5))
+    assert await writer.get_queue_config("q2") is not None
+
+    assert await writer.refresh_config_if_stale(min_interval=0) is False
+    assert "q2" in writer._queue_config_cache, "the writer already invalidated what it changed"
+
+
+@pytest.mark.asyncio
+async def test_writer_still_picks_up_another_process_write(redis, session_factory, dummy_task_adapter):
+    """Adopting our own version must not swallow a change made elsewhere first."""
+    writer, other = _sm_pair(redis, session_factory, dummy_task_adapter)
+    await writer.save_queue_config(QueueConfig(name="shared_q", max_concurrent=1))
+    assert (await other.get_queue_config("shared_q")).max_concurrent == 1
+
+    await writer.save_queue_config(QueueConfig(name="shared_q", max_concurrent=9))
+    # `other` writes an unrelated queue: its bump must not blind it to shared_q's change.
+    await other.save_queue_config(QueueConfig(name="other_q", max_concurrent=2))
+
+    assert (await other.get_queue_config("shared_q")).max_concurrent == 9
+
+
+@pytest.mark.asyncio
 async def test_refresh_config_if_stale_is_throttled(redis, session_factory, dummy_task_adapter):
     """Within min_interval the version is read once; min_interval=0 always reads."""
     _, reader = _sm_pair(redis, session_factory, dummy_task_adapter)

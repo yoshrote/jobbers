@@ -68,7 +68,7 @@ Edges involving a **router node** (`R{"..."}`) mean something different — see 
 
 | Edge | Meaning |
 | ----- | ------- |
-| `A --> R` | The router runs **once** over `A`'s results and submits the one candidate it picks. |
+| `A --> R` | The router runs **once** over `A`'s results and submits the one candidate it picks. A router takes exactly one incoming edge. |
 | `A -->> R` | The router runs **once per item** in `A.results[items_key]`; each item is routed independently. |
 | `R --> B` | `B` is a **candidate** the router may select. A router needs at least one. |
 | `R -.-> err` | The router's own error callback — fires when the router raises or resolves to no candidate. |
@@ -471,7 +471,12 @@ than none.
 
 ### Constraints
 
-- A router needs at least one `-->` candidate and at least one incoming edge — it cannot be a DAG root.
+- A router needs at least one `-->` candidate, and **exactly one** incoming edge — it cannot be a
+  DAG root, be fed by two parents, or be reached by both `-->` and `-->>`. Candidate ids are assigned
+  at parse time, so a second parent would submit the same candidate task ids a second time. Give each
+  parent its own router node.
+- A candidate's only incoming edge is its router's. Another path into it (`A --> B`, `A -->> B`,
+  `X --o B`, `X -.-> B` where `B` is a candidate) is a parse error for the same reason.
 - Candidates must be tasks: router chaining (`R1 --> R2`) is not supported.
 - Candidates must be distinguishable — no two may share the same `(name, version, queue)`.
 - A router cannot be a dispatcher (`R -->>`), an arm terminal (`R --o`), a collector (`X --o R`), or the
@@ -490,6 +495,8 @@ than none.
 | Multiple arm template chains from one dispatcher | **Not supported.** Each dispatcher has a single arm template. |
 | Router chaining (`R1 --> R2`) | **Parse error.** Candidates must be task nodes. |
 | A router selecting several candidates | **Not supported.** One candidate, or none. |
+| A router with two incoming edges | **Parse error.** Exactly one parent; one router node per parent. |
+| A candidate with an incoming edge besides its router's | **Parse error.** It would be submitted twice. |
 | A node fed by both a router branch and an unconditional edge | **Parse error.** The fan-in set cannot be sized. |
 
 ---

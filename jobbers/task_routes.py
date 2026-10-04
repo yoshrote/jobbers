@@ -257,7 +257,13 @@ async def update_queue(
     queue_name: Annotated[str, Path(pattern=QUEUE_NAME_PATTERN)],
     queue_config: QueueConfig,
 ) -> dict[str, Any]:
-    """Create or update the configuration for a queue. The name in the body is ignored; the path name is used."""
+    """
+    Create or update the configuration for a queue.
+
+    The path name is the one that is saved, but the body's ``name`` is still validated
+    against QUEUE_NAME_PATTERN by ``QueueConfig`` -- an unparseable name in the body is a
+    422 even though the value is then discarded.
+    """
     # Assigning to .name bypasses QueueConfig's field validator (pydantic does not
     # validate on assignment), so the path parameter carries the pattern itself.
     queue_config.name = queue_name
