@@ -29,7 +29,18 @@ const CLASS_DEFS = [
   '    classDef status_scheduled fill:#fff3cd,stroke:#ffc107,color:#000',
   '    classDef status_cancelled fill:#e2e3e5,stroke:#6c757d,color:#000',
   '    classDef status_active    fill:#cce5ff,stroke:#0d6efd,color:#000',
+  '    classDef status_degraded  fill:#fef3c7,stroke:#d97706,color:#000',
 ].join('\n')
+
+// The task that stands in for a failed router node. It carries the router node's own id,
+// so its status colours the rhombus with no extra mapping -- but a COMPLETED one means the
+// '-.->' degraded path was taken, not that the routing succeeded, so it must not go green.
+const RERUN_ROUTER_TASK = 'jobbers__rerun_router'
+
+function nodeClass(task) {
+  if (task.name === RERUN_ROUTER_TASK && task.status === 'completed') return 'status_degraded'
+  return STATUS_CLASS[task.status] ?? 'status_active'
+}
 
 function applyStatusColors(diagram, tasks) {
   if (!diagram || !tasks.length) return diagram
@@ -42,7 +53,7 @@ function applyStatusColors(diagram, tasks) {
   // Append our classDef block and per-node class assignments
   const classLines = tasks
     .filter((t) => t.id && t.status)
-    .map((t) => `    class ${t.id} ${STATUS_CLASS[t.status] ?? 'status_active'}`)
+    .map((t) => `    class ${t.id} ${nodeClass(t)}`)
 
   return result.trimEnd() + '\n' + CLASS_DEFS + '\n' + classLines.join('\n')
 }

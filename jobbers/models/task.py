@@ -55,6 +55,8 @@ class Task(BaseModel):
     id: ULID
     # task mapping fields
     name: str
+    # The queue this task runs on. Named directly by the author/submitter/router
+    # and frozen at first submit -- retries and scheduler dispatch reuse it.
     queue: str = "default"
     version: int = 0
     parameters: dict[Any, Any] = {}
@@ -296,7 +298,16 @@ class Task(BaseModel):
 
     def summarized(self) -> dict[str, Any]:
         summary = self.model_dump(
-            mode="json", include={"id", "name", "parameters", "status", "retry_attempt", "submitted_at"}
+            mode="json",
+            include={
+                "id",
+                "name",
+                "queue",
+                "parameters",
+                "status",
+                "retry_attempt",
+                "submitted_at",
+            },
         )
         if self.errors:
             summary["last_error"] = self.errors[-1]

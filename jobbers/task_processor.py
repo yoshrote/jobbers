@@ -1,10 +1,12 @@
 import asyncio
+import datetime as dt
 import logging
 from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, cast, get_args, get_origin, get_type_hints
 
 from opentelemetry import metrics
 from ulid import ULID
 
+from jobbers.constants import RERUN_ROUTER_TASK
 from jobbers.context import _current_task as _current_task_cv
 from jobbers.models.dag import (
     DAGNode,
@@ -13,14 +15,18 @@ from jobbers.models.dag import (
     DynamicFanOutCallback,
     FanInCallback,
     FromParent,
+    RouterCallback,
+    RouterSpec,
     SimpleCallback,
     TaskResult,
+    collect_fan_in_keys,
     validate_fan_in_cardinality,
 )
+from jobbers.models.router import RouteTo
 from jobbers.models.task import Task
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
 from jobbers.models.task_status import TaskStatus
-from jobbers.registry import get_task_config
+from jobbers.registry import get_router_config, get_task_config
 from jobbers.state_manager import (
     CancelReason,
     StaleTaskCancelledError,
@@ -104,15 +110,219 @@ def _spec_to_dag_node(root: DAGTaskSpec) -> DAGNode:
     return all_nodes[root.id]
 
 
+class RouterError(Exception):
+    """
+    A router was unregistered, raised, or made a selection that matched no single candidate.
+
+    Subclasses carry *why*, because the right response differs. A router is a pure
+    function of results that are already persisted, so re-running it on a timer fails
+    identically -- only a deploy changes the outcome. The one exception is an
+    unregistered router, which is genuinely transient mid-rolling-deploy: a different
+    worker may have the router and succeed. ``retryable`` is what distinguishes the two.
+
+    ``reason`` is the metric tag (see ``router_failures``) and is recorded on the
+    placeholder so an operator can tell an unregistered-router spike during a deploy
+    from a real logic bug.
+    """
+
+    reason = "router_error"
+    retryable = False
+
+
+class UnknownRouterError(RouterError):
+    """The router is not in this worker's registry -- possibly a rolling deploy in progress."""
+
+    reason = "unregistered"
+    retryable = True
+
+
+class RouterRaisedError(RouterError):
+    """The router function itself raised."""
+
+    reason = "raised"
+
+
+class NoCandidateMatchedError(RouterError):
+    """The router's selection matched none of its declared candidates."""
+
+    reason = "no_candidate"
+
+
+class AmbiguousSelectionError(RouterError):
+    """The router's selection matched more than one candidate."""
+
+    reason = "ambiguous"
+
+
+class InvalidRouterReturnError(RouterError):
+    """The router returned something that is not a task name, a RouteTo, or None."""
+
+    reason = "invalid_return"
+
+
 meter = metrics.get_meter(__name__)
 tasks_processed = meter.create_counter("tasks_processed", unit="1")
 tasks_retried = meter.create_counter("tasks_retried", unit="1")
 execution_time = meter.create_histogram("task_execution_time", unit="ms")
 end_to_end_latency = meter.create_histogram("task_end_to_end_latency", unit="ms")
 post_process_failures = meter.create_counter("post_process_failures", unit="1")
+router_decisions = meter.create_counter("router_decisions", unit="1")
+# Router failures get their own counters rather than sharing post_process_failures: a
+# fallback is not a post-process failure (the run continued), and a halt is specifically
+# a *router* failure, worth separating from the generic bucket that also holds store
+# errors and fan-in misconfiguration. halted = router_failures - router_fallbacks.
+router_failures = meter.create_counter("router_failures", unit="1")
+router_fallbacks = meter.create_counter("router_fallbacks", unit="1")
 tasks_completed_after_stale = meter.create_counter("tasks_completed_after_stale", unit="1")
 
 _OMIT = object()  # sentinel: key legitimately absent — let the function's own Python default apply
+
+
+def select_candidate(
+    router: RouterSpec,
+    results: dict[Any, Any],
+    parent: Task,
+    mode: str,
+) -> DAGTaskSpec | None:
+    """
+    Run *router* over *results* and return the candidate spec it selects.
+
+    Returns ``None`` when the router declines to route (returns ``None``) -- a decision,
+    not a failure, and in per-item mode the documented way to drop an item.
+
+    Raises a :class:`RouterError` subclass when the router is unregistered, raises, or
+    names a selection that does not resolve to exactly one candidate.
+
+    Module-level rather than a method because the ``jobbers__rerun_router`` system task
+    re-runs the identical selection on a resume (see ``jobbers/system_tasks.py``); sharing
+    one function is what stops the retry path and the inline path from diverging.
+    """
+    config = get_router_config(router.router, router.version)
+    if config is None:
+        raise UnknownRouterError(
+            f"Unknown router '{router.router}@{router.version}'. "
+            "Register it with @register_router before submitting."
+        )
+    try:
+        choice = config.function(results, **router.parameters)
+    except Exception as exc:
+        raise RouterRaisedError(f"Router '{router.router}' raised: {exc}") from exc
+
+    if choice is None:
+        router_decisions.add(1, {"router": router.router, "target": "<none>", "mode": mode})
+        logger.debug("Router %s on task %s selected nothing.", router.router, parent.id)
+        return None
+
+    selector = RouteTo(choice) if isinstance(choice, str) else choice
+    if not isinstance(selector, RouteTo):
+        raise InvalidRouterReturnError(
+            f"Router '{router.router}' returned {type(choice).__name__}; "
+            "expected a task name, a RouteTo, or None"
+        )
+
+    matches = [
+        c
+        for c in router.candidates
+        if c.name == selector.task
+        and (selector.queue is None or c.queue == selector.queue)
+        and (selector.version is None or c.version == selector.version)
+    ]
+    if not matches:
+        raise NoCandidateMatchedError(
+            f"Router '{router.router}' selected {selector!r}, which matches none of its "
+            f"candidates: {[f'{c.name}@{c.version}:{c.queue}' for c in router.candidates]}"
+        )
+    if len(matches) > 1:
+        raise AmbiguousSelectionError(
+            f"Router '{router.router}' selected {selector!r}, which is ambiguous across "
+            f"queues {sorted(c.queue for c in matches)}. Return RouteTo(task, queue=...) "
+            "to say which one."
+        )
+    chosen = matches[0]
+    router_decisions.add(
+        1, {"router": router.router, "target": f"{chosen.name}:{chosen.queue}", "mode": mode}
+    )
+    return chosen
+
+
+async def submit_router_choice(
+    state_manager: "StateManager",
+    parent: Task,
+    router: RouterSpec,
+    chosen: DAGTaskSpec,
+) -> Task:
+    """
+    Submit the candidate a router picked, initialising any fan-ins inside that branch.
+
+    The selected candidate spec is used as-is, keeping its pre-assigned ULID so the live
+    diagram lines up with the submitted task and so a re-run after a fix is idempotent --
+    picking the same candidate writes the same task id.
+
+    Shared by the inline path (``TaskProcessor._handle_router``) and the
+    ``jobbers__rerun_router`` system task.
+    """
+    task = parent._build_callback_task(chosen, [parent.id])
+    # Fan-in sets inside the chosen branch are initialised now rather than at
+    # submit time: the unchosen branches never run, so pre-populating their
+    # sets would leave collectors waiting forever.
+    fan_ins = collect_fan_in_keys(chosen)
+    if fan_ins:
+        if task.dag_run_id is None:
+            raise RouterError(
+                f"Router '{router.router}' selected a branch containing a fan-in but "
+                f"task {parent.id} has no dag_run_id. Submit via submit_dag()."
+            )
+        await asyncio.gather(
+            *(state_manager.init_fan_in(task.dag_run_id, key, ids) for key, ids in fan_ins.items())
+        )
+    await state_manager.submit_tasks_batch([task])
+    return task
+
+
+def build_router_placeholder(
+    parent: Task,
+    cb: RouterCallback,
+    exc: "RouterError",
+    *,
+    fell_back: bool,
+) -> Task:
+    """
+    Build the task that stands in for a router node whose selection failed.
+
+    It takes **the router node's own pre-assigned id**, not a fresh one. That is what lets
+    the router's rhombus in the emitted diagram carry this task's state with no extra
+    mapping, keeps a second failure of the same router an overwrite rather than a
+    duplicate, and means the placeholder needs no diagram node of its own -- it *is* the
+    router node.
+
+    Status: ``FAILED`` when halting, which puts the run in ``stuck_statuses()`` and so
+    makes it resumable; ``COMPLETED`` when a degraded path was taken, because
+    ``terminal_statuses() - stuck_statuses() == {COMPLETED}`` -- every other terminal
+    status would claim the run needs operator intervention when it does not.
+
+    Runs on the parent's queue: a router has no queue of its own (``:queue`` on a router
+    label is a parse error), and the parent's is where the work already was.
+    """
+    placeholder = Task(
+        id=cb.router.id,
+        name=RERUN_ROUTER_TASK,
+        version=0,
+        queue=parent.queue,
+        parameters={
+            "router_spec": cb.router.model_dump(mode="json"),
+            "parent_id": str(parent.id),
+            "reason": exc.reason,
+            "retryable": exc.retryable,
+        },
+        parent_ids=[parent.id],
+        dag_run_id=parent.dag_run_id,
+        dag_run_name=parent.dag_run_name,
+        task_config=get_task_config(RERUN_ROUTER_TASK, 0),
+    )
+    placeholder.errors.append(str(exc))
+    placeholder.submitted_at = dt.datetime.now(dt.UTC)
+    placeholder.set_status(TaskStatus.COMPLETED if fell_back else TaskStatus.FAILED)
+    return placeholder
 
 
 def _resolve_from_parent(
@@ -396,21 +606,26 @@ class TaskProcessor:
                         outer_fan_in_cbs_by_key[fc.fan_in_key] = fc
             await self._handle_dynamic_fanout(task, dynamic_fanout, list(outer_fan_in_cbs_by_key.values()))
 
+        # Router callbacks: run the router and submit whichever candidate it picks. A
+        # router that fails hands its branch to a placeholder or a degraded node, which
+        # takes over this task's fan-in obligation -- those keys come back here so
+        # generate_callbacks below doesn't also try to discharge them.
+        delegated_by_routers: set[str] = set()
+        for cb in task.dag_callbacks:
+            if isinstance(cb, RouterCallback):
+                delegated_by_routers |= await self._handle_router(task, cb)
+
         if task.has_callbacks():
-            skip_keys = frozenset(outer_fan_in_cbs_by_key)
+            skip_keys = frozenset(outer_fan_in_cbs_by_key) | delegated_by_routers
             callbacks = await task.generate_callbacks(
                 self.state_manager.task_state, skip_fan_in_keys=skip_keys
             )
-            for callback in callbacks:
-                callback.queue = await self.state_manager.resolve_queue(callback)
             await self.state_manager.submit_tasks_batch(callbacks)
 
     async def post_process_error(self, task: Task) -> None:
         """Submit error callback tasks for a permanently-failed task."""
         error_callbacks = task.generate_error_callbacks()
         if error_callbacks:
-            for cb in error_callbacks:
-                cb.queue = await self.state_manager.resolve_queue(cb)
             await self.state_manager.submit_tasks_batch(error_callbacks)
 
     async def _handle_post_process_failure(self, task: Task, exc: Exception) -> None:
@@ -429,13 +644,112 @@ class TaskProcessor:
         post_process_failures.add(1, {"queue": task.queue, "task": task.name, "status": task.status})
         await self.state_manager.save_task(task)
 
+    def _select_candidate(
+        self,
+        router: RouterSpec,
+        results: dict[Any, Any],
+        parent: Task,
+        mode: str,
+    ) -> DAGTaskSpec | None:
+        """Thin instance wrapper over :func:`select_candidate` (kept for call-site brevity)."""
+        return select_candidate(router, results, parent, mode)
+
+    async def _handle_router(self, parent: Task, cb: RouterCallback) -> set[str]:
+        """
+        Run a router declared in a ``RouterCallback`` and submit the task it picks.
+
+        Returns the set of the parent's ``fan_in_key``s that this router delegated to a
+        successor, which the caller must not then decrement itself.
+
+        A ``RouterError`` is contained here rather than allowed to escape
+        ``post_process``: the parent's own unrelated callbacks are none of this router's
+        business, and letting the exception through would silently drop them.
+        """
+        try:
+            chosen = select_candidate(cb.router, parent.results, parent, mode="simple")
+        except RouterError as exc:
+            return await self._handle_router_failure(parent, cb, exc)
+        if chosen is None:
+            return set()
+        try:
+            await submit_router_choice(self.state_manager, parent, cb.router, chosen)
+        except RouterError as exc:
+            return await self._handle_router_failure(parent, cb, exc)
+        return set()
+
+    async def _handle_router_failure(self, parent: Task, cb: RouterCallback, exc: RouterError) -> set[str]:
+        """
+        Turn a router failure into a placeholder task, and optionally a degraded path.
+
+        Without this a router failure is the only failure in jobbers with no task record:
+        nothing in the UI, nothing in the DLQ, and no way to retry the routing short of
+        re-running the parent. The placeholder is that record, and because it carries the
+        router's own pre-assigned id it *is* the router node as far as the diagram and the
+        DAG-run index are concerned.
+
+        Two shapes, chosen by whether the diagram declared a ``-.->`` edge:
+
+        - no ``-.->`` (**halt**) -- the placeholder is ``FAILED``, inherits the parent's
+          fan-in obligation, and the run becomes resumable via ``POST /dags/{id}/resume``.
+        - ``-.->`` present (**fall back**) -- the degraded node is submitted and inherits
+          the obligation instead; the placeholder is written ``COMPLETED`` as an inert
+          record, and the run reports ``degraded``.
+
+        Returns the parent fan_in_keys delegated away, for the caller's skip set.
+        """
+        router_failures.add(1, {"router": cb.router.router, "reason": exc.reason})
+        logger.warning("Router '%s' on task %s failed (%s): %s", cb.router.router, parent.id, exc.reason, exc)
+        fell_back = cb.error_callback is not None
+        placeholder = build_router_placeholder(parent, cb, exc, fell_back=fell_back)
+
+        # The successor that takes over the branch inherits the parent's fan-in obligation:
+        # whoever stands in for the routing must be what the collector waits on, or the
+        # collector either fires early (nothing waits) or never (parent already discharged).
+        fan_in_cbs = [c for c in parent.dag_callbacks if isinstance(c, FanInCallback)]
+
+        if not fell_back:
+            placeholder.dag_callbacks = list(fan_in_cbs)
+            await self.state_manager.record_terminal_task(placeholder)
+            await self._delegate_fan_ins(parent, placeholder.id, fan_in_cbs)
+            return {c.fan_in_key for c in fan_in_cbs}
+
+        router_fallbacks.add(1, {"router": cb.router.router})
+        assert cb.error_callback is not None  # noqa: S101 — fell_back is exactly this check
+        fallback = parent._build_callback_task(cb.error_callback, [parent.id])
+        fallback.dag_callbacks = list(fallback.dag_callbacks) + list(fan_in_cbs)
+        # Submit the degraded path *before* closing the placeholder: closing it can drive
+        # the run's pending count to zero, and a zero there marks the run complete and
+        # sweeps it. The fallback must already be pending when that check happens.
+        await self.state_manager.submit_tasks_batch([fallback])
+        await self._delegate_fan_ins(parent, fallback.id, fan_in_cbs)
+        await self.state_manager.record_terminal_task(placeholder, outcome="degraded")
+        return {c.fan_in_key for c in fan_in_cbs}
+
+    async def _delegate_fan_ins(
+        self, parent: Task, successor_id: ULID, fan_in_cbs: list[FanInCallback]
+    ) -> None:
+        """Swap *parent* for *successor_id* in each fan-in set, so the collector waits on it."""
+        if not fan_in_cbs or parent.dag_run_id is None:
+            return
+        await asyncio.gather(
+            *(
+                self.state_manager.task_state.delegate_fan_in(
+                    parent.dag_run_id, c.fan_in_key, parent.id, successor_id
+                )
+                for c in fan_in_cbs
+            )
+        )
+
     async def _handle_declarative_fanout(self, parent: Task, cb: DynamicFanOutCallback) -> None:
         """
         Drive a declarative fan-out declared in a ``DynamicFanOutCallback``.
 
         Reads ``parent.results[cb.items_key]`` (a list of dicts) and spawns one
-        arm instance per entry by cloning ``cb.arm_root`` with the entry's params
-        shallow-merged in (entry values override the template's static params).
+        arm instance per entry. With ``cb.arm_root`` set, every arm clones that
+        one template. With ``cb.arm_router`` set instead (mermaid ``A -->> R``),
+        each item is routed on its own, so different items can start different
+        tasks on different queues. Either way the entry's params are
+        shallow-merged into the chosen template (entry values win), and
         ``cb.collector`` is used as-is for the fan-in collector.
 
         Delegates to ``_handle_dynamic_fanout`` so that all fan-in wiring,
@@ -452,15 +766,19 @@ class TaskProcessor:
             )
             items = []
 
-        # Build arm DAGNodes from the template, merging per-item params.
+        # Build arm DAGNodes, merging per-item params into the arm template.
         arm_nodes: list[DAGNode] = []
-        fresh_root, _ = cb.arm_root.fresh_copy()
         for item_params in items:
-            cloned, _ = cb.arm_root.fresh_copy()
-            merged_params = {
-                **fresh_root.parameters,
-                **(item_params if isinstance(item_params, dict) else {}),
-            }
+            merge_from = item_params if isinstance(item_params, dict) else {}
+            if cb.arm_router is not None:
+                template = self._select_candidate(cb.arm_router, merge_from, parent, mode="per_item")
+                if template is None:
+                    continue  # router declined this item; it contributes no arm
+            else:
+                template = cb.arm_root
+            assert template is not None  # noqa: S101 -- guaranteed by the model validator
+            cloned, _ = template.fresh_copy()
+            merged_params = {**template.parameters, **merge_from}
             cloned = cloned.model_copy(update={"parameters": merged_params})
             # Rebuild a DAGNode from the spec so _handle_dynamic_fanout can walk it.
             arm_nodes.append(_spec_to_dag_node(cloned))
@@ -498,7 +816,8 @@ class TaskProcessor:
         if not outer_fan_in_cbs:
             return
         collector_task.dag_callbacks = list(collector_task.dag_callbacks) + cast(
-            "list[SimpleCallback | FanInCallback | DynamicFanOutCallback]", outer_fan_in_cbs
+            "list[SimpleCallback | FanInCallback | DynamicFanOutCallback | RouterCallback]",
+            outer_fan_in_cbs,
         )
         await asyncio.gather(
             *(

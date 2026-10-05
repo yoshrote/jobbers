@@ -11,6 +11,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
+from jobbers.system_tasks import register_system_tasks
 from jobbers.task_routes import app
 from jobbers.utils.otel import enable_otel, shutdown_otel
 
@@ -18,6 +19,9 @@ ENABLE_OTEL = True
 
 
 def _load_task_module(arg: str) -> None:
+    # Jobbers' own jobbers__* tasks first: a worker cannot record a router failure
+    # without them, and validate_task rejects anything absent from the registry.
+    register_system_tasks()
     if os.path.isabs(arg) or arg.endswith(".py"):
         spec = importlib.util.spec_from_file_location("_user_tasks", arg)
         if spec is None or spec.loader is None:

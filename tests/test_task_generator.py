@@ -371,45 +371,24 @@ async def test_missing_submitted_at_raises_runtime_error():
 
 
 @pytest.mark.asyncio
-async def test_queues_invalidates_routing_config_on_version_change():
-    """When routing_version changes between polls, invalidate_all_routing_config is called."""
+async def test_queues_polls_config_version_every_iteration():
+    """queues() forces an unthrottled config-version check (min_interval=0) each pass."""
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
     tag = ULID()
-    old_version = ULID()
-    new_version = ULID()
-    state_manager.get_routing_version = AsyncMock(return_value=new_version)
+    state_manager.refresh_config_if_stale = AsyncMock(return_value=True)
     state_manager.poll_refresh_signal = AsyncMock(return_value=tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
-    task_generator.routing_version = old_version  # stale version
     task_generator.refresh_tag = tag  # same as poll_refresh_signal return → no queue reload
 
     await task_generator.queues()
-
-    state_manager.invalidate_all_routing_config.assert_called_once()
-    assert task_generator.routing_version == new_version
-
-
-@pytest.mark.asyncio
-async def test_queues_no_routing_invalidation_when_version_unchanged():
-    """When routing_version is the same, invalidate_all_routing_config is NOT called."""
-    state_manager = Mock(spec=StateManager)
-    state_manager.active_tasks_per_queue = {}
-    state_manager.get_queue_limits = AsyncMock(return_value={})
-    tag = ULID()
-    version = ULID()
-    state_manager.get_routing_version = AsyncMock(return_value=version)
-    state_manager.poll_refresh_signal = AsyncMock(return_value=tag)
-
-    task_generator = TaskGenerator(state_manager, role="default")
-    task_generator.routing_version = version  # already current
-    task_generator.refresh_tag = tag  # same as poll_refresh_signal return → no reload
-
     await task_generator.queues()
 
-    state_manager.invalidate_all_routing_config.assert_not_called()
+    assert state_manager.refresh_config_if_stale.await_count == 2
+    for call in state_manager.refresh_config_if_stale.await_args_list:
+        assert call.kwargs == {"min_interval": 0}
 
 
 @pytest.mark.asyncio
@@ -418,13 +397,11 @@ async def test_queues_invalidates_queue_config_on_refresh_tag_change():
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
-    version = ULID()
-    state_manager.get_routing_version = AsyncMock(return_value=version)
+    state_manager.refresh_config_if_stale = AsyncMock(return_value=False)
     new_tag = ULID()
     state_manager.poll_refresh_signal = AsyncMock(return_value=new_tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
-    task_generator.routing_version = version  # pre-warm
     task_generator.refresh_tag = ULID()  # old tag, different from new_tag
 
     await task_generator.queues()
@@ -443,14 +420,12 @@ async def test_queues_pubsub_message_triggers_refresh_on_new_tag():
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
-    version = ULID()
-    state_manager.get_routing_version = AsyncMock(return_value=version)
+    state_manager.refresh_config_if_stale = AsyncMock(return_value=False)
     old_tag = ULID()
     new_tag = ULID()
     state_manager.poll_refresh_signal = AsyncMock(return_value=new_tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
-    task_generator.routing_version = version
     task_generator.refresh_tag = old_tag  # cached; different from new_tag delivered by pub/sub
 
     await task_generator.queues()
@@ -465,13 +440,11 @@ async def test_queues_records_refresh_metrics():
     state_manager = Mock(spec=StateManager)
     state_manager.active_tasks_per_queue = {}
     state_manager.get_queue_limits = AsyncMock(return_value={})
-    version = ULID()
-    state_manager.get_routing_version = AsyncMock(return_value=version)
+    state_manager.refresh_config_if_stale = AsyncMock(return_value=False)
     new_tag = ULID()
     state_manager.poll_refresh_signal = AsyncMock(return_value=new_tag)
 
     task_generator = TaskGenerator(state_manager, role="default")
-    task_generator.routing_version = version
     task_generator.refresh_tag = ULID()  # old tag — triggers refresh
 
     with (

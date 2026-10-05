@@ -7,7 +7,7 @@ from typing import Annotated, Any
 
 from croniter import croniter
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.params import Query
+from fastapi.params import Path, Query
 from fastapi.responses import JSONResponse
 from opentelemetry import metrics
 from pydantic import BaseModel, Field
@@ -15,10 +15,17 @@ from ulid import ULID
 
 from jobbers import db, registry
 from jobbers.models.cron_dag import ConcurrencyPolicy, CronDAGEntry
-from jobbers.models.dag import DAGResumeReason, DAGRunPagination, DAGTaskSpec, FanInCardinalityError
-from jobbers.models.queue_config import QueueConfig
+from jobbers.models.dag import (
+    DAGResumeReason,
+    DAGRunPagination,
+    DAGTaskSpec,
+    DynamicFanOutCallback,
+    FanInCardinalityError,
+    RouterCallback,
+    RouterSpec,
+)
+from jobbers.models.queue_config import QUEUE_NAME_PATTERN, QueueConfig
 from jobbers.models.task import Task, TaskPagination
-from jobbers.models.task_routing import RoutingConfig
 from jobbers.models.task_status import TaskStatus
 from jobbers.protocols import RoutingBackendReadOnlyError
 from jobbers.state_manager import StateManager, TaskException, TaskRateLimitedError
@@ -235,15 +242,30 @@ async def create_queue(queue_config: QueueConfig) -> dict[str, Any]:
 @app.get("/queues/{queue_name}/config")
 async def get_queue_config(queue_name: str) -> dict[str, Any]:
     """Retrieve the configuration for a specific queue."""
-    config = await db.get_state_manager().get_queue_config(queue_name)
+    sm = db.get_state_manager()
+    # Served from this process's cache, so poll (throttled) before answering: another
+    # Manager replica may have edited this queue since we last read it.
+    await sm.refresh_config_if_stale()
+    config = await sm.get_queue_config(queue_name)
     if config is None:
         raise HTTPException(status_code=404, detail=f"Queue '{queue_name}' not found.")
     return {"queue": config.model_dump(mode="json")}
 
 
 @app.put("/queues/{queue_name}")
-async def update_queue(queue_name: str, queue_config: QueueConfig) -> dict[str, Any]:
-    """Create or update the configuration for a queue. The name in the body is ignored; the path name is used."""
+async def update_queue(
+    queue_name: Annotated[str, Path(pattern=QUEUE_NAME_PATTERN)],
+    queue_config: QueueConfig,
+) -> dict[str, Any]:
+    """
+    Create or update the configuration for a queue.
+
+    The path name is the one that is saved, but the body's ``name`` is still validated
+    against QUEUE_NAME_PATTERN by ``QueueConfig`` -- an unparseable name in the body is a
+    422 even though the value is then discarded.
+    """
+    # Assigning to .name bypasses QueueConfig's field validator (pydantic does not
+    # validate on assignment), so the path parameter carries the pattern itself.
     queue_config.name = queue_name
     await db.get_state_manager().save_queue_config(queue_config)
     return {"message": "Queue updated successfully", "queue": queue_config.model_dump(mode="json")}
@@ -395,6 +417,53 @@ def _parse_ulid(raw: str, field_name: str = "id") -> ULID:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw!r}") from ex
 
 
+def _require_registered_task(name: str, version: int) -> None:
+    if not registry.get_task_config(name, version):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown task '{name}@{version}'. Register it with @register_task before submitting.",
+        )
+
+
+def _validate_spec_against_registry(spec: DAGTaskSpec) -> None:
+    """Validate a serialised spec subtree -- used for router candidates and fan-out arms."""
+    seen: set[str] = set()
+    worklist: list[DAGTaskSpec] = [spec]
+    while worklist:
+        current = worklist.pop()
+        if str(current.id) in seen:
+            continue
+        seen.add(str(current.id))
+        _require_registered_task(current.name, current.version)
+        for cb in current.dag_callbacks:
+            if isinstance(cb, RouterCallback):
+                _validate_router_against_registry(cb.router)
+                continue
+            if isinstance(cb, DynamicFanOutCallback):
+                if cb.arm_router is not None:
+                    _validate_router_against_registry(cb.arm_router)
+                elif cb.arm_root is not None:
+                    worklist.append(cb.arm_root)
+                worklist.append(cb.collector)
+            else:
+                worklist.append(cb.task)
+            if cb.error_callback is not None:
+                worklist.append(cb.error_callback)
+
+
+def _validate_router_against_registry(router: RouterSpec) -> None:
+    if not registry.get_router_config(router.router, router.version):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown router '{router.router}@{router.version}'. "
+                "Register it with @register_router before submitting."
+            ),
+        )
+    for candidate in router.candidates:
+        _validate_spec_against_registry(candidate)
+
+
 def _validate_dag_against_registry(roots: list[Any]) -> None:
     """Walk all reachable nodes (not just roots) and validate each against the registry."""
     visited: set[int] = set()
@@ -404,15 +473,25 @@ def _validate_dag_against_registry(roots: list[Any]) -> None:
         if id(node) in visited:
             continue
         visited.add(id(node))
-        if not registry.get_task_config(node._name, node._version):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown task '{node._name}@{node._version}'. Register it with @register_task before submitting.",
-            )
+        _require_registered_task(node._name, node._version)
         for successor, _, error_node in node._successors:
             worklist.append(successor)
             if error_node is not None:
                 worklist.append(error_node)
+        # Declarative fan-outs and routers hang off the builder as serialised
+        # specs rather than DAGNode successors, so walk them separately.
+        for fanout_cb in node._fanout_callbacks:
+            if fanout_cb.arm_router is not None:
+                _validate_router_against_registry(fanout_cb.arm_router)
+            elif fanout_cb.arm_root is not None:
+                _validate_spec_against_registry(fanout_cb.arm_root)
+            _validate_spec_against_registry(fanout_cb.collector)
+            if fanout_cb.error_callback is not None:
+                _validate_spec_against_registry(fanout_cb.error_callback)
+        for router_cb in node._router_callbacks:
+            _validate_router_against_registry(router_cb.router)
+            if router_cb.error_callback is not None:
+                _validate_spec_against_registry(router_cb.error_callback)
 
 
 async def _require_role(role_name: str, sm: StateManager) -> None:
@@ -489,38 +568,6 @@ async def refresh_role(role_name: str) -> dict[str, Any]:
     await _require_role(role_name, sm)
     new_tag = await sm.bump_refresh_tag(role_name)
     return {"role": role_name, "refresh_tag": new_tag}
-
-
-# ── Task routing ───────────────────────────────────────────────────────────────
-
-
-@app.get("/task-routing/{task_name}/{task_version}")
-async def get_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
-    """Retrieve the routing configuration for a specific task type."""
-    config = await db.get_state_manager().get_routing_config(task_name, task_version)
-    if config is None:
-        raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
-    return {"routing": config.model_dump(mode="json")}
-
-
-@app.put("/task-routing/{task_name}/{task_version}")
-async def update_task_routing(
-    task_name: str, task_version: int, routing_config: RoutingConfig
-) -> dict[str, Any]:
-    """Create or update the routing configuration for a task type. Path parameters override body values."""
-    routing_config.task_name = task_name
-    routing_config.task_version = task_version
-    await db.get_state_manager().save_routing_config(routing_config)
-    return {"message": "Task routing updated successfully", "routing": routing_config.model_dump(mode="json")}
-
-
-@app.delete("/task-routing/{task_name}/{task_version}", status_code=200)
-async def delete_task_routing(task_name: str, task_version: int) -> dict[str, Any]:
-    """Remove the routing configuration for a task type. Returns 404 if it does not exist."""
-    deleted = await db.get_state_manager().delete_routing_config(task_name, task_version)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"No routing config for '{task_name}' v{task_version}.")
-    return {"message": f"Routing config for '{task_name}' v{task_version} deleted successfully."}
 
 
 # ── DAG submission ─────────────────────────────────────────────────────────────

@@ -4,10 +4,9 @@ Protocol definitions for all pluggable adapters.
 Routing:
 - `RoutingBackendReadOnlyError` — raised by read-only backends on write operations.
 - `QueueConfigProtocol` — interface for queue/role configuration and refresh-tag management.
-- `TaskRoutingConfigProtocol` — interface for task routing configuration.
 - `RoutingBackendProtocol` — interface all routing backends must implement.
 - `CancellationBusProtocol` — pub/sub channel for in-flight task cancellation signals.
-- `RoutingNotificationProtocol` — routing version key and per-role queue-config refresh signals.
+- `RoutingNotificationProtocol` — config version key and per-role queue-config refresh signals.
 
 Task storage / dead-letter queue (split-store protocols):
 - `TaskStateProtocol` — task blob persistence, heartbeats, fan-in sets, DAG run index.
@@ -43,7 +42,6 @@ if TYPE_CHECKING:
     from jobbers.models.dag import DAGRunDetail, DagRunOutcome, DAGRunPagination, DAGRunSummary
     from jobbers.models.queue_config import QueueConfig
     from jobbers.models.task import Task, TaskPagination
-    from jobbers.models.task_routing import RoutingConfig
     from jobbers.models.task_status import TaskStatus
 
 
@@ -82,15 +80,6 @@ class QueueConfigProtocol(Protocol):
 
 
 @runtime_checkable
-class TaskRoutingConfigProtocol(Protocol):
-    """Interface for task routing configuration."""
-
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None: ...
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None: ...
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
-
-
-@runtime_checkable
 class RoutingBackendProtocol(Protocol):
     """Interface all routing backends must implement."""
 
@@ -113,11 +102,6 @@ class RoutingBackendProtocol(Protocol):
 
     # Lifecycle
     async def drop_stale_indexes(self) -> list[str]: ...
-
-    # Task routing config CRUD
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None: ...
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None: ...
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool: ...
 
 
 class CancellationKind(StrEnum):
@@ -145,10 +129,10 @@ class CancellationBusProtocol(Protocol):  # pragma: no cover
 
 
 class RoutingNotificationProtocol(Protocol):  # pragma: no cover
-    """Routing version key, per-role refresh tags, and pub/sub change signals."""
+    """Config version key, per-role refresh tags, and pub/sub change signals."""
 
-    async def get_routing_version(self) -> ULID | None: ...
-    async def bump_routing_version(self) -> None: ...
+    async def get_config_version(self) -> ULID | None: ...
+    async def bump_config_version(self) -> ULID: ...
     async def get_refresh_tag(self, role: str) -> ULID: ...
     async def bump_refresh_tag(self, role: str) -> str: ...
     async def poll_refresh_signal(self, role: str) -> ULID: ...
@@ -313,6 +297,22 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
         ...
 
     # DAG run index
+    async def register_dag_run_task(self, dag_run_id: ULID, task_id: ULID, *, closed: bool) -> None:
+        """
+        Add *task_id* to the run's membership index directly, as pending or already closed.
+
+        Normally this happens as a side effect of enqueueing, so a task that is created
+        already in a terminal status and never submitted (the router placeholder) would be
+        absent from ``get_dag_run``'s task list -- and therefore invisible to
+        ``can_resume_dag_run``, which is what makes a run resumable. This is how such a
+        task joins the run.
+
+        ``closed=False`` for a stuck status, matching where a real FAILED task ends up
+        (``finalize_dag_run_task`` never closes one). ``closed=True`` for a non-stuck
+        terminal status, matching a real completed task. Idempotent.
+        """
+        ...
+
     async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[DAGRunSummary], int]: ...
     async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None: ...
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...

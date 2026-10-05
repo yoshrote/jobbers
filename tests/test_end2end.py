@@ -20,7 +20,7 @@ from jobbers.adapters.sql import SQLQueueConfigAdapter, SQLRoutingBackend
 from jobbers.models.dag import DagRunStatus
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task_status import TaskStatus
-from jobbers.registry import clear_registry
+from jobbers.registry import reset_registry
 from jobbers.state_manager import StateManager
 from jobbers.task_processor import TaskProcessor
 from jobbers.utils.mermaid_dag import parse_mermaid_dag
@@ -30,10 +30,10 @@ from jobbers.utils.mermaid_dag import parse_mermaid_dag
 
 @pytest.fixture(autouse=True)
 def register_e2e_tasks():
-    clear_registry()
+    reset_registry()
     importlib.reload(end2end)
     yield
-    clear_registry()
+    reset_registry()
 
 
 @pytest_asyncio.fixture

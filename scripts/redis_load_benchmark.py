@@ -87,7 +87,7 @@ from jobbers import db
 from jobbers.models.queue_config import QueueConfig
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
-from jobbers.registry import clear_registry, register_task
+from jobbers.registry import register_task, reset_registry
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
 
@@ -130,7 +130,7 @@ class SweepResults:
 
 
 async def _register_bench_task(sleep_ms: int) -> None:
-    clear_registry()
+    reset_registry()
 
     async def _bench_noop(**_kwargs: object) -> dict[str, Any]:
         if sleep_ms:

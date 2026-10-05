@@ -922,7 +922,7 @@ async def test_clean_orphaned_entries_removes_stale_queue_index_member(msgpack_d
     await _add_to_dlq(dq, task, FROZEN_TIME)
 
     # Simulate a stale-queue removal: the real index set ("q1") never gets cleaned.
-    await dq.remove_from_dlq(task.id, queue="wrong-queue", name=task.name)
+    await dq.remove_from_dlq(task.id, queue="wrong_queue", name=task.name)
     assert await dq.data_store.smembers(dq.DLQ_QUEUE(queue="q1")) == {bytes(task.id)}
 
     removed = await dq.clean_orphaned_entries()
@@ -964,7 +964,7 @@ async def test_clean_orphaned_entries_preserves_concurrently_added_valid_member(
     await _add_to_dlq(dq, stale_task, FROZEN_TIME)
     # Make the only current member of dlq-queue:q1 stale (remove it from the DLQ proper, but
     # leave the index set itself untouched -- like a stale-queue remove_from_dlq() would).
-    await dq.remove_from_dlq(stale_task.id, queue="wrong-queue", name=stale_task.name)
+    await dq.remove_from_dlq(stale_task.id, queue="wrong_queue", name=stale_task.name)
     assert await dq.data_store.smembers(dq.DLQ_QUEUE(queue="q1")) == {bytes(stale_task.id)}
 
     # Inject a "concurrent" add_to_dlq landing right after _clean_stale_index_members() takes

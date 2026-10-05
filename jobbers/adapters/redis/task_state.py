@@ -31,13 +31,17 @@ if TYPE_CHECKING:
 _RECORD_DAG_RUN_TERMINAL_SCRIPT = """
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
     local field = 'failed'
-    if ARGV[1] == 'completed' then field = 'completed' end
+    if ARGV[1] == 'completed' then field = 'completed'
+    elseif ARGV[1] == 'degraded' then field = 'degraded' end
     redis.call('HINCRBY', KEYS[1], field, 1)
     local completed = tonumber(redis.call('HGET', KEYS[1], 'completed')) or 0
     local failed = tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0
+    local degraded = tonumber(redis.call('HGET', KEYS[1], 'degraded')) or 0
     local status = 'running'
     if failed > 0 then
         if completed > 0 then status = 'partial_failure' else status = 'failed' end
+    elseif degraded > 0 then
+        status = 'degraded'
     end
     redis.call('HSET', KEYS[1], 'status', status)
     return 1
@@ -49,7 +53,14 @@ _RECORD_DAG_RUN_TERMINAL_SCRIPT = """
 _MARK_DAG_RUN_COMPLETE_SCRIPT = """
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
     local failed = tonumber(redis.call('HGET', KEYS[1], 'failed')) or 0
-    if failed == 0 then redis.call('HSET', KEYS[1], 'status', 'complete') end
+    local degraded = tonumber(redis.call('HGET', KEYS[1], 'degraded')) or 0
+    if failed == 0 then
+        if degraded > 0 then
+            redis.call('HSET', KEYS[1], 'status', 'degraded')
+        else
+            redis.call('HSET', KEYS[1], 'status', 'complete')
+        end
+    end
     return 1
 """
 
@@ -66,9 +77,12 @@ _RECONCILE_DAG_RUN_TASK_RETRY_SCRIPT = """
     failed = math.max(0, failed - count)
     redis.call('HSET', KEYS[1], 'failed', failed)
     local completed = tonumber(redis.call('HGET', KEYS[1], 'completed')) or 0
+    local degraded = tonumber(redis.call('HGET', KEYS[1], 'degraded')) or 0
     local status = 'running'
     if failed > 0 then
         if completed > 0 then status = 'partial_failure' else status = 'failed' end
+    elseif degraded > 0 then
+        status = 'degraded'
     end
     redis.call('HSET', KEYS[1], 'status', status)
     return 1
@@ -184,6 +198,7 @@ class RedisTaskState(SharedTaskAdapterMixin):
         p.hsetnx(meta_key, "status", DagRunStatus.RUNNING.value)
         p.hsetnx(meta_key, "completed", 0)
         p.hsetnx(meta_key, "failed", 0)
+        p.hsetnx(meta_key, "degraded", 0)
 
     async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[DAGRunSummary], int]:
         """Return a paginated list of DAG runs ordered by submission time (oldest first)."""
@@ -234,7 +249,7 @@ class RedisTaskState(SharedTaskAdapterMixin):
         # time, so sorting restores the submission-order guarantee callers rely on
         # (e.g. the /dags/{dag_run_id} response) at no extra I/O cost.
         task_ids = sorted(ULID.from_bytes(b) for b in raw_ids)
-        name_raw, status_raw, cancelled_raw, completed_raw, failed_raw = cast(
+        name_raw, status_raw, cancelled_raw, completed_raw, failed_raw, degraded_raw = cast(
             "list[bytes | None]",
             await self.data_store.hmget(
                 self.DAG_RUN_META(dag_run_id=dag_run_id),
@@ -243,6 +258,7 @@ class RedisTaskState(SharedTaskAdapterMixin):
                 "cancelled_at",
                 "completed",
                 "failed",
+                "degraded",
             ),
         )
         status = DagRunStatus(status_raw.decode()) if status_raw else DagRunStatus.RUNNING
@@ -254,11 +270,11 @@ class RedisTaskState(SharedTaskAdapterMixin):
             # CANCELLING until then. Cancelled tasks never leave DAG_RUN_PENDING (see
             # finalize_dag_run_task), so "pending count reaches 0" can't be used as the
             # settled signal -- completed+failed reaching the full task count can.
-            completed = int(completed_raw or 0)
-            failed = int(failed_raw or 0)
-            status = (
-                DagRunStatus.CANCELLED if (completed + failed) >= len(task_ids) else DagRunStatus.CANCELLING
-            )
+            # 'degraded' counts here too: a degraded placeholder records neither
+            # completed nor failed, so leaving it out would keep a cancelled run that
+            # contains one reporting CANCELLING forever.
+            settled = int(completed_raw or 0) + int(failed_raw or 0) + int(degraded_raw or 0)
+            status = DagRunStatus.CANCELLED if settled >= len(task_ids) else DagRunStatus.CANCELLING
         return DAGRunDetail(
             dag_run_id=dag_run_id,
             name=name_raw.decode() if name_raw else "",

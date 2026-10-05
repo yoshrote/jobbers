@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
-import random
+import os
+import time
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -28,7 +29,6 @@ from jobbers.models.dag import (
 )
 from jobbers.models.task import Task
 from jobbers.models.task_config import DeadLetterPolicy
-from jobbers.models.task_routing import RoutingStrategy
 from jobbers.models.task_status import TaskStatus
 from jobbers.protocols import CancellationKind
 
@@ -38,7 +38,6 @@ if TYPE_CHECKING:
     from jobbers.models.cron_dag import CronDAGEntry
     from jobbers.models.dag import DAGNode, DAGRunDetail, DagRunOutcome, DAGRunPagination, DAGRunSummary
     from jobbers.models.queue_config import QueueConfig
-    from jobbers.models.task_routing import RoutingConfig
     from jobbers.protocols import (
         AtomicCronDAGSchedulerProtocol,
         AtomicDagRunProtocol,
@@ -61,6 +60,13 @@ meter = metrics.get_meter(__name__)
 tasks_dead_lettered = meter.create_counter("tasks_dead_lettered", unit="1")
 stale_cancellations_published = meter.create_counter("stale_cancellations_published", unit="1")
 tasks_completed_after_stale = meter.create_counter("tasks_completed_after_stale", unit="1")
+config_refreshes = meter.create_counter("config_refreshes", unit="1")
+
+# How often a process re-checks the shared config version before trusting its cached
+# queue config. Every process that reads queue config polls on this interval, so a
+# capacity or rate-limit change made through one Manager reaches the others without a
+# restart.
+CONFIG_POLL_INTERVAL = float(os.environ.get("CONFIG_POLL_INTERVAL", "5.0"))
 
 
 def _dag_run_uses_fan_in(tasks: list[Task]) -> bool:
@@ -159,7 +165,11 @@ class StateManager:
         self.task_state: TaskStateProtocol = task_state
         self.task_submit: TaskSubmitProtocol = task_submit
         self._queue_config_cache: dict[str, QueueConfig | None] = {}
-        self._routing_config_cache: dict[tuple[str, int], RoutingConfig | None] = {}
+        # Shared-config staleness tracking for refresh_config_if_stale(). _config_version is
+        # the version these caches were populated against; _config_checked_at is a monotonic
+        # clock reading of the last check, used to throttle the poll.
+        self._config_version: ULID | None = None
+        self._config_checked_at: float | None = None
         self.submission_limiter = SubmissionRateLimiter(self.get_queue_config)
         self.current_tasks_by_queue: dict[str, set[ULID]] = defaultdict(set)
         self._cancel_events: dict[ULID, _CancelHandle] = {}
@@ -479,7 +489,6 @@ class StateManager:
 
     async def schedule_new_task(self, task: Task, run_at: dt.datetime) -> Task:
         """Save a brand-new task directly into the scheduler in a single atomic transaction."""
-        task.queue = await self.resolve_queue(task)
         task.status = TaskStatus.SCHEDULED
         await self._run_schedule_pipeline(task, run_at)
         logger.info("Task %s scheduled to run at %s.", task.id, run_at)
@@ -633,7 +642,6 @@ class StateManager:
 
             fresh_spec, _ = entry.dag_spec.fresh_copy()
             fan_ins = collect_fan_in_keys(fresh_spec)
-            queue_config = await self.get_queue_config(fresh_spec.queue)
 
             dag_run_id = ULID()
             task = Task(
@@ -647,6 +655,10 @@ class StateManager:
                 dag_run_id=dag_run_id,
                 dag_run_name=f"{entry.name} @ {run_at.isoformat()}",
             )
+            # This path stages the submit itself rather than going through submit_task(),
+            # so the staleness poll has to happen here.
+            await self.refresh_config_if_stale()
+            queue_config = await self.get_queue_config(task.queue)
 
             is_rate_limited = bool(
                 queue_config
@@ -1085,27 +1097,60 @@ class StateManager:
             self._queue_config_cache[queue] = await self.routing.get_queue_config(queue)
         return self._queue_config_cache.get(queue)
 
-    async def get_routing_config(self, task_name: str, task_version: int) -> RoutingConfig | None:
-        """Return routing config, reading from cache on hit."""
-        key = (task_name, task_version)
-        if key not in self._routing_config_cache:
-            self._routing_config_cache[key] = await self.routing.get_routing_config(task_name, task_version)
-        return self._routing_config_cache.get(key)
-
     def invalidate_queue_config(self, queue: str) -> None:
         self._queue_config_cache.pop(queue, None)
 
-    def invalidate_routing_config(self, task_name: str, task_version: int) -> None:
-        self._routing_config_cache.pop((task_name, task_version), None)
+    def invalidate_all_queue_config(self) -> None:
+        self._queue_config_cache.clear()
 
-    def invalidate_all_routing_config(self) -> None:
-        self._routing_config_cache.clear()
+    async def get_config_version(self) -> ULID | None:
+        return await self.routing_notifications.get_config_version()
 
-    async def get_routing_version(self) -> ULID | None:
-        return await self.routing_notifications.get_routing_version()
+    async def bump_config_version(self) -> None:
+        """
+        Publish a local config change, and adopt the version it wrote.
 
-    async def bump_routing_version(self) -> None:
-        await self.routing_notifications.bump_routing_version()
+        Checking for staleness first is not redundant with the caller's own targeted
+        invalidation: a concurrent writer may have changed a *different* document that
+        this process still has cached, and adopting our own version below would hide it.
+
+        Recording the version we wrote is what stops a writer from clearing its whole
+        cache on its next poll -- and counting a `config_refreshes` -- purely because it
+        was the process that moved the key.
+        """
+        await self.refresh_config_if_stale(0)
+        self._config_version = await self.routing_notifications.bump_config_version()
+
+    async def refresh_config_if_stale(self, min_interval: float | None = None) -> bool:
+        """
+        Drop cached queue config when another process has changed it.
+
+        Every process caches queue config documents indefinitely, and a write only
+        invalidates the cache of the process that served it. Without this poll a config
+        change reaches workers (which call this once per iteration) but never a second
+        Manager replica, so the change appears to need a restart.
+
+        The check is throttled to *min_interval* seconds (default ``CONFIG_POLL_INTERVAL``)
+        so it can sit on the submit path: at most one extra read per interval per process.
+        Pass ``0`` to force a check, as ``TaskGenerator`` does.
+
+        Returns True when the caches were dropped.
+        """
+        interval = CONFIG_POLL_INTERVAL if min_interval is None else min_interval
+        now = time.monotonic()
+        if interval and self._config_checked_at is not None and now - self._config_checked_at < interval:
+            return False
+        self._config_checked_at = now
+        version = await self.get_config_version()
+        if version == self._config_version:
+            return False
+        # Clearing the cache is also what expires a negative (None) entry cached for a
+        # queue that has since been created -- the failure mode validation depends on.
+        self._config_version = version
+        self.invalidate_all_queue_config()
+        config_refreshes.add(1)
+        logger.info("Config caches invalidated at version %s", version)
+        return True
 
     async def bump_refresh_tag(self, role: str) -> str:
         return await self.routing_notifications.bump_refresh_tag(role)
@@ -1116,9 +1161,10 @@ class StateManager:
             await self.routing_notifications.bump_refresh_tag(role)
 
     async def save_queue_config(self, queue_config: QueueConfig) -> None:
-        """Save queue config, invalidate local cache, and bump refresh_tags for affected roles."""
+        """Save queue config, invalidate local cache, and signal every other process."""
         await self.routing.save_queue_config(queue_config)
         self.invalidate_queue_config(queue_config.name)
+        await self.bump_config_version()
         await self.bump_refresh_tags_for_queue(queue_config.name)
 
     async def create_queue_config(self, queue_config: QueueConfig) -> bool:
@@ -1126,20 +1172,11 @@ class StateManager:
         created = await self.routing.create_queue_config(queue_config)
         if created:
             self.invalidate_queue_config(queue_config.name)
+            # A new queue bumps the version because other processes may hold a negative
+            # lookup for this name -- e.g. a routing rule was pointed at the queue before
+            # it existed, so validation probed it and cached None.
+            await self.bump_config_version()
         return created
-
-    async def save_routing_config(self, routing_config: RoutingConfig) -> None:
-        """Save routing config, invalidate local cache entry, and bump routing version."""
-        await self.routing.save_routing_config(routing_config)
-        self.invalidate_routing_config(routing_config.task_name, routing_config.task_version)
-        await self.bump_routing_version()
-
-    async def delete_routing_config(self, task_name: str, task_version: int) -> bool:
-        """Delete routing config, invalidate local cache entry, and bump routing version."""
-        deleted = await self.routing.delete_routing_config(task_name, task_version)
-        self.invalidate_routing_config(task_name, task_version)
-        await self.bump_routing_version()
-        return deleted
 
     async def get_queues(self, role: str) -> set[str]:
         """Return the set of queues assigned to a role."""
@@ -1171,41 +1208,24 @@ class StateManager:
     async def delete_queue(self, queue_name: str) -> None:
         self.invalidate_queue_config(queue_name)
         affected_roles = await self.routing.delete_queue(queue_name)
+        await self.bump_config_version()
         for role in affected_roles:
             await self.routing_notifications.bump_refresh_tag(role)
 
     async def delete_role(self, role: str) -> None:
         await self.routing.delete_role(role)
 
-    async def resolve_queue(self, task: Task) -> str:
-        """Return the queue name to use for *task*, applying routing config if one is set."""
-        routing = await self.get_routing_config(task.name, task.version)
-        if routing is None:
-            return task.queue
-        match routing.strategy:
-            case RoutingStrategy.SINGLE:
-                final = routing.queues[0]
-            case RoutingStrategy.WEIGHTED:
-                final = random.choices(routing.queues, weights=routing.weights, k=1)[0]
-        if final != task.queue:
-            logger.info(
-                "Routing override: task=%s v%d original=%s resolved=%s strategy=%s",
-                task.name,
-                task.version,
-                task.queue,
-                final,
-                routing.strategy,
-            )
-        return final
-
     async def submit_task(self, task: Task) -> None:
         """
-        Resolve the task's queue and submit it, respecting rate limiting.
+        Submit the task to its queue, respecting rate limiting.
 
         Raises TaskRateLimitedError if the queue's rate limiter rejects the
         submission; the task's status is reverted to its pre-call value in that case.
         """
-        task.queue = await self.resolve_queue(task)
+        # The one place every submit reads queue config, so it is where the (throttled)
+        # staleness check belongs: a capacity or rate-limit edit must not wait for a
+        # restart to take effect on another Manager replica.
+        await self.refresh_config_if_stale()
         queue_config = await self.get_queue_config(task.queue)
         is_rate_limited = bool(
             queue_config
@@ -1348,6 +1368,38 @@ class StateManager:
         results = await pipe.execute()
         close_result = cast("list[int]", results[-1])
         return int(close_result[1])
+
+    async def record_terminal_task(self, task: Task, *, outcome: DagRunOutcome | None = None) -> None:
+        """
+        Persist a task that was created already in a terminal status and never submitted.
+
+        The router placeholder is the only such task. Going through the normal submit path
+        is not an option (it is terminal before it exists), but ``save_task`` alone is not
+        enough either: DAG-run membership is a side effect of *enqueueing*, so a
+        save-only task would be absent from ``get_dag_run``'s task list and therefore
+        invisible to ``can_resume_dag_run`` -- which is exactly the mechanism it needs.
+        Hence the explicit ``register_dag_run_task``.
+
+        *outcome* overrides what the run's counters record. Default derives it from the
+        task's status the same way ``record_dag_run_task_terminal`` does; the degraded
+        placeholder passes ``"degraded"``, which is neither a success nor a failure.
+
+        A stuck task stays pending (matching ``finalize_dag_run_task``, which deliberately
+        never closes one, so the run remains resumable); a non-stuck one is registered
+        already closed. Note the caller is responsible for ordering: closing a task can
+        drive the run's pending count to zero and sweep it, so anything that must already
+        be pending has to be submitted first.
+        """
+        stuck = task.status in TaskStatus.stuck_statuses()
+        await self.task_state.save_task(task)
+        if stuck and task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
+            await self.dead_queue.add_to_dlq(task, task.completed_at or dt.datetime.now(dt.UTC))
+            tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
+        if task.dag_run_id is None:
+            return
+        await self.task_state.register_dag_run_task(task.dag_run_id, task.id, closed=not stuck)
+        resolved: DagRunOutcome = outcome if outcome is not None else ("failed" if stuck else "completed")
+        await self.task_state.record_dag_run_task_terminal(task.dag_run_id, resolved)
 
     async def record_dag_run_task_terminal(self, task: Task) -> None:
         """

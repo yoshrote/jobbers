@@ -1,7 +1,7 @@
 """
 Plain Redis routing notifications adapter.
 
-- `RedisRoutingNotifications` — RoutingNotificationProtocol backed by Redis key + pub/sub.
+- `RedisRoutingNotifications` — RoutingNotificationProtocol backed by Redis keys + pub/sub.
 """
 
 from __future__ import annotations
@@ -17,7 +17,9 @@ if TYPE_CHECKING:
 class RedisRoutingNotifications:
     """RoutingNotificationProtocol backed by Redis keys and pub/sub channels."""
 
-    ROUTING_VERSION_KEY = "routing:version"
+    # One version for every cached config document: a reader only needs to know that
+    # *something* it may have cached changed.
+    CONFIG_VERSION_KEY = "config:version"
     REFRESH_CHANNEL = "queue-config-refresh:{role}".format
     ROLE_REFRESH_TAG_KEY = "config:role:{name}:refresh_tag".format
 
@@ -26,12 +28,15 @@ class RedisRoutingNotifications:
         self._pubsubs: dict[str, Any] = {}
         self._tag_cache: dict[str, ULID] = {}
 
-    async def get_routing_version(self) -> ULID | None:
-        raw = cast("bytes | None", await self._client.get(self.ROUTING_VERSION_KEY))
+    async def get_config_version(self) -> ULID | None:
+        raw = cast("bytes | None", await self._client.get(self.CONFIG_VERSION_KEY))
         return ULID.from_str(raw.decode()) if raw else None
 
-    async def bump_routing_version(self) -> None:
-        await self._client.set(self.ROUTING_VERSION_KEY, str(ULID()))
+    async def bump_config_version(self) -> ULID:
+        """Set the version key to a fresh ULID and return it."""
+        version = ULID()
+        await self._client.set(self.CONFIG_VERSION_KEY, str(version))
+        return version
 
     async def get_refresh_tag(self, role: str) -> ULID:
         if role in self._tag_cache:

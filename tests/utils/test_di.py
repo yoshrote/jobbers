@@ -9,7 +9,7 @@ from ulid import ULID
 
 from jobbers.models.task import Task
 from jobbers.models.task_config import TaskConfig
-from jobbers.registry import clear_registry, get_task_config, register_task
+from jobbers.registry import get_task_config, register_task, reset_registry
 from jobbers.utils.di import (
     DependencyNode,
     DependencyResolver,
@@ -509,7 +509,7 @@ def test_register_task_populates_dependency_graph():
         assert len(cfg.dependency_graph) == 1
         assert cfg.dependency_graph[0].provider is get_val
     finally:
-        clear_registry()
+        reset_registry()
 
 
 def test_register_task_cycle_raises_at_decoration_time():

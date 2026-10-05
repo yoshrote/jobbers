@@ -18,7 +18,7 @@ from jobbers.models.dag import (
     SimpleCallback,
 )
 from jobbers.models.task_status import TaskStatus
-from jobbers.registry import clear_registry, register_task
+from jobbers.registry import register_task, reset_registry
 from jobbers.utils.mermaid_dag import (
     MermaidParseError,
     _parse_label,
@@ -38,7 +38,7 @@ def register_collector():
         return fn
 
     yield _register
-    clear_registry()
+    reset_registry()
 
 
 # ── _parse_param_value ────────────────────────────────────────────────────────
@@ -421,6 +421,38 @@ def test_parse_empty_text_raises() -> None:
 def test_parse_invalid_label_raises() -> None:
     with pytest.raises(MermaidParseError, match="Invalid node label"):
         parse_mermaid_dag('flowchart TD\n    A["123badname"]')
+
+
+# ── :queue label segment ──────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("queue", ["heavy_jobs", "Q1", "_internal", "shard_1"])
+def test_parse_accepts_valid_queue_names(queue: str) -> None:
+    roots = parse_mermaid_dag(f'flowchart TD\n    A["t:{queue}"] --> B["other"]')
+    assert roots[0]._queue == queue
+
+
+@pytest.mark.parametrize("queue", ["priority-shard-a", "1shard", "my.queue"])
+def test_parse_rejects_queue_names_a_queue_could_never_have(queue: str) -> None:
+    """
+    Reject a queue name no queue could actually have.
+
+    The :queue segment shares the task-name identifier rule, which QUEUE_NAME_PATTERN
+    enforces on the queue itself. Hyphens are the live case: they were legal in the
+    old lane label, so a diagram carrying one must fail loudly rather than parse into
+    a queue that can never be created.
+    """
+    with pytest.raises(MermaidParseError, match="Invalid node label"):
+        parse_mermaid_dag(f'flowchart TD\n    A["t:{queue}"] --> B["other"]')
+
+
+def test_round_trip_preserves_a_non_default_queue() -> None:
+    text = 'flowchart TD\n    A["fetch_data:heavy_jobs"] --> B["process:bulk_a"]'
+    roots = parse_mermaid_dag(text)
+    emitted = dag_spec_to_mermaid(roots[0].to_spec())
+    assert "fetch_data:heavy_jobs" in emitted
+    assert "process:bulk_a" in emitted
+    assert parse_mermaid_dag(emitted)[0]._queue == "heavy_jobs"
 
 
 # ── dag_spec_to_mermaid ───────────────────────────────────────────────────────

@@ -16,11 +16,17 @@ Every node uses a **quoted rectangular-bracket label**:
 node_id["task_name[@version][:queue][(param=val, ...)]"]
 ```
 
+A **router node** uses a rhombus instead, naming a `@register_router` function:
+
+```text
+node_id{"router_name[@version][(param=val, ...)]"}
+```
+
 | Section | Required | Meaning |
 | --- | --- | --- |
 | `task_name` | yes | Registered task name — must match a `@register_task(name=...)` declaration |
 | `@version` | no | Integer task version; defaults to `0` when omitted |
-| `:queue` | no | Target queue; defaults to `"default"` |
+| `:queue` | no | Queue the task runs on; defaults to `"default"`. The queue must exist — see [resource-management.md](resource-management.md). |
 | `(key=val, …)` | no | Task parameters passed to the task function; values are type-coerced (see below) |
 | `{…}` | **reserved** | Output-only; appended by the generator for status / timestamps / metrics. **Stripped silently on parse** so UI-exported diagrams can be re-submitted without editing. |
 
@@ -57,6 +63,15 @@ fetch_data(limit=100, ids=~WzEsMiwzXQ==, config=~eyJyZXRyaWVzIjozfQ==)
 | `-->>` | **Dynamic fan-out** — the source task's results drive a runtime fan-out. The destination is the arm-chain root template. See the Dynamic fan-out section below. |
 | `--"key">>` | **Dynamic fan-out with custom items key** — same as `-->>` but reads `results["key"]` instead of `results["items"]` for the list of arm parameters. |
 | `--o` | **Fan-in boundary** — marks the arm terminal. The destination is the collector task submitted once all arm instances have completed. |
+
+Edges involving a **router node** (`R{"..."}`) mean something different — see the Router nodes section below:
+
+| Edge | Meaning |
+| ----- | ------- |
+| `A --> R` | The router runs **once** over `A`'s results and submits the one candidate it picks. A router takes exactly one incoming edge. |
+| `A -->> R` | The router runs **once per item** in `A.results[items_key]`; each item is routed independently. |
+| `R --> B` | `B` is a **candidate** the router may select. A router needs at least one. |
+| `R -.-> err` | The router's own error callback — fires when the router raises or resolves to no candidate. |
 
 ---
 
@@ -317,6 +332,190 @@ In system-generated diagrams (task detail view), arm nodes are expanded with the
 
 ---
 
+## Router nodes
+
+A router node picks **which task** handles a payload at runtime. Rectangles are tasks; diamonds are routers.
+
+```mermaid
+flowchart TD
+    A["measure_payload"]
+    R{"route_by_size(threshold=100)"}
+    B["fast_path"]
+    C["slow_path:heavy"]
+    D["report"]
+    err["notify_bad_route"]
+
+    A --> R
+    R --> B
+    R --> C
+    B --> D
+    C --> D
+    R -.-> err
+```
+
+When `A` completes, `route_by_size` runs and selects `fast_path` or `slow_path`. Only the selected branch is ever submitted.
+
+### Writing a router
+
+```python
+from jobbers.registry import register_router
+from jobbers.models.router import RouteTo
+
+@register_router(name="route_by_size", version=1)
+def route_by_size(results: dict, *, threshold: int) -> str | RouteTo | None:
+    if results["bytes"] < threshold:
+        return "fast_path"
+    return RouteTo("slow_path", queue="heavy")
+```
+
+- `results` is the parent task's result dict — or, in per-item mode, one **item** from it.
+- Keyword arguments come from the node label's `(key=val, ...)`.
+- Routers must be plain `def`, not `async def`. They run inline on the worker's event loop during
+  callback handling, so they must be fast, pure, and do no I/O. `async def` is rejected at registration.
+- Routers are loaded by the same `task_module` import that loads tasks — define them alongside your
+  `@register_task` functions; no extra CLI flag is needed.
+
+### The return value is a selector
+
+`RouteTo` narrows the router's **declared candidates**; it does not name a free-form destination. This
+keeps the diagram a complete description of what can happen.
+
+| Return value | Behaviour |
+| --- | --- |
+| `None` | The path ends; nothing is submitted. |
+| `"fast_path"` | Shorthand for `RouteTo("fast_path")`. |
+| `RouteTo(task)` | Match by name. **Ambiguous** (and an error) when several candidates share that name. |
+| `RouteTo(task, queue="priority")` | Match by name *and* queue. |
+| `RouteTo(task, version=2)` | Match by name *and* version; combine with `queue` as needed. |
+
+A selection matching zero or more than one candidate is an error (see Failure handling below).
+
+### Same task, different queues
+
+Candidates may share a task name as long as their queue or version differs — routing a subset of work
+to a higher-priority queue is the motivating case:
+
+```mermaid
+flowchart TD
+    A["classify_order"]
+    R{"route_by_tier"}
+    P["fulfil_order:priority"]
+    S["fulfil_order:standard"]
+    C["confirm"]
+
+    A --> R
+    R --> P
+    R --> S
+    P --> C
+    S --> C
+```
+
+```python
+@register_router(name="route_by_tier", version=1)
+def route_by_tier(results) -> RouteTo:
+    return RouteTo("fulfil_order", queue="priority" if results["tier"] == "gold" else "standard")
+```
+
+Each queue's capacity and rate limits stay the operator's call — see [resource-management.md](resource-management.md).
+
+### Converging branches are not a fan-in
+
+Above, `C` has two incoming `-->` edges, which would normally promote it to a `FanInCallback`. Because
+both predecessors are branches of the same router, exactly one ever runs, so each is wired as a plain
+success callback instead and `C` fires as soon as the taken branch completes.
+
+A node fed by **both** a router branch and an unconditional predecessor is rejected at parse time: a
+fan-in set cannot be sized when one of its predecessors may never run.
+
+An ordinary fan-in *inside* a single branch works normally — those predecessors all run together.
+
+### Per-item routing
+
+A `-->>` edge into a router routes every item of the dispatcher's result list independently, so one
+fan-out can spread arms across several queues:
+
+```mermaid
+flowchart TD
+    A["fetch_records"]
+    R{"route_by_region"}
+    US["process_record:us"]
+    EU["process_record:eu"]
+    C["aggregate"]
+
+    A -->> R
+    R --> US
+    R --> EU
+    US --o C
+    EU --o C
+```
+
+```python
+@register_router(name="route_by_region", version=1)
+def route_by_region(item) -> RouteTo | None:
+    return RouteTo("process_record", queue=item["region"])
+```
+
+The router receives one item at a time. Returning `None` for an item drops it — that item contributes
+no arm. `C`'s fan-in is sized from the arms actually spawned, so it still fires exactly once. Every
+candidate's arm must terminate at the same `--o` collector.
+
+### Failure handling
+
+A router that raises, is unregistered, or makes a selection matching zero or several candidates
+produces a **placeholder task** — `jobbers__rerun_router`, carrying the router node's own id. The
+parent task stays `COMPLETED` (it did its own work correctly) with its own `errors` untouched, and its
+unrelated callbacks still fire. Returning `None` is *not* a failure: it is a deliberate decline, and
+how you drop an item in per-item mode.
+
+Which of two shapes you get depends on whether the router declares a `-.->` edge. There is no separate
+policy to set:
+
+| | no `-.->` (**halt**) | `-.->` declared (**fall back**) |
+| --- | --- | --- |
+| Placeholder status | `FAILED` | `COMPLETED`, with the error in `errors` |
+| Branch | not run | the `-.->` node runs instead |
+| Inherits the parent's fan-in | yes — the collector waits on the placeholder | no — the `-.->` node does |
+| DAG run status | stuck; resumable | `degraded` |
+| In the DLQ | yes (`DeadLetterPolicy.SAVE`) | no |
+
+The placeholder runs on the parent's queue and shares the router node's id, so the rhombus in a
+rendered diagram carries its state: red when halted, amber (`degraded`) when the fallback was taken,
+and the usual purple when the router resolved normally — purple means "decision point", and the node
+that went green is the candidate it picked.
+
+**Resuming a halted router.** Deploy a fix, then `POST /dags/{dag_run_id}/resume`. The placeholder is
+`FAILED`, so it is already a stuck task; resuming re-runs the router against the parent's *stored*
+results. The parent is never re-run and siblings are never re-triggered. Because candidate ids are
+assigned at parse time, the re-run submits the same task id it would have the first time, so resuming
+twice is harmless. `GET /dags/{dag_run_id}/resume-check` says up front whether the run is still
+resumable — the run's whole task history has to be intact, which is the same requirement every resume
+has.
+
+Metrics: `router_failures` (tagged `router`, and `reason` — `unregistered` / `raised` /
+`no_candidate` / `ambiguous` / `invalid_return`) and `router_fallbacks` (tagged `router`).
+`halted = router_failures - router_fallbacks`. An unregistered router is the one transient reason — a
+rolling deploy where some workers lack it — and is recorded as `retryable` on the placeholder.
+
+In per-item mode a router failure on any item fails the whole fan-out; partial dispatch would be worse
+than none. Per-item routers do not produce placeholders.
+
+### Constraints
+
+- A router needs at least one `-->` candidate, and **exactly one** incoming edge — it cannot be a
+  DAG root, be fed by two parents, or be reached by both `-->` and `-->>`. Candidate ids are assigned
+  at parse time, so a second parent would submit the same candidate task ids a second time. Give each
+  parent its own router node.
+- A candidate's only incoming edge is its router's. Another path into it (`A --> B`, `A -->> B`,
+  `X --o B`, `X -.-> B` where `B` is a candidate) is a parse error for the same reason.
+- Candidates must be tasks: router chaining (`R1 --> R2`) is not supported.
+- Candidates must be distinguishable — no two may share the same `(name, version, queue)`.
+- A router cannot be a dispatcher (`R -->>`), an arm terminal (`R --o`), a collector (`X --o R`), or the
+  target of an error edge (`X -.-> R`).
+- `:queue` on a router label is a parse error; routers do not run on a queue.
+- A router selects at most one candidate. Conditional broadcast is not expressible.
+
+---
+
 ## Known limitations
 
 | Feature | Status |
@@ -324,6 +523,11 @@ In system-generated diagrams (task detail view), arm nodes are expanded with the
 | Multiple `-.->` error edges from the same source node | **Parse error.** The parser rejects diagrams with more than one error edge per source. |
 | Per-arm error callbacks | **Not expressible.** Use the `DAGNode` API directly. |
 | Multiple arm template chains from one dispatcher | **Not supported.** Each dispatcher has a single arm template. |
+| Router chaining (`R1 --> R2`) | **Parse error.** Candidates must be task nodes. |
+| A router selecting several candidates | **Not supported.** One candidate, or none. |
+| A router with two incoming edges | **Parse error.** Exactly one parent; one router node per parent. |
+| A candidate with an incoming edge besides its router's | **Parse error.** It would be submitted twice. |
+| A node fed by both a router branch and an unconditional edge | **Parse error.** The fan-in set cannot be sized. |
 
 ---
 

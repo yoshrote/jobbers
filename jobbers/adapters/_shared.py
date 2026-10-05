@@ -590,6 +590,15 @@ class SharedTaskAdapterMixin(ABC):
         pipe.expire(self.DAG_RUN_FANIN_MEMBERS(dag_run_id=dag_run_id), ttl * 2, gt=True)
         await pipe.execute()
 
+    async def register_dag_run_task(self, dag_run_id: ULID, task_id: ULID, *, closed: bool) -> None:
+        """Add task_id straight to the run's pending or closed set (see TaskStateProtocol)."""
+        key = (
+            self.DAG_RUN_CLOSED(dag_run_id=dag_run_id)
+            if closed
+            else self.DAG_RUN_PENDING(dag_run_id=dag_run_id)
+        )
+        await self.data_store.sadd(key, bytes(task_id))
+
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         """Atomically move task_id from the DAG run's pending set to closed; return the remaining count."""
         results: list[int] = await self._close_dag_run_task_script(
