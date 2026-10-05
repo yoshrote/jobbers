@@ -461,13 +461,43 @@ candidate's arm must terminate at the same `--o` collector.
 
 ### Failure handling
 
-A router that raises, is unregistered, or makes a selection matching zero or several candidates is a
-**post-process failure**. The parent task stays `COMPLETED` — it did its own work correctly — the error
-is appended to `task.errors` and counted in `post_process_failures`, and the router's own `-.->` edge
-fires if one is declared.
+A router that raises, is unregistered, or makes a selection matching zero or several candidates
+produces a **placeholder task** — `jobbers__rerun_router`, carrying the router node's own id. The
+parent task stays `COMPLETED` (it did its own work correctly) with its own `errors` untouched, and its
+unrelated callbacks still fire. Returning `None` is *not* a failure: it is a deliberate decline, and
+how you drop an item in per-item mode.
+
+Which of two shapes you get depends on whether the router declares a `-.->` edge. There is no separate
+policy to set:
+
+| | no `-.->` (**halt**) | `-.->` declared (**fall back**) |
+| --- | --- | --- |
+| Placeholder status | `FAILED` | `COMPLETED`, with the error in `errors` |
+| Branch | not run | the `-.->` node runs instead |
+| Inherits the parent's fan-in | yes — the collector waits on the placeholder | no — the `-.->` node does |
+| DAG run status | stuck; resumable | `degraded` |
+| In the DLQ | yes (`DeadLetterPolicy.SAVE`) | no |
+
+The placeholder runs on the parent's queue and shares the router node's id, so the rhombus in a
+rendered diagram carries its state: red when halted, amber (`degraded`) when the fallback was taken,
+and the usual purple when the router resolved normally — purple means "decision point", and the node
+that went green is the candidate it picked.
+
+**Resuming a halted router.** Deploy a fix, then `POST /dags/{dag_run_id}/resume`. The placeholder is
+`FAILED`, so it is already a stuck task; resuming re-runs the router against the parent's *stored*
+results. The parent is never re-run and siblings are never re-triggered. Because candidate ids are
+assigned at parse time, the re-run submits the same task id it would have the first time, so resuming
+twice is harmless. `GET /dags/{dag_run_id}/resume-check` says up front whether the run is still
+resumable — the run's whole task history has to be intact, which is the same requirement every resume
+has.
+
+Metrics: `router_failures` (tagged `router`, and `reason` — `unregistered` / `raised` /
+`no_candidate` / `ambiguous` / `invalid_return`) and `router_fallbacks` (tagged `router`).
+`halted = router_failures - router_fallbacks`. An unregistered router is the one transient reason — a
+rolling deploy where some workers lack it — and is recorded as `retryable` on the placeholder.
 
 In per-item mode a router failure on any item fails the whole fan-out; partial dispatch would be worse
-than none.
+than none. Per-item routers do not produce placeholders.
 
 ### Constraints
 

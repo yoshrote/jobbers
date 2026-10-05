@@ -1,6 +1,20 @@
 # Router Failure Placeholder — Design Proposal
 
-Status: **draft, pending review** — no implementation yet.
+Status: **implemented** (steps 1-11 of §8). Step 12 (`clean_terminal_tasks` DAG-run
+awareness) is deliberately not done -- it is a pre-existing bug independent of this feature
+and §7.3 has not been decided.
+
+Kept as the reasoning record. Two things the implementation settled differently from the
+text below:
+
+- §5.9 said the helper does "no DLQ write". Wrong as written: §6.2 is about the *degraded*
+  placeholder only. `record_terminal_task` gates the DLQ write on stuck-status **and**
+  `DeadLetterPolicy.SAVE`, so the halt placeholder does land in the DLQ (as §3.1 claims)
+  and the degraded one never can.
+- §5.9's "SQL derives run membership from the pending rows" is only half true: SQL's
+  `get_dag_run` builds `task_ids` from the `tasks` table, while the Redis backends use
+  `SUNION(pending, closed)`. `record_terminal_task` therefore has to do **both** the
+  `save_task` and the `register_dag_run_task` for the task to be visible on every backend.
 
 Audience: jobbers maintainers, and a future session picking this up cold.
 

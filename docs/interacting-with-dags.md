@@ -70,7 +70,7 @@ Returns `dag_run_id` and the IDs of the submitted root tasks. All task names in 
 GET /dags/{dag_run_id}
 ```
 
-Returns the run's `name`, aggregate `status` (`running`, `complete`, `partial_failure`, `failed`, `cancelling`, `cancelled`), `submitted_at`, and the full `task_ids` list for the run. `cancelling` means `POST /dags/{dag_run_id}/cancel` was called but at least one task hasn't reached a terminal status yet; `cancelled` means every task in the run has. For live per-task status with diagram colouring, poll `GET /task-status/{task_id}` on any task in the run and read its `dag_diagram` field (see [dag-composition.md](dag-composition.md)).
+Returns the run's `name`, aggregate `status` (`running`, `complete`, `degraded`, `partial_failure`, `failed`, `cancelling`, `cancelled`), `submitted_at`, and the full `task_ids` list for the run. `degraded` means every task succeeded but a router failed and its declared `-.->` fallback path was taken instead of the branch it would have chosen -- counted separately from `partial_failure` so that "a task in this run failed" keeps meaning exactly that (see [mermaid-dag-spec.md](mermaid-dag-spec.md#failure-handling)). `cancelling` means `POST /dags/{dag_run_id}/cancel` was called but at least one task hasn't reached a terminal status yet; `cancelled` means every task in the run has. For live per-task status with diagram colouring, poll `GET /task-status/{task_id}` on any task in the run and read its `dag_diagram` field (see [dag-composition.md](dag-composition.md)).
 
 ---
 
@@ -211,6 +211,8 @@ Cancellation is best-effort for `signalled` tasks in the same way single-task ca
 When one or more tasks in a run end up `FAILED`, `STALLED`, `CANCELLED`, or `DROPPED`, `POST /dags/{dag_run_id}/resume` resubmits each of those tasks from its stored parameters — same `dag_callbacks` and `parent_ids`, fresh attempt. Once a resumed task completes, the normal `post_process` → `generate_callbacks()` path continues the DAG exactly as it would have on a first attempt; no separate graph-replay logic is involved.
 
 > **This is why DAG tasks lean less on the DLQ than standalone tasks do.** [DLQ resubmit](interacting-with-tasks.md#4-resubmitting-from-the-dead-letter-queue) puts a single task back on its queue — for a DAG task, that skips reintegration with the run's fan-in tracking and DAG-run counters. Resume operates at the run level and keeps that bookkeeping intact, so for DAG tasks it's the primary recovery path even if `dead_letter_policy=SAVE` also saved a copy to the DLQ.
+
+A failed **router** is resumed the same way. Routers are not tasks, so there would otherwise be nothing to retry; instead a router whose selection fails leaves a `FAILED` `jobbers__rerun_router` placeholder carrying the router node's own id, which makes it an ordinary stuck task as far as everything in this section is concerned. Resuming it re-runs the router against the parent's **stored** results — the parent is never re-run and its siblings are never re-triggered — so the usual recovery is: deploy the router fix, then resume. Because candidate ids are assigned at parse time, the re-run submits the same task id it would have the first time, making a repeated resume harmless. See [mermaid-dag-spec.md](mermaid-dag-spec.md#failure-handling).
 
 ### Why a run might not be resumable
 

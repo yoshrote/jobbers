@@ -233,8 +233,27 @@ _CLASS_DEFS = (
     "    classDef failed    fill:#FFB3B3,stroke:#CC0000,color:#000\n"
     "    classDef cancelled fill:#E0E0E0,stroke:#666,color:#000\n"
     "    classDef stalled   fill:#FFD580,stroke:#CC8800,color:#000\n"
-    "    classDef router    fill:#E6D7FF,stroke:#7A4FBF,color:#000"
+    "    classDef router    fill:#E6D7FF,stroke:#7A4FBF,color:#000\n"
+    # Its own class rather than reusing `stalled`, so the colour for a decision-node
+    # outcome can move without touching task statuses. Shape already distinguishes a
+    # degraded rhombus from a stalled rectangle, so sharing the amber is safe for now.
+    "    classDef degraded  fill:#FFD580,stroke:#CC8800,color:#000"
 )
+
+# How a router node is coloured, given the status of the placeholder task that shares its
+# id. Absent from task_statuses (the normal case -- the router resolved, or the run has not
+# reached it) leaves the node `router` purple: purple means "decision point", and the thing
+# that went green is the candidate it picked, which is already its own node.
+_ROUTER_STATUS_CLASS: dict[TaskStatus, str] = {
+    # A halted routing. The run is stuck and resumable.
+    TaskStatus.FAILED: "failed",
+    # A placeholder only ever reaches COMPLETED by falling back to its '-.->' path --
+    # neither a success nor a failure, so neither green nor red.
+    TaskStatus.COMPLETED: "degraded",
+    # Re-running after a resume.
+    TaskStatus.SUBMITTED: "running",
+    TaskStatus.STARTED: "running",
+}
 
 
 # ── Label helpers ──────────────────────────────────────────────────────────────
@@ -1134,7 +1153,14 @@ def dag_spec_to_mermaid(
         params_str = _serialize_params(r.parameters)
         if params_str:
             label += f"({params_str})"
-        return f'    {r.id}{{"{label}"}}:::router'
+        # A failed router's placeholder task carries the router node's own id, so a status
+        # keyed by that id *is* this node's state. The {STATUS} suffix slot in a router
+        # label is already reserved and stripped on parse, so this still round-trips.
+        status = task_statuses.get(str(r.id)) if task_statuses else None
+        cls = "router" if status is None else _ROUTER_STATUS_CLASS.get(status, "router")
+        if status is not None:
+            label += f"{{{status.value}}}"
+        return f'    {r.id}{{"{label}"}}:::{cls}'
 
     def _emit_router(src_id: str, r: RouterSpec, arrow: str) -> None:
         """Emit the router node, the edge into it, and one selection edge per candidate."""

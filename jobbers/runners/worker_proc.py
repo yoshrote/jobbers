@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from jobbers import db
 from jobbers.adapters.static import StaticRoutingBackend
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
+from jobbers.system_tasks import register_system_tasks
 from jobbers.task_generator import TaskGenerator
 from jobbers.task_processor import TaskProcessor
 from jobbers.utils.asyncio_config import asyncio_debug_enabled, install_uvloop
@@ -137,6 +138,9 @@ async def main() -> None:
 
 
 def _load_task_module(arg: str) -> None:
+    # Jobbers' own jobbers__* tasks first: a worker cannot record a router failure
+    # without them, and validate_task rejects anything absent from the registry.
+    register_system_tasks()
     if os.path.isabs(arg) or arg.endswith(".py"):
         spec = importlib.util.spec_from_file_location("_user_tasks", arg)
         if spec is None or spec.loader is None:

@@ -125,6 +125,9 @@ button, .btn {
 /* ── DAG run status badges (aggregate run status, distinct from per-task status) ── */
 .dag-status-running         { background: #dbeafe; color: #1d4ed8; }
 .dag-status-complete        { background: #dcfce7; color: #166534; }
+/* Every task succeeded but a router fell back to its degraded path. Distinct from
+   partial_failure, which means a task actually failed. */
+.dag-status-degraded        { background: #fef3c7; color: #92400e; }
 .dag-status-partial_failure { background: #ffedd5; color: #9a3412; }
 .dag-status-failed          { background: #fee2e2; color: #991b1b; }
 .dag-status-cancelling      { background: #fde68a; color: #92400e; }

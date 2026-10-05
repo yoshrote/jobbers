@@ -297,6 +297,22 @@ class TaskStateProtocol(Protocol):  # pragma: no cover
         ...
 
     # DAG run index
+    async def register_dag_run_task(self, dag_run_id: ULID, task_id: ULID, *, closed: bool) -> None:
+        """
+        Add *task_id* to the run's membership index directly, as pending or already closed.
+
+        Normally this happens as a side effect of enqueueing, so a task that is created
+        already in a terminal status and never submitted (the router placeholder) would be
+        absent from ``get_dag_run``'s task list -- and therefore invisible to
+        ``can_resume_dag_run``, which is what makes a run resumable. This is how such a
+        task joins the run.
+
+        ``closed=False`` for a stuck status, matching where a real FAILED task ends up
+        (``finalize_dag_run_task`` never closes one). ``closed=True`` for a non-stuck
+        terminal status, matching a real completed task. Idempotent.
+        """
+        ...
+
     async def get_dag_runs(self, pagination: DAGRunPagination) -> tuple[list[DAGRunSummary], int]: ...
     async def get_dag_run(self, dag_run_id: ULID) -> DAGRunDetail | None: ...
     async def clean_dag_runs(self, now: dt.datetime, max_age: dt.timedelta) -> None: ...

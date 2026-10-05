@@ -200,6 +200,7 @@ class SQLTaskState:
                             status=DagRunStatus.RUNNING.value,
                             completed_count=0,
                             failed_count=0,
+                            degraded_count=0,
                         )
                     )
                 async with s.begin_nested() as sp:
@@ -595,7 +596,12 @@ class SQLTaskState:
             # CANCELLING until then. Cancelled tasks never leave dag_run_pending (see
             # finalize_dag_run_task), so "pending count reaches 0" can't be used as the
             # settled signal -- completed+failed reaching the full task count can.
-            settled = (run_row.completed_count + run_row.failed_count) >= len(task_ids)
+            # degraded_count counts as settled: a degraded placeholder records neither
+            # completed nor failed, so omitting it would pin a cancelled run containing
+            # one at CANCELLING forever.
+            settled = (run_row.completed_count + run_row.failed_count + run_row.degraded_count) >= len(
+                task_ids
+            )
             status = DagRunStatus.CANCELLED if settled else DagRunStatus.CANCELLING
         return DAGRunDetail(
             dag_run_id=dag_run_id,
@@ -665,6 +671,21 @@ class SQLTaskState:
                         delete(dag_run_pending).where(dag_run_pending.c.dag_run_id.in_(stale_ids))
                     )
 
+    async def register_dag_run_task(self, dag_run_id: ULID, task_id: ULID, *, closed: bool) -> None:
+        """Add task_id straight to the run's membership rows (see TaskStateProtocol)."""
+        async with self._sf() as session:
+            async with session.begin():
+                async with session.begin_nested() as sp:
+                    try:
+                        await session.execute(
+                            insert(dag_run_pending).values(
+                                dag_run_id=str(dag_run_id), task_id=str(task_id), closed=closed
+                            )
+                        )
+                    except IntegrityError:
+                        # Already a member: idempotent, same as the Redis SADD.
+                        await sp.rollback()
+
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         """
         Mark task_id resolved in the DAG run's pending set and return the remaining count.
@@ -726,6 +747,7 @@ class SQLTaskState:
         dag_run_id_str = str(dag_run_id)
         new_completed = dag_runs.c.completed_count + (1 if outcome == "completed" else 0)
         new_failed = dag_runs.c.failed_count + (1 if outcome == "failed" else 0)
+        new_degraded = dag_runs.c.degraded_count + (1 if outcome == "degraded" else 0)
         async with self._sf() as session:
             async with session.begin():
                 await session.execute(
@@ -734,10 +756,18 @@ class SQLTaskState:
                     .values(
                         completed_count=new_completed,
                         failed_count=new_failed,
+                        degraded_count=new_degraded,
+                        # failed > degraded > running. 'complete' is never written here.
                         status=case(
-                            (new_failed == 0, DagRunStatus.RUNNING.value),
-                            (new_completed > 0, DagRunStatus.PARTIAL_FAILURE.value),
-                            else_=DagRunStatus.FAILED.value,
+                            (
+                                new_failed > 0,
+                                case(
+                                    (new_completed > 0, DagRunStatus.PARTIAL_FAILURE.value),
+                                    else_=DagRunStatus.FAILED.value,
+                                ),
+                            ),
+                            (new_degraded > 0, DagRunStatus.DEGRADED.value),
+                            else_=DagRunStatus.RUNNING.value,
                         ),
                     )
                 )
@@ -760,17 +790,29 @@ class SQLTaskState:
                     .where(dag_runs.c.dag_run_id == dag_run_id_str)
                     .values(
                         failed_count=new_failed,
+                        # degraded_count is deliberately untouched: resuming some other
+                        # stuck task does not un-take a fallback that already happened.
                         status=case(
-                            (new_failed == 0, DagRunStatus.RUNNING.value),
-                            (dag_runs.c.completed_count > 0, DagRunStatus.PARTIAL_FAILURE.value),
-                            else_=DagRunStatus.FAILED.value,
+                            (
+                                new_failed > 0,
+                                case(
+                                    (dag_runs.c.completed_count > 0, DagRunStatus.PARTIAL_FAILURE.value),
+                                    else_=DagRunStatus.FAILED.value,
+                                ),
+                            ),
+                            (dag_runs.c.degraded_count > 0, DagRunStatus.DEGRADED.value),
+                            else_=DagRunStatus.RUNNING.value,
                         ),
                     )
                 )
 
     async def mark_dag_run_complete(self, dag_run_id: ULID) -> None:
         """
-        Set status='complete' iff failed_count == 0. No-op if the run's record is missing.
+        Set the run's final status iff failed_count == 0. No-op if the run's record is missing.
+
+        'complete' when nothing went wrong, 'degraded' when a router fell back to its
+        '-.->' path. Without the degraded branch this write would clobber the degraded
+        status on the run's last close -- the one moment the signal matters most.
 
         A single conditional UPDATE (see record_dag_run_task_terminal's docstring for
         why the row lock from a bare UPDATE is sufficient here too).
@@ -781,7 +823,12 @@ class SQLTaskState:
                 await session.execute(
                     update(dag_runs)
                     .where(dag_runs.c.dag_run_id == dag_run_id_str, dag_runs.c.failed_count == 0)
-                    .values(status=DagRunStatus.COMPLETE.value)
+                    .values(
+                        status=case(
+                            (dag_runs.c.degraded_count > 0, DagRunStatus.DEGRADED.value),
+                            else_=DagRunStatus.COMPLETE.value,
+                        )
+                    )
                 )
 
     # ── Lifecycle ───────────────────────────────────────────────────────────

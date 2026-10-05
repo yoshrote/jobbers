@@ -77,6 +77,8 @@ class DummyTaskState:
         self._store: dict[ULID, Task] = {}
         self._heartbeats: dict[ULID, float] = {}
         self._cancelling: set[ULID] = set()
+        # (dag_run_id, task_id, closed) for every register_dag_run_task call.
+        self.registered_dag_run_tasks: list[tuple[ULID, ULID, bool]] = []
 
     # ── TaskStateProtocol: reads ──────────────────────────────────────────────
 
@@ -160,6 +162,10 @@ class DummyTaskState:
 
     async def close_dag_run_task(self, dag_run_id: ULID, task_id: ULID) -> int:
         raise NotImplementedError("DummyTaskState.close_dag_run_task")
+
+    async def register_dag_run_task(self, dag_run_id: ULID, task_id: ULID, *, closed: bool) -> None:
+        """Record direct run membership so record_terminal_task's bookkeeping is assertable."""
+        self.registered_dag_run_tasks.append((dag_run_id, task_id, closed))
 
     async def record_dag_run_task_terminal(self, dag_run_id: ULID, outcome: object) -> None:
         """No-op: saga-mode tests exercising this only assert on the task-save sequence."""

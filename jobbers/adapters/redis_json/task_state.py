@@ -42,13 +42,20 @@ if TYPE_CHECKING:
 _RECORD_DAG_RUN_TERMINAL_SCRIPT = """
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
     local field = '$.failed'
-    if ARGV[1] == 'completed' then field = '$.completed' end
+    if ARGV[1] == 'completed' then field = '$.completed'
+    elseif ARGV[1] == 'degraded' then field = '$.degraded' end
+    if cjson.decode(redis.call('JSON.GET', KEYS[1], '$.degraded'))[1] == nil then
+        redis.call('JSON.SET', KEYS[1], '$.degraded', '0')
+    end
     redis.call('JSON.NUMINCRBY', KEYS[1], field, 1)
     local completed = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.completed'))[1]
     local failed = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.failed'))[1]
+    local degraded = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.degraded'))[1] or 0
     local status = 'running'
     if failed > 0 then
         if completed > 0 then status = 'partial_failure' else status = 'failed' end
+    elseif degraded > 0 then
+        status = 'degraded'
     end
     redis.call('JSON.SET', KEYS[1], '$.status', cjson.encode(status))
     return 1
@@ -59,7 +66,14 @@ _RECORD_DAG_RUN_TERMINAL_SCRIPT = """
 _MARK_DAG_RUN_COMPLETE_SCRIPT = """
     if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
     local failed = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.failed'))[1]
-    if failed == 0 then redis.call('JSON.SET', KEYS[1], '$.status', cjson.encode('complete')) end
+    local degraded = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.degraded'))[1] or 0
+    if failed == 0 then
+        if degraded > 0 then
+            redis.call('JSON.SET', KEYS[1], '$.status', cjson.encode('degraded'))
+        else
+            redis.call('JSON.SET', KEYS[1], '$.status', cjson.encode('complete'))
+        end
+    end
     return 1
 """
 
@@ -75,9 +89,12 @@ _RECONCILE_DAG_RUN_TASK_RETRY_SCRIPT = """
     failed = math.max(0, failed - count)
     redis.call('JSON.SET', KEYS[1], '$.failed', cjson.encode(failed))
     local completed = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.completed'))[1]
+    local degraded = cjson.decode(redis.call('JSON.GET', KEYS[1], '$.degraded'))[1] or 0
     local status = 'running'
     if failed > 0 then
         if completed > 0 then status = 'partial_failure' else status = 'failed' end
+    elseif degraded > 0 then
+        status = 'degraded'
     end
     redis.call('JSON.SET', KEYS[1], '$.status', cjson.encode(status))
     return 1
@@ -216,6 +233,7 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
                 "status": DagRunStatus.RUNNING.value,
                 "completed": 0,
                 "failed": 0,
+                "degraded": 0,
             },
             nx=True,
         )
@@ -281,11 +299,15 @@ class RedisJSONTaskState(SharedTaskAdapterMixin):
             # CANCELLING until then. Cancelled tasks never leave DAG_RUN_PENDING (see
             # finalize_dag_run_task), so "pending count reaches 0" can't be used as the
             # settled signal -- completed+failed reaching the full task count can.
-            completed = int((meta or {}).get("completed", 0))
-            failed = int((meta or {}).get("failed", 0))
-            status = (
-                DagRunStatus.CANCELLED if (completed + failed) >= len(task_ids) else DagRunStatus.CANCELLING
+            # 'degraded' counts here too: a degraded placeholder records neither
+            # completed nor failed, so leaving it out would keep a cancelled run that
+            # contains one reporting CANCELLING forever.
+            settled = (
+                int((meta or {}).get("completed", 0))
+                + int((meta or {}).get("failed", 0))
+                + int((meta or {}).get("degraded", 0))
             )
+            status = DagRunStatus.CANCELLED if settled >= len(task_ids) else DagRunStatus.CANCELLING
         return DAGRunDetail(
             dag_run_id=dag_run_id,
             name=(meta or {}).get("name", ""),

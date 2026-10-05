@@ -18,7 +18,7 @@ from jobbers.models.dag import (
     SimpleCallback,
 )
 from jobbers.models.task_status import TaskStatus
-from jobbers.registry import clear_registry, register_task
+from jobbers.registry import register_task, reset_registry
 from jobbers.utils.mermaid_dag import (
     MermaidParseError,
     _parse_label,
@@ -38,7 +38,7 @@ def register_collector():
         return fn
 
     yield _register
-    clear_registry()
+    reset_registry()
 
 
 # ── _parse_param_value ────────────────────────────────────────────────────────

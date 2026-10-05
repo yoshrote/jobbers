@@ -22,7 +22,7 @@ from jobbers.models.dag import (
 from jobbers.models.task import Task, TaskStatus
 from jobbers.models.task_config import BackoffStrategy
 from jobbers.models.task_shutdown_policy import TaskShutdownPolicy
-from jobbers.registry import TaskConfig, clear_registry, register_task
+from jobbers.registry import TaskConfig, register_task, reset_registry
 from jobbers.state_manager import (
     CancelReason,
     StaleTaskCancelledError,
@@ -42,7 +42,7 @@ def register_test_task():
 
     yield
 
-    clear_registry()
+    reset_registry()
 
 
 @pytest.mark.asyncio

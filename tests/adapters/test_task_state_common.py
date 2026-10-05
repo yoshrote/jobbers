@@ -1644,3 +1644,122 @@ async def test_queue_defaults_when_never_set(task_adapter):
     fetched = await state.get_task(task.id)
     assert fetched is not None
     assert fetched.queue == "default"
+
+
+@pytest.mark.asyncio
+async def test_record_dag_run_task_terminal_degraded_yields_degraded(task_adapter):
+    """A degraded outcome surfaces as its own status, not partial_failure."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+    await state.record_dag_run_task_terminal(ULID1, "degraded")
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_a_real_failure_outranks_degraded(task_adapter):
+    """Precedence is failed > degraded: a run that lost a task is not merely degraded."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "degraded")
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.PARTIAL_FAILURE
+
+
+@pytest.mark.asyncio
+async def test_mark_dag_run_complete_does_not_clobber_degraded(task_adapter):
+    """
+    The run finishing must not overwrite degraded with complete.
+
+    This is the one failure mode that only shows up on a run's *last* close, which is
+    exactly when the signal matters most.
+    """
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "degraded")
+    await state.record_dag_run_task_terminal(ULID1, "completed")
+    await state.mark_dag_run_complete(ULID1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_resume_reconcile_keeps_degraded(task_adapter):
+    """Resuming a stuck task does not un-take a fallback that already happened."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    await state.record_dag_run_task_terminal(ULID1, "degraded")
+    await state.record_dag_run_task_terminal(ULID1, "failed")
+    await state.reconcile_dag_run_task_retry(ULID1, count=1)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.status == DagRunStatus.DEGRADED
+
+
+@pytest.mark.asyncio
+async def test_register_dag_run_task_adds_a_never_submitted_task_to_the_run(task_adapter):
+    """
+    A task created directly in a terminal status joins the run through save + register.
+
+    Run membership is otherwise a side effect of enqueueing, which such a task never does,
+    and a task missing from the run index is invisible to can_resume_dag_run. Mirrors what
+    ``StateManager.record_terminal_task`` does, hence the ``save_task`` first -- the SQL
+    backend derives ``task_ids`` from the tasks table while the Redis backends derive it
+    from the pending/closed sets, so only the pair satisfies both.
+    """
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    placeholder = make_task(task_id=ULID2, submitted_at=FROZEN_TIME)
+    placeholder.dag_run_id = ULID1
+    placeholder.status = TaskStatus.FAILED
+    await state.save_task(placeholder)
+    await state.register_dag_run_task(ULID1, placeholder.id, closed=False)
+
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert placeholder.id in detail.task_ids
+    # Idempotent, like the SADD it stands in for.
+    await state.register_dag_run_task(ULID1, placeholder.id, closed=False)
+    detail = await state.get_dag_run(ULID1)
+    assert detail is not None
+    assert detail.task_ids.count(placeholder.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_register_dag_run_task_closed_does_not_hold_the_run_open(task_adapter):
+    """A non-stuck placeholder is registered already closed, so it never blocks completion."""
+    state, submit = task_adapter
+    task = make_task(submitted_at=FROZEN_TIME)
+    task.dag_run_id = ULID1
+    await submit.submit_task(task)
+
+    closed_one = ULID()
+    await state.register_dag_run_task(ULID1, closed_one, closed=True)
+
+    remaining = await state.close_dag_run_task(ULID1, task.id)
+    assert remaining == 0, "the closed placeholder must not count as pending"

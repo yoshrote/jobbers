@@ -1846,9 +1846,9 @@ flowchart TD
 @pytest.fixture
 def router_dag_registry():
     """Register the tasks and router that ROUTER_DIAGRAM refers to."""
-    from jobbers.registry import clear_registry, register_router, register_task
+    from jobbers.registry import register_router, register_task, reset_registry
 
-    clear_registry()
+    reset_registry()
     for name in ("router_root", "branch_one", "branch_two"):
 
         @register_task(name=name, version=0)
@@ -1860,7 +1860,7 @@ def router_dag_registry():
         return "branch_one"
 
     yield
-    clear_registry()
+    reset_registry()
 
 
 @pytest.mark.asyncio

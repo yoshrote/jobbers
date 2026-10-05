@@ -1369,6 +1369,38 @@ class StateManager:
         close_result = cast("list[int]", results[-1])
         return int(close_result[1])
 
+    async def record_terminal_task(self, task: Task, *, outcome: DagRunOutcome | None = None) -> None:
+        """
+        Persist a task that was created already in a terminal status and never submitted.
+
+        The router placeholder is the only such task. Going through the normal submit path
+        is not an option (it is terminal before it exists), but ``save_task`` alone is not
+        enough either: DAG-run membership is a side effect of *enqueueing*, so a
+        save-only task would be absent from ``get_dag_run``'s task list and therefore
+        invisible to ``can_resume_dag_run`` -- which is exactly the mechanism it needs.
+        Hence the explicit ``register_dag_run_task``.
+
+        *outcome* overrides what the run's counters record. Default derives it from the
+        task's status the same way ``record_dag_run_task_terminal`` does; the degraded
+        placeholder passes ``"degraded"``, which is neither a success nor a failure.
+
+        A stuck task stays pending (matching ``finalize_dag_run_task``, which deliberately
+        never closes one, so the run remains resumable); a non-stuck one is registered
+        already closed. Note the caller is responsible for ordering: closing a task can
+        drive the run's pending count to zero and sweep it, so anything that must already
+        be pending has to be submitted first.
+        """
+        stuck = task.status in TaskStatus.stuck_statuses()
+        await self.task_state.save_task(task)
+        if stuck and task.task_config and task.task_config.dead_letter_policy == DeadLetterPolicy.SAVE:
+            await self.dead_queue.add_to_dlq(task, task.completed_at or dt.datetime.now(dt.UTC))
+            tasks_dead_lettered.add(1, {"queue": task.queue, "task": task.name, "version": task.version})
+        if task.dag_run_id is None:
+            return
+        await self.task_state.register_dag_run_task(task.dag_run_id, task.id, closed=not stuck)
+        resolved: DagRunOutcome = outcome if outcome is not None else ("failed" if stuck else "completed")
+        await self.task_state.record_dag_run_task_terminal(task.dag_run_id, resolved)
+
     async def record_dag_run_task_terminal(self, task: Task) -> None:
         """
         Record *task*'s terminal outcome against its run's aggregate status counters.

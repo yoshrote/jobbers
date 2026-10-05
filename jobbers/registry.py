@@ -7,6 +7,7 @@ from typing import Any
 from ulid import ULID
 
 from jobbers import db
+from jobbers.constants import SYSTEM_TASK_PREFIX
 from jobbers.models.dag import DAGNode
 from jobbers.models.router import RouterConfig
 from jobbers.models.task import Task
@@ -70,14 +71,25 @@ def register_task(
     backoff_strategy: BackoffStrategy = BackoffStrategy.EXPONENTIAL,
     dead_letter_policy: DeadLetterPolicy = DeadLetterPolicy.NONE,
     on_shutdown: TaskShutdownPolicy = TaskShutdownPolicy.STOP,
+    _system: bool = False,
 ) -> Callable[..., Any]:
-    """Register a task function with the given name and version."""
+    """
+    Register a task function with the given name and version.
+
+    ``_system`` is internal: it lifts the reserved-prefix check so jobbers' own
+    ``jobbers__*`` tasks can register themselves. Application code leaves it alone.
+    """
 
     def decorator(func: Callable[..., Any]) -> TaskWrapper:
         """Decorate a task function and registers it for use with task instances."""
         if not callable(func):
             logger.exception("Task function must be callable")
             raise ValueError("Task function must be callable")
+        if name.startswith(SYSTEM_TASK_PREFIX) and not _system:
+            raise ValueError(
+                f"Task name {name!r} uses the reserved {SYSTEM_TASK_PREFIX!r} prefix, which is "
+                "for tasks jobbers registers itself. Choose another name."
+            )
         # Unwrap a TaskWrapper so double-decoration stores the raw function.
         raw_func: Callable[..., Any] = func._func if isinstance(func, TaskWrapper) else func
         dep_graph = inspect_task_dependencies(raw_func)
@@ -164,15 +176,37 @@ def get_router_config(name: str, version: int) -> RouterConfig | None:
     return _router_function_map.get((name, version))
 
 
-def get_tasks() -> Iterator[tuple[str, int]]:
-    return iter(_task_function_map.keys())
+def get_tasks(include_system: bool = False) -> Iterator[tuple[str, int]]:
+    """
+    Yield registered ``(name, version)`` pairs.
+
+    Jobbers' own ``jobbers__*`` tasks are excluded by default: they are not
+    user-submittable, so they have no business in an API task list or a UI dropdown.
+    Pass ``include_system=True`` for introspection that genuinely wants everything.
+    """
+    if include_system:
+        return iter(_task_function_map.keys())
+    return (key for key in _task_function_map if not key[0].startswith(SYSTEM_TASK_PREFIX))
 
 
 def get_routers() -> Iterator[tuple[str, int]]:
     return iter(_router_function_map.keys())
 
 
-def clear_registry() -> None:
-    """Clear all registered tasks and routers (for testing purposes)."""
+def reset_registry() -> None:
+    """
+    Reset the registry to its baseline: no user tasks or routers, system tasks re-seeded.
+
+    Named *reset* rather than *clear* because the baseline is not empty — jobbers' own
+    ``jobbers__*`` tasks are registered again on the way out. They have to exist for a
+    worker to be able to record a router failure at all, and ``validate_task`` rejects
+    anything absent from the registry, so re-seeding eagerly here keeps submission order
+    from mattering.
+    """
     _task_function_map.clear()
     _router_function_map.clear()
+    # Imported here, not at module scope: system_tasks imports task_processor, which
+    # imports this module.
+    from jobbers.system_tasks import register_system_tasks
+
+    register_system_tasks()

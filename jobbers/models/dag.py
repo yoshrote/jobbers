@@ -746,6 +746,12 @@ class DagRunStatus(StrEnum):
 
     RUNNING = "running"
     COMPLETE = "complete"
+    # Every task succeeded, but somewhere a router failed and a declared '-.->' degraded
+    # path was taken instead of the branch it would have chosen. Deliberately *not*
+    # partial_failure: no task failed, and folding fallbacks into the failure counters
+    # would stop "this run has a failed task" meaning that. Precedence is
+    # failed > degraded > complete > running, so a real failure still wins.
+    DEGRADED = "degraded"
     PARTIAL_FAILURE = "partial_failure"
     FAILED = "failed"
     # Cancellation was requested (StateManager.request_dag_cancellation) but at least
@@ -758,7 +764,12 @@ class DagRunStatus(StrEnum):
 # Outcome recorded against a run's aggregate counters when one of its tasks reaches a
 # terminal status -- "completed" for TaskStatus.COMPLETED, "failed" for any status in
 # TaskStatus.stuck_statuses() (FAILED/STALLED/CANCELLED/DROPPED).
-DagRunOutcome = Literal["completed", "failed"]
+#
+# "degraded" is not derived from a task status: it is passed explicitly by
+# StateManager.record_terminal_task for a router placeholder whose '-.->' fallback was
+# taken. The task itself is COMPLETED (the only terminal status outside
+# stuck_statuses()), so nothing about its status could convey this.
+DagRunOutcome = Literal["completed", "failed", "degraded"]
 
 
 class DAGRunSummary(BaseModel):

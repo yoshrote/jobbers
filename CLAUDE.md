@@ -109,7 +109,7 @@ def route_by_tier(results: dict, *, threshold: int = 100) -> str | RouteTo | Non
     return RouteTo("fulfil_order", queue="priority" if results["vip"] else "standard")
 ```
 
-Routers must be plain `def` (enforced at registration) — they run inline on the worker's event loop during callback handling, so they must be fast, pure and do no I/O. `RouteTo` is a *selector* over the router's declared candidates (matching on name, plus optional `queue`/`version`), not a free-form destination; it must match exactly one. Returning `None` ends that path. Routers are loaded by the same `task_module` import that loads tasks. Registry: `_router_function_map`, `get_router_config()`, `get_routers()`; `clear_registry()` clears tasks and routers.
+Routers must be plain `def` (enforced at registration) — they run inline on the worker's event loop during callback handling, so they must be fast, pure and do no I/O. `RouteTo` is a *selector* over the router's declared candidates (matching on name, plus optional `queue`/`version`), not a free-form destination; it must match exactly one. Returning `None` ends that path. Routers are loaded by the same `task_module` import that loads tasks. Registry: `_router_function_map`, `get_router_config()`, `get_routers()`; `reset_registry()` clears tasks and routers, then re-seeds system tasks. A router failure becomes a placeholder task rather than an escaping exception -- see Router Failure Handling.
 
 Serialised as `RouterCallback` (simple mode, `parent --> R`) or `DynamicFanOutCallback.arm_router` (per-item mode, `parent -->> R`), both in `jobbers/models/dag.py`. Driven by `TaskProcessor._handle_router` / `_handle_declarative_fanout`. See [docs/mermaid-dag-spec.md](docs/mermaid-dag-spec.md#router-nodes).
 
@@ -164,6 +164,31 @@ All metrics use the OTLP exporter (configured in `jobbers/utils/otel.py`) and ar
 | `refresh_lag_ms` | Histogram | `ms` | `task_generator.py` | Lag between when the `refresh_tag` was bumped (ULID timestamp) and when the worker picked up the change (tagged with `role`) |
 | `config_refreshes` | Counter | `1` | `state_manager.py` | Times a process dropped its cached queue/routing config because `config:version` moved |
 | `router_decisions` | Counter | `1` | `task_processor.py` | Router selections (tagged with `router`, `target` as `name:queue` or `<none>`, `mode` as `simple`/`per_item`) |
+| `router_failures` | Counter | `1` | `task_processor.py` | Router failures (tagged with `router`, `reason` as `unregistered`/`raised`/`no_candidate`/`ambiguous`/`invalid_return`). Fires for both halt and fallback; deliberately not folded into `post_process_failures` |
+| `router_fallbacks` | Counter | `1` | `task_processor.py` | Router failures absorbed by a declared `-.->` degraded path (tagged with `router`). `halted = router_failures - router_fallbacks` |
+
+## System Tasks
+
+Tasks jobbers registers itself live under the reserved `jobbers__` prefix (`SYSTEM_TASK_PREFIX` in `jobbers/constants.py`), defined in `jobbers/system_tasks.py` and registered by `register_system_tasks()`. `register_task` rejects a user task that claims the prefix, and `get_tasks()` hides them from the default listing (`get_tasks(include_system=True)` to see them) so they never appear in an API task list or a UI dropdown.
+
+Registration happens eagerly in two places: `_load_task_module` in the Worker and Manager runners, and the end of `registry.reset_registry()` — which is named *reset*, not *clear*, precisely because the baseline it restores is not empty.
+
+| Task | Role |
+| --- | --- |
+| `jobbers__rerun_router` | Stands in for a router node whose selection failed. Re-runs the router against the parent's stored results when resumed. See Router Failure Handling below. |
+
+## Router Failure Handling
+
+A `RouterError` no longer escapes `post_process`. It becomes a **placeholder task** carrying the *router node's own pre-assigned id*, which is what lets the rhombus in a rendered diagram show the routing's state with no extra mapping, makes a repeat failure an overwrite rather than a duplicate, and puts the router node in the DAG run's task index so `can_resume_dag_run` can see it.
+
+The shape is derived from whether the diagram declared a `-.->` edge — there is no policy enum:
+
+- **halt** (no `-.->`): placeholder is `FAILED`, inherits the parent's fan-in obligation via `delegate_fan_in`, lands in the DLQ, and the run is resumable with `POST /dags/{dag_run_id}/resume`.
+- **fall back** (`-.->` declared): the degraded node is submitted *first* (closing the placeholder can drive the run's pending count to zero and sweep it), inherits the fan-in obligation instead, and the placeholder is written `COMPLETED` reporting a `degraded` outcome. `COMPLETED` because `terminal_statuses() - stuck_statuses() == {COMPLETED}` — any other terminal status would claim the run needs operator intervention.
+
+`StateManager.record_terminal_task` is what writes a task that is terminal before it exists: `save_task` alone is not enough, because DAG-run membership is a side effect of *enqueueing*, so it also calls `TaskStateProtocol.register_dag_run_task`. Full reasoning in [.claude/plans/router-failure-placeholder-design.md](.claude/plans/router-failure-placeholder-design.md).
+
+`DagRunStatus.DEGRADED` ("every task succeeded but a router fell back") is counted in its own `degraded_count`, never in `failed_count`, so "this run has a failed task" keeps meaning that. Precedence is `failed` > `degraded` > `complete` > `running`; `mark_dag_run_complete` must not clobber it on the run's last close. **Existing SQL deployments need `ALTER TABLE dag_runs ADD COLUMN degraded_count INTEGER NOT NULL DEFAULT 0`** — `run_migrations` uses `metadata.create_all`, which creates tables but does not alter them.
 
 ## Adapter Architecture
 

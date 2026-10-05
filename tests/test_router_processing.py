@@ -13,10 +13,13 @@ from __future__ import annotations
 import pytest
 from ulid import ULID
 
-from jobbers.models.dag import FanInCallback, RouterCallback
+from jobbers import db
+from jobbers.constants import RERUN_ROUTER_TASK
+from jobbers.models.dag import DAGNode, FanInCallback, RouterCallback, SimpleCallback
 from jobbers.models.router import RouteTo
 from jobbers.models.task import Task, TaskStatus
-from jobbers.registry import clear_registry, register_router, register_task
+from jobbers.registry import register_router, register_task, reset_registry
+from jobbers.system_tasks import rerun_router
 from jobbers.task_processor import RouterError, TaskProcessor
 from jobbers.utils.mermaid_dag import parse_mermaid_dag
 
@@ -77,9 +80,9 @@ flowchart TD
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    clear_registry()
+    reset_registry()
     yield
-    clear_registry()
+    reset_registry()
 
 
 def _register_tasks(*names: str) -> None:
@@ -215,14 +218,30 @@ async def test_router_receives_node_parameters(state_manager_real_ta):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("router_body", "match"),
+    ("router_body", "match", "reason"),
     [
-        pytest.param(lambda results, threshold: 1 / 0, "raised", id="router-raises"),
-        pytest.param(lambda results, threshold: "no_such_task", "matches none", id="unknown-name"),
-        pytest.param(lambda results, threshold: 42, "expected a task name", id="bad-return-type"),
+        pytest.param(lambda results, threshold: 1 / 0, "raised", "raised", id="router-raises"),
+        pytest.param(
+            lambda results, threshold: "no_such_task",
+            "matches none",
+            "no_candidate",
+            id="unknown-name",
+        ),
+        pytest.param(
+            lambda results, threshold: 42,
+            "expected a task name",
+            "invalid_return",
+            id="bad-return-type",
+        ),
     ],
 )
-async def test_router_failures_raise_router_error(state_manager_real_ta, router_body, match):
+async def test_router_failures_produce_a_placeholder(state_manager_real_ta, router_body, match, reason):
+    """
+    Every router failure mode lands as a FAILED placeholder carrying the router's own id.
+
+    The exception does not escape: a router failure is the router's business, not the
+    parent's, so ``_handle_router`` contains it.
+    """
     _register_tasks("measure_payload", "fast_path", "slow_path")
     register_router(name="route_by_size", version=0)(
         lambda results, *, threshold: router_body(results, threshold)
@@ -230,17 +249,32 @@ async def test_router_failures_raise_router_error(state_manager_real_ta, router_
 
     task = _root_task(SIMPLE_ROUTER, results={"bytes": 10})
     cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
-    with pytest.raises(RouterError, match=match):
-        await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+    await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+
+    placeholder = await state_manager_real_ta.task_state.get_task(cb.router.id)
+    assert placeholder is not None, "the router node's id must now hold a placeholder task"
+    assert placeholder.name == RERUN_ROUTER_TASK
+    assert placeholder.status == TaskStatus.FAILED
+    assert any(match in e for e in placeholder.errors)
+    assert placeholder.parameters["reason"] == reason
+    assert placeholder.queue == task.queue, "the placeholder runs where the parent ran"
+    # No candidate was submitted — the branch is held, not guessed at.
+    for candidate in cb.router.candidates:
+        assert await state_manager_real_ta.task_state.get_task(candidate.id) is None
 
 
 @pytest.mark.asyncio
-async def test_unregistered_router_raises_router_error(state_manager_real_ta):
+async def test_unregistered_router_placeholder_is_marked_retryable(state_manager_real_ta):
+    """An unregistered router is the one transient failure: a mid-deploy worker may have it."""
     _register_tasks("measure_payload", "fast_path", "slow_path")
     task = _root_task(SIMPLE_ROUTER, results={"bytes": 10})
     cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
-    with pytest.raises(RouterError, match="Unknown router"):
-        await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+    await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+
+    placeholder = await state_manager_real_ta.task_state.get_task(cb.router.id)
+    assert placeholder is not None
+    assert placeholder.parameters["reason"] == "unregistered"
+    assert placeholder.parameters["retryable"] is True
 
 
 @pytest.mark.asyncio
@@ -254,13 +288,16 @@ async def test_ambiguous_bare_name_selection_names_the_queues(state_manager_real
 
     task = _root_task(TIERED_ROUTER, results={})
     cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
-    with pytest.raises(RouterError, match="ambiguous across queues"):
-        await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+    await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+
+    placeholder = await state_manager_real_ta.task_state.get_task(cb.router.id)
+    assert placeholder is not None
+    assert any("ambiguous across queues" in e for e in placeholder.errors)
 
 
 @pytest.mark.asyncio
-async def test_router_failure_is_recorded_without_changing_task_status(state_manager_real_ta):
-    """post_process failures leave the parent COMPLETED but record the error."""
+async def test_router_failure_leaves_the_parent_completed(state_manager_real_ta):
+    """The parent did its own work correctly, so its status and errors are untouched."""
     _register_tasks("measure_payload", "fast_path", "slow_path")
 
     @register_router(name="route_by_size", version=0)
@@ -268,14 +305,40 @@ async def test_router_failure_is_recorded_without_changing_task_status(state_man
         raise RuntimeError("boom")
 
     task = _root_task(SIMPLE_ROUTER, results={"bytes": 10})
-    processor = TaskProcessor(state_manager_real_ta)
-    try:
-        await processor.post_process(task)
-    except RouterError as exc:
-        await processor._handle_post_process_failure(task, exc)
+    task.set_status(TaskStatus.COMPLETED)
+    await TaskProcessor(state_manager_real_ta).post_process(task)
 
     assert task.status == TaskStatus.COMPLETED
-    assert any("post_process failed" in e and "boom" in e for e in task.errors)
+    assert task.errors == [], "the failure belongs to the router's placeholder, not the parent"
+    cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    placeholder = await state_manager_real_ta.task_state.get_task(cb.router.id)
+    assert placeholder is not None
+    assert any("boom" in e for e in placeholder.errors)
+
+
+@pytest.mark.asyncio
+async def test_router_failure_does_not_drop_the_parents_other_callbacks(state_manager_real_ta):
+    """
+    A broken router must not take the parent's unrelated continuations down with it.
+
+    Real-backend test: the regression is that the RouterError escaped post_process before
+    the has_callbacks() block ran, so the sibling was silently never submitted.
+    """
+    _register_tasks("measure_payload", "fast_path", "slow_path", "unrelated")
+
+    @register_router(name="route_by_size", version=0)
+    def route_by_size(results, *, threshold):
+        raise RuntimeError("boom")
+
+    task = _root_task(SIMPLE_ROUTER, results={"bytes": 10})
+    sibling = DAGNode("unrelated").to_spec()
+    task.dag_callbacks = list(task.dag_callbacks) + [SimpleCallback(task=sibling)]
+
+    await TaskProcessor(state_manager_real_ta).post_process(task)
+
+    submitted = await state_manager_real_ta.task_state.get_task(sibling.id)
+    assert submitted is not None, "the parent's unrelated callback must still fire"
+    assert submitted.name == "unrelated"
 
 
 # ── converging branches ───────────────────────────────────────────────────────
@@ -406,3 +469,287 @@ async def test_per_item_router_gets_the_item_not_the_whole_result(state_manager_
     await TaskProcessor(state_manager_real_ta).post_process(task)
 
     assert seen == [{"region": "us"}, {"region": "eu"}]
+
+
+# ── placeholder: fan-in handover, fallback, resume ────────────────────────────
+
+FAN_IN_AROUND_ROUTER = """
+flowchart TD
+    A["measure_payload"]
+    R{"route_by_size"}
+    B["fast_path"]
+    C["slow_path"]
+    X["sibling"]
+    Z["collect"]
+
+    A --> R
+    R --> B
+    R --> C
+    A --> Z
+    X --> Z
+"""
+
+FALLBACK_ROUTER = """
+flowchart TD
+    A["measure_payload"]
+    R{"route_by_size"}
+    B["fast_path"]
+    C["slow_path"]
+    E["degraded_path"]
+
+    A --> R
+    R --> B
+    R --> C
+    R -.-> E
+"""
+
+FALLBACK_WITH_FAN_IN = """
+flowchart TD
+    A["measure_payload"]
+    R{"route_by_size"}
+    B["fast_path"]
+    C["slow_path"]
+    E["degraded_path"]
+    X["sibling"]
+    Z["collect"]
+
+    A --> R
+    R --> B
+    R --> C
+    R -.-> E
+    A --> Z
+    X --> Z
+"""
+
+
+def _boom_router(name: str = "route_by_size") -> None:
+    @register_router(name=name, version=0)
+    def router(results, **_kwargs):
+        raise RuntimeError("boom")
+
+
+async def _size_fan_in(sm, task: Task, cb: FanInCallback) -> None:
+    """Populate the fan-in set the way the submission of both predecessors would have."""
+    await sm.init_fan_in(task.dag_run_id, cb.fan_in_key, {task.id, ULID()})
+
+
+@pytest.mark.asyncio
+async def test_halt_placeholder_takes_over_the_parents_fan_in(state_manager_real_ta):
+    """
+    The placeholder inherits the fan-in obligation, so the collector waits on it.
+
+    Real-backend test: this is about actual fan-in set membership. A stub would only show
+    that delegate_fan_in was called, not that the collector is now blocked on the right id
+    and that the parent did not discharge the obligation on its way past.
+    """
+    _register_tasks("measure_payload", "fast_path", "slow_path", "sibling", "collect")
+    _boom_router()
+
+    task = _root_task(FAN_IN_AROUND_ROUTER, results={})
+    fan_in_cb = next(c for c in task.dag_callbacks if isinstance(c, FanInCallback))
+    router_cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    await _size_fan_in(state_manager_real_ta, task, fan_in_cb)
+
+    await TaskProcessor(state_manager_real_ta).post_process(task)
+
+    members = await state_manager_real_ta.task_state.get_fan_in_members(task.dag_run_id, fan_in_cb.fan_in_key)
+    assert router_cb.router.id in members, "the collector must now wait on the placeholder"
+    assert task.id not in members, "the parent handed its obligation over"
+    assert await state_manager_real_ta.task_state.get_task(fan_in_cb.task.id) is None, (
+        "the collector must not have fired early"
+    )
+
+
+@pytest.mark.asyncio
+async def test_completing_the_placeholder_discharges_the_inherited_fan_in(state_manager_real_ta):
+    """
+    The placeholder carries the FanInCallbacks, so ordinary post_process closes them.
+
+    This is why the rerun_router handler needs no fan-in bookkeeping of its own.
+    """
+    _register_tasks("measure_payload", "fast_path", "slow_path", "sibling", "collect")
+    _boom_router()
+
+    task = _root_task(FAN_IN_AROUND_ROUTER, results={})
+    fan_in_cb = next(c for c in task.dag_callbacks if isinstance(c, FanInCallback))
+    router_cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    # Only the parent is pending, so discharging its obligation should fire the collector.
+    await state_manager_real_ta.init_fan_in(task.dag_run_id, fan_in_cb.fan_in_key, {task.id})
+    await TaskProcessor(state_manager_real_ta).post_process(task)
+
+    placeholder = await state_manager_real_ta.task_state.get_task(router_cb.router.id)
+    assert placeholder is not None
+    assert [c.fan_in_key for c in placeholder.dag_callbacks if isinstance(c, FanInCallback)] == [
+        fan_in_cb.fan_in_key
+    ]
+
+    placeholder.set_status(TaskStatus.COMPLETED)
+    await TaskProcessor(state_manager_real_ta).post_process(placeholder)
+
+    collector = await state_manager_real_ta.task_state.get_task(fan_in_cb.task.id)
+    assert collector is not None, "the collector fires once the placeholder resolves"
+    assert collector.name == "collect"
+
+
+@pytest.mark.asyncio
+async def test_fallback_submits_the_degraded_path_and_completes_the_placeholder(
+    state_manager_real_ta,
+):
+    """A declared dotted edge means continue degraded rather than halt."""
+    _register_tasks("measure_payload", "fast_path", "slow_path", "degraded_path")
+    _boom_router()
+
+    task = _root_task(FALLBACK_ROUTER, results={})
+    cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    assert cb.error_callback is not None
+
+    await TaskProcessor(state_manager_real_ta).post_process(task)
+
+    fallback = await state_manager_real_ta.task_state.get_task(cb.error_callback.id)
+    assert fallback is not None, "the degraded path must be submitted"
+    assert fallback.name == "degraded_path"
+
+    placeholder = await state_manager_real_ta.task_state.get_task(cb.router.id)
+    assert placeholder is not None
+    # COMPLETED, not FAILED: every non-COMPLETED terminal status is in stuck_statuses()
+    # and would claim the run needs operator intervention when it does not.
+    assert placeholder.status == TaskStatus.COMPLETED
+    assert any("boom" in e for e in placeholder.errors)
+
+
+@pytest.mark.asyncio
+async def test_fallback_node_takes_over_the_fan_in_not_the_placeholder(state_manager_real_ta):
+    """Under FALLBACK the degraded node is the successor, so it inherits the obligation."""
+    _register_tasks("measure_payload", "fast_path", "slow_path", "degraded_path", "sibling", "collect")
+    _boom_router()
+
+    task = _root_task(FALLBACK_WITH_FAN_IN, results={})
+    fan_in_cb = next(c for c in task.dag_callbacks if isinstance(c, FanInCallback))
+    cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    assert cb.error_callback is not None
+    await _size_fan_in(state_manager_real_ta, task, fan_in_cb)
+
+    await TaskProcessor(state_manager_real_ta).post_process(task)
+
+    members = await state_manager_real_ta.task_state.get_fan_in_members(task.dag_run_id, fan_in_cb.fan_in_key)
+    assert cb.error_callback.id in members, "the degraded node is the successor"
+    assert cb.router.id not in members, "the inert placeholder is not waited on"
+
+
+@pytest.mark.asyncio
+async def test_resuming_the_placeholder_routes_with_the_fixed_router(state_manager_real_ta, monkeypatch):
+    """
+    The point of the placeholder: deploy a fix, resume, and the routing happens.
+
+    The parent is never re-run and the candidate keeps its pre-assigned id, so the live
+    diagram still lines up with what was submitted.
+    """
+    _register_tasks("measure_payload", "fast_path", "slow_path")
+    calls: list[str] = []
+
+    @register_router(name="route_by_size", version=0)
+    def broken(results, **_kwargs):
+        calls.append("broken")
+        raise RuntimeError("boom")
+
+    task = _root_task(SIMPLE_ROUTER, results={"bytes": 10})
+    await state_manager_real_ta.task_state.save_task(task)
+    cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+    placeholder = await state_manager_real_ta.task_state.get_task(cb.router.id)
+    assert placeholder is not None
+    assert placeholder.status == TaskStatus.FAILED
+
+    # "Deploy the fix", then run what a resume would run.
+    reset_registry()
+    _register_tasks("measure_payload", "fast_path", "slow_path")
+
+    @register_router(name="route_by_size", version=0)
+    def fixed(results, **_kwargs):
+        calls.append("fixed")
+        return "fast_path"
+
+    monkeypatch.setattr(db, "get_state_manager", lambda: state_manager_real_ta)
+    result = await rerun_router(**placeholder.parameters)
+
+    chosen = next(c for c in cb.router.candidates if c.name == "fast_path")
+    assert result["routed"] == str(chosen.id)
+    submitted = await state_manager_real_ta.task_state.get_task(chosen.id)
+    assert submitted is not None, "the candidate keeps its pre-assigned id"
+    assert submitted.name == "fast_path"
+    assert calls == ["broken", "fixed"], "the parent task itself was never re-run"
+
+
+@pytest.mark.asyncio
+async def test_placeholder_joins_the_dag_run_so_it_is_resumable(state_manager_real_ta):
+    """
+    The placeholder must be in the run task index, or can_resume_dag_run cannot see it.
+
+    Real-backend test: run membership comes from the enqueue path, which a task created
+    directly in a terminal status never takes.
+    """
+    _register_tasks("measure_payload", "fast_path", "slow_path")
+    _boom_router()
+
+    task = _root_task(SIMPLE_ROUTER, results={})
+    await state_manager_real_ta.submit_tasks_batch([task])
+    task.set_status(TaskStatus.COMPLETED)
+    await TaskProcessor(state_manager_real_ta).post_process(task)
+
+    cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    detail = await state_manager_real_ta.task_state.get_dag_run(task.dag_run_id)
+    assert detail is not None
+    assert cb.router.id in detail.task_ids, "a run that cannot see the placeholder cannot resume it"
+
+    precheck = await state_manager_real_ta.can_resume_dag_run(task.dag_run_id)
+    assert precheck.resumable, precheck.reason
+    assert cb.router.id in precheck.stuck_task_ids
+
+
+@pytest.mark.asyncio
+async def test_rerun_router_declining_submits_nothing(state_manager_real_ta, monkeypatch):
+    """A fixed router may legitimately decide the right answer is to route nowhere."""
+    _register_tasks("measure_payload", "fast_path", "slow_path")
+    _boom_router()
+
+    task = _root_task(SIMPLE_ROUTER, results={"bytes": 10})
+    await state_manager_real_ta.task_state.save_task(task)
+    cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+    placeholder = await state_manager_real_ta.task_state.get_task(cb.router.id)
+    assert placeholder is not None
+
+    reset_registry()
+    _register_tasks("measure_payload", "fast_path", "slow_path")
+
+    @register_router(name="route_by_size", version=0)
+    def declines(results, **_kwargs):
+        return None
+
+    monkeypatch.setattr(db, "get_state_manager", lambda: state_manager_real_ta)
+    assert await rerun_router(**placeholder.parameters) == {"routed": None}
+    for candidate in cb.router.candidates:
+        assert await state_manager_real_ta.task_state.get_task(candidate.id) is None
+
+
+@pytest.mark.asyncio
+async def test_rerun_router_fails_clearly_when_the_parent_has_aged_out(state_manager_real_ta, monkeypatch):
+    """
+    Resuming after the parent blob is swept cannot work, and says so.
+
+    The router needs the parent results to route on, and the Cleaner prunes terminal tasks
+    on ``completed_task_age``. No router fix recovers this; the run has to be re-submitted.
+    """
+    _register_tasks("measure_payload", "fast_path", "slow_path")
+    _boom_router()
+
+    task = _root_task(SIMPLE_ROUTER, results={"bytes": 10})
+    cb = next(c for c in task.dag_callbacks if isinstance(c, RouterCallback))
+    await TaskProcessor(state_manager_real_ta)._handle_router(task, cb)
+    placeholder = await state_manager_real_ta.task_state.get_task(cb.router.id)
+    assert placeholder is not None
+
+    # The parent was never saved here, which is what an aged-out blob looks like.
+    monkeypatch.setattr(db, "get_state_manager", lambda: state_manager_real_ta)
+    with pytest.raises(RouterError, match="no longer exists"):
+        await rerun_router(**placeholder.parameters)

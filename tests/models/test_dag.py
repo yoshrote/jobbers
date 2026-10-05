@@ -17,7 +17,7 @@ from jobbers.models.dag import (
     TaskResult,
     collect_fan_in_keys,
 )
-from jobbers.registry import clear_registry, register_task
+from jobbers.registry import register_task, reset_registry
 
 
 def make_spec(name: str = "task", **kwargs) -> DAGTaskSpec:
@@ -615,7 +615,7 @@ def register_collector():
         return fn
 
     yield _register
-    clear_registry()
+    reset_registry()
 
 
 def test_merge_raises_for_singular_from_parent_on_collector(register_collector):

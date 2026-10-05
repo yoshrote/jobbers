@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from jobbers.models.dag import DynamicFanOutCallback, FanInCallback, RouterCallback
+from jobbers.models.task_status import TaskStatus
 from jobbers.utils.mermaid_dag import MermaidParseError, dag_spec_to_mermaid, parse_mermaid_dag
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -433,3 +434,50 @@ def test_compact_generation_keeps_router_skeleton() -> None:
     assert f"{spec.id} -->> {cb.arm_router.id}" in diagram
     for candidate in cb.arm_router.candidates:
         assert f"{candidate.id} --o {cb.collector.id}" in diagram
+
+
+# ── router node state (the placeholder shares the router node id) ──────────────
+
+
+def test_router_node_stays_purple_when_no_placeholder_exists() -> None:
+    """A resolved router is not green: the thing that went green is the candidate it picked."""
+    spec = parse_mermaid_dag(SIMPLE_ROUTER)[0].to_spec()
+    cb = next(c for c in spec.dag_callbacks if isinstance(c, RouterCallback))
+    diagram = dag_spec_to_mermaid(spec, task_statuses={str(spec.id): TaskStatus.COMPLETED})
+    assert f"{cb.router.id}" in diagram
+    assert ":::router" in diagram
+    assert "classDef degraded" in diagram
+
+
+def test_halted_router_node_renders_as_failed() -> None:
+    """A FAILED placeholder under the router id colours the rhombus red."""
+    spec = parse_mermaid_dag(SIMPLE_ROUTER)[0].to_spec()
+    cb = next(c for c in spec.dag_callbacks if isinstance(c, RouterCallback))
+    diagram = dag_spec_to_mermaid(spec, task_statuses={str(cb.router.id): TaskStatus.FAILED})
+    assert f"{cb.router.id}" in diagram
+    router_line = next(ln for ln in diagram.splitlines() if str(cb.router.id) in ln and "{" in ln)
+    assert router_line.endswith(":::failed")
+    # Same lowercase status.value form that _spec_label uses on task nodes.
+    assert f"{{{TaskStatus.FAILED.value}}}" in router_line
+
+
+def test_degraded_router_node_renders_amber_not_green() -> None:
+    """A COMPLETED placeholder means the fallback was taken, so it must not read as success."""
+    spec = parse_mermaid_dag(SIMPLE_ROUTER)[0].to_spec()
+    cb = next(c for c in spec.dag_callbacks if isinstance(c, RouterCallback))
+    diagram = dag_spec_to_mermaid(spec, task_statuses={str(cb.router.id): TaskStatus.COMPLETED})
+    router_line = next(ln for ln in diagram.splitlines() if str(cb.router.id) in ln and "{" in ln)
+    assert router_line.endswith(":::degraded")
+    assert ":::completed" not in router_line
+
+
+def test_router_node_with_a_status_still_round_trips() -> None:
+    """The {STATUS} suffix on a router label is a reserved slot, stripped on re-parse."""
+    spec = parse_mermaid_dag(SIMPLE_ROUTER)[0].to_spec()
+    cb = next(c for c in spec.dag_callbacks if isinstance(c, RouterCallback))
+    diagram = dag_spec_to_mermaid(spec, task_statuses={str(cb.router.id): TaskStatus.FAILED})
+    reparsed = parse_mermaid_dag(diagram)[0].to_spec()
+    reparsed_cb = next(c for c in reparsed.dag_callbacks if isinstance(c, RouterCallback))
+    assert reparsed_cb.router.router == cb.router.router
+    assert reparsed_cb.router.parameters == cb.router.parameters
+    assert [c.name for c in reparsed_cb.router.candidates] == [c.name for c in cb.router.candidates]

@@ -128,6 +128,10 @@ dag_runs = Table(
     Column("status", String, nullable=False, server_default="running"),
     Column("completed_count", Integer, nullable=False, server_default="0"),
     Column("failed_count", Integer, nullable=False, server_default="0"),
+    # Tasks that neither succeeded nor failed: a router placeholder whose '-.->' degraded
+    # path was taken. Counted apart from failed_count so "this run has a failed task"
+    # keeps meaning that; see DagRunStatus.DEGRADED.
+    Column("degraded_count", Integer, nullable=False, server_default="0"),
     # Set once, idempotently, by StateManager.request_dag_cancellation. NULL means
     # cancellation was never requested for this run.
     Column("cancelled_at", DateTime(timezone=True), nullable=True),
